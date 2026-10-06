@@ -2108,12 +2108,13 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return true;
 	}
-	if (args.gpu_args != 0 && state.vs_input_info.stage.program->stage == ShaderType::Mesh) {
-		// A mesh draw sizes its task grid from the counts.
-		ResetBindings();
-		return false;
-	}
-
+	
+	if (args.gpu_args != 0 && state.vs_input_info.stage.program != nullptr && state.vs_input_info.stage.program->stage == ShaderType::Mesh) {
+	        // A mesh draw sizes its task grid from the counts.
+        	ResetBindings();
+    	    return false;
+        }
+	
 	bool programs_ok = false;
 	if (XprCapture::Enabled() && XprCapture::g_state.current_xpr &&
 	    XprCapture::g_state.capture_this) {

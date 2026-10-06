@@ -682,13 +682,13 @@ struct GuestStackFrame {
 };
 
 static bool IsReadableRange(uint64_t addr, uint64_t size);
+static RuntimeLinker* g_faulting_linker = nullptr;
 
 static int WalkGuestStack(uint64_t rbp, uint64_t rsp, void** stack, int capacity) {
 	constexpr uintptr_t STACK_SIZE = 1024u * 1024u;
-	const uintptr_t     code_start = SYSTEM_RESERVED + CODE_BASE_OFFSET;
 	const uintptr_t     stack_end  = rsp + STACK_SIZE;
-	if (stack == nullptr || capacity <= 0 || rsp == 0 || rbp < rsp || stack_end < rsp ||
-	    g_desired_base_addr <= code_start) {
+	
+	if (stack == nullptr || capacity <= 0 || rsp == 0 || rbp < rsp || stack_end < rsp) {
 		return 0;
 	}
 
@@ -698,10 +698,15 @@ static int WalkGuestStack(uint64_t rbp, uint64_t rsp, void** stack, int capacity
 	while (depth < capacity) {
 		const auto frame_addr = reinterpret_cast<uintptr_t>(frame);
 		if (frame_addr < rsp || frame_addr > stack_end - sizeof(GuestStackFrame) ||
-		    !IsReadableRange(frame_addr, sizeof(GuestStackFrame)) ||
-		    frame->return_address < code_start || frame->return_address >= g_desired_base_addr) {
+		    !IsReadableRange(frame_addr, sizeof(GuestStackFrame))) {
 			break;
 		}
+		
+		// FIX: Use linker to test if the return address belongs to valid guest space
+		if (g_faulting_linker == nullptr || g_faulting_linker->FindProgramByAddr(frame->return_address) == nullptr) {
+		    break;
+		}
+		
 		stack[depth++] = reinterpret_cast<void*>(frame->return_address);
 		if (reinterpret_cast<uintptr_t>(frame->next) <= frame_addr) {
 			break;
@@ -784,7 +789,6 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
-static RuntimeLinker* g_faulting_linker = nullptr;
 
 static std::string DescribeGuestAddress(uint64_t vaddr) {
 	if (g_faulting_linker == nullptr || vaddr == 0) {
@@ -811,184 +815,182 @@ static std::string DescribeGuestCode(uint64_t vaddr) {
 	}
 	return bytes;
 }
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
-	const auto* info = &exception_info;
+    const auto* info = &exception_info;
 
-	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
-	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
-		return true;
-	}
+    if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
+        Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
+        return true;
+    }
 
-	// The game's debug break after a failed assertion (an audio plugin's assert(0) ended 4 of ~420 runs):
-	// no debugger, so the guest goes on.
-	if (info->type == Common::HostException::ExceptionType::AccessViolation &&
-	    info->access_violation_vaddr == UINT64_MAX && g_faulting_linker != nullptr &&
-	    g_faulting_linker->FindProgramByAddr(info->exception_address) != nullptr &&
-	    Loader::X64InstructionEmulator::TrySkipDebugBreak(info->native_context)) {
-		static std::atomic<uint32_t> reported {0};
-		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
-			std::printf("Guest debug break (int 0x41) at %s skipped: no debugger\n",
-			            DescribeGuestAddress(info->exception_address).c_str());
-			std::fflush(stdout);
-		}
-		return true;
-	}
+    // The game's debug break after a failed assertion (an audio plugin's assert(0) ended 4 of ~420 runs):
+    // no debugger, so the guest goes on.
+    if (info->type == Common::HostException::ExceptionType::AccessViolation &&
+        info->access_violation_vaddr == UINT64_MAX && g_faulting_linker != nullptr &&
+        g_faulting_linker->FindProgramByAddr(info->exception_address) != nullptr &&
+        Loader::X64InstructionEmulator::TrySkipDebugBreak(info->native_context)) {
+        static std::atomic<uint32_t> reported {0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+            std::printf("Guest debug break (int 0x41) at %s skipped: no debugger\n",
+                        DescribeGuestAddress(info->exception_address).c_str());
+            std::fflush(stdout);
+        }
+        return true;
+    }
 
-	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
-		using CoreAccess = Common::HostException::AccessViolationType;
-		using GpuAccess  = Libs::Graphics::PageFaultAccess;
-		GpuAccess access;
-		switch (info->access_violation_type) {
-			case CoreAccess::Read: access = GpuAccess::Read; break;
-			case CoreAccess::Write: access = GpuAccess::Write; break;
-			case CoreAccess::Execute: access = GpuAccess::Execute; break;
-			case CoreAccess::Unknown: return false;
-		}
-		// Live trace: which guest code touches tracked pages (a readback or an invalidation follows).
-		LiveTrace::Event(LiveTrace::FaultSite, info->exception_address,
-		                 info->access_violation_vaddr | (access == GpuAccess::Write ? uint64_t {1} << 63u : 0));
-		// Host code (a runtime copy or the emulator itself): the return address at the stack
-		// top names the caller of a leaf routine such as memcpy.
-		if (LiveTrace::g_on.load(std::memory_order_relaxed) && info->rsp != 0 &&
-		    (info->exception_address < 0x800000000ull || info->exception_address >= 0x100000000000ull)) {
-			LiveTrace::Event(LiveTrace::FaultCaller, *reinterpret_cast<const uint64_t*>(info->rsp),
-			                 info->exception_address);
-		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
-			LiveTrace::Event(LiveTrace::FaultDone, access == GpuAccess::Write ? 1 : 0, info->access_violation_vaddr);
-			return true;
-		}
-	}
-	// Guest code that touched memory another thread is mapping back (a partial unmap on Windows unmaps the
-	// whole view and maps its other parts again): once that is done the address is mapped and the access
-	// runs again. Texture streaming unmaps parts of pool views every frame; a read in the gap exited.
-	// A thread faulting again and again on the same address is a real fault.
-	if (info->type == Common::HostException::ExceptionType::AccessViolation && g_faulting_linker != nullptr &&
-	    g_faulting_linker->FindProgramByAddr(info->exception_address) != nullptr &&
-	    Libs::LibKernel::Memory::IsGuestMappedAfterChanges(info->access_violation_vaddr)) {
-		thread_local uint64_t last_fault = 0;
-		thread_local uint32_t repeats    = 0;
-		repeats    = info->access_violation_vaddr == last_fault ? repeats + 1 : 0;
-		last_fault = info->access_violation_vaddr;
-		if (repeats < 64) {
-			static std::atomic<uint32_t> reported {0};
-			if (repeats == 0 && reported.fetch_add(1, std::memory_order_relaxed) < 16) {
-				std::printf("Guest access to memory being mapped again retried: %s reading/writing 0x%016" PRIx64 "\n",
-				            DescribeGuestAddress(info->exception_address).c_str(), info->access_violation_vaddr);
-				std::fflush(stdout);
-			}
-			return true;
-		}
-	}
-	// Report whatever guest context can be read safely before terminating: which guest thread
-	// faulted, the register file, the faulting code bytes and the top of its stack.
-	{
-		char thread_name[64] = "(host thread)";
-		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
-			if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
-				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
-			}
-		}
-		std::printf("--- Guest fault context ---\n");
-		std::printf("thread: %s\n", thread_name);
-		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
-		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
-		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
-		            "r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
-		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
-		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
-		            info->r14, info->r15);
-		if (IsReadableRange(info->exception_address - 48, 96)) {
-			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
-			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
-			for (int i = 0; i < 96; i++) {
-				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
-			}
-			std::printf("\n");
-		}
-		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
-			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
-			std::printf("stack:");
-			for (int i = 0; i < 32; i++) {
-				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
-			}
-			std::printf("\n");
-		}
-		// GPU write-backs (Memory::WriteBacking) over the pages the registers and the stack top point at:
-		// a structure the game broke may have been overwritten by stale GPU data.
-		{
-			std::vector<uint64_t> pages;
-			const auto note = [&](uint64_t value) {
-				if (value >= 0x10000 && value < 0x10000000000ull) pages.push_back(value & ~uint64_t {0xfff});
-			};
-			for (const auto value: {info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
-			                         info->r8, info->r9, info->r10, info->r11, info->r12, info->r13, info->r14,
-			                         info->r15, info->access_violation_vaddr})
-				note(value);
-			if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t)))
-				for (int i = 0; i < 32; i++) note(reinterpret_cast<const uint64_t*>(info->rsp)[i]);
-			std::sort(pages.begin(), pages.end());
-			pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
-			std::printf("GPU write-backs onto the pages registers and stack point at (%zu pages):\n", pages.size());
-			bool any = false;
-			for (const auto page: pages) any |= Libs::LibKernel::Memory::PrintWriteBacksOverlapping(page, 0x1000);
-			if (!any) std::printf("  none\n");
-		}
-		// The memory the registers point at (the object a bad pointer came from: its fields and lists).
-		{
-			const std::pair<const char*, uint64_t> registers[] {
-			    {"rax", info->rax}, {"rbx", info->rbx}, {"rcx", info->rcx}, {"rdx", info->rdx}, {"rsi", info->rsi},
-			    {"rdi", info->rdi}, {"rbp", info->rbp}, {"r8", info->r8},   {"r9", info->r9},   {"r10", info->r10},
-			    {"r11", info->r11}, {"r12", info->r12}, {"r13", info->r13}, {"r14", info->r14}, {"r15", info->r15}};
-			for (const auto& [name, value]: registers) {
-				const auto begin = (value & ~uint64_t {7}) - 0x40;
-				if (value < 0x10000 || value >= 0x10000000000ull || !IsReadableRange(begin, 0xc0)) continue;
-				const auto* words = reinterpret_cast<const uint64_t*>(begin);
-				std::printf("[%s-0x40..+0x80]:", name);
-				for (int i = 0; i < 24; i++) std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", words[i]);
-				std::printf("\n");
-			}
-		}
+    if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+        using CoreAccess = Common::HostException::AccessViolationType;
+        using GpuAccess  = Libs::Graphics::PageFaultAccess;
+        GpuAccess access;
+        switch (info->access_violation_type) {
+            case CoreAccess::Read: access = GpuAccess::Read; break;
+            case CoreAccess::Write: access = GpuAccess::Write; break;
+            case CoreAccess::Execute: access = GpuAccess::Execute; break;
+            case CoreAccess::Unknown: return false;
+        }
+        // Live trace: which guest code touches tracked pages (a readback or an invalidation follows).
+        LiveTrace::Event(LiveTrace::FaultSite, info->exception_address,
+                         info->access_violation_vaddr | (access == GpuAccess::Write ? uint64_t {1} << 63u : 0));
+        // Host code (a runtime copy or the emulator itself): the return address at the stack
+        // top names the caller of a leaf routine such as memcpy.
+        if (LiveTrace::g_on.load(std::memory_order_relaxed) && info->rsp != 0 &&
+            (info->exception_address < 0x800000000ull || info->exception_address >= 0x100000000000ull)) {
+            LiveTrace::Event(LiveTrace::FaultCaller, *reinterpret_cast<const uint64_t*>(info->rsp),
+                             info->exception_address);
+        }
+        if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+            LiveTrace::Event(LiveTrace::FaultDone, access == GpuAccess::Write ? 1 : 0, info->access_violation_vaddr);
+            return true;
+        }
+    }
+    // Guest code that touched memory another thread is mapping back (a partial unmap on Windows unmaps the
+    // whole view and maps its other parts again): once that is done the address is mapped and the access
+    // runs again. Texture streaming unmaps parts of pool views every frame; a read in the gap exited.
+    // A thread faulting again and again on the same address is a real fault.
+    if (info->type == Common::HostException::ExceptionType::AccessViolation && g_faulting_linker != nullptr &&
+        g_faulting_linker->FindProgramByAddr(info->exception_address) != nullptr &&
+        Libs::LibKernel::Memory::IsGuestMappedAfterChanges(info->access_violation_vaddr)) {
+        thread_local uint64_t last_fault = 0;
+        thread_local uint32_t repeats    = 0;
+        repeats    = info->access_violation_vaddr == last_fault ? repeats + 1 : 0;
+        last_fault = info->access_violation_vaddr;
+        if (repeats < 64) {
+            static std::atomic<uint32_t> reported {0};
+            if (repeats == 0 && reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+                std::printf("Guest access to memory being mapped again retried: %s reading/writing 0x%016" PRIx64 "\n",
+                            DescribeGuestAddress(info->exception_address).c_str(), info->access_violation_vaddr);
+                std::fflush(stdout);
+            }
+            return true;
+        }
+    }
+    // Report whatever guest context can be read safely before terminating: which guest thread
+    // faulted, the register file, the faulting code bytes and the top of its stack.
+    {
+        // SAFETY FIX: Bypassing guest Pthread queries to prevent double-faults on host threads
+        const char* thread_name = "(thread info omitted to prevent crash)";
+        
+        std::printf("--- Guest fault context ---\n");
+        std::printf("thread: %s\n", thread_name);
+        std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
+                    "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
+                    "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
+                    "r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
+                    info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
+                    info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
+                    info->r14, info->r15);
+        if (IsReadableRange(info->exception_address - 48, 96)) {
+            const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
+            std::printf("code (pc-48 .. pc+48, fault at byte 48):");
+            for (int i = 0; i < 96; i++) {
+                std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
+            }
+            std::printf("\n");
+        }
+        if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
+            const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
+            std::printf("stack:");
+            for (int i = 0; i < 32; i++) {
+                std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
+            }
+            std::printf("\n");
+        }
+        // GPU write-backs (Memory::WriteBacking) over the pages the registers and the stack top point at:
+        // a structure the game broke may have been overwritten by stale GPU data.
+        {
+            std::vector<uint64_t> pages;
+            const auto note = [&](uint64_t value) {
+                if (value >= 0x10000 && value < 0x10000000000ull) pages.push_back(value & ~uint64_t {0xfff});
+            };
+            for (const auto value: {info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
+                                     info->r8, info->r9, info->r10, info->r11, info->r12, info->r13, info->r14,
+                                     info->r15, info->access_violation_vaddr})
+                note(value);
+            if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t)))
+                for (int i = 0; i < 32; i++) note(reinterpret_cast<const uint64_t*>(info->rsp)[i]);
+            std::sort(pages.begin(), pages.end());
+            pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+            std::printf("GPU write-backs onto the pages registers and stack point at (%zu pages):\n", pages.size());
+            bool any = false;
+            for (const auto page: pages) any |= Libs::LibKernel::Memory::PrintWriteBacksOverlapping(page, 0x1000);
+            if (!any) std::printf("  none\n");
+        }
+        // The memory the registers point at (the object a bad pointer came from: its fields and lists).
+        {
+            const std::pair<const char*, uint64_t> registers[] {
+                {"rax", info->rax}, {"rbx", info->rbx}, {"rcx", info->rcx}, {"rdx", info->rdx}, {"rsi", info->rsi},
+                {"rdi", info->rdi}, {"rbp", info->rbp}, {"r8", info->r8},   {"r9", info->r9},   {"r10", info->r10},
+                {"r11", info->r11}, {"r12", info->r12}, {"r13", info->r13}, {"r14", info->r14}, {"r15", info->r15}};
+            for (const auto& [name, value]: registers) {
+                const auto begin = (value & ~uint64_t {7}) - 0x40;
+                if (value < 0x10000 || value >= 0x10000000000ull || !IsReadableRange(begin, 0xc0)) continue;
+                const auto* words = reinterpret_cast<const uint64_t*>(begin);
+                std::printf("[%s-0x40..+0x80]:", name);
+                for (int i = 0; i < 24; i++) std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", words[i]);
+                std::printf("\n");
+            }
+        }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		// The host frames, by their unwind tables (the emulator's resolve with its linker map;
-		// guest code has none, which ends the walk), and the state of the faulting page.
-		if (info->native_context != nullptr) {
-			auto context = *static_cast<const CONTEXT*>(info->native_context);
-			std::printf("host frames (emulator at %p):", static_cast<void*>(GetModuleHandleA(nullptr)));
-			for (int i = 0; i < 32 && context.Rip != 0; i++) {
-				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", static_cast<uint64_t>(context.Rip));
-				DWORD64     image_base = 0;
-				auto*       function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
-				if (function == nullptr) {
-					// Only the faulting frame can be a leaf function: its return address on top.
-					if (i != 0 || !IsReadableRange(context.Rsp, sizeof(DWORD64))) break;
-					context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
-					context.Rsp += sizeof(DWORD64);
-					continue;
-				}
-				void*   handler_data = nullptr;
-				DWORD64 frame        = 0;
-				RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context, &handler_data,
-				                 &frame, nullptr);
-			}
-			std::printf("\n");
-		}
-		MEMORY_BASIC_INFORMATION page {};
-		if (info->type == Common::HostException::ExceptionType::AccessViolation &&
-		    VirtualQuery(reinterpret_cast<const void*>(info->access_violation_vaddr), &page, sizeof(page)) != 0) {
-			std::printf("fault page: state=0x%lx protect=0x%lx type=0x%lx region=%p+0x%zx\n", page.State,
-			            page.Protect, page.Type, page.BaseAddress, page.RegionSize);
-		}
+        // The host frames, by their unwind tables (the emulator's resolve with its linker map;
+        // guest code has none, which ends the walk), and the state of the faulting page.
+        if (info->native_context != nullptr) {
+            auto context = *static_cast<const CONTEXT*>(info->native_context);
+            std::printf("host frames (emulator at %p):", static_cast<void*>(GetModuleHandleA(nullptr)));
+            for (int i = 0; i < 32 && context.Rip != 0; i++) {
+                std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", static_cast<uint64_t>(context.Rip));
+                DWORD64     image_base = 0;
+                auto*       function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+                if (function == nullptr) {
+                    // Only the faulting frame can be a leaf function: its return address on top.
+                    if (i != 0 || !IsReadableRange(context.Rsp, sizeof(DWORD64))) break;
+                    context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+                    context.Rsp += sizeof(DWORD64);
+                    continue;
+                }
+                void*   handler_data = nullptr;
+                DWORD64 frame        = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context, &handler_data,
+                                 &frame, nullptr);
+            }
+            std::printf("\n");
+        }
+        MEMORY_BASIC_INFORMATION page {};
+        if (info->type == Common::HostException::ExceptionType::AccessViolation &&
+            VirtualQuery(reinterpret_cast<const void*>(info->access_violation_vaddr), &page, sizeof(page)) != 0) {
+            std::printf("fault page: state=0x%lx protect=0x%lx type=0x%lx region=%p+0x%zx\n", page.State,
+                        page.Protect, page.Type, page.BaseAddress, page.RegionSize);
+        }
 #endif
-		std::fflush(stdout);
-	}
-	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64 " (%s)"
-	     " access=%u address=0x%016" PRIx64 " (%s) code=%s\n",
-	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,
-	     DescribeGuestAddress(info->exception_address).c_str(),
-	     static_cast<unsigned>(info->access_violation_type), info->access_violation_vaddr,
-	     DescribeGuestAddress(info->access_violation_vaddr).c_str(),
-	     DescribeGuestCode(info->exception_address).c_str());
+        std::fflush(stdout);
+    }
+    EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64 " (%s)"
+         " access=%u address=0x%016" PRIx64 " (%s) code=%s\n",
+         static_cast<unsigned>(info->type), info->native_code, info->exception_address,
+         DescribeGuestAddress(info->exception_address).c_str(),
+         static_cast<unsigned>(info->access_violation_type), info->access_violation_vaddr,
+         DescribeGuestAddress(info->access_violation_vaddr).c_str(),
+         DescribeGuestCode(info->exception_address).c_str());
 }
 
 static void EncodeId64(uint16_t in_id, std::string* out_id) {

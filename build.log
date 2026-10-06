@@ -1,0 +1,11 @@
+ninja: Entering directory `_Build/linux'
+[0/2] Re-checking globbed directories...
+[1/380] Generate kytyGitVersion.h
+[2/380] Building CXX object common/CMakeFiles/common.dir/assert.cpp.o
+FAILED: [code=1] common/CMakeFiles/common.dir/assert.cpp.o 
+/usr/bin/c++ @common/CMakeFiles/common.dir/assert.cpp.o.rsp -MD -MT common/CMakeFiles/common.dir/assert.cpp.o -MF common/CMakeFiles/common.dir/assert.cpp.o.d -o common/CMakeFiles/common.dir/assert.cpp.o -c /home/leozin/KytyPS5/src/common/assert.cpp
+/home/leozin/KytyPS5/src/common/assert.cpp: In function ‘void Common::DbgExit(int)’:
+/home/leozin/KytyPS5/src/common/assert.cpp:112:72: error: exception handling disabled, use ‘-fexceptions’ to enable
+  112 |                 throw RecoverableExit {std::move(t_recoverable_message)};
+      |                                                                        ^
+ninja: build stopped: subcommand failed.
