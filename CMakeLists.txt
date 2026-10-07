@@ -763,6 +763,24 @@ endif()
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
 
+if(LINUX)
+	set_property(SOURCE
+		"${KYTY_SOURCE_DIR}/graphics/guest_gpu/graphicsRun.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/guest_gpu/speculation.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandScheduler.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/image/tiler.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/shader/shader.cpp"
+		"${KYTY_SOURCE_DIR}/loader/redZonePatcher.cpp"
+		"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
+		"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
+		"${KYTY_SOURCE_DIR}/libs/libKernel.cpp"
+		"${KYTY_SOURCE_DIR}/kernel/syncOnAddress.cpp"
+		APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
+endif()
+
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)

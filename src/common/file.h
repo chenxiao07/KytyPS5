@@ -6,6 +6,7 @@
 #include "common/dateTime.h"
 
 #include <filesystem>
+#include <optional>
 #include <memory>
 #include <optional>
 #include <string>

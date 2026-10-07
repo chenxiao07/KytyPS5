@@ -23,6 +23,8 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+
+#include "common/archive.h"
 #include <random>
 #include <system_error>
 #include <vector>
@@ -925,6 +927,9 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	LOGF("\t KernelStat: %s\n", path);
 
 	auto real_file_name = g_mount_points->ResolvePath(path);
+	if (Common::IsArchivePath(real_file_name)) {
+		return KERNEL_ERROR_EROFS;
+	}
 
 	const auto info = Common::File::GetInfo(real_file_name);
 	if (!info) {

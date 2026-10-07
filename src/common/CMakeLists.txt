@@ -12,6 +12,10 @@ endif()
 
 add_library(common STATIC ${common_src} ${common_headers})
 
+if(LINUX)
+	set_property(SOURCE assert.cpp hostException.cpp APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
+endif()
+
 target_include_directories(common
 	PUBLIC ${KYTY_SOURCE_DIR}
 	PRIVATE

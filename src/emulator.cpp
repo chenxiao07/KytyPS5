@@ -85,6 +85,7 @@ static void MountSandboxDirs() {
 	MountOrCreateDir("_DownloadData/" + title_id, "/download0");
 	MountOrCreateDir("_TempData/" + title_id, "/temp0");
 	MountOrCreateDir("_TempData/" + title_id, "/temp");
+	MountOrCreateDir("_DevLog/" + title_id, "/devlog");
 }
 
 static bool ClearDirectoryContents(const std::filesystem::path& dir) {

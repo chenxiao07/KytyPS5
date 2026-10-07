@@ -10,6 +10,8 @@ Layout (little endian, validated over every material of the game):
 import struct
 from pathlib import Path
 
+import gamefs
+
 KIND_PAIR, KIND_COMPUTE = 0x11, 0x20
 
 
@@ -49,13 +51,13 @@ def parse(b):
 
 
 def bundle_file(game, bundle_path, platform='_ps5'):
-    return Path(game) / bundle_path.lstrip('/').replace('****', platform)
+    return gamefs.game_path(game) / bundle_path.lstrip('/').replace('****', platform)
 
 
 def techniques(game):
     """{bundle file: (flags, [(pass id, kind)])} for every material; materials sharing a bundle share its list."""
     out = {}
-    for f in sorted(Path(game).rglob('*.cmat')):
+    for f in sorted(gamefs.game_path(game).rglob('*.cmat')):
         m = parse(f.read_bytes())
         out.setdefault(bundle_file(game, m['bundle']), (m['flags'], m['techniques']))
     return out

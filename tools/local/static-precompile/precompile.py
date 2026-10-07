@@ -33,6 +33,7 @@ import keys  # noqa: E402
 import materials  # noqa: E402
 import warmfile  # noqa: E402
 import xxh3  # noqa: E402
+from gamefs import game_path  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[3]
 GAME = Path.home() / 'Documents' / 'PPSA01341-app0'  # precompile-windows.ps1's default too
@@ -48,7 +49,7 @@ class Inventory:
     """Every shader of the game, by code bytes, with the headers it comes with."""
 
     def __init__(self, game):
-        self.game = Path(game)
+        self.game = game_path(game)
         self.headers = collections.defaultdict(list)  # code -> [agc]
         self.bundles = {}                              # bundle file -> [(code, agc)]
         self.failures = []
@@ -134,7 +135,7 @@ class Inventory:
 
 def game_id(game):
     """The name of the game version's caches (PipelineCacheGameId in pipelineCache.cpp): <title>_<version>."""
-    param = json.loads((Path(game) / 'sce_sys' / 'param.json').read_text(encoding='utf-8'))
+    param = json.loads((game_path(game) / 'sce_sys' / 'param.json').read_text(encoding='utf-8'))
     return f"{param['titleId']}_{param['contentVersion']}"
 
 

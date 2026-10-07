@@ -16,6 +16,8 @@ in its data segment with the code laid out after it, one blob per header in head
 import struct
 from pathlib import Path
 
+import gamefs
+
 MAGIC = 0x34333231
 VERSION = 0x18
 HEADER_MAGIC = b'1234\x18\x00\x00\x00'
@@ -153,7 +155,7 @@ def parse_bundle(data):
 
 def csdr_files(game):
     """The PS5 bundles the emulator loads (the '_trinity' twins are the PS5 Pro variants)."""
-    return [f for f in sorted(Path(game).rglob('*.csdr')) if not f.stem.endswith('_trinity')]
+    return [f for f in sorted(gamefs.game_path(game).rglob('*.csdr')) if not f.stem.endswith('_trinity')]
 
 
 SELF_MAGICS = (b'\x4f\x15\x3d\x1d', b'\x54\x14\xf5\xee')
@@ -239,9 +241,9 @@ def embedded_shaders(game):
     """The AGC headers in eboot.bin's data segment with their code: list of dicts (index, agc, header, code).
     From decrypted/eboot.bin when the game has one, else the eboot.bin the emulator runs (a plain ELF or a SELF
     with plaintext segments, plain_elf); [] without either."""
-    path = Path(game) / 'decrypted' / 'eboot.bin'
+    path = gamefs.game_path(game) / 'decrypted' / 'eboot.bin'
     if not path.is_file():
-        path = Path(game) / 'eboot.bin'
+        path = gamefs.game_path(game) / 'eboot.bin'
     if not path.is_file():
         return []
     elf = plain_elf(path.read_bytes())
