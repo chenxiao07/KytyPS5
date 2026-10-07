@@ -609,6 +609,7 @@ vk::CommandBuffer CommandScheduler::UploadPrologue(uint64_t last_dirty, uint64_t
 }
 
 CommandScheduler::SubmitEntry CommandScheduler::ClosePrologue() {
+	if (m_prologue_hook) m_prologue_hook(m_prologue.Handle());
 	// Everything after the copies (the open buffer's commands) sees them.
 	VulkanMemoryBarrier after {};
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;

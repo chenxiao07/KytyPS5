@@ -138,6 +138,23 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::Flush();
 }
 
+// The name of the caches made from one build of the game (the static precompile's, the warmup recording): its
+// title and version, such as PPSA01341_01.007.000, since versions need not share shaders (Demon's Souls
+// 01.005.000 and 01.007.000 have 10 of about 21000 in common). The driver's pipeline cache stays the title's:
+// the driver finds a pipeline by its whole input. (Caches named by the title alone, from before, are renamed
+// by run-windows.ps1 and precompile-windows.ps1.)
+const std::string& PipelineCacheGameId() {
+	static const std::string id = [] {
+		const auto  title = PipelineCacheTitleId();
+		std::string version;
+		if (title.empty() || !Loader::SystemContentParamSfoGetString("APP_VER", &version) || version.empty() ||
+		    !std::ranges::all_of(version, [](unsigned char c) { return std::isalnum(c) != 0 || c == '.'; }))
+			return title;
+		return title + "_" + version;
+	}();
+	return id;
+}
+
 // Reads through a null pointer (a draw the game leaves unset during loads): no guest memory is mapped
 // there, and the GPU reads zeros where the host would fault.
 constexpr uint64_t NullPageEnd = 0x10000;
@@ -1389,7 +1406,7 @@ void PipelineCache::FinishCompileWorkers() {
 // The compiler inputs the static precompile compiled, as a warmup file: what the shader prefetch
 // translates (precompile-windows.ps1 writes it next to the static pipeline cache).
 static std::filesystem::path StaticInputsPath() {
-	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheTitleId() + ".shaders");
+	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheGameId() + ".shaders");
 }
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
@@ -1407,19 +1424,20 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		const auto device = ShaderInputDeviceSignature(m_graphics.GetPhysicalDeviceProperties());
 		const auto title = PipelineCacheTitleId();
 		const auto root = std::filesystem::path("_PipelineCache") / "warmup-v2";
-		auto path = root / fmt::format("{:016x}", XXH3_64bits(device.data(), device.size())) / (title + ".shaders");
+		// (Its file is the game version's, its identity line the title's: PipelineCacheGameId.)
+		auto path = root / fmt::format("{:016x}", XXH3_64bits(device.data(), device.size())) / (PipelineCacheGameId() + ".shaders");
 		// KYTY_SHADER_WARMUP_FILE: another file (a fresh recording starts empty, nothing adopted).
 		const char* file = std::getenv("KYTY_SHADER_WARMUP_FILE");
 		if (file != nullptr && *file != 0) path = file;
 		// No inputs for this device signature yet (a driver update, or inputs recorded on another
-		// OS): start from the newest file of the same title and GPU (vendor and device id).
+		// OS): start from the newest file of the same game version and GPU (vendor and device id).
 		std::filesystem::path adopt_from;
 		std::error_code       error;
 		if ((file == nullptr || *file == 0) && !std::filesystem::exists(path, error)) {
 			const auto gpu = "KytyShaderWarmup3:" + title + device.substr(0, 1 + 8 + 1 + 8 + 1);
 			std::filesystem::file_time_type newest {};
 			for (const auto& entry: std::filesystem::directory_iterator(root, error)) {
-				const auto candidate = entry.path() / (title + ".shaders");
+				const auto candidate = entry.path() / (PipelineCacheGameId() + ".shaders");
 				if (!std::filesystem::is_regular_file(candidate, error) ||
 				    !LocalShaderWarmup::Cache::FileIdentity(candidate).starts_with(gpu))
 					continue;
@@ -1593,20 +1611,20 @@ PipelineCache::~PipelineCache() {
 	}
 }
 
-// The static pipeline cache: _PipelineCache/static/<title>.bin, headed by the GPU and driver it was
+// The static pipeline cache: _PipelineCache/static/<title>_<version>.bin, headed by the GPU and driver it was
 // compiled on only (its pipelines are keyed by their whole create info, whatever build made them).
 static std::string StaticCacheSignature(const vk::PhysicalDeviceProperties& properties) {
 	return "KytyPCStatic1" + ShaderInputDeviceSignature(properties);
 }
 
 static std::filesystem::path StaticCachePath() {
-	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheTitleId() + ".bin");
+	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheGameId() + ".bin");
 }
 
 // Its pipelines as the driver's binaries (VK_KHR_pipeline_binary), read when needed: the driver keeps a
 // copy of a whole pipeline cache in memory. Headed by the GPU, the driver and its global pipeline key.
 static std::filesystem::path StaticBinariesPath() {
-	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheTitleId() + ".binaries");
+	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheGameId() + ".binaries");
 }
 
 static std::string StaticBinariesSignature(GraphicContext& graphics) {

@@ -1,35 +1,37 @@
 # Static shader and pipeline precompile (tools\local\static-precompile), a program of its own:
 #   .\precompile-windows.ps1              every shader and pipeline of the game into the static pipeline
-#                                         cache _PipelineCache\static\<title>.bin, which the emulator looks
-#                                         up before compiling (hours the first time: run it overnight); with
+#                                         cache _PipelineCache\static\<title>_<version>.bin, which the emulator
+#                                         looks up before compiling (hours the first time: run it overnight); with
 #                                         a driver that has VK_KHR_pipeline_binary (NVIDIA 5xx) the pipelines'
-#                                         binaries instead, <title>.binaries, read only when a pipeline is
+#                                         binaries instead, <title>_<version>.binaries, read only when a pipeline is
 #                                         needed (the driver copies a whole .bin into memory: GBs)
 #   .\precompile-windows.ps1 -Jobs 8      8 processes at a time (default: 3 threads each on the allowed CPUs)
 #   .\precompile-windows.ps1 -Coverage    no pipelines, only what the seeds compile to, for
 #                                         tools\local\static-precompile\precompile.py coverage
 #   .\precompile-windows.ps1 -InputsOnly  only the compiled inputs the emulator's shader prefetch
-#                                         translates in the background (_PipelineCache\static\<title>.shaders;
+#                                         translates in the background (_PipelineCache\static\<title>_<version>.shaders;
 #                                         every full run writes them too)
 # The NVIDIA driver compiles big compute shaders nearly one at a time per process, so the work is split
 # into shards, a below-normal-priority process each (kyty_shader_precompile --shard i/n), whose caches
 # are merged into the static cache at the end. The shards are small (-Shards, about 100 pipelines each):
 # after a few hundred pipelines NVIDIA compresses binaries with a dictionary of its own, which only that
 # PC reads (pipelineBinaries.h); a shard that got there anyway left the rest out (exit code 3) and runs
-# again as two. recorded.seeds next to the seed file (-Recorded) adds the specializations of recorded
-# play. An interrupted run resumes: finished shards are merged first, and what the static cache
+# again as two. recorded-<title>_<version>.seeds next to the seed file (-Recorded) adds the specializations of
+# recorded play. An interrupted run resumes: finished shards are merged first, and what the static cache
 # holds is not compiled again (binaries: the final merge keeps only what this run's shards made, so
 # pipelines no seed makes any more are dropped; a .bin left from before is where the first binaries run
 # takes them from without compiling). Build the program with build-windows.cmd kyty_shader_precompile.
 # A release package (.github/workflows/build.yml) has the program, launch.json and the seed file's generator
-# next to this script (precompile.cmd); the seed file is made there.
+# next to this script (precompile.cmd); the seed file is made there. The files are the game version's
+# (seeds-<title>_<version>.seeds): versions need not share shaders.
 param(
 	[string]$Game = '',
-	[string]$Seeds = $(if ((Test-Path "$PSScriptRoot\seeds.seeds") -or !(Test-Path "$PSScriptRoot\_Build")) { "$PSScriptRoot\seeds.seeds" } else { "$PSScriptRoot\_Build\static-precompile\seeds.seeds" }),
+	# Default: seeds-<title>_<version>.seeds next to this script (a release) or in _Build\static-precompile.
+	[string]$Seeds = '',
 	# The shaders as the game specialized them in recorded play (tools\local\static-precompile\precompile.py
 	# recorded-seeds): the specializations the seeds' guesses miss (a new PC compiled ~55 compute
-	# pipelines, up to 6 s each, before the HUD). '' = none.
-	[string]$Recorded = $(Join-Path (Split-Path $Seeds) 'recorded.seeds'),
+	# pipelines, up to 6 s each, before the HUD). '' = none; default: recorded-<title>_<version>.seeds next to the seed file.
+	[string]$Recorded = '*',
 	[int]$Jobs = 0,
 	[int]$Threads = 3,
 	[int]$Shards = 512,
@@ -40,10 +42,45 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if (!(Test-Path $Exe)) { throw "missing $Exe; build it with build-windows.cmd kyty_shader_precompile" }
+# Caches made from the game's files are named by its title and version (seeds-<title>_<version>.seeds,
+# _PipelineCache\static\<title>_<version>.*, the warmup recordings; versions need not share shaders). Those named
+# by the title alone are from before: the game's that was played last (the remembered one), so they take its
+# name (run-windows.ps1 has the same).
+function Rename-TitleCaches([string]$game) {
+	$info = if (Test-Path "$game\sce_sys\param.json") { Get-Content "$game\sce_sys\param.json" -Raw -Encoding UTF8 | ConvertFrom-Json }
+	if (!$info -or !$info.titleId -or !$info.contentVersion) { return }
+	$title = $info.titleId
+	$id = "$($title)_$($info.contentVersion)"
+	$moves = @()
+	foreach ($dir in @($PSScriptRoot, "$PSScriptRoot\_Build\static-precompile")) {
+		$moves += , @("$dir\seeds.seeds", "$dir\seeds-$id.seeds")
+		$moves += , @("$dir\recorded.seeds", "$dir\recorded-$id.seeds")
+	}
+	foreach ($file in @(Get-ChildItem "$PSScriptRoot\_PipelineCache\static\$title.*" -File -ErrorAction SilentlyContinue)) {
+		$moves += , @($file.FullName, (Join-Path $file.DirectoryName ($id + $file.Name.Substring($title.Length))))
+	}
+	foreach ($file in @(Get-ChildItem "$PSScriptRoot\_PipelineCache\warmup-v2\*\$title.shaders" -File -ErrorAction SilentlyContinue)) {
+		$moves += , @($file.FullName, (Join-Path $file.DirectoryName "$id.shaders"))
+	}
+	foreach ($move in $moves) {
+		if (!(Test-Path $move[0]) -or (Test-Path $move[1])) { continue }
+		Move-Item $move[0] $move[1]
+		Write-Host "caches:   $($move[0].Substring($PSScriptRoot.Length + 1)) is $id's"
+	}
+}
+
 # The game run-windows.ps1 was given last, else the default folder.
-if (!$Game -and (Test-Path "$PSScriptRoot\game-path.txt")) { $Game = (Get-Content "$PSScriptRoot\game-path.txt" -Raw).Trim() }
-if (!$Game) { $Game = "$env:USERPROFILE\Documents\PPSA01341-app0" }
+$lastGame = if (Test-Path "$PSScriptRoot\game-path.txt") { "$(Get-Content "$PSScriptRoot\game-path.txt" -Raw)".Trim() }
+if (!$lastGame) { $lastGame = "$env:USERPROFILE\Documents\PPSA01341-app0" }
+Rename-TitleCaches $lastGame
+if (!$Game) { $Game = $lastGame }
 if (!(Test-Path "$Game\sce_sys\param.json")) { throw "no sce_sys\param.json in $Game (-Game <folder>, or start the game once to choose it)" }
+$info = Get-Content "$Game\sce_sys\param.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+$gameId = "$($info.titleId)_$($info.contentVersion)"
+if (!$Seeds) {
+	$Seeds = if ((Test-Path "$PSScriptRoot\seeds-$gameId.seeds") -or !(Test-Path "$PSScriptRoot\_Build")) { "$PSScriptRoot\seeds-$gameId.seeds" } else { "$PSScriptRoot\_Build\static-precompile\seeds-$gameId.seeds" }
+}
+if ($Recorded -eq '*') { $Recorded = Join-Path (Split-Path $Seeds) "recorded-$gameId.seeds" }
 if (!(Test-Path $Seeds)) {
 	# Every shader the game ships, with the pipelines it draws them with (from the game files).
 	New-Item -ItemType Directory -Force (Split-Path $Seeds) | Out-Null
@@ -102,7 +139,7 @@ if ($Coverage) {
 $inputs = @('--seeds', "`"$Seeds`"", '--no-pipelines', '--threads', "$cpus", '--static-inputs')
 if ($InputsOnly) {
 	Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs'
-	Write-Host 'wrote _PipelineCache\static\<title>.shaders'
+	Write-Host "wrote _PipelineCache\static\$gameId.shaders"
 	return
 }
 # The shards an interrupted run finished first: what they hold is not compiled again.
@@ -154,7 +191,7 @@ while ($pending.Count -or $running.Count) {
 $env:KYTY_PRECOMPILE_CLAIMS = $null
 Wait-Precompile (Start-Precompile 'merge' @('--merge', '--prune')) 'merge'
 Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs'
-$cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\*.bin", "$PSScriptRoot\_PipelineCache\static\*.binaries" |
+$cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\$gameId.bin", "$PSScriptRoot\_PipelineCache\static\$gameId.binaries" -ErrorAction SilentlyContinue |
 	Sort-Object LastWriteTime | Select-Object -Last 1
 Write-Host ("done in {0:hh\:mm\:ss}: {1} ({2:N0} MB; {3} shards split)" -f ((Get-Date) - $begin), $cache.FullName, ($cache.Length / 1MB), $split)
 } finally {

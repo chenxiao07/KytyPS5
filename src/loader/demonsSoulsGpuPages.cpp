@@ -5,14 +5,25 @@
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "kernel/memory.h"
 #include "loader/runtimeLinker.h"
+#include <cstdio>
 #include <cstdlib>
 
 namespace Loader::DemonsSoulsGpuPages {
 namespace {
 uint64_t base = 0, cave = 0;
 size_t written = 0;
-constexpr std::array<uint64_t, 3> AllSites {Sites[0], Sites[1], ContextSite};
-std::array<std::array<uint8_t, 5>, AllSites.size()> original {}, installed {};
+constexpr size_t SiteCount = 3; // the two CBuffer allocation calls and the render-context call
+std::array<uint64_t, SiteCount> sites {};
+std::array<std::array<uint8_t, 5>, SiteCount> original {}, installed {};
+// Every audited function of the build is the loaded code.
+bool Verified(const Program& program, const Build& build) {
+    const auto* guest = reinterpret_cast<const uint8_t*>(program.base_vaddr);
+    return std::all_of(build.audited.begin(), build.audited.end(), [&](const Function& function) {
+        return function.rva + function.size <= program.mapped_size &&
+               Libs::Graphics::HostMemoryRangeIsReadable(program.base_vaddr + function.rva, function.size) &&
+               VerifyLoadedFunction(guest, build, function, program.tls.handler_vaddr - program.base_vaddr);
+    });
+}
 }
 void Install(Program* program) {
 #if defined(__x86_64__) || defined(_M_X64)
@@ -25,21 +36,17 @@ void Install(Program* program) {
         program->tls.handler_vaddr < program->base_vaddr ||
         program->tls.handler_vaddr - program->base_vaddr > INT32_MAX) return;
     const auto* guest = reinterpret_cast<const uint8_t*>(program->base_vaddr);
-    for (const auto& function : AuditedFunctions) {
-        if (function.rva + function.size > program->mapped_size ||
-            !Libs::Graphics::HostMemoryRangeIsReadable(program->base_vaddr + function.rva, function.size) ||
-            !VerifyLoadedFunction(guest, function, program->tls.handler_vaddr - program->base_vaddr)) {
-            LOGF("GPU buffer pages: audited function differs at %llx; retaining original allocations\n",
-                 static_cast<unsigned long long>(function.rva));
-            return;
-        }
+    const auto build = std::find_if(Builds.begin(), Builds.end(), [&](const Build& b) { return Verified(*program, b); });
+    if (build == Builds.end()) {
+        std::printf("GPU buffer pages: the allocation code of no audited build; retaining original allocations\n");
+        return;
     }
     std::array<uint8_t, ImageSize> image;
-    if (!BuildImage(image.data())) return;
-    const size_t site_count = AllSites.size();
-    for (size_t i = 0; i < site_count; ++i) {
-        if (!BuildCall(installed[i], guest, AllSites[i])) return;
-        std::memcpy(original[i].data(), guest + AllSites[i], 5);
+    if (!BuildImage(image.data(), *build)) return;
+    sites = {build->sites[0], build->sites[1], build->context_site};
+    for (size_t i = 0; i < SiteCount; ++i) {
+        if (!BuildCall(installed[i], guest, *build, sites[i])) return;
+        std::memcpy(original[i].data(), guest + sites[i], 5);
     }
     const auto requested = program->base_vaddr + CaveOffset;
     const auto allocated = Libs::LibKernel::Memory::AllocateRuntimeMemory(requested, ImageSize,
@@ -57,8 +64,8 @@ void Install(Program* program) {
         Clear();
         return;
     }
-    for (size_t i = 0; i < site_count; ++i) {
-        const auto address = base + AllSites[i];
+    for (size_t i = 0; i < SiteCount; ++i) {
+        const auto address = base + sites[i];
         std::memcpy(reinterpret_cast<void*>(address), installed[i].data(), 5);
         ++written;
         if (!Common::VirtualMemory::FlushInstructionCache(address, 5)) {
@@ -66,16 +73,17 @@ void Install(Program* program) {
             return;
         }
     }
-    LOGF("GPU buffer pages: %zu verified allocation calls installed, 4096-byte pages\n", site_count);
+    std::printf("GPU buffer pages: %zu verified allocation calls of %s installed, 4096-byte pages\n", SiteCount,
+                build->version);
 #endif
 }
 void Clear() {
     if (!cave) return;
     for (size_t i = 0; i < written; ++i) {
-        auto* address = reinterpret_cast<void*>(base + AllSites[i]);
+        auto* address = reinterpret_cast<void*>(base + sites[i]);
         if (std::memcmp(address, installed[i].data(), 5) == 0) {
             std::memcpy(address, original[i].data(), 5);
-            Common::VirtualMemory::FlushInstructionCache(base + AllSites[i], 5);
+            Common::VirtualMemory::FlushInstructionCache(base + sites[i], 5);
         }
     }
     const auto* stats = reinterpret_cast<const uint64_t*>(cave + StatsOffset);

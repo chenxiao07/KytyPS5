@@ -1,9 +1,10 @@
 > [!NOTE]
 > **This fork is tuned for Demon's Souls.** Its renderer, shader and memory paths are optimized for
-> **Demon's Souls (PS5, PPSA01341), game version 1.07 (01.007.000)**; other versions and games are
-> untested here and may not run. Tested on Windows 11 with an Intel i9-14900K and an NVIDIA RTX 5090
-> (about 45–60 fps at 2560×1440); AMD and Intel GPUs are untested. It needs 32 GB of RAM and a GPU
-> with 12 GB of video memory or more.
+> **Demon's Souls (PS5, PPSA01341), game versions 1.07 (01.007.000) and 1.05 (01.005.000)**: both are
+> supported, with the same performance patches (each version precompiles its own shader caches); other
+> versions and games are untested here and may not run. Tested on Windows 11 with an Intel i9-14900K and
+> an NVIDIA RTX 5090 (about 45–60 fps at 2560×1440); AMD and Intel GPUs are untested. It needs 32 GB of
+> RAM and a GPU with 12 GB of video memory or more.
 >
 > **Download: [the latest release](https://github.com/chenxiao07/KytyPS5/releases/latest)**, a Windows
 > x64 build made by GitHub Actions from this branch. Unzip it, double-click `launcher.cmd` (or
@@ -11,7 +12,8 @@
 > the rest. Use only a game dump made from your own copy of the game. To build it yourself, see
 > [Building with build-windows.cmd](#building-with-build-windowscmd-windows).
 >
-> 中文：本分支专为《恶魔之魂》(PS5 版 PPSA01341，游戏版本 1.07 / 01.007.000) 优化，其他版本和游戏未测试。
+> 中文：本分支专为《恶魔之魂》(PS5 版 PPSA01341) 优化，支持游戏版本 1.07 (01.007.000) 和 1.05 (01.005.000)，两者性能补丁相同
+> （着色器缓存按版本分别预编译）；其他版本和游戏未测试。
 > 下载[最新 release](https://github.com/chenxiao07/KytyPS5/releases/latest)，解压后双击 `launcher.cmd`
 > 或 `run.cmd`，选择游戏目录（含 `eboot.bin` 的那一层）。需要 32 GB 内存、12 GB 以上显存的显卡。
 

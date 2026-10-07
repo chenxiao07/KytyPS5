@@ -10,9 +10,9 @@ namespace Libs::Graphics {
 class BufferCache;
 struct ShaderComputeInputInfo;
 namespace DemonsSouls {
-// Demon's Souls in the regions seen (PPSA01341 01.007.000, PPSA01340 01.005.000), any version: each
-// code patch checks the bytes it replaces (or finds the same code elsewhere), the periodic copy its
-// shader hash, and the explicit compute boundaries are the engine's.
+// Demon's Souls in the regions seen (PPSA01341 01.007.000 and 01.005.000, PPSA01340 01.005.000), any version:
+// each code patch finds its code by the signature of the builds seen or checks the bytes of an audited build,
+// the periodic copy checks its shader hashes, and the explicit compute boundaries are the engine's.
 constexpr bool IsSupportedTitle(std::string_view title) {
 	return title == "PPSA01340" || title == "PPSA01341";
 }

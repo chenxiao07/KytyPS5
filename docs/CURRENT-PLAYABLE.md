@@ -62,11 +62,13 @@ python3 tools/local/play-demons-souls.py --2k  # 带运行日志的同一正式�
   （`tools/local/static-precompile`）和给测试者的 `README.md`（源文件 `docs/PORTABLE-README.md`）。只在 Actions 页
   Run workflow 或推 `v*` tag 时编译并发布 release（标为 latest，README 顶部链接到它）；推送代码不触发编译。
   不含游戏、存档、着色器缓存（按 GPU+驱动区分）、Streamline、`srt-aot.dll` 和种子文件（含游戏的 shader 代码）：
-  首次启动由 `run-windows.ps1` 从玩家自己的游戏文件生成 `seeds.seeds`（Python 3 + numpy，本机 16 秒）。
+  首次启动由 `run-windows.ps1` 从玩家自己的游戏文件生成 `seeds-<标题>_<版本>.seeds`（Python 3 + numpy，本机 16 秒）。
+  种子、静态缓存、预取输入和预热录制都按游戏版本命名（`<标题>_<版本>`：1.05 与 1.07 只有 10/约 21000 个 shader
+  相同）；旧的只按标题命名的文件由 `run-windows.ps1` / `precompile-windows.ps1` 改名归给上次玩的游戏（`game-path.txt`）。
   窗口比屏幕大时模拟器按比例缩进可用区域。
 - 着色器准备：启动器每次先跑 `kyty_shader_precompile --status`（约 1 秒，报告预取输入和静态管线缓存是否属于当前
   GPU+驱动），预取输入缺失或过期时自动生成（首次运行、更新驱动后）。`run.cmd` 带 `-Prompt`：静态缓存没做或游戏版本不是
-  PPSA01341 01.007.000 时先弹窗（先预编译 / 直接开始 / 退出，可勾选不再提示，记在 `no-precompile-prompt.txt`）。
+  已测试的 PPSA01341 01.007.000 / 01.005.000 时先弹窗（先预编译 / 直接开始 / 退出，可勾选不再提示，记在 `no-precompile-prompt.txt`）。
 - PGO：`_Build\pgo\windows\kyty.profdata` 存在时自动使用。重新训练：`KYTY_BUILD_DIR=_Build\windows-pgo-gen`、
   `KYTY_CMAKE_ARGS=-DKYTY_PGO_GENERATE=ON -DKYTY_THIN_LTO=OFF` 编译插桩版，用它进游戏走固定场景，
   live 命令 `pgo <路径>` 导出 profraw（模拟器以 quick_exit 退出，不会自动写出），`llvm-profdata merge` 后 clean 重编正式版。

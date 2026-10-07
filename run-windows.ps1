@@ -86,12 +86,41 @@ function Show-Choice([string]$message, [string[]]$choices, [string]$checkbox = '
 	return $form.Tag, $check.Checked
 }
 
+# Caches made from the game's files are named by its title and version (seeds-<title>_<version>.seeds,
+# _PipelineCache\static\<title>_<version>.*, the warmup recordings; versions need not share shaders). Those named
+# by the title alone are from before: the game's that was played last (the remembered one), so they take its
+# name (precompile-windows.ps1 has the same).
+function Rename-TitleCaches([string]$game) {
+	$info = if (Test-Path "$game\sce_sys\param.json") { Get-Content "$game\sce_sys\param.json" -Raw -Encoding UTF8 | ConvertFrom-Json }
+	if (!$info -or !$info.titleId -or !$info.contentVersion) { return }
+	$title = $info.titleId
+	$id = "$($title)_$($info.contentVersion)"
+	$moves = @()
+	foreach ($dir in @($PSScriptRoot, "$PSScriptRoot\_Build\static-precompile")) {
+		$moves += , @("$dir\seeds.seeds", "$dir\seeds-$id.seeds")
+		$moves += , @("$dir\recorded.seeds", "$dir\recorded-$id.seeds")
+	}
+	foreach ($file in @(Get-ChildItem "$PSScriptRoot\_PipelineCache\static\$title.*" -File -ErrorAction SilentlyContinue)) {
+		$moves += , @($file.FullName, (Join-Path $file.DirectoryName ($id + $file.Name.Substring($title.Length))))
+	}
+	foreach ($file in @(Get-ChildItem "$PSScriptRoot\_PipelineCache\warmup-v2\*\$title.shaders" -File -ErrorAction SilentlyContinue)) {
+		$moves += , @($file.FullName, (Join-Path $file.DirectoryName "$id.shaders"))
+	}
+	foreach ($move in $moves) {
+		if (!(Test-Path $move[0]) -or (Test-Path $move[1])) { continue }
+		Move-Item $move[0] $move[1]
+		Write-Host "caches:   $($move[0].Substring($PSScriptRoot.Length + 1)) is $id's"
+	}
+}
+
 # The game: -Game, else the last one given, else the default folder; a folder dialog when that has
 # no eboot.bin (a portable package started by double-clicking run.cmd).
 $gameFile = "$PSScriptRoot\game-path.txt"
 $remember = [bool]$Game
-if (!$Game -and (Test-Path $gameFile)) { $Game = (Get-Content $gameFile -Raw).Trim() }
-if (!$Game) { $Game = "$env:USERPROFILE\Documents\PPSA01341-app0" }
+$lastGame = if (Test-Path $gameFile) { "$(Get-Content $gameFile -Raw)".Trim() }
+if (!$lastGame) { $lastGame = "$env:USERPROFILE\Documents\PPSA01341-app0" }
+if (!$DryRun) { Rename-TitleCaches $lastGame }
+if (!$Game) { $Game = $lastGame }
 if ($Prompt -or (!$remember -and !(Test-Path "$Game\eboot.bin"))) { Initialize-Dialogs }
 if (!$remember -and !(Test-Path "$Game\eboot.bin")) {
 	$dialog = New-Object System.Windows.Forms.FolderBrowserDialog -Property @{ Description = 'Choose the game folder (the one with eboot.bin and sce_sys)' }
@@ -100,12 +129,12 @@ if (!$remember -and !(Test-Path "$Game\eboot.bin")) {
 if (!(Test-Path "$Game\eboot.bin")) { throw "no eboot.bin in $Game" }
 if ($remember) { Set-Content $gameFile $Game -Encoding UTF8 }
 # Its title and version (sce_sys\param.json): the emulator is tested with one of them.
-$testedVersion = 'PPSA01341 01.007.000'
+$testedVersions = @('PPSA01341 01.007.000', 'PPSA01341 01.005.000')
 $param = if (Test-Path "$Game\sce_sys\param.json") { Get-Content "$Game\sce_sys\param.json" -Raw -Encoding UTF8 | ConvertFrom-Json }
 $titleId = if ($param) { $param.titleId } else { '' }
 $version = if ($param) { "$titleId $($param.contentVersion)" } else { 'unknown' }
 $titleName = if ($param) { $param.localizedParameters.($param.localizedParameters.defaultLanguage).titleName }
-$tested = $version -eq $testedVersion
+$tested = $testedVersions -contains $version
 
 $launch = Get-Content $Config -Raw | ConvertFrom-Json
 
@@ -307,7 +336,7 @@ if ('KYTY_RECORDING_CPUS', 'KYTY_RENDER_CPUS' | Where-Object { $environment[$_] 
 $quoted = @('--game', "`"$Game`"") + ($options | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } })
 $logDir = if (Test-Path "$PSScriptRoot\_Build") { "$PSScriptRoot\_Build\run-logs" } else { "$PSScriptRoot\logs" }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
-Write-Host "game:     $(if ($titleName) { "$titleName, " })$version$(if (!$tested) { " (untested: the emulator is tested with $testedVersion)" })"
+Write-Host "game:     $(if ($titleName) { "$titleName, " })$version$(if (!$tested) { " (untested: the emulator is tested with $($testedVersions -join ' and '))" })"
 Write-Host "config:   $Config$(if ($Baseline) { ' (baseline: no switches)' })$(if ($Precompile) { ' (precompile)' })"
 Write-Host ("affinity: 0x{0:X} ({1} CPUs){2}" -f $mask, $cpus, $(if ($environment['KYTY_RENDER_CPUS']) { "; render threads on CPUs $($environment['KYTY_RENDER_CPUS'])" }))
 Write-Host "switches: $($environment.Count)"
@@ -315,19 +344,21 @@ Write-Host "command:  $Exe $($quoted -join ' ')"
 if ($DryRun) { $environment.GetEnumerator() | ForEach-Object { "  $($_.Key)=$($_.Value)" }; return }
 
 # Shaders, from the seed file (every shader of the game) by the precompile program: the shader
-# prefetch's inputs for this GPU and driver (_PipelineCache\static\<title>.shaders; new shaders are
-# then translated in the background while playing), made when they are missing or stale (the first
+# prefetch's inputs for this GPU and driver (_PipelineCache\static\<title>_<version>.shaders; new shaders
+# are then translated in the background while playing), made when they are missing or stale (the first
 # launch, a driver update: half a minute on 22 CPUs); and the static pipeline cache, the whole game
 # compiled ahead by precompile-windows.ps1 (44 minutes on 22 CPUs), offered by -Prompt.
 $tool = Join-Path (Split-Path $Exe) 'kyty_shader_precompile.exe'
-$seeds = @("$PSScriptRoot\seeds.seeds", "$PSScriptRoot\_Build\static-precompile\seeds.seeds") | Where-Object { Test-Path $_ } | Select-Object -First 1
+# The seed file of this game version (Rename-TitleCaches).
+$seedName = if ($param -and $titleId -and $param.contentVersion) { "seeds-$($titleId)_$($param.contentVersion).seeds" } else { 'seeds.seeds' }
+$seeds = @("$PSScriptRoot\$seedName", "$PSScriptRoot\_Build\static-precompile\$seedName") | Where-Object { Test-Path $_ } | Select-Object -First 1
 # No seed file yet (a release has none: it holds the game's shader code): made from the game's files once, as
 # precompile-windows.ps1 makes it (Python 3 with numpy; 16 s on 22 CPUs).
 $generator = "$PSScriptRoot\tools\local\static-precompile\precompile.py"
 if (!$seeds -and !$Precompile -and (Test-Path $tool) -and (Test-Path $generator)) {
 	cmd /c 'python -c "import numpy" >nul 2>nul'
 	if ($LASTEXITCODE -eq 0) {
-		$made = if (Test-Path "$PSScriptRoot\_Build") { "$PSScriptRoot\_Build\static-precompile\seeds.seeds" } else { "$PSScriptRoot\seeds.seeds" }
+		$made = if (Test-Path "$PSScriptRoot\_Build") { "$PSScriptRoot\_Build\static-precompile\$seedName" } else { "$PSScriptRoot\$seedName" }
 		New-Item -ItemType Directory -Force (Split-Path $made) | Out-Null
 		Write-Host "shaders:  listing the game's shaders from its files (once)"
 		python $generator --game $Game seeds $made | Out-Null
@@ -367,7 +398,7 @@ $noPrompt = "$PSScriptRoot\no-precompile-prompt.txt"
 $offer = $shaders -and !$cacheReady -and !(Test-Path $noPrompt)
 if ($Prompt -and ($offer -or !$tested)) {
 	$info = "Game: $(if ($titleName) { $titleName } else { 'unknown' }) ($version)"
-	$info += if ($tested) { ', a tested version.' } else { "`n⚠ This version is untested (the emulator was tested with $testedVersion): it may not run or may fail." }
+	$info += if ($tested) { ', a tested version.' } else { "`n⚠ This version is untested (the emulator was tested with $($testedVersions -join ' and ')): it may not run or may fail." }
 	if ($offer) {
 		$minutes = [math]::Ceiling(44 * 22 / $cpus / 10) * 10
 		$time = if ($minutes -lt 90) { "about $minutes minutes" } else { 'about {0:N1} hours' -f ($minutes / 60) }

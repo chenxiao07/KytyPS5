@@ -140,6 +140,11 @@ public:
 	[[nodiscard]] bool ComputeChainPending() const noexcept { return m_compute_access_pending; }
 	void ContinueComputeChain() const;
 	[[nodiscard]] vk::CommandBuffer HandleForFullBarrier() const;
+	// Guest buffer copies in a row (Buffer::CopyInRun): one barrier before the run and one after it, recorded before
+	// the next other command (Handle, ChainHandle; a full barrier covers it). A copy that reads what an earlier copy of
+	// the run writes, or writes what one reads or writes, starts a new run.
+	[[nodiscard]] vk::CommandBuffer CopyRunHandle(vk::Buffer source, uint64_t source_offset, vk::Buffer destination,
+	                                              uint64_t destination_offset, uint64_t size) const;
 	// Local diagnostic (GPU marks): the handle without draining a pending dependency.
 	[[nodiscard]] vk::CommandBuffer RawHandle() const noexcept { return m_buffer; }
 	// The recorded work count after this buffer's last global barrier (CommandProcessor::EmitGlobalBarrier).
@@ -161,10 +166,18 @@ private:
 
 	void Begin();
 	void End() const;
+	void FlushCopyRun() const;
+
+	struct CopyRunRange {
+		VkBuffer buffer;
+		uint64_t begin, end;
+		bool     written;
+	};
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
 	mutable bool        m_compute_access_pending = false;
+	mutable std::vector<CopyRunRange> m_copy_run; // a run's ranges (not empty: its after barrier is owed)
 	mutable uint64_t    m_graphics_generation    = 0;
 	vk::CommandBuffer   m_buffer          = nullptr;
 	uint32_t            m_timestamp_slot  = UINT32_MAX; // live trace GPU timestamps

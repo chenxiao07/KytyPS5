@@ -46,7 +46,7 @@ Kyty PS5 模拟器的 Windows 移植，目标游戏《恶魔之魂》（PPSA0134
 
 - 问题：游戏第一次遇到新 shader/管线时要现场编译，大的计算 shader 卡 1–3 s 以上。
 - 做法：**静态预编译**——直接从游戏文件收集全部 shader 和管线，提前编译进"静态管线缓存"
-  `_PipelineCache/static/PPSA01341.bin`（只按 GPU/驱动做 key，跨模拟器版本保留；游戏建管线时先在其中免编译查找）。
+  `_PipelineCache/static/PPSA01341_<版本>.bin`（只按 GPU/驱动做 key，跨模拟器版本保留；游戏建管线时先在其中免编译查找）。
   - 收集：`tools/local/static-precompile/precompile.py seeds`（CSDR 包 + eboot 内嵌 shader + 材质配对 + 学得的渲染状态）。
   - 编译：独立程序 `kyty_shader_precompile.exe`（不开游戏），`precompile-windows.ps1` 分多进程并行、可中断续跑。
   - "便携 shader"（`KYTY_PORTABLE_SHADERS`，默认开）：把只在运行时描述符里的信息（buffer stride、格式、间接纹理表大小、
@@ -61,7 +61,7 @@ Kyty PS5 模拟器的 Windows 移植，目标游戏《恶魔之魂》（PPSA0134
 - 翻译器（`TranslateProgram`）首遇卡顿：CFG 支配分析改为支配树后，固定路线从 28 次/2.7 s/最长 915 ms 降到
   26 次/1.4 s/最长 162 ms（SPIR-V 不变）；分派器回退路径的 SPIR-V 改为确定性（见 `docs/EXPERIMENTS.md`）。
 - **后台着色器预翻译**（09-30，`KYTY_SHADER_PREFETCH`，默认开，`=0` 关）：静态预编译的全部程序（2.1 万个输入，
-  `_PipelineCache/static/PPSA01341.shaders`，由 `precompile-windows.ps1` 写出，`-InputsOnly` 只写它，约 30 s）在游戏
+  `_PipelineCache/static/PPSA01341_<版本>.shaders`，由 `precompile-windows.ps1` 写出，`-InputsOnly` 只写它，约 30 s）在游戏
   启动后由 12 个低优先级线程（避开 `KYTY_RENDER_CPUS`）按大小从大到小翻译，预热里已有的跳过；游戏第一次遇到某程序时
   直接取用它的资源计划和模块，只需建 shader 模块。翻译结果的 SPIR-V 共约 4.7 GB，放在系统临时文件里
   （`FILE_ATTRIBUTE_TEMPORARY`，内存够时不落盘，进程退出即删）；计划和程序信息留在内存，进程私有内存约多 1.2 GB。

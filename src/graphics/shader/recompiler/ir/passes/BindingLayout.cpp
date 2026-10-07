@@ -136,12 +136,12 @@ void EnterTableMode(Program& program) {
 		if (image.mip_mode != ImageMipMode::None || image.indirect_root != ImageResource::NoIndirectImage ||
 		    image.indirect_search_iterations != 0)
 			refuse("an indirect image or one of dynamic mip levels");
-		// A pixel shader may write storage images (the deferred decals: TableResolveSet binds them as CommitBindings
-		// does). Dispatches writing images the table way made the culling chain slower before the exact
-		// specializations, and no faster after them (1-1 same process 51.1 vs 51.0 fps, 10-05); under speculation
-		// they made more lost than they saved (10-06: the images their storage writes invalidate stop the commit).
+		// Pixel and compute shaders may write storage images (TableResolveSet binds them as CommitBindings does: the
+		// deferred decals, the async culling chain's dispatches). The chain's translation is on the frame's critical
+		// path since its uploads stage in video memory: 1-1 same process 51.81 -> 53.21 fps (10-07; 10-05, when the
+		// chain waited on those uploads, 51.1 vs 51.0).
 		if (image.atomic || ((image.written || image.resource_class == ImageResourceClass::Storage) &&
-		                     program.stage != ShaderType::Pixel))
+		                     program.stage != ShaderType::Pixel && program.stage != ShaderType::Compute))
 			refuse("an image the shader writes");
 		auto& descriptor = plan.images.emplace_back();
 		descriptor.count = program.descriptor_sources.at(image.source).dword_count;

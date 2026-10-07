@@ -6,18 +6,18 @@
 //   kyty_shader_precompile --game <dir> --seeds <file> --status
 //
 // compiles the shaders and pipelines of a seed file on a headless Vulkan device (the one the emulator
-// creates, without a window) into the static pipeline cache _PipelineCache/static/<title>.bin, which
+// creates, without a window) into the static pipeline cache _PipelineCache/static/<title>_<version>.bin, which
 // the emulator looks up before compiling. With --shard, the i-th of n shares goes into a cache file of
 // its own next to it: the NVIDIA driver compiles big shaders nearly one at a time per process, so the
 // shares are processes (precompile-windows.ps1 runs them); --merge folds their files into the static
 // cache. Where the driver has VK_KHR_pipeline_binary the static cache is the pipelines' binaries instead
-// (_PipelineCache/static/<title>.binaries, read by the emulator when it needs a pipeline): every share
+// (_PipelineCache/static/<title>_<version>.binaries, read by the emulator when it needs a pipeline): every share
 // writes its pipelines' binaries to a shard file, and --merge --prune makes the store of the shards' alone
 // (what no seed makes any more is dropped; without --prune the store keeps its pipelines too); exit code
 // 3: binaries were left out (the driver began compressing with its own dictionary), to be made by two
 // shards (2n) instead. --out
 // writes what was compiled as a warmup file, for precompile.py coverage; --static-inputs
-// writes it where the emulator's shader prefetch reads it (_PipelineCache/static/<title>.shaders);
+// writes it where the emulator's shader prefetch reads it (_PipelineCache/static/<title>_<version>.shaders);
 // --timings each pipeline's compile time (ms, SPIR-V words, the seeds' hashes). --status prints
 // whether those inputs and the static cache are this GPU's and driver's ("inputs current|stale",
 // "static cache current|stale"; run-windows.ps1 asks before every launch). Run it from the directory

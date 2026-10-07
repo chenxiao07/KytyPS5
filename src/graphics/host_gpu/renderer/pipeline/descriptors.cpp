@@ -797,6 +797,19 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	                                     ? storage_view_format
 	                                     : pixel_format;
 	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
+	// (A descriptor of no guest memory, which the texture cache would stop the emulator over: once in a 1-1 walk a
+	// normal-path indirect draw's T# held 0x503f80000000.)
+	if (address >= TRACKER_ADDRESS_SIZE || size.size > TRACKER_ADDRESS_SIZE - address) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+			std::printf("TextureCache: texture data outside guest memory addr=0x%llx size=0x%llx, bound as null\n",
+			            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size.size));
+		return bind_null(fmt::format("texture data outside guest memory: addr=0x{:x} size=0x{:x} "
+		                             "dwords={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+		                             address, static_cast<uint64_t>(size.size), descriptor.fields[0], descriptor.fields[1],
+		                             descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+		                             descriptor.fields[6], descriptor.fields[7]));
+	}
 	TextureCache::ImageDesc desc {};
 	desc.info.data         = {address, size.size};
 	desc.info.pixel_format = pixel_format;
@@ -1171,7 +1184,10 @@ void RenderExecutor::PrepareBdaBindings(const PreparedBindings& first, const Pre
 	const bool first_dma = first.runtime->program->info.uses_dma;
 	const bool second_dma = second && second->runtime->program->info.uses_dma;
 	if (!first_dma && !second_dma) return;
-	std::vector<GuestRange> first_ranges, second_ranges;
+	// (Reused per thread: every dispatch with flat or global reads prepares them.)
+	thread_local std::vector<GuestRange> first_ranges, second_ranges;
+	first_ranges.clear();
+	second_ranges.clear();
 	const bool bounded = (!first_dma || ShaderRecompiler::IR::EvaluateBdaReadPlan(
 	    first.runtime->program->bda_read_plan, first.runtime->resources, first_ranges)) &&
 	    (!second_dma || ShaderRecompiler::IR::EvaluateBdaReadPlan(

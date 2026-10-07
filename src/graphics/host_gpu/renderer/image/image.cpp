@@ -330,7 +330,15 @@ void MoveImageStateEpoch() noexcept {
 }
 
 void BeginTransitGroup() noexcept {
-	g_transit_group = g_transit_group_next.fetch_add(1, std::memory_order_relaxed);
+	// Groups are only compared for equality: each thread takes a block of numbers at a time (an atomic add per group
+	// was 0.6% of the render thread).
+	constexpr uint64_t    Block = uint64_t {1} << 20u;
+	thread_local uint64_t next = 0, end = 0;
+	if (next == end) {
+		next = g_transit_group_next.fetch_add(Block, std::memory_order_relaxed);
+		end  = next + Block;
+	}
+	g_transit_group = next++;
 }
 
 void EndTransitGroup() noexcept {

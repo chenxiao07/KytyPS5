@@ -78,9 +78,30 @@ struct RenderExecutor::TablePair {
 	const char* special = nullptr; // a dispatch's: the normal path's special path that takes it (refused)
 	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> programs {}; // vertex, pixel (null: inactive)
 	std::array<std::vector<Run>, 2>                             runs;
+	// TableEvaluate's form of a stage's plan (TableRuns): every operand an index into one of three arrays (the stage's
+	// user data, its block's slots, the stage's constants), so a draw's evaluation branches on no operand kind.
+	struct FlatOperand {
+		uint32_t index = 0;
+		uint32_t base  = 2; // 0: user data, 1: slots, 2: constants
+	};
+	struct FlatRun {
+		std::array<FlatOperand, 3> address; // low, high, offset
+		int32_t                    immediate = 0;
+		uint32_t                   first = 0, count = 0;
+	};
+	struct FlatStage {
+		std::vector<FlatRun>     runs;        // the runs in level order
+		std::vector<uint32_t>    level_ends;  // the run after each level
+		std::vector<FlatOperand> image_words; // every image's words, then every sampler's
+		std::vector<uint32_t>    image_counts;
+		std::vector<FlatOperand> buffer_words; // every buffer's four V# words (TableBlocks)
+		std::vector<uint32_t>    constants;
+		uint32_t                 user_words = 0; // the user data it reads: below this
+	};
+	std::array<FlatStage, 2> flat;
 	std::vector<TableVariant>                                   variants;
 	uint64_t                                                    store_frame = 0;
-	std::unordered_map<uint64_t, std::unique_ptr<TableImageSet>> sets; // by T#/S# words
+	std::unordered_map<uint64_t, std::unique_ptr<TableImageSet>, HashedKey> sets; // by T#/S# words
 	std::array<TableImageSet*, Roles>                           last_set {}; // by role
 	// ShaderMapGeneration under which the shaders at vs and ps were proven those the programs were compiled
 	// from (the game registers shaders often; code replaced at an address resets the pair), by role.
@@ -102,8 +123,11 @@ struct RenderExecutor::TablePair {
 struct RenderExecutor::TableXpr {
 	using Pair    = TablePair;
 	using Variant = TableVariant;
-	std::unordered_map<uint64_t, Pair> pairs;          // by shader addresses
-	std::unordered_map<uint64_t, Pair> dispatches;     // by the compute stage's registers (TableDispatchKey)
+	std::unordered_map<uint64_t, Pair, HashedKey> pairs;      // by shader addresses
+	std::unordered_map<uint64_t, Pair, HashedKey> dispatches; // by the compute stage's registers (TableDispatchKey)
+	// The pairs found last, direct-mapped by key (pairs are never erased and do not move: a pointer stays valid).
+	static constexpr size_t PairCacheEntries = 256;
+	std::array<std::pair<uint64_t, Pair*>, PairCacheEntries> pair_cache {};
 	uint64_t collected  = 0;                           // the frame unused image sets were last dropped
 	// Moves when a pair is reset or a set leaves (sets are replaced): an executor reading this catalog drops its last
 	// pair, state and set (RenderExecutor::m_catalog) when it moved since it saw it (seen_epoch, its own table's).
@@ -150,6 +174,10 @@ struct RenderExecutor::TableXpr {
 	static constexpr size_t           ResolvedEntries = 65536;
 	std::unique_ptr<ResolvedBuffer[]> resolved = std::make_unique<ResolvedBuffer[]>(ResolvedEntries);
 	uint32_t                          special_generation = 1; // moves with the image starts and the mappings
+	// Addresses no image starts at, each with the TextureCache::StartEpoch it was proven at (only an address gaining
+	// its first image moves that epoch): TableBlocks asks the texture cache (a lock and a map lookup) again only then.
+	static constexpr size_t                           NoImageStartEntries = 1024;
+	std::array<std::pair<uint64_t, uint64_t>, NoImageStartEntries> no_image_start {};
 	uint64_t                          resolved_start = UINT64_MAX, resolved_mapping = UINT64_MAX;
 	std::vector<std::pair<std::array<uint32_t, 4>, ResolvedBuffer*>> entries; // a stage's V#s (TableDraw)
 	// A written V#'s range clamped to the mappings, and (`image_checked`) that no image starts at it, while `special`
@@ -222,17 +250,23 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	// (Another executor's catalog: what it learned, none of it made here.)
 	const auto found = catalog == nullptr || Role() == 0 ? decltype(catalog->pairs.end()) {} : catalog->pairs.find(pair_hash);
 	if (Role() != 0 && (catalog == nullptr || found == catalog->pairs.end())) return Spec::Refuse("table store"), TableResult::Native;
-	auto* own = Role() != 0 ? nullptr : &table.pairs;
-	auto  it  = own != nullptr ? own->find(pair_hash) : found;
-	if (own != nullptr && it == own->end()) {
-		const auto write    = CatalogWrite();
-		it                  = own->try_emplace(pair_hash).first;
-		auto& fresh         = it->second;
-		fresh.vs            = vs_address;
-		fresh.ps            = ps_address;
-		fresh.start_instance = vs.start_instance_user_sgpr;
+	auto* own    = Role() != 0 ? nullptr : &table.pairs;
+	auto& cached = table.pair_cache[pair_hash & (TableXpr::PairCacheEntries - 1)];
+	auto* known  = own != nullptr && cached.first == pair_hash ? cached.second : nullptr;
+	if (known == nullptr) {
+		auto it = own != nullptr ? own->find(pair_hash) : found;
+		if (own != nullptr && it == own->end()) {
+			const auto write    = CatalogWrite();
+			it                  = own->try_emplace(pair_hash).first;
+			auto& fresh         = it->second;
+			fresh.vs            = vs_address;
+			fresh.ps            = ps_address;
+			fresh.start_instance = vs.start_instance_user_sgpr;
+		}
+		known = &it->second;
+		if (own != nullptr) cached = {pair_hash, known};
 	}
-	auto& pair = it->second;
+	auto& pair = *known;
 	if (pair.vs != vs_address || pair.ps != ps_address || pair.start_instance != vs.start_instance_user_sgpr)
 		return Spec::Refuse("table: pair key"), TableResult::Native;
 	if (const auto generation = ShaderMapGeneration(); generation != pair.generation[Role()]) {
@@ -544,42 +578,54 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 	words.clear();
 	table.lod_stats.clear();
 	NativeXprReader reader(resources);
-	for (uint32_t st = 0; st < stages; ++st) {
+	// A run's address, its pages proven mapped and its lines loading.
+	const auto locate = [&](uint64_t low, uint64_t high, uint32_t offset, int32_t immediate, uint32_t count,
+	                        uint64_t& out) {
+		const auto address = ((low | high << 32u) & 0x0000fffffffffffcull) + (offset & ~3u) +
+		                     static_cast<uint64_t>(int64_t {immediate});
+		for (auto page = address >> 14u; page <= (address + count * 4ull - 1) >> 14u; ++page) {
+			auto& seen = table.mapped[page & 255u];
+			if (seen == page) continue;
+			if (!Libs::LibKernel::Memory::IsFullyMapped(page << 14u, 16384)) return false;
+			seen = page;
+		}
+		for (auto line = address & ~63ull; line < address + count * 4ull; line += 64)
+			__builtin_prefetch(reinterpret_cast<const void*>(line));
+		out = address;
+		return true;
+	};
+	// The LOD statistics fields of the T#s (the game reassigns the counters every frame) reach only the shader data
+	// (as RebindBuffers computes it), not the set.
+	const auto lod_stats = [&](const std::array<uint32_t, 8>& image) {
+		ShaderTextureResource desc;
+		std::memcpy(&desc, image.data(), sizeof(desc));
+		table.lod_stats.push_back(desc.MipStatsCntEn() ? (0x80000000u | desc.MipStatsCntId() |
+		                                                  (uint32_t(desc.BaseLevel()) << 8u) |
+		                                                  (uint32_t(desc.MinLodWarn5()) << 12u))
+		                                               : 0u);
+	};
+	// A stage from its plan's operands: for user data the flat form cannot index (fewer words than it reads, or more
+	// than 64: one beyond them reads 0 here, the flat form's constant 0 stands for those of 64 and up).
+	const auto by_operands = [&](uint32_t st) {
 		const auto& program = *pair.programs[st];
 		const auto& plan    = program.table_plan;
-		// (Slots no stage reads keep what an earlier draw left: the block carries them unread.)
-		auto& slots = table.blocks[st];
-		slots.resize(plan.BlockDwords());
-		const auto value = [&](const ShaderRecompiler::IR::TablePlan::Operand& operand) -> uint32_t {
+		auto&       slots   = table.blocks[st];
+		const auto  value   = [&](const ShaderRecompiler::IR::TablePlan::Operand& operand) -> uint32_t {
 			if (operand.kind == Kind::Immediate) return operand.value;
 			if (operand.kind == Kind::Slot) return slots[operand.value];
 			const auto index = operand.value - program.user_data_base;
 			return index < user_data[st].size() ? user_data[st][index] : 0;
 		};
-		// A level's addresses are known together: their lines load at once (the guest's tables are cold).
 		const auto& runs = pair.runs[st];
-		if (table.addresses.size() < runs.size()) table.addresses.resize(runs.size());
 		for (size_t begin = 0, end = 0; begin < runs.size(); begin = end) {
 			for (end = begin; end < runs.size() && runs[end].level == runs[begin].level; ++end) {
-				const auto& run  = runs[end];
-				const auto  base = (uint64_t {value(run.read.low)} | uint64_t {value(run.read.high)} << 32u) &
-				                  0x0000fffffffffffcull;
-				const auto address =
-				    base + (value(run.read.offset) & ~3u) + static_cast<uint64_t>(int64_t {run.read.immediate});
-				for (auto page = address >> 14u; page <= (address + run.count * 4ull - 1) >> 14u; ++page) {
-					auto& seen = table.mapped[page & 255u];
-					if (seen == page) continue;
-					if (!Libs::LibKernel::Memory::IsFullyMapped(page << 14u, 16384)) return false;
-					seen = page;
-				}
-				for (auto line = address & ~63ull; line < address + run.count * 4ull; line += 64)
-					__builtin_prefetch(reinterpret_cast<const void*>(line));
-				table.addresses[end] = address;
+				const auto& run = runs[end];
+				if (!locate(value(run.read.low), value(run.read.high), value(run.read.offset), run.read.immediate, run.count,
+				            table.addresses[end]))
+					return false;
 			}
 			for (size_t i = begin; i < end; ++i) reader.Read(table.addresses[i], runs[i].count, slots.data() + runs[i].first);
 		}
-		// The LOD statistics fields of the T#s (the game reassigns the counters every frame) reach only the shader
-		// data (as RebindBuffers computes it), not the set.
 		for (size_t i = 0; i < plan.images.size(); ++i) {
 			const auto& descriptor = plan.images[i];
 			std::array<uint32_t, 8> image {};
@@ -587,17 +633,53 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 				image[w] = value(descriptor.words[w]);
 				words.push_back(image[w] & ~NativeXprLodStatsMask[w]);
 			}
-			if (i < program.bindings.lod_stats_count) {
-				ShaderTextureResource desc;
-				std::memcpy(&desc, image.data(), sizeof(desc));
-				table.lod_stats.push_back(desc.MipStatsCntEn() ? (0x80000000u | desc.MipStatsCntId() |
-				                                                  (uint32_t(desc.BaseLevel()) << 8u) |
-				                                                  (uint32_t(desc.MinLodWarn5()) << 12u))
-				                                               : 0u);
-			}
+			if (i < program.bindings.lod_stats_count) lod_stats(image);
 		}
 		for (const auto& descriptor: plan.samplers)
 			for (uint32_t w = 0; w < descriptor.count; ++w) words.push_back(value(descriptor.words[w]));
+		return true;
+	};
+	for (uint32_t st = 0; st < stages; ++st) {
+		const auto& program = *pair.programs[st];
+		const auto& form    = pair.flat[st];
+		// (Slots no stage reads keep what an earlier draw left: the block carries them unread.)
+		auto& slots = table.blocks[st];
+		slots.resize(program.table_plan.BlockDwords());
+		if (table.addresses.size() < pair.runs[st].size()) table.addresses.resize(pair.runs[st].size());
+		if (form.runs.size() != pair.runs[st].size() || user_data[st].size() < form.user_words || user_data[st].size() > 64) {
+			if (!by_operands(st)) return false;
+			continue;
+		}
+		// The flat form (TablePair::flat): every operand one load from one of three arrays. A level's addresses are
+		// known together: their lines load at once (the guest's tables are cold).
+		const std::array<const uint32_t*, 3> bases {user_data[st].data(), slots.data(), form.constants.data()};
+		const auto get = [&](const TablePair::FlatOperand& operand) { return bases[operand.base][operand.index]; };
+		uint32_t   begin = 0;
+		for (const auto end: form.level_ends) {
+			for (auto i = begin; i < end; ++i) {
+				const auto& run = form.runs[i];
+				if (!locate(get(run.address[0]), get(run.address[1]), get(run.address[2]), run.immediate, run.count,
+				            table.addresses[i]))
+					return false;
+			}
+			for (auto i = begin; i < end; ++i) reader.Read(table.addresses[i], form.runs[i].count, slots.data() + form.runs[i].first);
+			begin = end;
+		}
+		const auto first = words.size();
+		words.resize(first + form.image_words.size());
+		auto*  out = words.data() + first;
+		size_t at  = 0;
+		for (size_t i = 0; i < form.image_counts.size(); ++i) {
+			std::array<uint32_t, 8> image {};
+			const auto              count = form.image_counts[i];
+			for (uint32_t w = 0; w < count; ++w) {
+				image[w]    = get(form.image_words[at + w]);
+				out[at + w] = image[w] & ~NativeXprLodStatsMask[w];
+			}
+			at += count;
+			if (i < program.bindings.lod_stats_count) lod_stats(image);
+		}
+		for (; at < form.image_words.size(); ++at) out[at] = get(form.image_words[at]);
 	}
 	return true;
 }
@@ -663,7 +745,14 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 	auto&      textures     = m_context.GetTextureCache();
 	auto&      upload       = buffer_cache.GetTableUploadBuffer();
 	const auto stages       = pair.programs[1] != nullptr ? 2u : 1u;
-	const auto start_epoch  = textures.StartEpoch();
+	const auto start_epoch  = textures.StartEpoch(); // (before any question below: a later image start moves it)
+	const auto image_starts = [&](uint64_t address) {
+		auto& known = table.no_image_start[(address * 0x9e3779b97f4a7c15ull) >> 54u];
+		if (known.first == address && known.second == start_epoch) return false;
+		if (textures.HasImageStartingAt(address)) return true;
+		known = {address, start_epoch};
+		return false;
+	};
 	if (table.resolved_start != start_epoch || table.resolved_mapping != table.mapping_epoch) {
 		table.resolved_start   = start_epoch;
 		table.resolved_mapping = table.mapping_epoch;
@@ -689,14 +778,21 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 	// A null buffer's device address: valid memory (the shaders' loads of a buffer are not branched around its bounds:
 	// out of bounds they load its first dword).
 	const vk::DeviceAddress null_device = upload.BufferDeviceAddress();
-	// A V#'s buffer word (IR::BufferWord, as IR::BufferDescriptorWord makes it) and stride.
+	// A V#'s buffer word (IR::BufferWord, as IR::BufferDescriptorWord makes it) and stride. (Each format's class
+	// once: the V#s of every draw's buffers asked for it.)
+	static const auto format_classes = [] {
+		std::array<uint32_t, 128> classes {};
+		for (uint32_t format = 0; format < classes.size(); ++format)
+			classes[format] = ShaderRecompiler::IR::BufferFormatClass(static_cast<Prospero::BufferFormat>(format));
+		return classes;
+	}();
 	const auto word_of = [](const std::array<uint32_t, 4>& words4) -> std::pair<uint32_t, uint32_t> {
 		ShaderBufferResource descriptor;
 		std::copy_n(words4.begin(), 4, descriptor.fields);
 		if (descriptor.Type() != 0) return {0, 0};
 		using Word = ShaderRecompiler::IR::BufferWord;
 		return {(descriptor.Stride() <= Word::MaxStride ? descriptor.Stride() : 0u) |
-		            ShaderRecompiler::IR::BufferFormatClass(descriptor.Format()) << Word::LayoutShift |
+		            format_classes[descriptor.RawFormat()] << Word::LayoutShift |
 		            descriptor.DstSelXYZW() << Word::DstSelShift,
 		        descriptor.Stride()};
 	};
@@ -734,18 +830,30 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 		const auto& program = *pair.programs[st];
 		const auto& plan    = program.table_plan;
 		auto&       block   = table.blocks[st];
-		// The V#s' words and entries first: the entries' lines load together.
+		// The V#s' words and entries first: the entries' lines load together. (The flat form, TablePair::flat, as
+		// TableEvaluate takes it: every word one load.)
 		auto& entries = table.entries;
 		entries.resize(plan.buffers.size());
+		const auto& form = pair.flat[st];
+		const bool  flat = form.buffer_words.size() == 4 * plan.buffers.size() && user_data[st].size() >= form.user_words &&
+		                  user_data[st].size() <= 64;
+		const std::array<const uint32_t*, 3> bases {user_data[st].data(), block.data(), form.constants.data()};
 		for (size_t i = 0; i < plan.buffers.size(); ++i) {
 			auto& [words4, entry] = entries[i];
-			for (uint32_t w = 0; w < 4; ++w) {
-				const auto& operand = plan.buffers[i][w];
-				words4[w] = operand.kind == Kind::Immediate ? operand.value
-				            : operand.kind == Kind::Slot    ? block[operand.value]
-				            : operand.value - program.user_data_base < user_data[st].size()
-				                ? user_data[st][operand.value - program.user_data_base]
-				                : 0;
+			if (flat) {
+				for (uint32_t w = 0; w < 4; ++w) {
+					const auto& operand = form.buffer_words[4 * i + w];
+					words4[w]           = bases[operand.base][operand.index];
+				}
+			} else {
+				for (uint32_t w = 0; w < 4; ++w) {
+					const auto& operand = plan.buffers[i][w];
+					words4[w] = operand.kind == Kind::Immediate ? operand.value
+					            : operand.kind == Kind::Slot    ? block[operand.value]
+					            : operand.value - program.user_data_base < user_data[st].size()
+					                ? user_data[st][operand.value - program.user_data_base]
+					                : 0;
+				}
 			}
 			entry = &table.resolved[XXH3_64bits(words4.data(), sizeof(words4)) & (TableXpr::ResolvedEntries - 1)];
 			__builtin_prefetch(entry);
@@ -753,7 +861,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 		// The buffers it writes first: a range it also reads through another V# is GPU-written by then, as the
 		// normal path's second lookup (RebindBuffers) sees it (not a copy of the guest's bytes in the ring).
 		for (size_t n = 0; n < 2 * plan.buffers.size(); ++n) {
-			const auto  i         = n % plan.buffers.size();
+			const auto  i         = n < plan.buffers.size() ? n : n - plan.buffers.size();
 			const auto& words4    = entries[i].first;
 			const auto& resource  = program.info.buffers[i];
 			const bool  formatted = resource.formatted;
@@ -783,7 +891,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				if (size != 0) {
 					if (address % 4 != 0) return false;
 					if (formatted && !proof.image_checked) {
-						if (textures.HasImageStartingAt(address)) return false;
+						if (image_starts(address)) return false;
 						proof.image_checked = true;
 					}
 					const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, true, formatted);
@@ -832,7 +940,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				if (size != 0) {
 					// The shader reads whole dwords from the device address; a buffer an image starts at is made from
 					// the image by ObtainBuffer only (SynchronizeBufferFromImage).
-					if (address % 4 != 0 || (formatted && textures.HasImageStartingAt(address))) return false;
+					if (address % 4 != 0 || (formatted && image_starts(address))) return false;
 					// (A speculation's: the guest's writes, not those its commit makes current; with none of its own
 					// guest memory writes pending over the range, read as no GPU work wrote it.)
 					auto* const spec        = Spec::Current();
@@ -1087,6 +1195,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	}
 	m_context.GetCommandScheduler().BeginRendering(draw_state.rendering);
 	if (same_command && emit.state != &draw_state && emit.state != nullptr &&
+	    emit.state->dynamic_hash == draw_state.dynamic_hash &&
 	    std::memcmp(&emit.state->dynamic, &draw_state.dynamic, sizeof(draw_state.dynamic)) == 0)
 		emit.state = &draw_state;
 	if (!same_command || emit.state != &draw_state) {
@@ -1202,6 +1311,39 @@ void RenderExecutor::TableRuns(TablePair& pair) {
 		}
 		std::ranges::stable_sort(pair.runs[st], {}, &TablePair::Run::level);
 		table.addresses.resize(std::max(table.addresses.size(), pair.runs[st].size()));
+		// The flat form: a user data register by its index (TableEvaluate takes it where the stage's user data hold it,
+		// value() reads one beyond them as 0: one of 64 and up is the constant 0), a slot by its index, an immediate
+		// from the constants (the first is 0).
+		const auto& program = *pair.programs[st];
+		auto&       flat    = pair.flat[st];
+		flat                = {};
+		flat.constants.push_back(0);
+		const auto flat_of = [&](const ShaderRecompiler::IR::TablePlan::Operand& operand) -> TablePair::FlatOperand {
+			if (operand.kind == Kind::Slot) return {operand.value, 1};
+			if (operand.kind == Kind::UserData) {
+				const auto index = operand.value - program.user_data_base;
+				if (index >= 64) return {0, 2};
+				flat.user_words = std::max(flat.user_words, index + 1);
+				return {index, 0};
+			}
+			flat.constants.push_back(operand.value);
+			return {static_cast<uint32_t>(flat.constants.size() - 1), 2};
+		};
+		const auto& runs = pair.runs[st];
+		for (size_t i = 0; i < runs.size(); ++i) {
+			const auto& run = runs[i];
+			flat.runs.push_back({{flat_of(run.read.low), flat_of(run.read.high), flat_of(run.read.offset)},
+			                     run.read.immediate, run.first, run.count});
+			if (i + 1 == runs.size() || runs[i + 1].level != run.level) flat.level_ends.push_back(static_cast<uint32_t>(i + 1));
+		}
+		for (const auto& descriptor: plan.images) {
+			flat.image_counts.push_back(descriptor.count);
+			for (uint32_t w = 0; w < descriptor.count; ++w) flat.image_words.push_back(flat_of(descriptor.words[w]));
+		}
+		for (const auto& descriptor: plan.samplers)
+			for (uint32_t w = 0; w < descriptor.count; ++w) flat.image_words.push_back(flat_of(descriptor.words[w]));
+		for (const auto& words: plan.buffers)
+			for (const auto& word: words) flat.buffer_words.push_back(flat_of(word));
 	}
 }
 

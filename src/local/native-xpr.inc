@@ -71,6 +71,11 @@ extern "C" {
 // records meanwhile). A new area brings hundreds of pairs whose programs and pipelines compile in the background.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_store_budget {32};
 }
+// Keys that are XXH3 hashes already: their own bucket index (std::hash<uint64_t> is FNV-1a over the bytes on MSVC).
+struct HashedKey {
+	[[nodiscard]] size_t operator()(uint64_t key) const noexcept { return static_cast<size_t>(key); }
+};
+
 namespace {
 // word_patch value of a logged word whose change reaches nothing the evaluation produces.
 constexpr int32_t NativeXprIgnore = -2;
@@ -202,6 +207,7 @@ struct RenderExecutor::NativeXprDrawState {
 	RenderState                      first_rendering; // as the stored draw began it
 	std::vector<Target>              targets;
 	LocalDrawRecording::DynamicState dynamic;
+	uint64_t                         dynamic_hash = 0; // of the dynamic state's bytes: two states compare it first
 	// Metadata epoch under which no target had a pending fast clear.
 	mutable uint64_t                 meta_epoch = 0;
 	// Texture cache resolution epoch under which the targets were what a lookup finds (0: not yet).
@@ -498,7 +504,7 @@ void NativeXprPrefetchArrays(const Record& record) {
 
 struct RenderExecutor::NativeXprCache {
 	vk::Device                                                        device;
-	std::unordered_map<uint64_t, std::unique_ptr<NativeXprRecord>>    records;
+	std::unordered_map<uint64_t, std::unique_ptr<NativeXprRecord>, HashedKey> records;
 	// Past this many records the sweep keeps only recently used ones (NativeXprCollect); at
 	// RecordsHardCap a store drops them all (NativeXprStore).
 	static constexpr size_t RecordsSoftCap = 49152, RecordsHardCap = 65536;
@@ -562,10 +568,10 @@ struct RenderExecutor::NativeXprCache {
 		index[at] = {};
 		--index_count;
 	}
-	std::unordered_map<uint64_t, std::unique_ptr<NativeXprDrawState>> states;
+	std::unordered_map<uint64_t, std::unique_ptr<NativeXprDrawState>, HashedKey> states;
 	// Invalidated records: their sets retire once the GPU passed retire_tick;
 	// their logged reads stay for learning until the key is stored again.
-	std::unordered_map<uint64_t, std::unique_ptr<NativeXprRecord>> stale;
+	std::unordered_map<uint64_t, std::unique_ptr<NativeXprRecord>, HashedKey> stale;
 	struct RetiredSet {
 		vk::DescriptorPool pool;
 		vk::DescriptorSet  set;
@@ -638,7 +644,7 @@ struct RenderExecutor::NativeXprCache {
 		std::vector<Identity> identity;
 		bool                  identity_known = false;
 	};
-	std::unordered_map<uint64_t, PairStats> pairs;
+	std::unordered_map<uint64_t, PairStats, HashedKey> pairs;
 	// Keys that missed, with the frame of their latest miss. A record pays off only
 	// when its key comes again, so it is stored at the second sighting within the
 	// frames a record outlives unused: keys new every frame (user data pointing at
@@ -1631,6 +1637,7 @@ void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRend
 	    rendering.depth_stencil_attachment.image_layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 	        ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eDepth}
 	        : vk::ImageAspectFlags {});
+	draw_state.dynamic_hash = XXH3_64bits(&draw_state.dynamic, sizeof(draw_state.dynamic));
 	// Entries stay at their address (emission tracking compares pointers); a
 	// replaced state must be emitted again.
 	const auto write = CatalogWrite();
@@ -3042,6 +3049,7 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	// stays bound unless another path bound graphics state (generation).
 	const bool same_command = emit.command == vk_buffer && emit.generation == buffer.GraphicsGeneration();
 	if (same_command && emit.state != &draw_state && emit.state != nullptr &&
+	    emit.state->dynamic_hash == draw_state.dynamic_hash &&
 	    std::memcmp(&emit.state->dynamic, &draw_state.dynamic, sizeof(draw_state.dynamic)) == 0) {
 		// Another draw state with the same dynamic state is bound already.
 		emit.state = &draw_state;

@@ -115,6 +115,16 @@ static void AddPipelineBinaryExtensions(const std::vector<vk::ExtensionPropertie
 	}
 }
 
+// VK_NV_copy_memory_indirect for the upload prologues' copies (one command for a submission's, by device address).
+// KYTY_COPY_INDIRECT=0: a copy command per buffer.
+static void AddCopyMemoryIndirectExtension(const std::vector<vk::ExtensionProperties>& available,
+                                           std::vector<const char*>&                   extensions) {
+	const char* setting = std::getenv("KYTY_COPY_INDIRECT");
+	if ((setting == nullptr || std::string_view(setting) != "0") &&
+	    HasExtension(available, VK_NV_COPY_MEMORY_INDIRECT_EXTENSION_NAME))
+		extensions.push_back(VK_NV_COPY_MEMORY_INDIRECT_EXTENSION_NAME);
+}
+
 static bool HasLayer(const std::vector<vk::LayerProperties>& layers, const char* name) {
 	return std::any_of(layers.begin(), layers.end(),
 	                   [name](const auto& layer) { return strcmp(layer.layerName, name) == 0; });
@@ -726,7 +736,15 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		supported_binaries.pNext     = &supported_maintenance5;
 		supported_features2.pNext    = &supported_binaries;
 	}
+	const bool copy_indirect_extension = HasExtension(device_extensions, VK_NV_COPY_MEMORY_INDIRECT_EXTENSION_NAME);
+	vk::PhysicalDeviceCopyMemoryIndirectFeaturesNV supported_copy_indirect {};
+	if (copy_indirect_extension) {
+		supported_copy_indirect.pNext = supported_features2.pNext;
+		supported_features2.pNext     = &supported_copy_indirect;
+	}
 	physical_device.getFeatures2(&supported_features2);
+	graphics.copy_memory_indirect_enabled = copy_indirect_extension && supported_copy_indirect.indirectCopy;
+	LOGF("Vulkan indirect memory copies: %s\n", graphics.copy_memory_indirect_enabled ? "true" : "false");
 	graphics.pipeline_binaries_enabled =
 	    binary_extensions && supported_binaries.pipelineBinaries && supported_maintenance5.maintenance5;
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
@@ -895,6 +913,12 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 			internal_cache.pNext                = create_info.pNext;
 			create_info.pNext                   = &internal_cache;
 		}
+	}
+	vk::PhysicalDeviceCopyMemoryIndirectFeaturesNV copy_indirect {};
+	if (graphics.copy_memory_indirect_enabled) {
+		copy_indirect.indirectCopy = VK_TRUE;
+		copy_indirect.pNext        = const_cast<void*>(create_info.pNext);
+		create_info.pNext          = &copy_indirect;
 	}
 	vk::PhysicalDeviceFaultFeaturesEXT fault_features {};
 	const bool fault_extension = HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
@@ -1320,6 +1344,7 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
 		}
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
+		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
 	}
 
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
@@ -1464,6 +1489,7 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
+		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
 	}
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
 	const VulkanExtensions no_layers {};

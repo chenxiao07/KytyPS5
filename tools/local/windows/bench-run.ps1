@@ -1,7 +1,8 @@
 param([string]$Label = 'run', [int]$Rounds = 3, [string]$Exe = '', [switch]$NoAot, [string[]]$Extra = @(),
       [switch]$KeepRunning, [string]$PresentMode = '', [int]$Vblank = 0, [string[]]$Set = @(),
       [string]$Patch = '', [switch]$Fullscreen, [switch]$ShotOnly, [switch]$NoWalk,
-      [int]$StartupSeconds = 100, [int]$StartupAttempts = 3, [switch]$NoPrecompile, [string]$Config = '')
+      [int]$StartupSeconds = 100, [int]$StartupAttempts = 3, [switch]$NoPrecompile, [string]$Config = '',
+      [string]$Game = '')
 # End to end: fresh baseline save, launch, skip to the game, walk the fixed path once the HUD
 # is really up, measure. Screen states are told apart by pixel statistics.
 $S = $PSScriptRoot
@@ -81,6 +82,14 @@ function State($source) {
 		# In game: 109 slot and 151 bar pixels (the full-screen captures this replaced also counted
 		# red desktop icons next to the window).
 		if ($red -gt 70 -and $bar -gt 100) { return 'hud' }
+		# A character in soul form (half health, a short bar: 35 slot and 12 bar pixels) has the green
+		# stamina bar under it (180 pixels; none in the menus, prompt, fog or cinematics).
+		$stamina = 0
+		if ($red -gt 20) {
+			for ($y = 2; $y -lt 30; $y += 1) { for ($x = 10; $x -lt 200; $x += 1) {
+				$c = $bmp.GetPixel($x, $y); if ($c.G -gt 80 -and $c.G -gt 1.5 * $c.R -and $c.G -gt 1.3 * $c.B) { $stamina++ } } }
+		}
+		if ($stamina -gt 120) { return 'hud' }
 		# Offline prompt: black screen with a lit box in the middle. Menu: green-tinted.
 		$dark = 0; $total = 0; $sr = 0; $sg = 0; $sb = 0; $center = 0; $sat = 0
 		for ($y = 0; $y -lt 360; $y += 4) { for ($x = 0; $x -lt 640; $x += 4) {
@@ -129,8 +138,17 @@ if ($Set.Count) { $params['Set'] = $Set }
 if ($Patch) { $params['Patch'] = $Patch }
 if ($Fullscreen) { $params['Fullscreen'] = $true }
 if ($Config) { $params['Config'] = $Config } # another launch config (run-windows.ps1 -Config)
+# -Game <folder>: another game (version) for this run; game-path.txt keeps the folder remembered before
+# it (run-windows.ps1 remembers a -Game).
+$gameFile = "$root\game-path.txt"
+$remembered = if (Test-Path $gameFile) { [IO.File]::ReadAllBytes($gameFile) }
+function Restore-GamePath {
+	if (!$Game) { return }
+	if ($remembered) { [IO.File]::WriteAllBytes($gameFile, $remembered) } else { Remove-Item $gameFile -ErrorAction SilentlyContinue }
+}
+if ($Game) { $params['Game'] = $Game }
 # -NoPrecompile: the driver cache as it is (first-encounter measurements with KYTY_SHADER_WARMUP=0).
-if (!$NoPrecompile) { & "$root\run-windows.ps1" -Precompile -Width 1280 -Height 720 @params *> $null }
+if (!$NoPrecompile) { & "$root\run-windows.ps1" -Precompile -Width 1280 -Height 720 @params *> $null; Restore-GamePath }
 $env:KYTY_LIVE_FILE = "$root\_Build\windows-bench\live-commands.txt"
 # The HUD is up about 60 s after launch: a start-up still short of it after -StartupSeconds is stuck
 # (seen once in the attract loop), so it starts again from a fresh baseline save.
@@ -145,6 +163,7 @@ if ($attempt -gt 1) {
 }
 foreach ($pair in $Extra) { $k, $v = $pair -split '=', 2; Set-Item "env:$k" $v }
 & "$root\run-windows.ps1" @params 6>&1 | Select-Object -Last 1
+Restore-GamePath
 foreach ($pair in $Extra) { Remove-Item ("env:" + ($pair -split '=', 2)[0]) -ErrorAction SilentlyContinue }
 
 $start = Get-Date

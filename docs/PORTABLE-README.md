@@ -4,17 +4,19 @@ A Windows test build of the Kyty PS5 emulator. So far it has been tuned only for
 **Demon's Souls (the PS5 remake)**. It is built by GitHub Actions from the source at
 https://github.com/chenxiao07/KytyPS5, where newer builds are under Releases.
 
-## Supported game version
+## Supported game versions
 
-| Item | Tested version |
+| Item | Supported |
 | --- | --- |
 | Game | Demon's Souls |
 | Title ID | PPSA01341 |
 | Content ID | EP9000-PPSA01341_00-DEMONSSOULS00000 |
-| Version | 01.007.000 |
+| Versions | 01.007.000 (1.07) and 01.005.000 (1.05) |
 
-Other versions, other regions and other games have not been tested and may not run or may fail.
-At start-up the launcher reads the game's `sce_sys\param.json` and warns when the version differs.
+Both versions get the same performance patches. Each version has shader caches of its own (versions do
+not share shaders), so the shader precompile is done once per version. Other versions, other regions
+and other games have not been tested and may not run or may fail. At start-up the launcher reads the
+game's `sce_sys\param.json` and warns when the version is not one of these.
 
 ## System requirements
 
@@ -70,7 +72,7 @@ The first launch goes like this:
 1. Choose the game folder (see above).
 2. The console lists the game's shaders from its files (once, about 20 seconds; it needs Python 3
    with numpy, see the system requirements).
-3. A dialog shows whether the game version is the tested one and offers to precompile the shaders
+3. A dialog shows whether the game version is a supported one and offers to precompile the shaders
    first (see the next section).
 4. The console window makes the input files for the background shader preparation (once per
    graphics card and driver version): about 50 seconds on the test PC's 22 threads, a few minutes on
@@ -109,7 +111,7 @@ There are two levels of preparation, both specific to the graphics card and driv
    meanwhile. The first launch makes the input files it needs.
 2. **Full precompile (recommended once)**: compiles every shader and pipeline of the game into
    `_PipelineCache`. Afterwards shader stutters are essentially gone. With a recent NVIDIA driver the
-   result is a store the game reads pipeline by pipeline (`<title>.binaries`, about 2 GB, nothing to
+   result is a store the game reads pipeline by pipeline (`<title>_<version>.binaries`, about 2 GB, nothing to
    load at launch); with other drivers a cache each launch loads (with a progress bar).
    - Choose "Precompile first" in the dialog at launch, or double-click `precompile.cmd` on its own.
    - The time depends on the CPU threads: about 45 minutes with 22 threads, about 1 hour with 16,
@@ -163,7 +165,7 @@ can be warped too; one in the character creation cannot (it has no save yet).
 | `_PipelineCache` | Shader caches (valid only for this PC's graphics card and driver: do not copy them to other PCs) |
 | `logs` | Run logs |
 | `game-path.txt` | The remembered game location |
-| `seeds.seeds` | The list of shaders the first launch collects from the game files (it contains the game's shader code: do not share it), for the precompile |
+| `seeds-<title>_<version>.seeds` | The list of shaders the first launch collects from the game files (one per game version) (it contains the game's shader code: do not share it), for the precompile |
 | `launch.json` | The emulator's switches; normally left alone |
 
 ## Known issues

@@ -1,6 +1,6 @@
 #pragma once
 // VK_KHR_pipeline_binary: the static precompile's pipelines as the driver's own binaries, in one file
-// (_PipelineCache/static/<title>.binaries) indexed by the driver's pipeline keys. A pipeline's
+// (_PipelineCache/static/<title>_<version>.binaries) indexed by the driver's pipeline keys. A pipeline's
 // binaries are read when the game first needs it; a whole static VkPipelineCache is instead copied by
 // the driver into memory when it is loaded (4 GB for Demon's Souls).
 //

@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <string_view>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #ifndef XBYAK_NO_EXCEPTION
@@ -20,17 +21,13 @@ namespace DemonsSoulsIdle {
 void Install(Program* program);
 void Clear();
 
-inline constexpr uint64_t                CallOffset = 0x83b59b, PollOffset = 0x83b880;
-inline constexpr std::array<uint8_t, 24> CallBytes {0xe8, 0xe0, 0x02, 0x00, 0x00, 0x84, 0xc0, 0x74,
-                                                    0xd7, 0x4c, 0x8b, 0x7d, 0xc8, 0x49, 0x8b, 0xb7,
-                                                    0x90, 0x00, 0x00, 0x00, 0x48, 0x85, 0xf6, 0x74};
-inline constexpr std::array<uint8_t, 24> PollBytes {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
-                                                    0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec,
-                                                    0x88, 0x00, 0x00, 0x00, 0x4c, 0x8b, 0x35, 0x25};
-
-inline bool Matches(std::span<const uint8_t> call, std::span<const uint8_t> poll) {
-	return std::ranges::equal(call, CallBytes) && std::ranges::equal(poll, PollBytes);
-}
+// The job workers' idle loop as every build seen has it (01.005.000 and 01.007.000): the call of the poll for
+// work, the test of its result and the loop back, the call's displacement left out (IdleCallAt: the call's
+// offset in it); and the poll's prologue, its frame size left out (01.005.000 0x98 bytes, 01.007.000 0x88).
+inline constexpr std::string_view IdleCall = "48 89 df 4c 89 f6 48 c7 45 c8 00 00 00 00 e8 ?? ?? ?? ?? 84 c0 74 d7 "
+                                             "4c 8b 7d c8 49 8b b7 90 00 00 00 48 85 f6 74";
+inline constexpr size_t           IdleCallAt   = 14;
+inline constexpr std::string_view PollPrologue = "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec ?? ?? ?? ?? 4c 8b 35";
 
 #if defined(__x86_64__) || defined(_M_X64)
 // The poll's observable register state is retained even on the idle path.

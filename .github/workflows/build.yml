@@ -139,7 +139,7 @@ jobs:
           # A tag's own release, else a new tag named after the package at this commit.
           tag="$GITHUB_REF_NAME"
           [ "$GITHUB_REF_TYPE" = tag ] || tag="$PACKAGE"
-          notes="Windows x64 build of ${GITHUB_SHA::8} for Demon's Souls (PPSA01341, version 01.007.000). Unzip it and double-click run.cmd or launcher.cmd; the README.md inside explains the rest."
+          notes="Windows x64 build of ${GITHUB_SHA::8} for Demon's Souls (PPSA01341, versions 01.007.000 and 01.005.000). Unzip it and double-click run.cmd or launcher.cmd; the README.md inside explains the rest."
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$tag" "$PACKAGE.zip" --clobber --repo "$GITHUB_REPOSITORY"
           else

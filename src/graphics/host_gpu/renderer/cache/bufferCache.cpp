@@ -8,6 +8,9 @@
 #include "native-resource-state.h"
 #include "async-upload.h"
 #include "readback-queue.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#endif
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "gpu_tiler_shaders/lod_stats_pack_spv.h"
 
@@ -1135,14 +1138,18 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB,
+                       AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_host_shader_upload(graphics, scheduler, MemoryUsage::Upload, 64 * MiB),
       m_table_upload(graphics, scheduler, MemoryUsage::Upload, 32 * MiB,
                      AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress),
+      m_staging_device(graphics, scheduler, MemoryUsage::Stream, 64 * MiB,
+                       AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache), m_resources(resources) {
+	m_scheduler.SetPrologueHook([this](vk::CommandBuffer command) { FlushPrologueCopies(command); });
 	m_gpu_modified_ranges.AllowFastPath();
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
@@ -1461,13 +1468,14 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	uint64_t                    total_size = 0;
 	uint64_t                    last_dirty = 0;
 	vk::Buffer                  source;
+	const Buffer*               ring = nullptr; // (the staging ring the copies read)
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
 	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); }, &last_dirty);
+	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size, &ring); }, &last_dirty);
 	if (source) {
 		for (const auto& copy: copies) {
 			InvalidateCopyFeedback(buffer.CpuAddress() + copy.dstOffset, copy.size);
@@ -1475,6 +1483,20 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		}
 		// Pages dirty since before the open command buffer began: copied ahead of all its commands.
 		if (const auto prologue = m_scheduler.UploadPrologue(last_dirty, buffer.written_serial)) {
+			// By device address, all of the prologue's as one command (FlushPrologueCopies): a copy command per buffer
+			// was ~1 us of GPU time each, ~200 in one prologue of the async culling chain at 1-1 (~175 us there).
+			if (m_graphics.copy_memory_indirect_enabled && ring != nullptr && ring->HasDeviceAddress() &&
+			    buffer.HasDeviceAddress()) {
+				const auto from = ring->BufferDeviceAddress(), to = buffer.BufferDeviceAddress();
+				uint64_t   bits = from | to;
+				for (const auto& copy: copies) bits |= copy.srcOffset | copy.dstOffset | copy.size;
+				// (Addresses and sizes of an indirect copy are dword aligned: else copy commands.)
+				if ((bits & 3u) == 0) {
+					for (const auto& copy: copies)
+						m_prologue_copies.push_back({from + copy.srcOffset, to + copy.dstOffset, copy.size});
+					return;
+				}
+			}
 			prologue.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()), copies.data());
 			return;
 		}
@@ -1505,8 +1527,40 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	}
 }
 
+namespace {
+struct IndirectCopies {
+	VkCommandBuffer command;
+	VkDeviceAddress list;
+	uint32_t        count;
+};
+void ReplayIndirectCopies(std::span<const LocalVulkanRecording::Segment> segments,
+                          const vk::detail::DispatchLoaderDynamic& dispatch) {
+	const auto& copies = *static_cast<const IndirectCopies*>(segments[0].data);
+	dispatch.vkCmdCopyMemoryIndirectNV(copies.command, copies.list, copies.count, sizeof(VkCopyMemoryIndirectCommandNV));
+}
+} // namespace
+
+// The closing upload prologue's copies (UploadDirtyRanges), from a list in the table ring, as one command recorded in
+// order with the prologue's other commands (the recording worker replays it).
+void BufferCache::FlushPrologueCopies(vk::CommandBuffer command) {
+	if (m_prologue_copies.empty()) return;
+	const auto bytes          = m_prologue_copies.size() * sizeof(VkCopyMemoryIndirectCommandNV);
+	auto [mapped, offset]     = m_table_upload.Map(bytes, 16);
+	EXIT_IF(mapped == nullptr);
+	std::memcpy(mapped, m_prologue_copies.data(), bytes);
+	m_table_upload.Commit();
+	const IndirectCopies copies {command, m_table_upload.BufferDeviceAddress() + offset,
+	                             static_cast<uint32_t>(m_prologue_copies.size())};
+	m_prologue_copies.clear();
+	const LocalVulkanRecording::Segment segments[] {{&copies, sizeof(copies)}};
+	if (!LocalVulkanRecording::EnqueueDeferred(ReplayIndirectCopies, segments, false)) {
+		LocalVulkanRecording::Drain();
+		ReplayIndirectCopies(segments, VULKAN_HPP_DEFAULT_DISPATCHER);
+	}
+}
+
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-                                     uint64_t total_size) {
+                                     uint64_t total_size, const Buffer** ring_used) {
 	if (copies.empty()) {
 		return nullptr;
 	}
@@ -1519,12 +1573,20 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		}
 	}
 
-	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
+	// In video memory while that ring has room without waiting (its copies were ~1 ms of GPU work a frame at 1-1,
+	// reading system memory across the bus, and the frame's chain waits on them), else in the host ring.
+	auto* ring                 = &m_staging_device;
+	auto [mapped, base_offset] = m_staging_device.Map(total_size, 4, false);
+	if (mapped == nullptr) {
+		ring                            = &m_staging_buffer;
+		std::tie(mapped, base_offset) = m_staging_buffer.Map(total_size, 4);
+	}
+	auto& staging_ring = *ring;
 	// KYTY_ASYNC_REPROTECT: the pages being copied were marked clean with their write
 	// protection deferred. It precedes every copy: queued ahead of them when all go to the
 	// worker, applied here otherwise.
 	if (auto deferred = MemoryTracker::TakeDeferredProtects(); !deferred.empty()) {
-		bool queued = mapped != nullptr && AsyncUpload::Enabled() && m_staging_buffer.IsCoherent();
+		bool queued = mapped != nullptr && AsyncUpload::Enabled() && staging_ring.IsCoherent();
 		for (const auto& copy: copies)
 			queued = queued && LibKernel::Memory::TryGetBackingPointer(buffer.CpuAddress() + copy.dstOffset, copy.size);
 		for (const auto& item: deferred) {
@@ -1542,7 +1604,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (mapped != nullptr) {
 		// KYTY_ASYNC_UPLOAD: the worker fills coherent staging memory from the backing view
 		// before the submission that carries these copies; ranges without one copy here.
-		const bool async = AsyncUpload::Enabled() && m_staging_buffer.IsCoherent();
+		const bool async = AsyncUpload::Enabled() && staging_ring.IsCoherent();
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
 			const auto* source = async ? LibKernel::Memory::TryGetBackingPointer(address, copy.size) : nullptr;
@@ -1554,8 +1616,9 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			copy.srcOffset += base_offset;
 		}
 		if (async) AsyncUpload::Get().Kick();
-		m_staging_buffer.Commit();
-		return m_staging_buffer.Handle();
+		staging_ring.Commit();
+		if (ring_used != nullptr) *ring_used = &staging_ring;
+		return staging_ring.Handle();
 	}
 
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
@@ -1895,7 +1958,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	if (src == dst && src_offset < dst_offset + size && dst_offset < src_offset + size) {
 		EXIT("BufferCache: resolved Vulkan copy ranges overlap\n");
 	}
-	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
+	dst->CopyInRun(command, *src, src_offset, dst_offset, size);
 }
 
 void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size) {

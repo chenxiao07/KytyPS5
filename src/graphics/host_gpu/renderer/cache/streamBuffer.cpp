@@ -303,6 +303,23 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
 }
 
+void Buffer::CopyInRun(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
+                       uint64_t destination_offset, uint64_t size) {
+	if (size == 0 || source_offset > source.Size() || size > source.Size() - source_offset ||
+	    destination_offset > Size() || size > Size() - destination_offset) {
+		EXIT("Buffer: invalid copy range\n");
+	}
+	if (source.Handle() == Handle() && source_offset < destination_offset + size &&
+	    destination_offset < source_offset + size) {
+		EXIT("Buffer: overlapping self-copy\n");
+	}
+	written_serial = Scheduler().CommandSerial();
+	command.EndRendering();
+	const vk::BufferCopy copy {source_offset, destination_offset, size};
+	command.CopyRunHandle(source.Handle(), source_offset, Handle(), destination_offset, size)
+	    .copyBuffer(source.Handle(), Handle(), 1, &copy);
+}
+
 void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	if (((offset | size) & 3u) != 0) {
 		EXIT("Buffer: fill range must be dword aligned\n");

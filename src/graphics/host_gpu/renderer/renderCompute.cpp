@@ -690,7 +690,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 7);
 	RebindImages(bindings);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 8);
-	if (FrameGen::Enabled() && program.shader_hash == FrameGen::TaaShader &&
+	if (FrameGen::Enabled() && FrameGen::IsTaaShader(program.shader_hash) &&
 	    bindings.images.size() > 3) {
 		// TAA inputs (docs/RE-DEMONS-SOULS.md): slot 1 depth, slot 3 motion vectors.
 		FrameGen::OnDispatch(program.shader_hash, bindings.images[1].image_id,

@@ -753,7 +753,7 @@ void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
 
 void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId motion,
                 uint64_t motion_address) {
-	if (cs_hash != TaaShader) {
+	if (!IsTaaShader(cs_hash)) {
 		return;
 	}
 	g_sources = {depth, motion, depth_address, motion_address, true};

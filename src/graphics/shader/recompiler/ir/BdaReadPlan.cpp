@@ -192,8 +192,9 @@ bool EvaluateBdaReadPlan(const BdaReadPlan& plan, const ResourceSnapshot& snapsh
                          std::vector<GuestRange>& output) {
 	if (!plan.complete || plan.spans.empty() || plan.spans.size() > BdaReadPlan::Capacity)
 		return false;
-	std::vector<GuestRange> ranges;
-	ranges.reserve(plan.spans.size());
+	// (Reused per thread: a dispatch's or table draw's reads are evaluated at every use.)
+	thread_local std::vector<GuestRange> ranges;
+	ranges.clear();
 	const auto word = [&](BdaReadWord source, uint32_t& value) {
 		if (source.kind == BdaReadWord::Kind::Immediate) {
 			value = source.value;
@@ -234,15 +235,13 @@ bool EvaluateBdaReadPlan(const BdaReadPlan& plan, const ResourceSnapshot& snapsh
 		ranges.push_back(range);
 	}
 	std::ranges::sort(ranges);
-	std::vector<GuestRange> merged;
-	merged.reserve(ranges.size());
+	output.clear();
 	for (const auto range: ranges) {
-		if (!merged.empty() && range.address <= merged.back().End())
-			merged.back().size = std::max(merged.back().End(), range.End()) - merged.back().address;
+		if (!output.empty() && range.address <= output.back().End())
+			output.back().size = std::max(output.back().End(), range.End()) - output.back().address;
 		else
-			merged.push_back(range);
+			output.push_back(range);
 	}
-	output = std::move(merged);
 	return true;
 }
 } // namespace Libs::Graphics::ShaderRecompiler::IR

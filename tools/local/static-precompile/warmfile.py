@@ -833,8 +833,8 @@ class WarmFile:
 
 
 def find_files() -> list[Path]:
-    """Cache files ordered oldest -> newest by mtime."""
-    files = sorted(CACHE_ROOT.glob('*/PPSA01341.shaders'), key=lambda p: p.stat().st_mtime)
+    """Cache files (every game version's) ordered oldest -> newest by mtime."""
+    files = sorted(CACHE_ROOT.glob('*/PPSA01341*.shaders'), key=lambda p: p.stat().st_mtime)
     return files
 
 

@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 
 #include <queue>
@@ -59,6 +60,9 @@ public:
 	// a buffer created now gets its old buffers' bytes by a copy, an image download writes more than the range synced).
 	// Null: the upload is recorded in order (pages dirtied since, a speculation's recorder, switch off).
 	[[nodiscard]] vk::CommandBuffer UploadPrologue(uint64_t last_dirty, uint64_t written_serial);
+	// Called with the upload prologue's buffer as it closes, before its closing barrier (BufferCache: the prologue's
+	// copies gathered as one indirect copy).
+	void SetPrologueHook(std::function<void(vk::CommandBuffer)> hook) { m_prologue_hook = std::move(hook); }
 	// Advances with every command buffer this scheduler begins.
 	[[nodiscard]] uint64_t CommandSerial() const noexcept { return m_command_serial; }
 	// A speculative translation's (src/graphics/guest_gpu/speculation.cpp): its recorder's pending tick (from
@@ -157,6 +161,7 @@ private:
 
 	// The open buffer's upload prologue (UploadPrologue), ended and put ahead of it in its submission.
 	[[nodiscard]] SubmitEntry ClosePrologue();
+	std::function<void(vk::CommandBuffer)> m_prologue_hook;
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;

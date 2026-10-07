@@ -6,6 +6,7 @@
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <string>
@@ -20,13 +21,19 @@ bool IsSupportedGame() {
 	return supported;
 }
 
+// The engine's cs_memset32 shader (coredata/enginesupport/shaders/_ps5/cs_memset32) as the builds seen have it:
+// 01.007.000's, and 01.005.000's with the period in s12 instead of s8 (the same translated program).
+constexpr std::array<uint64_t, 2> LinearCopyShaders {0xeb7456322124ecc7ULL, 0x81bb2b1b9c751ecaULL};
+
 // Verified shader semantics: dst[i] = src[i % period], i < count. Only the
 // linear subset is replaced. Other formats, workgroup shapes, overlaps and
 // GPU-owned control words stay on the shader path; CopyBuffer owns coherence.
 bool TryLinearCopy(const ShaderComputeInputInfo& input, BufferCache& cache, uint32_t x, uint32_t y,
                    uint32_t z, uint32_t mode) {
 	const auto& program = *input.stage.program;
-	if (!IsSupportedGame() || program.shader_hash != 0xeb7456322124ecc7ULL || program.user_data_base != 0)
+	if (!IsSupportedGame() || std::find(LinearCopyShaders.begin(), LinearCopyShaders.end(), program.shader_hash) ==
+	                              LinearCopyShaders.end() ||
+	    program.user_data_base != 0)
 		return false;
 	const LinearCopyDispatch dispatch {.user_data          = input.stage.resources.user_data,
 	                                   .threads            = {input.threads_num[0], input.threads_num[1],

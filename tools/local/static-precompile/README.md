@@ -22,7 +22,7 @@ shader / pipeline in the game no longer stalls for 1–3 seconds.
 2. `precompile-windows.ps1` (repository root): the standalone program `kyty_shader_precompile` (no game,
    no window; build it with `build-windows.cmd kyty_shader_precompile`) translates every seed into
    SPIR-V (portable specialization, see below), creates every pipeline and writes the **static pipeline
-   cache** `_PipelineCache/static/PPSA01341.bin`. It runs step 1 first when the seed file is missing.
+   cache** `_PipelineCache/static/PPSA01341_<version>.bin` (one per game version). It runs step 1 first when the seed file is missing.
    - The static cache is keyed by the GPU/driver signature only and survives emulator rebuilds; the
      game looks a pipeline up there first without compiling
      (`VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT`) and returns on a hit.
@@ -34,7 +34,7 @@ shader / pipeline in the game no longer stalls for 1–3 seconds.
      saves a checkpoint every 10 minutes; after an interruption a rerun merges those checkpoints first.
    - `-Coverage`: builds no pipelines, only writes what was compiled (`<seeds>.compiled.shaders` and
      `.spirv.txt`/`.rejected.txt`).
-   - A full run finally writes `_PipelineCache/static/PPSA01341.shaders` (the compile inputs, warmup
+   - A full run finally writes `_PipelineCache/static/PPSA01341_<version>.shaders` (the compile inputs, warmup
      format, 136 MB) for the game's **background pre-translation** (`KYTY_SHADER_PREFETCH`, on by
      default): after start-up, low-priority threads translate all of these programs (about 60–100 s,
      SPIR-V kept in a temporary system file), and the first encounter takes them instead of
