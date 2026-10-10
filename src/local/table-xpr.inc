@@ -424,22 +424,26 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	}
 	if (pair.refused) return Spec::Refuse("table: pair refused"), TableResult::Native;
 	// A store at most once a frame per pair and draw state, within the frame's budget (kyty_local_table_store_budget):
-	// while its programs and pipeline compile, the pair's draws keep the native path. (Once a frame per pair kept its
-	// other states' draws on the native path, storing native records, until a later frame.)
+	// while its programs and pipeline compile, the pair's draws take the normal path (Deferred). (Once a frame per pair
+	// kept its other states' draws on the native path, storing native records, until a later frame.) Those draws
+	// stored native records too, which the table variant replaced a frame or two later: 100-230 a slow frame walking
+	// into new parts of Boletarian Palace 1-3 (each traced and sorted, ~3 ms of the frame).
 	const auto request_store = [&] {
 		if (Spec::Current() != nullptr) return Spec::Refuse("table store"), TableResult::Native;
 		if (pair.waiting) {
 			if (!pair.waiting->load(std::memory_order_acquire))
-				return LiveCounters::Add(LiveCounters::TableStoreDeferred), TableResult::Native; // (programs compiling)
+				return LiveCounters::Add(LiveCounters::TableStoreDeferred), TableResult::Deferred; // (programs compiling)
 			pair.waiting.reset();
 		}
 		if (table.store_frame != frame) {
 			table.store_frame    = frame;
 			table.store_requests = 0;
 		}
-		const auto budget = kyty_local_table_store_budget.load(std::memory_order_relaxed);
-		if ((pair.store_frame == frame && pair.store_state == cache.state_key) ||
-		    (budget != 0 && table.store_requests >= budget))
+		if (pair.store_frame == frame && pair.store_state == cache.state_key)
+			return LiveCounters::Add(LiveCounters::TableStoreDeferred), TableResult::Deferred;
+		// (Past the budget, the others draw from native records meanwhile.)
+		if (const auto budget = kyty_local_table_store_budget.load(std::memory_order_relaxed);
+		    budget != 0 && table.store_requests >= budget)
 			return LiveCounters::Add(LiveCounters::TableStoreDeferred), TableResult::Native;
 		++table.store_requests;
 		pair.store_frame  = frame;

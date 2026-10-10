@@ -3248,6 +3248,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 		const auto table = TableTry(buffer, commands, index_base, index_bytes, index_type, direct);
 		if (table == TableResult::Drawn) return true;
 		if (table == TableResult::Store) return LiveCounters::Add(LiveCounters::TableStores), false;
+		if (table == TableResult::Deferred) return false;
 	}
 	// A speculative translation draws only the table way (speculation-state.h), as does a draw of vertices.
 	if (Spec::Current() != nullptr) return Spec::Refuse("native record"), false;

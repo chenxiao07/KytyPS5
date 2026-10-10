@@ -417,7 +417,8 @@ private:
 	struct TablePair;
 	struct TableVariant;
 	struct TableImageSet;
-	enum class TableResult { Drawn, Native, Store };
+	// Deferred: the pair's table variant is on its way (TableTry): the normal path draws, storing no native record.
+	enum class TableResult { Drawn, Native, Store, Deferred };
 	std::shared_ptr<TableXpr> m_table_xpr;
 	// The executor whose catalog this one reads (a speculation's: the graphics queue's), null: its own. It changes none
 	// of it but its own proofs in it (Role: TablePair::generation, TableImageSet::validated_frame...); what it holds of
