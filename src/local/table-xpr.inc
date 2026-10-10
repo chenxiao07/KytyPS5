@@ -158,6 +158,9 @@ struct RenderExecutor::TablePair {
 	// A translation or a pipeline compile the pair's next store needs (TableStore, TableDispatch): until it is done,
 	// its draws keep the native path without asking for a store (a request a frame each kept the store budget).
 	std::shared_ptr<const std::atomic<bool>> waiting;
+	// A dispatch's: the pair of the table dispatch that came after this one's the last time (the main executor's):
+	// TablePrefetchNext loads its lines while this one is made.
+	TablePair* next = nullptr;
 };
 
 struct RenderExecutor::TableXpr {
@@ -172,6 +175,7 @@ struct RenderExecutor::TableXpr {
 	// the render thread at 1-1 standing, nor lookup then).
 	std::array<uint64_t, 3> found_key {};
 	Pair*                   found_pair = nullptr;
+	Pair*                   previous_dispatch = nullptr; // the pair of the last table dispatch (TablePrefetchNext)
 	// The same for TableDispatch's dispatches (the main executor's own: its catalog), by TableDispatchWords.
 	std::array<uint64_t, 4> found_dispatch_key {};
 	Pair*                   found_dispatch = nullptr;
@@ -330,6 +334,26 @@ static void TablePrefetchArrays(const Pair& pair, const Set* set) {
 		__builtin_prefetch(set);
 		lines(set->words);
 	}
+}
+
+// A frame's dispatches come in much the same order frame after frame (the culling chain's ~1000 of a few hundred
+// programs): the pair that followed this one's last dispatch is noted, and the pairs of the next two dispatches expected
+// load while this one is made, in two steps (each line a load reads is in by then: the next pair's arrays from its own
+// lines, which the dispatch before asked for, and the pair after it, whose lines the next one's arrays need). Their
+// lines were cold at each use: TablePrefetchPair asks for them only once the pair is found, ~0.1 us before the first
+// read. Census per call, 1-1 standing and Latria (2 boots x 2 rounds each): async-queue table dispatches 1.76 -> 1.70
+// and 2.06 -> 2.00 us (their evaluation -9%), graphics-queue ones -4%. (For draws, whose successors vary more, the
+// same cost +3% a draw.)
+template <typename Pair>
+static void TablePrefetchNext(Pair*& previous, Pair& pair) {
+	if (previous != nullptr && previous != &pair) previous->next = &pair;
+	previous = &pair;
+	auto* const next = pair.next;
+	if (next == nullptr || next == &pair) return;
+	using Set = std::remove_pointer_t<std::remove_cvref_t<decltype(next->last_set[0])>>;
+	TablePrefetchArrays(*next, static_cast<const Set*>(nullptr));
+	__builtin_prefetch(next->last_set[0]);
+	if (auto* const after = next->next; after != nullptr && after != &pair && after != next) TablePrefetchPair(*after);
 }
 
 RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands,
@@ -1925,6 +1949,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	if ((Role() == 0 && known->sightings < 2) || known->vs != cs.cs_regs.data_addr) return false;
 	auto& pair = *known;
 	TablePrefetchPair(pair);
+	if (Role() == 0) TablePrefetchNext(OwnTable().previous_dispatch, pair);
 	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1f, 0); // census: the dispatches' phases (b)
 	// The dispatch executor's sets retire here too (NativeXprTry collects only the draw executor's): without it they
 	// were never reused or freed, a new pool every 1024.
