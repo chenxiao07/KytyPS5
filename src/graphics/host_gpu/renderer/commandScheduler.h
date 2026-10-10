@@ -56,8 +56,9 @@ public:
 	// command recorded into the open buffer read or wrote them (every use of a CPU-dirty range synchronizes it first),
 	// and their copies may run before all of its commands. They go into this buffer, submitted ahead of the open one:
 	// one dependency each way per submission, where an upload in order ended the render pass and drained the queue on
-	// both sides. Not into a buffer the open buffer recorded a write into (`written_serial`, Buffer::written_serial:
+	// both sides. Not into a buffer the open buffer recorded a copy into (`written_serial`, Buffer::written_serial:
 	// a buffer created now gets its old buffers' bytes by a copy, an image download writes more than the range synced).
+	// A shader's write synchronized its pages first: those are not among the pages still CPU-dirty.
 	// Null: the upload is recorded in order (pages dirtied since, a speculation's recorder, switch off).
 	[[nodiscard]] vk::CommandBuffer UploadPrologue(uint64_t last_dirty, uint64_t written_serial);
 	// Called with the upload prologue's buffer as it closes, before its closing barrier (BufferCache: the prologue's

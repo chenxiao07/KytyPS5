@@ -1896,7 +1896,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(*buffer);
 	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
-		buffer->written_serial = m_scheduler.CommandSerial();
+		// (Not Buffer::written_serial: the write's pages were synchronized above, none of them is a CPU-dirty page an
+		// upload prologue copies later.)
 		InvalidateCopyFeedback(vaddr, size);
 		{
 			const std::unique_lock lock(m_gpu_modified_mutex);
