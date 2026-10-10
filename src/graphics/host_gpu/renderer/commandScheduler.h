@@ -161,6 +161,8 @@ private:
 
 	// The open buffer's upload prologue (UploadPrologue), ended and put ahead of it in its submission.
 	[[nodiscard]] SubmitEntry ClosePrologue();
+	// The GPU still runs work of this scheduler's the driver has (CompleteDispatch, CompleteDraws).
+	[[nodiscard]] bool GpuBusy();
 	std::function<void(vk::CommandBuffer)> m_prologue_hook;
 
 	MasterSemaphore              m_master;
@@ -173,6 +175,8 @@ private:
 	uint64_t                     m_command_serial = 1;
 	uint32_t                     m_recorded_dispatches = 0;
 	uint32_t                     m_recorded_draws      = 0;
+	// The last tick handed to the driver (its vkQueueSubmit returned: on the recording worker for a deferred one).
+	std::atomic<uint64_t>        m_driver_tick {0};
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	// Count of live entries in m_pending_operations, updated under
