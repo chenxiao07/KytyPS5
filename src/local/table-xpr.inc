@@ -227,9 +227,10 @@ struct RenderExecutor::TableXpr {
 	// A copy in the table upload ring of a small range the guest wrote (TableBlocks reads such a range from a copy,
 	// none held: the guest writes its pages unseen), direct-mapped by the range: the main executor's uses share it
 	// while no point the guest could learn that GPU work ran at passed (PageManager::ObservationEpoch: until then the
-	// guest writes nothing that work reads), in the same submission (`tick`: the ring keeps the copy for it) and with
-	// no page of the range's tracker regions made CPU-dirty since (`cpu_epoch`: one the GPU wrote and the guest read
-	// back in between is dirty again). A frame's constants are read by many draws: in the Latria spin ~2950 copies,
+	// guest writes nothing that work reads), in the same submission (`tick`: the ring keeps the copy for it), with
+	// the range's tracker regions' epoch unchanged (`cpu_epoch`: it moves when pages become CPU-dirty, when the
+	// emulator writes dirty pages, MemoryTracker::NoteHostWrite, and when GPU-written pages are given back) and no
+	// page of it GPU-written at the use. A frame's constants are read by many draws: in the Latria spin ~2950 copies,
 	// 11.8 MB a frame, before; ~1140 and 4.6 MB with the shared ones.
 	struct RingCopy {
 		uint64_t          address = 0, size = 0, observation = 0, tick = 0, cpu_epoch = 0;
@@ -1240,8 +1241,8 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 			auto& held    = *entries[i].second;
 			bool  current = held.words == words4 && (held.special == 0 || held.special == table.special_generation);
 			if (current && (held.registration & TableXpr::RingCopyMark) != 0) {
-				// Its ring copy (RingCopy's terms: the same observation epoch, no page of the range's tracker regions
-				// made CPU-dirty since, none of it GPU-written).
+				// Its ring copy (RingCopy's terms: the same observation epoch, the regions' epoch unchanged, no page
+				// GPU-written).
 				if (Role() == 0 && Spec::Current() == nullptr &&
 				    held.registration == (TableXpr::RingCopyMark | PageManager::ObservationEpoch()) &&
 				    cpu_epoch(held.address, held.size) == held.cpu_epoch &&
