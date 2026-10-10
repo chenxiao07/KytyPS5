@@ -183,6 +183,56 @@ static bool KeepsDeferredProtection(uint32_t opcode) {
 	return ((KeepsDeferredProtectionBits[(opcode >> 6u) & 3u] >> (opcode & 63u)) & 1u) != 0;
 }
 
+static bool DrawsOrDispatches(uint32_t opcode) {
+	return opcode == Pm4::IT_DRAW_INDEX_INDIRECT || opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 ||
+	       opcode == Pm4::IT_DRAW_INDEX_2 || opcode == Pm4::IT_DRAW_INDEX_AUTO ||
+	       opcode == Pm4::IT_DRAW_INDEX_INDIRECT_MULTI || opcode == Pm4::IT_DISPATCH_DIRECT ||
+	       opcode == Pm4::IT_DISPATCH_INDIRECT;
+}
+// The next draw's (or dispatch's) state, asked for while this one is made: it is read ~1 us from now and is cold (the
+// game's job threads wrote it). Past this draw (and the draws right after it), up to the next one: the tables of the
+// indirect register packets (the draw state observer and the register handlers read them first), and the first lines
+// of what each 64-bit word of the SET_SH_REG packets (user data) would point at in the guest's range (the tables a
+// draw's SRT evaluation reads first; a prefetch of an address nothing maps does nothing). Census at 1-1 standing, same
+// process, 2 rounds: a table draw's evaluation 0.31 -> 0.28 us, the whole table draw 1.42 -> 1.37 us, the frame's PM4
+// runs -0.24 ms.
+static void PrefetchNextDraw(const uint32_t* packet, uint32_t remaining_dw) {
+	bool     state = false;
+	uint32_t at    = 0;
+	for (uint32_t n = 0; n < 64 && at < remaining_dw; ++n) {
+		const uint32_t header = packet[at];
+		if (header == 0x80000000u) {
+			++at;
+			continue;
+		}
+		if ((header >> 30u) != 3u) return;
+		const uint32_t len = KYTY_PM4_LEN(header);
+		if (len > remaining_dw - at) return;
+		const uint32_t  op = (header >> 8u) & 0xffu;
+		const uint32_t* p  = packet + at;
+		at += len;
+		if (DrawsOrDispatches(op)) {
+			if (state) return;
+			continue;
+		}
+		state = true;
+		if (op == Pm4::IT_SET_SH_REG_INDIRECT || op == Pm4::IT_SET_CONTEXT_REG_INDIRECT ||
+		    op == Pm4::IT_SET_UCONFIG_REG_INDIRECT) {
+			if (len < 5) continue;
+			const auto*    block = reinterpret_cast<const char*>((uint64_t {p[1]} & 0xfffffffcu) | (uint64_t {p[2]} << 32u));
+			const uint32_t bytes = std::min<uint32_t>((p[4] & 0x3fffu) * 8u, 512u);
+			for (uint32_t offset = 0; offset < bytes; offset += 64) __builtin_prefetch(block + offset);
+		} else if (op == Pm4::IT_SET_SH_REG) {
+			for (uint32_t i = 2; i + 1 < len; ++i) {
+				if (p[i + 1] - 1u >= 0x20u) continue; // (a guest address: 4 GiB to 128 GiB)
+				const auto* table = reinterpret_cast<const char*>(uint64_t {p[i]} | (uint64_t {p[i + 1]} << 32u));
+				__builtin_prefetch(table);
+				__builtin_prefetch(table + 64);
+			}
+		}
+	}
+}
+
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
@@ -1402,6 +1452,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		if (!KeepsDeferredProtection(opcode)) PageManager::FlushDeferredProtection();
 		auto handler = g_cp_op_func[opcode];
 		LiveCounters::AddPm4(opcode);
+		if (DrawsOrDispatches(opcode)) PrefetchNextDraw(packet, remaining_dw);
 		if (XprCapture::Enabled()) {
 			if (opcode == Pm4::IT_DRAW_INDEX_INDIRECT) {
 				XprCapture::ObserveDraw(m_draw_indirect_args_base_addr + packet[1]);
