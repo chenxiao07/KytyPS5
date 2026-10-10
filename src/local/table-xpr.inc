@@ -805,8 +805,32 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 		// depth and stencil read by lighting and post passes: at 1-1 their sets were made again every other frame) is
 		// found by other rules than a texture's: the proof is that nothing was registered over its view since the set
 		// was last proven (or made).
-		const bool sampled = textures.IsSampledImageCurrent(dep.id, dep.desc, true);
-		if (!sampled && !textures.IsSampledDepthCurrent(dep.id, dep.desc, set.resolution_epoch[Role()])) return refuse();
+		bool sampled = textures.IsSampledImageCurrent(dep.id, dep.desc, true);
+		bool current = sampled || textures.IsSampledDepthCurrent(dep.id, dep.desc, set.resolution_epoch[Role()]);
+		const bool texture = dep.desc.type == TextureCache::BindingType::Texture;
+		if (!current && own && (texture || dep.desc.type == TextureCache::BindingType::Storage) &&
+		    !m_context.GetCommandScheduler().Current().IsInvalid()) {
+			// A surface the game uses as depth and as colour in turn (0x28a010000 at 1-1 and Latria, twice a frame): the
+			// form a use leaves is parked (TextureCache::ParkImage), registrations over it move every frame, and the sets
+			// using it failed here at every use (made again, 30-70 us each, the dispatch on the normal path meanwhile). The
+			// normal path's lookup takes the set's image back (TakeParkedImage: the same id and serial, its views kept, the
+			// other form's bytes copied in): the set then binds what that lookup and its acquisition bind. (The lookup is
+			// the proof for a depth-tiled view too, which IsSampledImageCurrent declines: the surface's storage use.)
+			auto       desc  = dep.desc;
+			const bool taken = textures.FindImage(desc) == dep.id && desc.view_info == dep.desc.view_info;
+			image            = textures.m_slot_images.try_get(dep.id); // (the lookup may have moved the slots)
+			if (taken && image != nullptr && image->serial == dep.serial && image->registered && !image->depth_id &&
+			    !image->binding.needs_rebind) {
+				if (texture && (dep.desc.info.IsDepth() || image->info.IsDepth())) {
+					current = textures.IsSampledDepthCurrent(dep.id, dep.desc, textures.ResolutionEpoch());
+				} else {
+					(void)textures.FindTexture(dep.id, dep.desc);
+					sampled = textures.IsSampledImageCurrent(dep.id, dep.desc, true);
+					current = sampled || (!dep.desc.info.HasMetadata() && !dep.desc.info.HasStencil());
+				}
+			}
+		}
+		if (!current) return refuse();
 		// (A DCC image's surface and a depth image's view are proven otherwise: checked at every validation.)
 		if (own) {
 			dep.proven   = sampled && dep.desc.info.metadata.kind != ImageMetadataKind::Dcc;
