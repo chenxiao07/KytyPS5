@@ -212,12 +212,16 @@ struct RenderExecutor::TableXpr {
 	// whose proof also needs the image starts and the mappings (formatted: an image may start at it; clamped: a mapping
 	// may extend it) holds while `special` is the table's special generation (0: no such need). (Buffer registrations
 	// anywhere used to drop them all: 3800 resolves a frame walking at 1-1, 1000 standing.)
+	// One holding a copy in the table upload ring of a range the guest wrote (RingCopy, made or shared for the main
+	// executor) has `registration` RingCopyMark | the observation epoch it is shared in and `cpu_epoch` the range's
+	// tracker regions' epoch then: the use takes it as RingCopy's terms allow, without resolving the V# again.
 	struct alignas(64) ResolvedBuffer {
 		std::array<uint32_t, 4> words {};
 		uint32_t                dwords = 0, special = 0;
 		vk::DeviceAddress       device = 0;
 		uint64_t                address = 0, size = 0, cpu_epoch = 0, registration = 0;
 	};
+	static constexpr uint64_t RingCopyMark = uint64_t {1} << 63u;
 	static constexpr size_t           ResolvedEntries = 65536;
 	std::unique_ptr<ResolvedBuffer[]> resolved = std::make_unique<ResolvedBuffer[]>(ResolvedEntries);
 	// A copy in the table upload ring of a small range the guest wrote (TableBlocks reads such a range from a copy,
@@ -1235,6 +1239,25 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 			}
 			auto& held    = *entries[i].second;
 			bool  current = held.words == words4 && (held.special == 0 || held.special == table.special_generation);
+			if (current && (held.registration & TableXpr::RingCopyMark) != 0) {
+				// Its ring copy (RingCopy's terms: the same observation epoch, no page of the range's tracker regions
+				// made CPU-dirty since, none of it GPU-written).
+				if (Role() == 0 && Spec::Current() == nullptr &&
+				    held.registration == (TableXpr::RingCopyMark | PageManager::ObservationEpoch()) &&
+				    cpu_epoch(held.address, held.size) == held.cpu_epoch &&
+				    !buffer_cache.IsRegionGpuModified(held.address, held.size)) {
+					LiveCounters::Add(LiveCounters::TableRingShared);
+					LiveCounters::Add(LiveCounters::TableRingSharedBytes, held.size);
+					const auto [word, stride]      = word_of(words4);
+					block[plan.BufferDword(i)]     = static_cast<uint32_t>(held.device);
+					block[plan.BufferDword(i) + 1] = static_cast<uint32_t>(held.device >> 32u);
+					block[plan.BufferDword(i) + 2] = held.dwords;
+					block[plan.BufferDword(i) + 3] = word;
+					block[plan.BufferDword(i) + 4] = stride;
+					continue;
+				}
+				current = false;
+			}
 			// (A speculation's guest memory writes wait for its commit: such a range is resolved, ObtainBuffer decides.)
 			if (const auto* spec = Spec::Current();
 			    current && held.size != 0 && spec != nullptr && spec->JournalIntersects(held.address, held.size))
@@ -1302,6 +1325,16 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 								           .cpu_epoch   = cpu,
 								           .device      = device};
 						}
+						// (The V#'s later uses take it from its held entry.)
+						if (device != 0 && shared != nullptr && cpu != 0)
+							held = {.words        = words4,
+							        .dwords       = static_cast<uint32_t>(size / 4),
+							        .special      = fresh.special,
+							        .device       = device,
+							        .address      = address,
+							        .size         = size,
+							        .cpu_epoch    = cpu,
+							        .registration = TableXpr::RingCopyMark | observation};
 						if (device != 0) {
 							const auto [word, stride]      = word_of(words4);
 							block[plan.BufferDword(i)]     = static_cast<uint32_t>(device);
