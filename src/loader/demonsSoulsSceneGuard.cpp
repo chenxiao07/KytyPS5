@@ -10,6 +10,13 @@
 // children read each child's word at + 8 in place and crashed on the same null children when the world was torn
 // down at "save and quit" (eboot+0xc5a3be 10-07, after the first guard had skipped them 32 times). Their loops
 // skip a null child here (nothing to pass the bit to).
+// The find by id has five siblings next to it (01.007.000 eboot+0x8db150, +0x8db350, +0x8db5c0, +0x8db650 and
+// +0x8db780; 01.005.000 the same five after +0x8bf620), each reading node + 0x98 / + 0xa0 first and recursing into
+// the children the same way: two collect a subtree's components matching a type into a vector, one finds a component
+// by its 128-bit id, two visit them. The first crashed on a null child in a job worker at 1-1 (eboot+0x8db185 10-11),
+// after the visit at +0xb9d1d0 had skipped 32 null children of the same parent, whose children vector changed size
+// and null slots between the skips. A null node is an empty one in each of them too (a collector returns the count
+// of its vector, unchanged).
 #include "loader/demonsSoulsSceneGuard.h"
 
 #include "common/logging/log.h"
@@ -25,26 +32,53 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace Loader::DemonsSoulsSceneGuard {
 namespace {
 constexpr uint64_t PageSize = 0x4000, CaveOffset = 0x8000000 + 2 * PageSize;
 
 // The traversals' first bytes as both builds seen have them (01.007.000 eboot+0x8dafd0, +0xb9d1d0 and +0xc5ca90;
-// 01.005.000 +0x8bf620, +0xb7dd20 and +0xc3bf90), up to their reads of node + 0x98 / + 0xa0, with what a build
-// moves (displacements, the frame size) left out.
+// 01.005.000 +0x8bf620, +0xb7dd20 and +0xc3bf90; the find's five siblings), up to their reads of node + 0x98 /
+// + 0xa0, with what a build moves (displacements, the frame size) left out; two of the siblings in each build's own
+// register allocation.
+// What a null node returns: nothing found (null) or visited, or for a collector the count of the vector it appends to
+// (rcx: begin, end), of 8- or 32-byte elements, as its own end computes it (shr rax, 3 or 5).
+enum class Empty : uint8_t { Zero, Count8, Count32 };
 struct Traversal {
-	const char* what;
-	const char* code;
+	const char*                what;
+	std::array<const char*, 2> code; // (a second for a build whose code differs)
+	Empty                      empty = Empty::Zero;
 };
-constexpr std::array<Traversal, 3> Traversals {{
+constexpr std::array<Traversal, 8> Traversals {{
     {"find a node by id (returns it or null)",
-     "55 48 89 e5 41 57 41 56 41 55 41 54 53 50 89 c8 89 d3 41 89 f6 49 89 ff 48 89 4d d0 83 e0 fd 83 f8 04 0f 84 ?? ?? "
-     "?? ?? 4d 8b a7 98 00 00 00 4d 3b a7 a0 00 00 00 0f 84 ?? ?? ?? ?? 41 83 fe ff"},
-    {"visit a subtree", "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec 58 48 8b 87 a0 00 00 00 4c 8b bf 98 00 00 00 89 75 "
-                        "d4 48 89 7d c8 48 89 45 b0 49 39 c7 74 60 48 8d 45 10 48 8b 48 28 48 8b 10 4c 8b 60 08 4c 8b 68 10"},
-    {"visit a subtree", "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec ?? ?? ?? ?? 48 8b 05 ?? ?? ?? ?? 89 b5 5c ff ff ff 48 "
-                        "8b 00 48 89 45 d0 48 89 bd 50 ff ff ff 4c 8b af 98 00 00 00 4c 8b a7 a0 00 00 00 4d 39 e5"},
+     {"55 48 89 e5 41 57 41 56 41 55 41 54 53 50 89 c8 89 d3 41 89 f6 49 89 ff 48 89 4d d0 83 e0 fd 83 f8 04 0f 84 ?? ?? "
+      "?? ?? 4d 8b a7 98 00 00 00 4d 3b a7 a0 00 00 00 0f 84 ?? ?? ?? ?? 41 83 fe ff"}},
+    {"visit a subtree", {"55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec 58 48 8b 87 a0 00 00 00 4c 8b bf 98 00 00 00 89 75 "
+                         "d4 48 89 7d c8 48 89 45 b0 49 39 c7 74 60 48 8d 45 10 48 8b 48 28 48 8b 10 4c 8b 60 08 4c 8b 68 10"}},
+    {"visit a subtree", {"55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec ?? ?? ?? ?? 48 8b 05 ?? ?? ?? ?? 89 b5 5c ff ff ff 48 "
+                         "8b 00 48 89 45 d0 48 89 bd 50 ff ff ff 4c 8b af 98 00 00 00 4c 8b a7 a0 00 00 00 4d 39 e5"}},
+    {"collect a subtree's components (8-byte elements)",
+     {"55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec ?? 44 89 c0 48 89 cb 41 89 d4 41 89 f5 48 89 7d ?? 4c 89 45 ?? "
+      "83 e0 fd 83 f8 04 0f 84 ?? ?? ?? ?? 48 8b 45 ?? 4c 8b b0 98 00 00 00 4c 3b b0 a0 00 00 00",
+      "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec ?? 44 89 c0 49 89 cd 41 89 d4 48 89 7d ?? 4c 89 45 ?? 89 75 ?? "
+      "83 e0 fd 83 f8 04 0f 84 ?? ?? ?? ?? 48 8b 45 ?? 4c 8b b0 98 00 00 00 4c 3b b0 a0 00 00 00"},
+     Empty::Count8},
+    {"collect a subtree's components (32-byte elements)",
+     {"55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec ?? 44 89 c0 49 89 cc 41 89 d5 48 89 7d ?? 4c 89 45 ?? 89 75 ?? "
+      "83 e0 fd 83 f8 04 0f 84 ?? ?? ?? ?? 48 8b 45 ?? 4c 8b b8 98 00 00 00 4c 3b b8 a0 00 00 00"},
+     Empty::Count32},
+    {"find a component by its 128-bit id (returns it or null)",
+     {"55 48 89 e5 41 57 41 56 53 50 48 8b 8f 98 00 00 00 48 8b 97 a0 00 00 00 48 89 f3 48 39 d1 74 ?? c5 fa 6f 03",
+      "55 48 89 e5 41 57 41 56 41 54 53 48 8b 87 98 00 00 00 48 8b 8f a0 00 00 00 48 89 f3 48 39 c8 74 ?? c5 fa 6f 03"}},
+    {"visit a subtree's components",
+     {"55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec ?? 48 8b 05 ?? ?? ?? ?? 48 89 f3 48 8b 00 48 89 45 ?? 48 89 7d ?? "
+      "4c 8b b7 98 00 00 00 4c 8b bf a0 00 00 00"}},
+    {"visit a subtree's components",
+     {"55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec ?? 4c 8b af 98 00 00 00 48 8b 87 a0 00 00 00 4c 89 c3 49 89 ce "
+      "49 89 d7"}},
 }};
 // Each begins with push rbp; mov rbp, rsp; push r15: its stub runs them, the jump to the stub replaces them.
 constexpr std::array<uint8_t, 6> Prologue {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
@@ -108,11 +142,15 @@ void Install(Program* program) {
 	if (program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "eboot.bin" ||
 	    program->mapped_size > CaveOffset || program->base_vaddr > UINT64_MAX - CaveOffset - PageSize)
 		return;
-	// The null node traversals: the three of a known build, or none of them.
+	// The null node traversals: all of a known build, or none of them.
 	std::array<uint64_t, Traversals.size()> entries {};
 	bool                                    traversals = true;
 	for (size_t i = 0; i < Traversals.size() && traversals; i++) {
-		const auto entry = GuestCode::FindUnique(*program, GuestCode::Pattern(Traversals[i].code));
+		std::vector<uint64_t> found;
+		for (const auto* code: Traversals[i].code)
+			if (code != nullptr)
+				for (const auto at: GuestCode::Find(*program, GuestCode::Pattern(code), 2)) found.push_back(at);
+		const std::optional<uint64_t> entry = found.size() == 1 ? std::optional {found.front()} : std::nullopt;
 		if (!entry || std::memcmp(reinterpret_cast<const void*>(*entry), Prologue.data(), Prologue.size()) != 0) {
 			std::printf("Demon's Souls scene guard: no single '%s' traversal of a known build found; retaining their guest "
 			            "code\n",
@@ -165,7 +203,13 @@ void Install(Program* program) {
 		for (const auto& reg: {r11, r10, r9, r8, rdi, rsi, rdx, rcx, rax})
 			c.pop(reg);
 		c.popfq();
-		c.xor_(eax, eax);
+		if (Traversals[i].empty == Empty::Zero) {
+			c.xor_(eax, eax);
+		} else {
+			c.mov(rax, ptr[rcx + 8]);
+			c.sub(rax, ptr[rcx]);
+			c.shr(rax, Traversals[i].empty == Empty::Count8 ? 3 : 5);
+		}
 		c.ret();
 	}
 	// A children loop: the child's load, a null child continues with the next one, else the moved instruction and back.
@@ -225,11 +269,15 @@ void Install(Program* program) {
 		patch(entries[i], stubs[i], 5);
 	for (size_t i = 0; i < loops.size(); i++)
 		patch(loops[i].load, loop_stubs[i], loops[i].moved);
-	if (traversals)
-		std::printf("Demon's Souls scene guard: installed (traversals at eboot+0x%llx, 0x%llx and 0x%llx skip a null node)\n",
-		            static_cast<unsigned long long>(entries[0] - program->base_vaddr),
-		            static_cast<unsigned long long>(entries[1] - program->base_vaddr),
-		            static_cast<unsigned long long>(entries[2] - program->base_vaddr));
+	if (traversals) {
+		std::string at;
+		for (const auto entry: entries) {
+			char text[24];
+			std::snprintf(text, sizeof(text), "%s0x%llx", at.empty() ? "" : ", ", static_cast<unsigned long long>(entry - program->base_vaddr));
+			at += text;
+		}
+		std::printf("Demon's Souls scene guard: installed (traversals at eboot+%s skip a null node)\n", at.c_str());
+	}
 	for (const auto& loop: loops)
 		std::printf("Demon's Souls scene guard: installed (the children loop at eboot+0x%llx skips a null child)\n",
 		            static_cast<unsigned long long>(loop.load - program->base_vaddr));
