@@ -19,6 +19,7 @@
 // of its vector, unchanged).
 #include "loader/demonsSoulsSceneGuard.h"
 
+#include "common/guardedCopy.h"
 #include "common/logging/log.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/hostMemory.h"
@@ -27,13 +28,17 @@
 #include "loader/demonsSoulsIdle.h"
 #include "loader/guestCode.h"
 #include "loader/runtimeLinker.h"
+#include "local/local-platform.h"
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace Loader::DemonsSoulsSceneGuard {
@@ -88,11 +93,18 @@ constexpr std::array<uint8_t, 6> Prologue {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
 // (mov REG, [r12]) and the read of its word (mov eax, [REG + 8], or 01.005.000's mov ecx, imm32 first).
 constexpr std::array<const char*, 2> ChildLoops {"49 83 c4 08 4d 3b ?? 38 74 ?? 4d 8b ?? 24",
                                                  "49 83 c4 08 4d 3b ?? 38 0f 84 ?? ?? ?? ?? 4d 8b ?? 24"};
+// The children loop of the traversal that sets a subtree's update group (01.007.000 eboot+0x8da540, 01.005.000 the
+// same bytes; node + 8 bits 8..11 and its times): add r14, 8; cmp r14, r15; je; mov rdi, [r14]; mov eax, [rdi + 8].
+// It crashed on a null child in a job worker at 1-1 (eboot+0x8da64c 10-11), 4 null children of one parent that the
+// bit-passing loops had skipped just before.
+constexpr const char* GroupLoop = "49 83 c6 08 4d 39 fe 74 ?? 49 8b 3e 8b 47 08";
 struct ChildLoop {
-	uint64_t increment = 0; // the loop's add r12, 8: a null child continues there
-	uint64_t load      = 0; // mov REG, [r12]
-	uint32_t reg       = 0; // REG: r8..r15
-	uint32_t moved     = 0; // the bytes the jump to the stub replaces: the load and the next instruction
+	uint64_t increment = 0;  // the loop's add ITER, 8: a null child continues there
+	uint64_t load      = 0;  // mov REG, [ITER]
+	uint32_t reg       = 0;  // REG
+	uint32_t moved     = 0;  // the bytes the jump to the stub replaces: the load and the next instruction
+	uint32_t load_size = 4;  // (mov REG, [r12] takes a SIB byte)
+	uint32_t iter      = 12; // ITER: the element's address
 };
 
 std::vector<ChildLoop> FindChildLoops(const Program& program) {
@@ -112,6 +124,8 @@ std::vector<ChildLoop> FindChildLoops(const Program& program) {
 			loops.push_back({at, at + pattern.Size() - 4, 8 + reg, moved});
 		}
 	}
+	const GuestCode::Pattern group(GroupLoop);
+	if (const auto at = GuestCode::FindUnique(program, group)) loops.push_back({*at, *at + 9, 7, 6, 3, 14});
 	return loops;
 }
 
@@ -119,7 +133,101 @@ uint64_t              g_base = 0;
 std::atomic<uint32_t> g_skips {0};
 std::atomic<uint32_t> g_child_skips {0};
 
-void KYTY_SYSV_ABI Skipped(uint64_t offset, uint64_t caller, uint64_t rbx, uint64_t r14) {
+// What leaves the null children is not known. The first null seen starts one dump (SCENE-NULL lines): every thread's
+// frames then and 200 ms later (who is in the middle of what), and the null elements seen meanwhile read again 50 ms
+// to 10 s later (filled later: a subtree being built; still null: written over).
+std::array<std::atomic<uint64_t>, 16> g_null_elements {};
+std::atomic<uint32_t>                 g_null_count {0};
+std::atomic<bool>                     g_null_dump {false};
+
+void DumpThreads(const char* when) {
+	LocalPlatform::PrepareSampling();
+	const auto self = LocalPlatform::ThreadId();
+	std::string out = std::string("SCENE-NULL threads ") + when + "\n";
+	char        line[160];
+	for (const auto& [tid, name]: LocalPlatform::ProcessThreads()) {
+		if (tid == self || name.rfind("SDLAudio", 0) == 0) continue;
+		const auto handle = LocalPlatform::OpenThreadForSampling(tid);
+		if (handle == 0) continue;
+		uint64_t   words[24] {};
+		const bool sampled = LocalPlatform::SampleThread(handle, 0, 0, words, std::size(words));
+		LocalPlatform::CloseThreadForSampling(handle);
+		if (!sampled) continue;
+		std::snprintf(line, sizeof(line), "SCENE-NULL   %u %s:", tid, name.empty() ? "-" : name.c_str());
+		out += line;
+		for (const auto word: words) {
+			if (word == 0) break;
+			const auto guest = DescribeGuestAddressForDiagnostics(word);
+			if (!guest.empty()) out += " " + guest;
+			else {
+				std::snprintf(line, sizeof(line), " %llx", static_cast<unsigned long long>(word));
+				out += line;
+			}
+		}
+		out += "\n";
+	}
+	std::fputs(out.c_str(), stdout);
+	std::fflush(stdout);
+}
+
+void DumpNullElements(int after_ms) {
+	std::string out;
+	char        line[64];
+	std::snprintf(line, sizeof(line), "SCENE-NULL +%d ms:", after_ms);
+	out += line;
+	const auto count = std::min<uint32_t>(g_null_count.load(std::memory_order_acquire), g_null_elements.size());
+	for (uint32_t i = 0; i < count; i++) {
+		const auto element = g_null_elements[i].load(std::memory_order_relaxed);
+		uint64_t   value   = 0;
+		const bool read    = element != 0 && Common::GuardedCopy(&value, reinterpret_cast<const void*>(element), sizeof(value)) == 0;
+		std::snprintf(line, sizeof(line), read ? " %llx=%llx" : " %llx=?", static_cast<unsigned long long>(element),
+		              static_cast<unsigned long long>(value));
+		out += line;
+	}
+	out += "\n";
+	std::fputs(out.c_str(), stdout);
+	std::fflush(stdout);
+}
+
+void NullDump() {
+	LocalPlatform::SetThreadName("Kyty.SceneNull");
+	const auto start = std::chrono::steady_clock::now();
+	DumpThreads("at the first null");
+	int dumped = 0;
+	for (const int after_ms: {50, 200, 1000, 3000, 10000}) {
+		std::this_thread::sleep_until(start + std::chrono::milliseconds(after_ms));
+		DumpNullElements(after_ms);
+		if (after_ms == 200 && dumped++ == 0) DumpThreads("200 ms later");
+	}
+}
+
+// A null element of a children vector at `element` (0: not known).
+void NullSeen(uint64_t element) {
+	if (element != 0 && (element & 7u) == 0) {
+		bool known = false;
+		const auto count = std::min<uint32_t>(g_null_count.load(std::memory_order_acquire), g_null_elements.size());
+		for (uint32_t i = 0; i < count && !known; i++) known = g_null_elements[i].load(std::memory_order_relaxed) == element;
+		if (!known) {
+			if (const auto at = g_null_count.fetch_add(1, std::memory_order_acq_rel); at < g_null_elements.size())
+				g_null_elements[at].store(element, std::memory_order_release);
+		}
+	}
+	if (!g_null_dump.exchange(true, std::memory_order_acq_rel)) std::thread(NullDump).detach();
+}
+
+// The register that points at the null element of the caller's loop: a readable, aligned null word.
+uint64_t NullElementOf(std::initializer_list<uint64_t> candidates) {
+	for (const auto candidate: candidates) {
+		uint64_t value = 1;
+		if (candidate >= 0x10000 && (candidate & 7u) == 0 &&
+		    Common::GuardedCopy(&value, reinterpret_cast<const void*>(candidate), sizeof(value)) == 0 && value == 0)
+			return candidate;
+	}
+	return 0;
+}
+
+void KYTY_SYSV_ABI Skipped(uint64_t offset, uint64_t caller, uint64_t rbx, uint64_t r14, uint64_t r12, uint64_t r15) {
+	NullSeen(NullElementOf({rbx, r14, r12, r15}));
 	if (g_skips.fetch_add(1, std::memory_order_relaxed) >= 32) return;
 	// (At the recursive visits' call sites rbx points at the null element of the parent's vector, r14 at its end.)
 	std::printf("Demon's Souls scene guard: a null node skipped by eboot+0x%llx (caller eboot+0x%llx, rbx 0x%llx, r14 "
@@ -129,6 +237,7 @@ void KYTY_SYSV_ABI Skipped(uint64_t offset, uint64_t caller, uint64_t rbx, uint6
 }
 
 void KYTY_SYSV_ABI SkippedChild(uint64_t offset, uint64_t element, uint64_t r14, uint64_t r15) {
+	NullSeen(element);
 	if (g_child_skips.fetch_add(1, std::memory_order_relaxed) >= 32) return;
 	// (r12 points at the null element of the parent's vector; the parent is r14 in 01.007.000, r15 in 01.005.000.)
 	std::printf("Demon's Souls scene guard: a null child skipped at eboot+0x%llx (element 0x%llx, r14 0x%llx, r15 0x%llx)\n",
@@ -194,6 +303,8 @@ void Install(Program* program) {
 		c.mov(rdi, entry - program->base_vaddr);
 		c.mov(rdx, rbx);
 		c.mov(rcx, r14);
+		c.mov(r8, r12);
+		c.mov(r9, r15);
 		c.sub(rsp, 520); // entry rsp is 8 mod 16: 80 + 520 bytes align it for FXSAVE
 		c.db(save_fp, sizeof(save_fp));
 		c.mov(rax, reinterpret_cast<uint64_t>(&Skipped));
@@ -220,10 +331,10 @@ void Install(Program* program) {
 		Xbyak::Label       null_child;
 		c.align(16);
 		loop_stubs.push_back(c.getCurr());
-		c.db(load, 4); // mov REG, [r12]
+		c.db(load, loop.load_size); // mov REG, [ITER]
 		c.test(child, child);
 		c.jz(null_child);
-		c.db(load + 4, loop.moved - 4);
+		c.db(load + loop.load_size, loop.moved - loop.load_size);
 		c.jmp(reinterpret_cast<const void*>(loop.load + loop.moved));
 		// Printed (registers, flags and FP state kept; below the red zone, on a realigned stack), then the next child.
 		c.L(null_child);
@@ -236,7 +347,7 @@ void Install(Program* program) {
 		c.sub(rsp, 512);
 		c.db(save_fp, sizeof(save_fp));
 		c.mov(rdi, loop.load - program->base_vaddr);
-		c.mov(rsi, r12);
+		c.mov(rsi, Xbyak::Reg64(static_cast<int>(loop.iter)));
 		c.mov(rdx, r14);
 		c.mov(rcx, r15);
 		c.mov(rax, reinterpret_cast<uint64_t>(&SkippedChild));
