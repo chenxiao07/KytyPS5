@@ -44,6 +44,13 @@ export KYTY_SHADER_WARMUP_THREADS=16
 export KYTY_READBACK_QUEUE=1
 export KYTY_TABLE_XPR=2
 export KYTY_TABLE_DISPATCH=1
+# The game renders 2560x1440 internally and downsamples into the 1080p window. Rendering at the
+# output resolution instead cuts GPU pixel work ~1.8x with no visible change (the window shows 1080p
+# either way). 900 = 1600x900 -> 1080p for more fps; 1440 restores the original behavior.
+export KYTY_RENDER_HEIGHT=${KYTY_RENDER_HEIGHT:-1080}
+# Live VRAM-budget GC: texture/buffer collection thresholds follow the current device-memory budget
+# (prints KYTYGCBUDGET lines) instead of fixed startup values.
+export KYTY_GC_LIVE_BUDGET=1
 # GPU render thread pinned off CPU 0 (interrupt-heavy); physical cores 1-7.
 export KYTY_RENDER_CPUS=${KYTY_RENDER_CPUS:-"1,2,3,4,5,6,7"}
 BIN="${KYTY_BIN:-./_Build/linux-nt/kyty_emulator}"
