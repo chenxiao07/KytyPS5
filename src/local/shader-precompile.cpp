@@ -227,9 +227,6 @@ int main(int argc, char* argv[]) {
 	Config::Load(config);
 	subsystems.Initialize<Log::Lifecycle>();
 	// The title the caches are named after.
-	if (Common::IsSupportedArchive(game)) {
-		game = Common::MakeArchivePath(game);
-	}
 	const auto param_json = game / "sce_sys" / "param.json";
 	if (!Common::File::IsFileExisting(param_json)) {
 		std::fprintf(stderr, "no %s\n", param_json.string().c_str());
