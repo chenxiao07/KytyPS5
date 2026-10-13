@@ -423,6 +423,11 @@ function(add_kyty_full_emulator_test target source)
 	add_executable(${target} EXCLUDE_FROM_ALL ${source} ${kyty_emulator_src})
 	target_link_libraries(${target} ${kyty_emulator_link_libraries})
 	target_include_directories(${target} PRIVATE ${inc_headers})
+	# These targets share the emulator's sources: give them its linker too, or ThinLTO objects
+	# fail to resolve on a stock toolchain (GNU ld has no ThinLTO without the LLVM plugin).
+	if(KYTY_LD_OPTIONS)
+		target_link_options(${target} PRIVATE ${KYTY_LD_OPTIONS})
+	endif()
 	if (WIN32)
 		target_link_libraries(${target} iphlpapi)
 	endif()
