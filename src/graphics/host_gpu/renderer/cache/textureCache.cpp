@@ -21,7 +21,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -255,6 +257,51 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	// Collection starts where the video memory use reaches the budget less its headroom (GetTotalMemoryBudget):
 	// below it a kept image costs nothing, a deleted one an upload when the game uses it again.
 	m_trigger_gc_memory = m_graphics.GetTotalMemoryBudget();
+}
+
+void KytyTextureGcThresholds(uint64_t total_budget, uint64_t& trigger, uint64_t& pressure, uint64_t& critical) {
+	constexpr int64_t GiB       = 1024ll * 1024 * 1024;
+	const auto        budget    = static_cast<int64_t>(std::min<uint64_t>(total_budget, INT64_MAX));
+	const auto        threshold = std::min<int64_t>(budget, 8 * GiB);
+	pressure =
+	    static_cast<uint64_t>(std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
+	critical =
+	    static_cast<uint64_t>(std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
+	trigger = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+}
+
+bool KytyGcLiveBudget() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_GC_LIVE_BUDGET");
+		return env != nullptr && std::atoi(env) != 0;
+	}();
+	return enabled;
+}
+
+uint64_t KytyGcLiveBudgetValue(const GraphicContext& graphics) {
+	static const uint64_t cap = [] {
+		const char* env = std::getenv("KYTY_GC_BUDGET_CAP_MB");
+		return env != nullptr ? std::strtoull(env, nullptr, 10) << 20 : 0ull;
+	}();
+	const uint64_t budget     = graphics.GetTotalMemoryBudget();
+	const uint64_t now_budget = cap != 0 ? std::min(budget, cap) : budget;
+	static std::mutex                        mutex;
+	static std::array<uint64_t, 15>          samples {};
+	static size_t                            next = 0;
+	static std::chrono::steady_clock::time_point last {};
+	std::scoped_lock                        lock {mutex};
+	const auto                              now = std::chrono::steady_clock::now();
+	if (samples[0] == 0) {
+		samples.fill(now_budget);
+		last = now;
+	} else if (now - last >= std::chrono::seconds(2)) {
+		next          = (next + 1) % samples.size();
+		samples[next] = now_budget;
+		last          = now;
+	} else {
+		samples[next] = std::min(samples[next], now_budget);
+	}
+	return *std::min_element(samples.begin(), samples.end());
 }
 
 TextureCache::~TextureCache() {
@@ -3775,6 +3822,27 @@ void TextureCache::RunGarbageCollector() {
 	RetireStaleImages(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+	}
+	if (KytyGcLiveBudget() && m_graphics.CanReportMemoryUsage()) {
+		static auto   kyty_budget_window = std::chrono::steady_clock::time_point {};
+		const auto    now                = std::chrono::steady_clock::now();
+		const uint64_t budget            = KytyGcLiveBudgetValue(m_graphics);
+		if (now - kyty_budget_window >= std::chrono::seconds(2)) {
+			kyty_budget_window = now;
+			uint64_t trigger = 0, pressure = 0, critical = 0;
+			KytyTextureGcThresholds(budget, trigger, pressure, critical);
+			const auto moved = [](uint64_t a, uint64_t b) { return (a > b ? a - b : b - a) >= (uint64_t {64} << 20u); };
+			if (moved(trigger, m_trigger_gc_memory)) {
+				std::printf("KYTYGCBUDGET texture budget=%lluMB trigger=%lluMB pressure=%lluMB critical=%lluMB "
+				            "used=%lluMB\n",
+				            static_cast<unsigned long long>(budget >> 20), static_cast<unsigned long long>(trigger >> 20),
+				            static_cast<unsigned long long>(pressure >> 20),
+				            static_cast<unsigned long long>(critical >> 20),
+				            static_cast<unsigned long long>(m_total_used_memory >> 20));
+				std::fflush(stdout);
+			}
+			m_trigger_gc_memory = trigger;
+		}
 	}
 	// A GPU short of video memory: a log line on where it goes when its use moved by 256 MiB (checked every 60 flips).
 	if (uint64_t video = 0, budget = 0; m_graphics.small_video_memory && tick % 60 == 0 &&
