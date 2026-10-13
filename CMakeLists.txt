@@ -775,6 +775,7 @@ if(LINUX)
 		"${KYTY_SOURCE_DIR}/graphics/shader/shader.cpp"
 		"${KYTY_SOURCE_DIR}/loader/redZonePatcher.cpp"
 		"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
+		"${KYTY_SOURCE_DIR}/local/static-seeds.cpp"
 		"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
 		"${KYTY_SOURCE_DIR}/libs/libKernel.cpp"
 		"${KYTY_SOURCE_DIR}/kernel/syncOnAddress.cpp"
