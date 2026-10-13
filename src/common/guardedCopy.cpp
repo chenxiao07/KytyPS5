@@ -49,4 +49,37 @@ bool ResumeGuardedCopy(void* context) noexcept {
 
 } // namespace Common
 
+#else
+
+#include <fcntl.h>
+#include <unistd.h>
+
+namespace Common {
+
+uint64_t GuardedCopy(void* destination, const void* source, uint64_t size) noexcept {
+	if (size == 0) {
+		return 0;
+	}
+	// /proc/self/mem serves this process's whole address space: a read of an unmapped page fails with EIO and a read
+	// that spans into one returns a short count, so what was copied is exactly what was readable where it started.
+	static const int mem = ::open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
+	if (mem < 0) {
+		return size;
+	}
+	auto*       dst    = static_cast<uint8_t*>(destination);
+	const auto* src    = static_cast<const uint8_t*>(source);
+	uint64_t    copied = 0;
+	while (copied < size) {
+		const auto done = ::pread(mem, dst + copied, static_cast<size_t>(size - copied),
+		                          static_cast<off_t>(reinterpret_cast<uintptr_t>(src + copied)));
+		if (done <= 0) {
+			break;
+		}
+		copied += static_cast<uint64_t>(done);
+	}
+	return size - copied;
+}
+
+} // namespace Common
+
 #endif

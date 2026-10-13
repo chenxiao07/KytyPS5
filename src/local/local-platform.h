@@ -102,20 +102,23 @@ void ReleaseRedirectedConsole();
 // reached the file.
 void AsyncStdout();
 void DrainStdout();
+#endif
 
-// Collects the unwind tables of the loaded images for SampleThread (call before sampling).
+// Collects the unwind tables of the loaded images for SampleThread (call before sampling). Linux: nothing to
+// collect; SampleThread falls back to the frame-pointer chain.
 void PrepareSampling();
 
 // Suspends the thread (a CurrentThreadHandle) and records pc and its callers (unwound with
 // the tables of PrepareSampling, else the word at rsp and the frame-pointer chain) within its
 // stack [stack_low, stack_high) into out[0..words). stack_high 0: the stack is unknown (a guest
-// thread), the walk stays inside the committed region that holds rsp.
+// thread), the walk stays inside the committed region that holds rsp. Linux: no cross-thread sampler (false).
 bool SampleThread(uint64_t handle, uint64_t stack_low, uint64_t stack_high, uint64_t* out, size_t words);
 // A handle to another thread of this process for SampleThread and PinThreadHandleToCpuList (0 if
-// it cannot be opened), and its release.
+// it cannot be opened), and its release. Linux: ProcessThreads is empty, so it is never needed (0).
 uint64_t OpenThreadForSampling(uint32_t thread_id);
 void     CloseThreadForSampling(uint64_t handle);
 
+#if defined(_WIN32)
 // Base address and path of the module that contains the address.
 bool ModuleOf(const void* address, uint64_t* base, char* path, size_t path_size);
 #endif

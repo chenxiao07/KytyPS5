@@ -841,6 +841,22 @@ std::vector<std::pair<uint32_t, std::string>> ProcessThreads() {
 	return {};
 }
 
+// Windows samples another thread's stack (SuspendThread + GetThreadContext + unwind data). Linux has no such
+// cross-thread sampler here: ProcessThreads() is empty, so the diagnostic's per-thread dump stays empty and these
+// are never reached; they exist so the callers compile and link.
+void PrepareSampling() {}
+
+uint64_t OpenThreadForSampling(uint32_t /*thread_id*/) {
+	return 0;
+}
+
+void CloseThreadForSampling(uint64_t /*handle*/) {}
+
+bool SampleThread(uint64_t /*handle*/, uint64_t /*stack_low*/, uint64_t /*stack_high*/, uint64_t* /*out*/,
+                  size_t /*words*/) {
+	return false;
+}
+
 double NamedThreadsCpuSeconds(const char* name) {
 	double     total = 0;
 	const long ticks = sysconf(_SC_CLK_TCK);
