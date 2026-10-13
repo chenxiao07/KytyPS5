@@ -287,6 +287,18 @@ if (!$environment.Contains('KYTY_GAME_CONVARS') -and !$Baseline -and $titleId -e
 # the game upscales it to its 3840x2160 output as it does 1440 (a laptop's RTX 3080 at Boletaria 1-1: standing
 # 20.7 -> 24.5 fps at 1080, walking 18.7 -> 22.2).
 if ($RenderHeight -gt 0 -and $RenderHeight -ne 1440) { $environment['KYTY_RENDER_HEIGHT'] = "$RenderHeight" }
+# The Linux launcher's performance set (tools/local/run_ds.sh), the same cross-platform code paths under
+# src/graphics/host_gpu/renderer:
+# - live VRAM-budget GC: texture/buffer collection thresholds follow the current device-memory budget
+#   (KYTYGCBUDGET lines) instead of fixed startup values
+# - optimized-first pipeline builds (0): a new pipeline's first build is fully optimized on the render
+#   thread, no fast unoptimized first build with a background worker rebuild (1 switches back; the Linux
+#   A/B was a fps tie but kept ~7.75 s freeze spikes in the heavy shader phase, so 0 is the default here too)
+# - a 10 GiB cap on the live budget: collection starts earlier and keeps the resident texture set below
+#   the VRAM cap with room to absorb level-load bursts (0 = uncapped; override with -Set KYTY_GC_BUDGET_CAP_MB=0)
+if (!$environment.Contains('KYTY_GC_LIVE_BUDGET') -and !$Baseline) { $environment['KYTY_GC_LIVE_BUDGET'] = '1' }
+if (!$environment.Contains('KYTY_PIPELINE_FAST_BUILD') -and !$Baseline) { $environment['KYTY_PIPELINE_FAST_BUILD'] = '0' }
+if (!$environment.Contains('KYTY_GC_BUDGET_CAP_MB') -and !$Baseline) { $environment['KYTY_GC_BUDGET_CAP_MB'] = '10240' }
 # Memory the game releases (texture pool layers, 64 KiB mappings each) is not unprotected mapping
 # by mapping before its unmap: VirtualProtect was ~15% of the render thread in the open area.
 if (!$environment.Contains('KYTY_UNMAP_PROTECT_SKIP') -and !$Baseline) { $environment['KYTY_UNMAP_PROTECT_SKIP'] = '1' }
