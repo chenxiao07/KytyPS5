@@ -1,6 +1,11 @@
 #!/bin/bash
 # Production switch set for Demon's Souls (from run-windows.json) + best binary.
-cd /mnt/AI/PS5-chenxiao07 || exit 1
+# Work in the repository root when this is the checked-out script (tools/local/), else in the folder
+# of a packaged copy (the executable next to it).
+_kyty_here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+if [ -d "$_kyty_here/../../_Build" ]; then cd "$_kyty_here/../.." || exit 1
+elif [ -d "$_kyty_here/../_Build" ]; then cd "$_kyty_here/.." || exit 1
+else cd "$_kyty_here" || exit 1; fi
 export KYTY_SHADER_WARMUP=1
 export KYTY_GPU_BUFFER_PAGES=1
 export KYTY_RECORDING_CPUS=auto
@@ -67,6 +72,8 @@ export KYTY_GC_BUDGET_CAP_MB=${KYTY_GC_BUDGET_CAP_MB:-10240}
 # GPU render thread pinned off CPU 0 (interrupt-heavy); physical cores 1-7.
 export KYTY_RENDER_CPUS=${KYTY_RENDER_CPUS:-"1,2,3,4,5,6,7"}
 BIN="${KYTY_BIN:-./_Build/linux-nt/kyty_emulator}"
+# A packaged copy has the executable next to the script.
+[ -x "$BIN" ] || [ ! -x "./kyty_emulator" ] || BIN="./kyty_emulator"
 # NOTE: default is the current (linux-nt) build, NOT the stale Oct 7 _Build/linux one.
 # Hands-off stutter capture (KYTY_LIVE_FILE): a fresh frame-interval (flips) file every ~12 s.
 # The game writes the last 3000 presented-frame intervals (us) per file, so any hitch is recorded
@@ -98,12 +105,16 @@ if [ -n "$KYTY_LIVE_FILE" ]; then
 fi
 # Mailbox = vblank-aligned, no tearing, low latency (smooth). Override with PRESENT_MODE=Fifo|Immediate.
 # MANGO=1 (default): MangoHud FPS/CPU/GPU overlay; MANGO=0 disables it.
+# The game: KYTY_GAME, else Demon's Souls where it is installed here. (The apostrophe cannot sit
+# inside a ${KYTY_GAME:-...} default: bash reads it as an opening quote.)
+GAME="${KYTY_GAME:-}"
+[ -n "$GAME" ] || GAME="/mnt/4tb/REtro/ps5/Demon's Souls.zar"
 RUN=("$BIN")
 if [ "${MANGO:-1}" = 1 ] && command -v mangohud >/dev/null 2>&1; then
   RUN=(mangohud "$BIN")
   export MANGOHUD_CONFIG=${MANGOHUD_CONFIG:-fps,frame_timing,vram,ram,gpu_temp,cpu_temp,gpu_power,cpu_power}
 fi
-exec "${RUN[@]}" --game "/mnt/4tb/REtro/ps5/Demon's Souls.zar" \
+exec "${RUN[@]}" --game "$GAME" \
   --screen-width 1920 --screen-height 1080 --console-language 1 \
   --shader-validation false --shader-log-direction Silent --printf-direction Silent \
   --vblank-frequency 60 --present-mode "${PRESENT_MODE:-Mailbox}" "$@"

@@ -226,9 +226,10 @@ The shortest way to a Release build of the emulator (without the Qt launcher):
 
 The build is optimized for the CPU it is built on (`-march=native`). For an executable that other
 PCs can run, set `KYTY_CMAKE_ARGS=-DKYTY_MARCH=x86-64-v3` before the first configure. The release
-package is built that way by [`.github/workflows/build.yml`](.github/workflows/build.yml) when
-**Actions > Build KytyPS5 (Windows) > Run workflow** is started or a `v*` tag is pushed, and published as a
-release (pushes build nothing).
+package is built that way by [`.github/workflows/build.yml`](.github/workflows/build.yml) on every
+push to any branch and on a `v*` tag, or by hand with **Actions > Build KytyPS5 (Windows) > Run
+workflow**, and published as a release (marked latest). The Linux package is built the same way by
+[`.github/workflows/build-linux.yml`](.github/workflows/build-linux.yml).
 
 ### Build requirements (Windows)
 
@@ -266,6 +267,11 @@ The finished application and its runtime dependencies will be placed in
 `_Build/windows/install`.
 
 ### Building on Linux
+
+`./build-linux.sh` builds the emulator alone (no Qt launcher) in one step: `./build-linux.sh` builds
+`kyty_emulator`, `./build-linux.sh kyty_shader_precompile` another target. It uses `-O3`, ThinLTO and
+`-march=x86-64-v3` for an executable other PCs can run (`KYTY_MARCH=native` for this CPU only). The
+manual steps below build the Qt launcher as well.
 
 Install the toolchain and the libraries the bundled SDL2 needs. Without the audio, Wayland and
 udev development packages SDL2 quietly configures itself without those backends, and the resulting

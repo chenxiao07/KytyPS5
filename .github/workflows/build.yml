@@ -1,10 +1,12 @@
 name: Build KytyPS5 (Windows)
 
-# This fork's Windows build (Demon's Souls, see README.md): a manual run (Actions > Build KytyPS5 (Windows) >
-# Run workflow) or a pushed v* tag builds the release package and publishes it as a GitHub release, marked
-# latest (README.md links to the latest one). Pushes build nothing.
+# This fork's Windows build (Demon's Souls, see README.md): a push to any branch (every commit) or a
+# pushed v* tag builds the release package and publishes it as a GitHub release, marked latest
+# (README.md links to the latest one). A manual run (Actions > Build KytyPS5 (Windows) > Run
+# workflow) does the same. The Linux workflow (.github/workflows/build-linux.yml) does this for Linux.
 on:
   push:
+    branches: [ '**' ]
     tags: [ 'v*' ]
   workflow_dispatch:
 
