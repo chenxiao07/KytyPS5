@@ -53,9 +53,10 @@ export KYTY_RENDER_HEIGHT=${KYTY_RENDER_HEIGHT:-1080}
 export KYTY_GC_LIVE_BUDGET=1
 # KYTY_PIPELINE_FAST_BUILD=1: first compile of a new pipeline is unoptimized
 # (VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT), the optimized one is built on a worker: faster to
-# first draw. A driver crash was once seen on RDNA2 at startup compute-pipeline creation; 0 restores
-# optimized-first if this run misbehaves.
-export KYTY_PIPELINE_FAST_BUILD=${KYTY_PIPELINE_FAST_BUILD:-1}
+# first draw. A driver crash was once seen on RDNA2 at startup compute-pipeline creation. The
+# 1080p+FAST_BUILD run was stable at 51.4 fps median (no crash); we now A/B the optimized-first
+# default (0) against it - set 1 to restore the fast first draw.
+export KYTY_PIPELINE_FAST_BUILD=${KYTY_PIPELINE_FAST_BUILD:-0}
 # Name every >100 ms stall in the log (frames, shader translations, pipeline creations, image
 # uploads): turns "the hang" into "what the hang was", for attribution and verification.
 export KYTY_HITCH_LOG_MS=${KYTY_HITCH_LOG_MS:-100}
