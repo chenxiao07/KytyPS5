@@ -4173,7 +4173,9 @@ void TextureCache::RunGarbageCollector() {
 	// come back after a few seconds (160 flips: 5-7 MB of uploads a frame instead of 0.2-1.7, 1% low 47 -> 27 fps).
 	constexpr uint64_t StaleTicks   = 600;
 	constexpr size_t   MaxDeletions = 40;
-	if (m_total_used_memory < m_trigger_gc_memory || tick < StaleTicks) {
+	// Less the room game buffers in use that got system memory need back (BufferCache::MoveSpilledBufferBack).
+	const uint64_t collect_above = m_trigger_gc_memory - std::min(m_trigger_gc_memory, m_buffer_cache.SpilledRoom());
+	if (m_total_used_memory < collect_above || tick < StaleTicks) {
 		return;
 	}
 	// An image the collector keeps (a depth image with its stencil association; one the GPU wrote, tiled: no download
@@ -4193,7 +4195,7 @@ void TextureCache::RunGarbageCollector() {
 	});
 	for (const auto id: candidates) {
 		auto owner = m_slot_images.try_get(id);
-		if (m_total_used_memory < m_trigger_gc_memory) {
+		if (m_total_used_memory < collect_above) {
 			break;
 		}
 		if (owner == nullptr || !owner->registered) {

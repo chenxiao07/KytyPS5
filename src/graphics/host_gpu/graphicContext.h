@@ -143,6 +143,9 @@ struct GraphicContext {
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
+	// The video memory heap's budget less its usage (VMA's figures, the largest device-local heap): what a new
+	// device-local allocation can take without going over the budget; 0 without the driver's figures.
+	[[nodiscard]] uint64_t GetVideoMemoryRoom() const;
 	// The driver's usage figures read again (VMA otherwise refreshes them every 30 of its own allocations: memory
 	// the driver takes itself, such as pipelines, shows late).
 	void                   RefreshMemoryBudget();

@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -138,6 +139,21 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 // Pages of video memory bound to a sparse buffer as it is used, from chunks of SparseChunkPages pages.
 constexpr uint32_t SparseChunkPages = 32;
 
+// KYTY_TEST_BUFFER_SPILL_MB: the least size of the next buffer made in system memory (0: none; Buffer::Buffer).
+std::atomic<uint64_t> g_forced_spill_bytes {[] {
+	const char* value = std::getenv("KYTY_TEST_BUFFER_SPILL_MB");
+	const auto  mib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull; // ("-1": ULLONG_MAX, off)
+	return mib < (uint64_t {1} << 44u) ? mib << 20u : uint64_t {0};
+}()};
+
+[[nodiscard]] bool TakeForcedSpill(uint64_t size) {
+	auto least = g_forced_spill_bytes.load(std::memory_order_relaxed);
+	while (least != 0 && size >= least) {
+		if (g_forced_spill_bytes.compare_exchange_weak(least, 0, std::memory_order_relaxed)) return true;
+	}
+	return false;
+}
+
 } // namespace
 
 struct Buffer::Sparse {
@@ -227,6 +243,21 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		return;
 	}
 
+	// KYTY_TEST_BUFFER_SPILL_MB=<n> (a test): the first game buffer (device-local, with device addresses and a guest
+	// address) of at least n MiB is made in the memory types without video memory, as one is when video memory is
+	// full, so that its move back can be watched (BufferCache::MoveSpilledBufferBack). (A GPU without such types: no
+	// change.)
+	const bool forced_spill =
+	    usage == MemoryUsage::DeviceLocal && with_bda && cpu_address != 0 && TakeForcedSpill(size);
+	if (forced_spill) {
+		const auto& memory = graphics.physical_device_memory_properties;
+		for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+			const auto properties = static_cast<VkMemoryPropertyFlags>(memory.memoryTypes[i].propertyFlags);
+			if ((properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) allocation_info.memoryTypeBits |= 1u << i;
+		}
+		allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+	}
+
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
 	const auto        create        = [&] {
@@ -255,7 +286,10 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
 	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
 	if (usage == MemoryUsage::DeviceLocal && (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
-		graphics.ReportMemoryFallback("a GPU buffer is in system memory", size);
+		m_in_system_memory = true;
+		graphics.ReportMemoryFallback(forced_spill ? "a GPU buffer is in system memory (KYTY_TEST_BUFFER_SPILL_MB)"
+		                                           : "a GPU buffer is in system memory",
+		                              size);
 	}
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
