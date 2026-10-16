@@ -489,6 +489,35 @@ void LogPipelineKey(const char* what, const PipelineBinaries::Key& key, const In
 		    found != g_key_log_modules.end() ? found->second : std::pair<uint64_t, uint64_t> {0, 0};
 		line += fmt::format(" {:016x}/{:016x}", shader, spirv);
 	}
+	// What else the key is made of: the create flags, the pNext chain, each stage's flags, pNext and specialization.
+	const auto chain = [](const void* next) {
+		std::string text;
+		for (const auto* s = static_cast<const VkBaseInStructure*>(next); s != nullptr; s = s->pNext)
+			text += fmt::format("{}{}", text.empty() ? "" : ",", static_cast<int>(s->sType));
+		return text;
+	};
+	line += fmt::format(" | flags={:x} next=[{}]", static_cast<uint32_t>(info.flags), chain(info.pNext));
+	const auto stage_text = [&](const vk::PipelineShaderStageCreateInfo& stage) {
+		std::string text = fmt::format(" stage={:x}/{:x}/{} next=[{}]", static_cast<uint32_t>(stage.stage),
+		                               static_cast<uint32_t>(stage.flags), stage.pName != nullptr ? stage.pName : "",
+		                               chain(stage.pNext));
+		if (const auto* spec = stage.pSpecializationInfo; spec != nullptr) {
+			text += fmt::format(" spec={}:{}:{:016x}", spec->mapEntryCount, spec->dataSize,
+			                    spec->pData != nullptr ? XXH3_64bits(spec->pData, spec->dataSize) : 0);
+		}
+		if (const auto* sub = static_cast<const VkBaseInStructure*>(stage.pNext); sub != nullptr &&
+		    sub->sType == VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO) {
+			text += fmt::format(" subgroup={}",
+			                    reinterpret_cast<const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo*>(sub)
+			                        ->requiredSubgroupSize);
+		}
+		return text;
+	};
+	if constexpr (std::is_same_v<Info, vk::ComputePipelineCreateInfo>) {
+		line += stage_text(info.stage);
+	} else {
+		for (uint32_t i = 0; i < info.stageCount; i++) line += stage_text(info.pStages[i]);
+	}
 	std::printf("%s\n", line.c_str());
 }
 } // namespace

@@ -68,6 +68,14 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if (!(Test-Path $Exe)) { throw "missing $Exe; build it with build-windows.cmd kyty_shader_precompile" }
+# The AMD driver keys its pipelines (VK_KHR_pipeline_binary keys, its pipeline cache) by the executable's name: what
+# kyty_shader_precompile.exe compiled, kyty_emulator.exe never found (10-16, RX 9070 XT: 0 of every pipeline the game
+# made). The program runs as a copy named like the emulator (its DLLs next to it), on any GPU.
+$runAs = Join-Path ([IO.Path]::GetTempPath()) 'kyty-precompile-as-emulator'
+New-Item -ItemType Directory -Force $runAs | Out-Null
+Copy-Item $Exe "$runAs\kyty_emulator.exe" -Force
+Get-ChildItem (Split-Path $Exe) -Filter *.dll | Copy-Item -Destination $runAs -Force
+$Exe = "$runAs\kyty_emulator.exe"
 # The game's sce_sys\param.json (its title and version). The game is its folder (eboot.bin and sce_sys) or the
 # folder packed into a ZArchive (a .zar file, read without extracting it): a .zar's is copied out by the program.
 function Read-GameParam([string]$game) {
