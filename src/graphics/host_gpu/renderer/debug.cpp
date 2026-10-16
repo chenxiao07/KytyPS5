@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <fmt/format.h>
@@ -22,6 +23,18 @@ namespace Libs::Graphics {
 
 uint32_t render_target_mask_slot(uint32_t mask, uint32_t slot) {
 	return (mask >> (slot * 4u)) & 0x0fu;
+}
+
+uint32_t render_target_write_mask_slot(uint32_t target_mask, uint32_t shader_mask, uint32_t slot) {
+	static const bool ignore_shader_mask = [] {
+		const char* value = std::getenv("KYTY_IGNORE_CB_SHADER_MASK");
+		return value != nullptr && value[0] == '1';
+	}();
+	const auto slot_mask = render_target_mask_slot(target_mask, slot);
+	if (ignore_shader_mask || render_target_mask_slot(shader_mask, slot) != 0) {
+		return slot_mask;
+	}
+	return 0;
 }
 
 static bool RenderTargetMaskHasMrt(uint32_t mask) {

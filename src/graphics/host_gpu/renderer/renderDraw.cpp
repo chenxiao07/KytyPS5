@@ -481,10 +481,12 @@ static ResolvedDynamicState ResolveGraphicsDynamicParams(const Buffer& buffer, b
 	}
 
 	// Color-control operation selects special color-buffer paths, not the normal component write
-	// mask. Attachment availability therefore follows the target write mask.
+	// mask. Attachment availability therefore follows the target write mask, and CB_SHADER_MASK: a target the pixel
+	// shader exports nothing to is not written (render_target_write_mask_slot). Kept out of the pipelines' static
+	// color mask, so their keys and the precompiled caches do not depend on it.
 	out.color_count = color_count;
 	for (uint32_t i = 0; i < color_count; i++) {
-		out.color_write[i] = render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot) != 0
+		out.color_write[i] = render_target_write_mask_slot(ctx, colors[i].target_slot) != 0
 		                         ? VK_TRUE
 		                         : VK_FALSE;
 	}
@@ -665,7 +667,8 @@ static DynamicState Capture(const CommandBuffer& buffer, const ShaderVertexInput
     const auto& ctx = buffer.GetRegisters();
     state.buffer.registers = {ctx.GetScreenViewport(), ctx.GetClipControl(),
         ctx.GetScanModeControl(), ctx.GetModeControl(), ctx.GetPolyOffset(),
-        ctx.GetBlendColor(), ctx.GetLineWidth(), ctx.GetRenderTargetMask()};
+        ctx.GetBlendColor(), ctx.GetLineWidth(), ctx.GetRenderTargetMask(),
+        ctx.GetShaderRegisters().m_cbShaderMask};
     const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
     state.buffer.graphics.properties.limits = {limits.maxFramebufferWidth, limits.maxFramebufferHeight,
         {limits.maxViewportDimensions[0], limits.maxViewportDimensions[1]}};

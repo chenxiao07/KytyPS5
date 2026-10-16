@@ -17,6 +17,9 @@ struct Registers {
     HW::BlendColor blend;
     float line_width = 1.0f;
     uint32_t target_mask = 0;
+    uint32_t shader_mask = ~0u; // CB_SHADER_MASK
+    struct ShaderRegisters { uint32_t m_cbShaderMask; };
+    ShaderRegisters GetShaderRegisters() const { return {shader_mask}; }
     const auto& GetScreenViewport() const { return viewport; }
     const auto& GetClipControl() const { return clip; }
     const auto& GetScanModeControl() const { return scan; }
