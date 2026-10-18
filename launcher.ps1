@@ -142,7 +142,10 @@ function Get-PlayCommand {
 	if ($settings.quality -in 'low', 'lowest') {
 		$arguments += @('-Quality', $settings.quality, '-TextureReduce', $(if ($settings.quality -eq 'lowest') { 2 } else { 1 }))
 	}
-	if ($frameGenAvailable -and [int]$settings.framegen -ge 2) { $arguments += @('-FrameGen', ([int]$settings.framegen - 1)) }
+	if ($frameGenAvailable -and [int]$settings.framegen -ge 2) {
+		$arguments += @('-FrameGen', ([int]$settings.framegen - 1))
+		if ((Test-Path "$root\version.dll") -or (Test-Path "$root\..\version.dll")) { $arguments += '-Rtx30FrameGen' }
+	}
 	if ($dlss) { $arguments += @('-Upscaler', 'dlss') }
 	if ($frameGenAvailable -and ([int]$settings.framegen -ge 2 -or $dlss)) { $arguments += @('-StreamlineDir', "`"$streamline`"") }
 	# Switches of the config, one -Set argument (run-windows.ps1 splits it at the commas).
@@ -323,9 +326,18 @@ if ($frameGen.SelectedIndex -lt 0) { $frameGen.SelectedIndex = 0 }
 $frameGenFolder = New-Object System.Windows.Forms.Button -Property @{ Text = 'Streamline...'; AutoSize = $true }
 $frameGenNote = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
 function Update-FrameGenNote {
-	$frameGenNote.Text = if ($frameGenAvailable) { 'DLSS; NVIDIA RTX 40 or newer (3x and up: RTX 50)' }
-		elseif (!$rtxGpu) { 'DLSS: needs an NVIDIA RTX 40 or newer graphics card' }
-		else { 'needs NVIDIA''s Streamline SDK: download it, then choose its folder' }
+	$hasProxy = (Test-Path "$root\version.dll") -or (Test-Path "$root\..\version.dll")
+	$frameGenNote.Text = if ($frameGenAvailable) {
+		if ($hasProxy) {
+			'DLSS; RTX 40+ native, RTX 30 with OpenDLSSG Enabler'
+		} else {
+			'DLSS; NVIDIA RTX 40 or newer (3x and up: RTX 50)'
+		}
+	} elseif (!$rtxGpu) {
+		'DLSS: needs an NVIDIA RTX graphics card'
+	} else {
+		'needs NVIDIA''s Streamline SDK: download it, then choose its folder'
+	}
 }
 Update-FrameGenNote
 $frameGenTips = New-Object System.Windows.Forms.ToolTip
