@@ -77,8 +77,6 @@ where clang-cl >nul 2>nul || (
 rem glslangValidator: Vulkan SDK (winget install KhronosGroup.VulkanSDK).
 if not defined VULKAN_SDK for /d %%d in ("%SystemDrive%\VulkanSDK\*") do set "VULKAN_SDK=%%d"
 if defined VULKAN_SDK set "PATH=%VULKAN_SDK%\Bin;%PATH%"
-if exist "%ROOT%..\tools\glslang\bin\glslangValidator.exe" set "PATH=%ROOT%..\tools\glslang\bin;%PATH%"
-if exist "%ROOT%tools\glslang\bin\glslangValidator.exe" set "PATH=%ROOT%tools\glslang\bin;%PATH%"
 where glslangValidator >nul 2>nul || (
 	echo glslangValidator not found: install the Vulkan SDK ^(winget install KhronosGroup.VulkanSDK^).
 	exit /b 1

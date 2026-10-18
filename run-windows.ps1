@@ -1,4 +1,4 @@
-# Windows launcher: runs the Windows build with the switches of a launch config.
+﻿# Windows launcher: runs the Windows build with the switches of a launch config.
 #   .\run-windows.ps1                        the release package's switches (run-windows.json), 2560x1440
 #   .\run-windows.ps1 -Precompile            compile every recorded shader and pipeline, then exit
 #                                            (every shader of the game: precompile-windows.ps1)
@@ -74,7 +74,6 @@ param(
 	[switch]$AspectFit,
 	[int]$Language = -1,
 	[int]$FrameGen = 0,
-	[switch]$Rtx30FrameGen,
 	[ValidateSet('', 'dlss')][string]$Upscaler = '',
 	[string]$StreamlineDir = '',
 	[string]$Affinity = '',
@@ -370,9 +369,6 @@ if ($Threads -gt 0) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$Threads" }
 if (!$environment.Contains('KYTY_HITCH_LOG_MS')) { $environment['KYTY_HITCH_LOG_MS'] = '100' }
 if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
-if ($Rtx30FrameGen -or (Test-Path "$PSScriptRoot\version.dll") -or (Test-Path "$PSScriptRoot\..\version.dll")) {
-	$environment['KYTY_EXPERIMENTAL_RTX30_FG'] = '1'
-}
 # -Upscaler dlss: src/loader/demonsSoulsSuperResolution.h.
 if ($Upscaler) { $environment['KYTY_UPSCALER'] = $Upscaler }
 # Without -StreamlineDir, the Streamline folder chosen in the launcher (launcher-settings.json), as the launcher passes
@@ -380,10 +376,6 @@ if ($Upscaler) { $environment['KYTY_UPSCALER'] = $Upscaler }
 if (!$StreamlineDir -and ($FrameGen -gt 0 -or $Upscaler) -and (Test-Path "$PSScriptRoot\launcher-settings.json")) {
 	$chosen = try { [string](Get-Content "$PSScriptRoot\launcher-settings.json" -Raw | ConvertFrom-Json).streamline } catch { '' }
 	if ($chosen -and (Test-Path $chosen)) { $StreamlineDir = $chosen }
-}
-if (!$StreamlineDir -and ($FrameGen -gt 0 -or $Upscaler)) {
-	if (Test-Path "$PSScriptRoot\streamline\sl.interposer.dll") { $StreamlineDir = "$PSScriptRoot\streamline" }
-	elseif (Test-Path "$PSScriptRoot\..\streamline\sl.interposer.dll") { $StreamlineDir = (Resolve-Path "$PSScriptRoot\..\streamline").Path }
 }
 if ($StreamlineDir) { $environment['KYTY_STREAMLINE_DIR'] = $StreamlineDir }
 # -Set KEY=VALUE overrides a switch of the config; KEY= drops it. Several: -Set A=1,B=2 (a comma

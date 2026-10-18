@@ -383,28 +383,17 @@ bool OpenDlssgDetected() {
 #if defined(_WIN32)
 	static const bool detected = [] {
 		HMODULE ver = GetModuleHandleW(L"version.dll");
-		HMODULE winmm = GetModuleHandleW(L"winmm.dll");
 		wchar_t exe[MAX_PATH] {};
 		GetModuleFileNameW(nullptr, exe, MAX_PATH);
 		std::error_code ec;
 		const auto exe_dir = std::filesystem::path(exe).parent_path();
 		return (ver != nullptr && std::filesystem::exists(exe_dir / "version.dll", ec)) ||
-		       (winmm != nullptr && std::filesystem::exists(exe_dir / "winmm.dll", ec)) ||
 		       std::filesystem::exists(exe_dir / "opendlssg.ini", ec);
 	}();
 	return detected;
 #else
 	return false;
 #endif
-}
-
-bool ExperimentalRtx30Enabled() {
-	static const bool enabled = [] {
-		const char* env = std::getenv("KYTY_EXPERIMENTAL_RTX30_FG");
-		if (env != nullptr && std::string_view(env) != "0") return true;
-		return OpenDlssgDetected();
-	}();
-	return enabled;
 }
 
 bool Requested() {
@@ -445,26 +434,13 @@ std::string SupportProblem(vk::PhysicalDevice physical_device) {
 		case sl::Result::eErrorDriverOutOfDate: problem = "the NVIDIA driver is too old for DLSS frame generation"; break;
 		case sl::Result::eErrorNoSupportedAdapterFound:
 		case sl::Result::eErrorAdapterNotSupported:
-			if (ExperimentalRtx30Enabled()) {
-				if (OpenDlssgDetected()) {
-					problem = "Streamline reported adapter not supported despite OpenDLSSG Enabler (check NVIDIA driver version and ensure HAGS is on in Windows Settings)";
-				} else {
-					problem = "this graphics card has no official DLSS frame generation (NVIDIA RTX 40 or newer; for RTX 30, place OpenDLSSG Enabler version.dll & opendlssg.ini next to kyty_emulator.exe)";
-				}
-			} else {
-				problem = "this graphics card has no DLSS frame generation (NVIDIA RTX 40 or newer; for RTX 30, enable experimental RTX 30 support with OpenDLSSG Enabler)";
-			}
+			problem = "this graphics card has no DLSS frame generation (NVIDIA RTX 40 or newer)";
 			break;
 		default: problem = std::string("Streamline does not offer DLSS frame generation here (") + sl::getResultAsStr(result) + ")"; break;
 	}
 	if (problem.empty()) {
-		if (OpenDlssgDetected()) {
-			LOGF("frame generation: Streamline offers DLSS-G with OpenDLSSG Enabler on Ampere/RTX 3070\n");
-			std::printf("Frame generation: Streamline offers DLSS-G (OpenDLSSG Enabler RTX 30 path active)\n");
-		} else {
-			LOGF("frame generation: Streamline offers DLSS-G with this GPU, driver and Windows\n");
-			std::printf("Frame generation: Streamline offers DLSS-G with this GPU, driver and Windows\n");
-		}
+		LOGF("frame generation: Streamline offers DLSS-G with this GPU, driver and Windows\n");
+		std::printf("Frame generation: Streamline offers DLSS-G with this GPU, driver and Windows\n");
 	} else {
 		LOGF("frame generation: %s\n", problem.c_str());
 		std::printf("Frame generation: %s\n", problem.c_str());
@@ -588,11 +564,8 @@ void Initialize() {
 		return;
 	}
 	if (OpenDlssgDetected()) {
-		LOGF("frame generation: OpenDLSSG Enabler proxy detected (version.dll)\n");
-		std::printf("Frame generation: OpenDLSSG Enabler proxy detected (version.dll)\n");
-	} else if (ExperimentalRtx30Enabled()) {
-		LOGF("frame generation: experimental RTX 30 FG mode enabled\n");
-		std::printf("Frame generation: experimental RTX 30 FG mode enabled\n");
+		LOGF("frame generation: OpenDLSSG Enabler detected (version.dll/opendlssg.ini)\n");
+		std::printf("Frame generation: OpenDLSSG Enabler detected (version.dll/opendlssg.ini)\n");
 	}
 	if (std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr) {
 		// Graphics modules already loaded before Streamline (it must come first).
@@ -700,8 +673,7 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 	if (g_api.is_feature_supported(sl::kFeatureDLSS_G, adapter) != sl::Result::eOk ||
 	    g_api.is_feature_loaded(sl::kFeatureDLSS_G, loaded) != sl::Result::eOk || !loaded) {
 		LOGF("frame generation: DLSS-G is not supported on this device\n");
-		std::printf("Frame generation: DLSS-G is not supported on this device%s\n",
-		            OpenDlssgDetected() ? " (OpenDLSSG detected; verify NVIDIA driver version and HAGS is on)" : "");
+		std::printf("Frame generation: DLSS-G is not supported on this device\n");
 		return;
 	}
 	if (!FeatureFunction(sl::kFeatureDLSS_G, "slDLSSGSetOptions", g_api.dlssg_set_options) ||
@@ -718,9 +690,8 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 		LOGF("frame generation: slReflexSetOptions failed (%d)\n", static_cast<int>(result));
 	}
 	g_ready = true;
-	LOGF("frame generation: DLSS-G ready%s\n", OpenDlssgDetected() ? " (OpenDLSSG RTX 30 compatibility path active)" : "");
-	std::printf("Frame generation: DLSS-G ready (%d generated frame(s) per frame%s)\n",
-	            g_generate, OpenDlssgDetected() ? ", OpenDLSSG RTX 30 path active" : "");
+	LOGF("frame generation: DLSS-G ready\n");
+	std::printf("Frame generation: DLSS-G ready (%d generated frame(s) per frame)\n", g_generate);
 	std::fflush(stdout);
 #endif
 }

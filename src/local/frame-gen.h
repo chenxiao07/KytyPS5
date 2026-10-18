@@ -76,7 +76,6 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 void BypassCommandHooks(vk::Device device);
 [[nodiscard]] bool Enabled();
 [[nodiscard]] bool OpenDlssgDetected();
-[[nodiscard]] bool ExperimentalRtx30Enabled();
 
 // Present thread, around vkQueuePresentKHR of the image showing `inputs` (null: a frame
 // without inputs, e.g. a menu). `backbuffer` is the swapchain extent, `region` the part the

@@ -144,7 +144,6 @@ function Get-PlayCommand {
 	}
 	if ($frameGenAvailable -and [int]$settings.framegen -ge 2) {
 		$arguments += @('-FrameGen', ([int]$settings.framegen - 1))
-		if ((Test-Path "$root\version.dll") -or (Test-Path "$root\..\version.dll")) { $arguments += '-Rtx30FrameGen' }
 	}
 	if ($dlss) { $arguments += @('-Upscaler', 'dlss') }
 	if ($frameGenAvailable -and ([int]$settings.framegen -ge 2 -or $dlss)) { $arguments += @('-StreamlineDir', "`"$streamline`"") }
@@ -334,7 +333,7 @@ function Update-FrameGenNote {
 			'DLSS; NVIDIA RTX 40 or newer (3x and up: RTX 50)'
 		}
 	} elseif (!$rtxGpu) {
-		'DLSS: needs an NVIDIA RTX graphics card'
+		'DLSS: needs an NVIDIA RTX 40 or newer graphics card'
 	} else {
 		'needs NVIDIA''s Streamline SDK: download it, then choose its folder'
 	}
