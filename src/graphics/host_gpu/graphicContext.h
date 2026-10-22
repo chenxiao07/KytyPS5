@@ -98,6 +98,22 @@ struct GraphicContext {
 	vk::Queue                          fsr_compute_queue = nullptr;
 	vk::Queue                          fsr_acquire_queue = nullptr;
 	uint32_t                           fsr_compute_family = static_cast<uint32_t>(-1);
+	// Linux KYTY_FRAMEGEN_BACKEND=fsr with KYTY_FSR_ASYNC=1 (fsr-native.h): a queue of a compute-only family for FSR 3's
+	// frame interpolation, used by the present thread alone (swapchain.cpp). Null: it runs on `queue`. The images both
+	// queues use are shared with its family (ShareWithAsyncCompute).
+	uint32_t                           async_compute_family = static_cast<uint32_t>(-1);
+	vk::Queue                          async_compute_queue  = nullptr;
+	uint32_t                           async_compute_families[2] {};
+
+	// `info` made concurrent between the graphics and the async compute families, when that queue exists.
+	void ShareWithAsyncCompute(vk::ImageCreateInfo& info) {
+		if (async_compute_queue == nullptr) return;
+		async_compute_families[0]  = queue_family;
+		async_compute_families[1]  = async_compute_family;
+		info.sharingMode           = vk::SharingMode::eConcurrent;
+		info.queueFamilyIndexCount = 2;
+		info.pQueueFamilyIndices   = async_compute_families;
+	}
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

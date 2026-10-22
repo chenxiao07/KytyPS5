@@ -190,6 +190,7 @@ void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view
 	}
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.samples       = vk::SampleCountFlagBits::e1;
+	graphics.ShareWithAsyncCompute(create); // (KYTY_FSR_ASYNC: FSR 3 reads it on its own queue)
 	if (!graphics.CreateImage(create, image)) {
 		// (`failed`: an image the frame can do without, the HUD canvas's copy: none this time.)
 		if (failed != nullptr) {
@@ -799,6 +800,7 @@ bool FsrHudSetup(GraphicContext& graphics, vk::Format format, vk::Extent2D exten
 			               vk::ImageUsageFlagBits::eSampled;
 			create.sharingMode = vk::SharingMode::eExclusive;
 			create.samples     = vk::SampleCountFlagBits::e1;
+			graphics.ShareWithAsyncCompute(create); // (KYTY_FSR_ASYNC: FSR 3 reads it on its own queue)
 			if (!graphics.CreateImage(create, h.images[i])) {
 				FsrHudDestroyImages(graphics);
 				return false;

@@ -334,7 +334,8 @@ public:
 	// The acquired swapchain image made a copy of `source` (the swapchain's size and format, general layout) and left for
 	// the present (Linux frame generation: a generated frame, or the finished one).
 	void                 RecordShow(CommandBuffer& command, const VulkanImage& source);
-	uint64_t             Submit(CommandScheduler& scheduler);
+	// `wait` (with `wait_tick`): also waited for before the copy (Linux frame generation's async compute).
+	uint64_t             Submit(CommandScheduler& scheduler, vk::Semaphore wait = nullptr, uint64_t wait_tick = 0);
 	[[nodiscard]] Status Present();
 
 	[[nodiscard]] uint32_t ImageCount() const noexcept {
@@ -665,7 +666,111 @@ struct Presenter::Impl {
 	std::chrono::steady_clock::time_point last_game_frame {};
 	double                                game_frame_ms = 0.0; // the game's frame time, smoothed
 
-	~Impl() { DestroyGenerationImages(); }
+	// KYTY_FSR_ASYNC=1: FSR 3's frame interpolation recorded into its own command buffer and run on
+	// GraphicContext::async_compute_queue, the graphics queue going on with the game meanwhile (made with the first frame
+	// it generates). One command buffer: each generation is waited for before its frames are shown.
+	vk::CommandPool   async_pool     = nullptr;
+	vk::CommandBuffer async_command  = nullptr;
+	vk::Semaphore     async_timeline = nullptr;
+	uint64_t          async_tick     = 0;
+	bool              async_failed   = false;
+
+	~Impl() {
+		DestroyGenerationImages();
+		DestroyAsyncCompute();
+	}
+
+	// (The present thread's own calls, not the recording worker's: FidelityFX records into the buffer directly too.)
+	static const vk::detail::DispatchLoaderDynamic& AsyncDispatch() {
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		return LocalVulkanRecording::DirectDispatch();
+#else
+		return VULKAN_HPP_DEFAULT_DISPATCHER;
+#endif
+	}
+
+	void DestroyAsyncCompute() {
+		auto&       device = window.graphic_ctx.device;
+		const auto& d      = AsyncDispatch();
+		if (async_timeline != nullptr) {
+			WaitAsyncCompute(async_tick);
+			device.destroySemaphore(async_timeline, nullptr, d);
+			async_timeline = nullptr;
+		}
+		if (async_pool != nullptr) device.destroyCommandPool(async_pool, nullptr, d);
+		async_pool    = nullptr;
+		async_command = nullptr;
+	}
+
+	[[nodiscard]] bool AsyncComputeReady() {
+		auto& graphics = window.graphic_ctx;
+		if (async_command != nullptr) return true;
+		if (graphics.async_compute_queue == nullptr || async_failed) return false;
+		const auto&               d = AsyncDispatch();
+		vk::CommandPoolCreateInfo pool {};
+		pool.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		pool.queueFamilyIndex = graphics.async_compute_family;
+		bool made             = graphics.device.createCommandPool(&pool, nullptr, &async_pool, d) == vk::Result::eSuccess;
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.commandPool        = async_pool;
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		made = made && graphics.device.allocateCommandBuffers(&allocate, &async_command, d) == vk::Result::eSuccess;
+		vk::SemaphoreTypeCreateInfo type {};
+		type.semaphoreType = vk::SemaphoreType::eTimeline;
+		vk::SemaphoreCreateInfo semaphore {};
+		semaphore.pNext = &type;
+		made = made && graphics.device.createSemaphore(&semaphore, nullptr, &async_timeline, d) == vk::Result::eSuccess;
+		if (!made) {
+			async_command = nullptr;
+			DestroyAsyncCompute();
+			async_failed = true;
+		}
+		std::printf(made ? "Frame generation: FSR 3 on the async compute queue (family %u)\n"
+		                 : "Frame generation: FSR 3 on the graphics queue (no async compute objects, family %u)\n",
+		            graphics.async_compute_family);
+		std::fflush(stdout);
+		return made;
+	}
+
+	// The async command buffer recorded: run after the present scheduler's `composed_tick`; returns its own tick.
+	[[nodiscard]] uint64_t SubmitAsyncCompute(uint64_t composed_tick) {
+		auto&       graphics = window.graphic_ctx;
+		const auto& d        = AsyncDispatch();
+		EXIT_IF(d.vkEndCommandBuffer(static_cast<VkCommandBuffer>(async_command)) != VK_SUCCESS);
+		const uint64_t                  done_tick = ++async_tick;
+		const vk::Semaphore             composed  = present_scheduler.GetMasterSemaphore().Handle();
+		const vk::PipelineStageFlags    stage     = vk::PipelineStageFlagBits::eAllCommands;
+		vk::TimelineSemaphoreSubmitInfo timeline {};
+		timeline.waitSemaphoreValueCount   = 1;
+		timeline.pWaitSemaphoreValues      = &composed_tick;
+		timeline.signalSemaphoreValueCount = 1;
+		timeline.pSignalSemaphoreValues    = &done_tick;
+		vk::SubmitInfo submit {};
+		submit.pNext                = &timeline;
+		submit.waitSemaphoreCount   = 1;
+		submit.pWaitSemaphores      = &composed;
+		submit.pWaitDstStageMask    = &stage;
+		submit.commandBufferCount   = 1;
+		submit.pCommandBuffers      = &async_command;
+		submit.signalSemaphoreCount = 1;
+		submit.pSignalSemaphores    = &async_timeline;
+		if (const auto result = graphics.async_compute_queue.submit(1, &submit, nullptr, d); result != vk::Result::eSuccess) {
+			EXIT("Frame generation: the async compute submission failed (%d)\n", static_cast<int>(result));
+		}
+		return done_tick;
+	}
+
+	void WaitAsyncCompute(uint64_t tick) {
+		vk::SemaphoreWaitInfo wait {};
+		wait.semaphoreCount = 1;
+		wait.pSemaphores    = &async_timeline;
+		wait.pValues        = &tick;
+		if (const auto result = window.graphic_ctx.device.waitSemaphores(&wait, 5'000'000'000ULL, AsyncDispatch());
+		    result != vk::Result::eSuccess) {
+			EXIT("Frame generation: waiting for the async compute queue failed (%d)\n", static_cast<int>(result));
+		}
+	}
 
 	void DestroyGenerationImages() {
 		if (composed.image == nullptr && generated[0].image == nullptr) return;
@@ -708,6 +813,7 @@ struct Presenter::Impl {
 			create.usage         = usage;
 			create.sharingMode   = vk::SharingMode::eExclusive;
 			create.samples       = vk::SampleCountFlagBits::e1;
+			graphics.ShareWithAsyncCompute(create); // (KYTY_FSR_ASYNC: FSR 3 reads and writes it on its own queue)
 			if (!graphics.CreateImage(create, image)) return false;
 			vk::ImageViewCreateInfo info {};
 			info.image            = image.image;
@@ -747,6 +853,10 @@ struct Presenter::Impl {
 		const auto format = swapchain.Format();
 
 		uint32_t count = 0;
+		// KYTY_FSR_ASYNC: the frames generated on the async compute queue (not with a screenshot due: it reads them).
+		const auto shot       = Screenshot::Take();
+		const bool async      = shot.empty() && AsyncComputeReady();
+		uint64_t   async_done = 0;
 		{
 			// (The renderer's lock: frame generation's inputs and HUD-less images are the renderer's, as on Windows.)
 			RenderLockGuard render_lock(renderer.GetMutex());
@@ -774,6 +884,16 @@ struct Presenter::Impl {
 				FrameGen::ScaleHudless(window.graphic_ctx, command.Handle(), frame.fg, extent, swapchain.PresentRegion(),
 				                       format);
 			}
+			// (Async: the frame composed, and its inputs copied before it on the same queue, then the compute queue starts.)
+			uint64_t          composed_tick = 0;
+			vk::CommandBuffer generation    = command.Handle();
+			if (async) {
+				composed_tick = present_scheduler.Submit();
+				generation    = async_command;
+				vk::CommandBufferBeginInfo begin {};
+				begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+				EXIT_IF(generation.begin(&begin, AsyncDispatch()) != vk::Result::eSuccess);
+			}
 			std::array<FrameGen::UpscaleImage, 3> outputs {};
 			for (size_t i = 0; i < generated.size(); ++i) {
 				auto&                   image = generated[i];
@@ -791,27 +911,37 @@ struct Presenter::Impl {
 				vk::DependencyInfo dependency {};
 				dependency.imageMemoryBarrierCount = 1;
 				dependency.pImageMemoryBarriers    = &barrier;
-				command.Handle().pipelineBarrier2(dependency);
+				if (async) {
+					generation.pipelineBarrier2(dependency, AsyncDispatch());
+				} else {
+					generation.pipelineBarrier2(dependency);
+				}
 				image.state = {vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderWrite, vk::ImageLayout::eGeneral};
 				outputs[i]  = {image.image, generated_views[i], vk::ImageLayout::eGeneral, format, extent, image.usage, 0, 0};
 			}
 			const FrameGen::UpscaleImage backbuffer {composed.image, composed_view, vk::ImageLayout::eGeneral, format, extent,
 			                                         composed.usage, 0, 0};
-			count = FrameGen::Generate(window.graphic_ctx, command.Handle(), frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr,
+			count = FrameGen::Generate(window.graphic_ctx, generation, frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr,
 			                           backbuffer, swapchain.PresentRegion(), outputs, frame.hdr);
-			// (A live `screenshot`: the finished frame and the frame generated before it.)
-			const auto shot      = Screenshot::Take();
-			auto       capture   = Screenshot::Record(window.graphic_ctx, command.Handle(), composed, shot);
-			auto       generated_capture =
-			    count > 0 && !shot.empty() ? Screenshot::Record(window.graphic_ctx, command.Handle(), generated[0], shot + ".gen.ppm")
-			                               : Screenshot::Pending {};
-			frame.present_tick = present_scheduler.Submit();
-			if (capture.buffer != VK_NULL_HANDLE || generated_capture.buffer != VK_NULL_HANDLE) {
-				present_scheduler.Wait(frame.present_tick);
-				Screenshot::Finish(window.graphic_ctx, capture);
-				Screenshot::Finish(window.graphic_ctx, generated_capture);
+			if (async) {
+				async_done         = SubmitAsyncCompute(composed_tick);
+				frame.present_tick = composed_tick;
+			} else {
+				// (A live `screenshot`: the finished frame and the frame generated before it.)
+				auto       capture   = Screenshot::Record(window.graphic_ctx, command.Handle(), composed, shot);
+				auto       generated_capture =
+				    count > 0 && !shot.empty() ? Screenshot::Record(window.graphic_ctx, command.Handle(), generated[0], shot + ".gen.ppm")
+				                               : Screenshot::Pending {};
+				frame.present_tick = present_scheduler.Submit();
+				if (capture.buffer != VK_NULL_HANDLE || generated_capture.buffer != VK_NULL_HANDLE) {
+					present_scheduler.Wait(frame.present_tick);
+					Screenshot::Finish(window.graphic_ctx, capture);
+					Screenshot::Finish(window.graphic_ctx, generated_capture);
+				}
 			}
 		}
+		// Async: the generated frames done, waited for without the renderer's lock (the game goes on meanwhile).
+		if (async) WaitAsyncCompute(async_done);
 
 		// The game's frame time (the time between its frames here), smoothed; long gaps (a load, a pause) left out.
 		const auto now = std::chrono::steady_clock::now();
@@ -835,7 +965,8 @@ struct Presenter::Impl {
 			}
 			auto& command = present_scheduler.BeginCommand();
 			swapchain.RecordShow(command, image);
-			(void)swapchain.Submit(present_scheduler);
+			// (Async: its wait already reached; it makes the generated frames visible to this queue.)
+			(void)swapchain.Submit(present_scheduler, async ? async_timeline : vk::Semaphore {}, async_done);
 			status = swapchain.Present();
 			if (status != Swapchain::Status::Success) {
 				RecoverSwapchain(status);
@@ -1367,10 +1498,11 @@ void Swapchain::RecordShow(CommandBuffer& command, const VulkanImage& source) {
 	                           vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 1, &to_present);
 }
 
-uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
+uint64_t Swapchain::Submit(CommandScheduler& scheduler, vk::Semaphore wait, uint64_t wait_tick) {
 	EXIT_IF(m_frame_index >= m_image_acquired.size() || m_image_index >= m_render_complete.size());
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
+	if (wait != nullptr) submit.AddWait(wait, wait_tick, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
 	return scheduler.Submit(submit);
 }
