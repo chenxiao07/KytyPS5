@@ -34,6 +34,9 @@ namespace FsrNative {
 
 // KYTY_FRAMEGEN_BACKEND=fsr in a build with the FidelityFX sources.
 [[nodiscard]] bool InterpolationRequested();
+// KYTY_FSR_ASYNC=1 with InterpolationRequested: the interpolation on a queue of a compute-only family
+// (GraphicContext::async_compute_queue), the graphics queue going on with the game meanwhile.
+[[nodiscard]] bool AsyncRequested();
 struct InterpolationInputs {
 	FrameGen::UpscaleImage backbuffer;                  // this frame at the swapchain's size, general layout
 	FrameGen::UpscaleImage depth, motion;               // the game's, at the render size, shader-read layouts

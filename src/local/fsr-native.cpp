@@ -98,6 +98,14 @@ bool InterpolationRequested() {
 #endif
 }
 
+bool AsyncRequested() {
+	static const bool requested = [] {
+		const char* value = std::getenv("KYTY_FSR_ASYNC");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return requested && InterpolationRequested();
+}
+
 #if KYTY_FSR_NATIVE
 namespace {
 
