@@ -42,6 +42,8 @@
 #include "local-platform.h"
 
 #if defined(_WIN32)
+#include "kernel/memory.h"
+
 #include <windows.h>
 #elif defined(__linux__)
 #include "common/virtualMemory.h"
@@ -264,6 +266,8 @@ inline bool Protect(uint64_t address, uint64_t size, Access access) {
 	const DWORD protection = access == Access::None   ? PAGE_NOACCESS
 	                         : access == Access::Read ? PAGE_READONLY
 	                                                  : PAGE_READWRITE;
+	// (A locked page given no access is unlocked by Windows: KYTY_READ_GUARD=2's locks of it taken off first.)
+	if (access == Access::None) Libs::LibKernel::Memory::UnlockBackingReads(address, size);
 	DWORD       old        = 0;
 	return VirtualProtect(reinterpret_cast<void*>(address), size, protection, &old) != 0;
 }
@@ -405,7 +409,9 @@ inline bool DiscardRange(uint64_t begin) {
 	constexpr uint64_t Chunk = uint64_t {1} << 20u;
 	for (const auto& piece: it->second.pieces) {
 #if defined(_WIN32)
-		// (A discard is refused on pages without access.)
+		// (A discard is refused on pages without access; a locked page would stay in RAM: KYTY_READ_GUARD=2's locks are
+		// taken off first.)
+		Libs::LibKernel::Memory::UnlockBackingReads(piece.backing, piece.size);
 		for (uint64_t at = 0; at < piece.size; at += Chunk) {
 			(void)DiscardVirtualMemory(reinterpret_cast<void*>(piece.backing + at), std::min(Chunk, piece.size - at));
 			SwitchToThread();

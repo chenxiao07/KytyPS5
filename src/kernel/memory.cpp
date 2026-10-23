@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
@@ -87,8 +88,13 @@ extern "C" {
 // twice its size (issues #157, #158, #159; reproduced at the Tower of Latria with a 1080p render and DLSS: black and
 // dark frames from the second point of the tour, every frame right without guards), and putting the guard back without
 // waiting (f2ecf299) did not help. The blue screen needs the RAM to run full: the PCs with little of it keep the guards.
+// KYTY_READ_GUARD=2: the GPU trackers' read protection is no access again, the page's bytes locked in RAM first through
+// the backing view (GuestBackingStore::LockReads): a guard lets every thread through once its first reader faulted, so
+// a second thread reading within microseconds read the stale bytes before the fault was served (issue #159; Linux under
+// Wine: ~0.85 such reads a frame). A locked page is never paged out, which no access did to the blue screen's pages. A
+// range whose lock fails (the budget used up, the texture offload's ranges: their pages are dropped) keeps a guard.
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_read_guard {[] {
-	if (const char* value = std::getenv("KYTY_READ_GUARD"); value != nullptr && *value != '\0') return value[0] == '0' ? 0u : 1u;
+	if (const char* value = std::getenv("KYTY_READ_GUARD"); value != nullptr && *value != '\0') return value[0] == '0' ? 0u : value[0] == '2' ? 2u : 1u;
 	const auto ram = LocalPlatform::PhysicalMemory();
 	return ram != 0 && ram <= (uint64_t {20} << 30u) ? 1u : 0u;
 }()};
@@ -1230,6 +1236,14 @@ bool DiscardBacking(uint64_t address, uint64_t size) {
 	return g_guest_address_space != nullptr && g_guest_address_space->DiscardBacking(address, size);
 }
 
+void UnlockBackingReads(uint64_t address, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (g_guest_address_space != nullptr) g_guest_address_space->UnlockBackingReads(address, size);
+#else
+	(void)address, (void)size;
+#endif
+}
+
 void TrimGuestRange(uint64_t vaddr, uint64_t size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (size != 0) ParkedRangeTrimmer::Trim(vaddr, size);
@@ -1528,9 +1542,11 @@ void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept {
 	// (Installed whatever the switch: guards made while it was on are served after it changed.)
 	if (resources != nullptr) {
 		Common::HostException::SetReadGuardHandlers(ArmReadGuard, SettleReadGuard);
-		std::printf(kyty_local_read_guard.load(std::memory_order_relaxed) != 0
-		                ? "Memory: guest pages kept from reads by guard pages (KYTY_READ_GUARD=0: no access)\n"
-		                : "Memory: guest pages kept from reads by no access (KYTY_READ_GUARD=1: guard pages)\n");
+		if (const auto read_guard = kyty_local_read_guard.load(std::memory_order_relaxed); read_guard == 2)
+			std::printf("Memory: guest pages kept from reads by no access, their bytes locked in RAM (KYTY_READ_GUARD=2)\n");
+		else
+			std::printf(read_guard != 0 ? "Memory: guest pages kept from reads by guard pages (KYTY_READ_GUARD=0: no access)\n"
+			                            : "Memory: guest pages kept from reads by no access (KYTY_READ_GUARD=1: guard pages)\n");
 	}
 #endif
 }

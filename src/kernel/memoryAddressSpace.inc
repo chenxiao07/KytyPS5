@@ -139,6 +139,8 @@ public:
 			           static_cast<uint32_t>(GetLastError()));
 			CloseHandle(m_handle);
 			m_handle = nullptr;
+		} else {
+			m_read_locked = std::make_unique<std::atomic<uint64_t>[]>(((m_size >> 12u) + 63u) >> 6u);
 		}
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #if defined(__APPLE__)
@@ -313,6 +315,84 @@ public:
 		return nullptr;
 #endif
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// KYTY_READ_GUARD=2: [backing, backing + size) of the backing view locked in RAM (VirtualLock) before guest pages of it
+	// get no access as the GPU trackers' read protection (true; false: not locked, the caller keeps a guard there). A
+	// locked page stays in the working set, so Windows neither trims nor pages it out: the prototype PTE of a no-access
+	// page never goes out under memory pressure (bug check 0x1A/0x41202, issues #5, #50). Pages stay locked after
+	// (m_read_locked): most get no access again within frames, and a lock and an unlock each time would be two more system
+	// calls a protection change. At most the budget (KYTY_READ_LOCK_MB, default a sixteenth of the RAM within 256 MiB-2
+	// GiB), by which the minimum working set is raised first (a process locks no more than its minimum working set).
+	bool LockReads(uint64_t backing, uint64_t size) {
+		const auto base = reinterpret_cast<uint64_t>(m_backing_base);
+		if (m_read_locked == nullptr || size == 0 || backing < base || !RangeOk(backing - base, size)) return false;
+		const uint64_t first = (backing - base) >> 12u;
+		const uint64_t last  = (backing - base + size - 1) >> 12u;
+		if (ReadLockedAll(first, last)) return true;
+		std::call_once(m_read_lock_once, [this] { StartReadLocks(); });
+		const uint64_t bytes = (last + 1 - first) << 12u;
+		if (m_read_locked_bytes.load(std::memory_order_relaxed) + bytes > m_read_lock_budget) {
+			if (!m_read_lock_full.exchange(true, std::memory_order_relaxed))
+				std::printf("Memory: the %llu MiB for no-access pages are locked: guard pages over the next ones "
+				            "(KYTY_READ_LOCK_MB)\n",
+				            static_cast<unsigned long long>(m_read_lock_budget >> 20u));
+			return false;
+		}
+		if (VirtualLock(m_backing_base + (first << 12u), bytes) == 0) {
+			if (!m_read_lock_refused.exchange(true, std::memory_order_relaxed))
+				std::printf("Memory: VirtualLock of %llu KiB refused (error %lu, %llu MiB locked): guard pages over those\n",
+				            static_cast<unsigned long long>(bytes >> 10u), GetLastError(),
+				            static_cast<unsigned long long>(m_read_locked_bytes.load(std::memory_order_relaxed) >> 20u));
+			return false;
+		}
+		uint64_t added = 0;
+		for (uint64_t word = first >> 6u; word <= last >> 6u; ++word) {
+			const uint64_t mask = ReadLockMask(word, first, last);
+			added += static_cast<uint64_t>(std::popcount(mask & ~m_read_locked[word].fetch_or(mask, std::memory_order_relaxed)));
+		}
+		LiveCounters::Add(LiveCounters::ReadLockPages, added);
+		const auto now = m_read_locked_bytes.fetch_add(added << 12u, std::memory_order_relaxed) + (added << 12u);
+		// (Each 256 MiB more than ever before, said once.)
+		constexpr uint64_t Step = uint64_t {256} << 20u;
+		if (auto said = m_read_lock_said.load(std::memory_order_relaxed);
+		    now >= said + Step && m_read_lock_said.compare_exchange_strong(said, now / Step * Step))
+			std::printf("Memory: %llu MiB locked for no-access pages\n", static_cast<unsigned long long>(now >> 20u));
+		return true;
+	}
+
+	// The locks of [backing, backing + size) that LockReads made, taken off: before its pages are discarded or get no
+	// access in the backing view (the texture offload; a protection of a locked page to no access unlocks it unseen).
+	void UnlockReads(uint64_t backing, uint64_t size) {
+		const auto base = reinterpret_cast<uint64_t>(m_backing_base);
+		if (m_read_locked == nullptr || size == 0 || backing < base || !RangeOk(backing - base, size)) return;
+		const uint64_t first = (backing - base) >> 12u;
+		const uint64_t last  = (backing - base + size - 1) >> 12u;
+		uint64_t       run_begin = 0, run_end = 0, removed = 0;
+		const auto     flush = [&] {
+			if (run_begin < run_end)
+				VirtualUnlock(m_backing_base + (run_begin << 12u), (run_end - run_begin) << 12u);
+		};
+		for (uint64_t word = first >> 6u; word <= last >> 6u; ++word) {
+			const uint64_t mask = ReadLockMask(word, first, last);
+			if ((m_read_locked[word].load(std::memory_order_relaxed) & mask) == 0) continue;
+			for (uint64_t bits = m_read_locked[word].fetch_and(~mask, std::memory_order_relaxed) & mask; bits != 0;
+			     bits &= bits - 1) {
+				const uint64_t page = (word << 6u) + static_cast<uint64_t>(std::countr_zero(bits));
+				if (page != run_end) {
+					flush();
+					run_begin = page;
+				}
+				run_end = page + 1;
+				removed++;
+			}
+		}
+		flush();
+		if (removed == 0) return;
+		LiveCounters::Add(LiveCounters::ReadUnlockPages, removed);
+		m_read_locked_bytes.fetch_sub(removed << 12u, std::memory_order_relaxed);
+	}
+#endif
 
 	bool ZeroRange(uint64_t backing_offset, uint64_t size) {
 		GuestBackingMutation mutation;
@@ -553,7 +633,7 @@ public:
 			}
 			return false;
 		}
-		if (protective) ProtectRemapped(vaddr, size, mode);
+		if (protective) ProtectRemapped(vaddr, size, backing_offset, mode);
 
 		{
 			std::lock_guard lock(m_mutex);
@@ -1365,6 +1445,44 @@ private:
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// m_read_locked's bits of `word` in pages [first, last].
+	static uint64_t ReadLockMask(uint64_t word, uint64_t first, uint64_t last) {
+		const uint64_t low  = word == first >> 6u ? first & 63u : 0;
+		const uint64_t high = word == last >> 6u ? last & 63u : 63;
+		return (~uint64_t {0} >> (63 - high)) & (~uint64_t {0} << low);
+	}
+
+	[[nodiscard]] bool ReadLockedAll(uint64_t first, uint64_t last) const {
+		for (uint64_t word = first >> 6u; word <= last >> 6u; ++word) {
+			const uint64_t mask = ReadLockMask(word, first, last);
+			if ((m_read_locked[word].load(std::memory_order_relaxed) & mask) != mask) return false;
+		}
+		return true;
+	}
+
+	// LockReads' first lock: the budget, and the minimum working set raised by it (a budget of 0 when Windows refuses).
+	void StartReadLocks() {
+		MEMORYSTATUSEX status {sizeof(status)};
+		const uint64_t ram    = GlobalMemoryStatusEx(&status) ? status.ullTotalPhys : 0;
+		const char*    value  = std::getenv("KYTY_READ_LOCK_MB");
+		uint64_t       budget = value != nullptr ? std::strtoull(value, nullptr, 10) << 20u
+		                                         : std::clamp<uint64_t>(ram / 16, uint64_t {256} << 20u, uint64_t {2} << 30u);
+		SIZE_T     minimum = 0, maximum = 0;
+		DWORD      flags   = 0;
+		const bool raised  = budget != 0 && GetProcessWorkingSetSizeEx(GetCurrentProcess(), &minimum, &maximum, &flags) &&
+		                    SetProcessWorkingSetSizeEx(GetCurrentProcess(), minimum + budget,
+		                                               std::max<SIZE_T>(maximum, minimum + budget + (SIZE_T {64} << 20u)),
+		                                               flags) != 0;
+		const DWORD error  = raised ? 0 : GetLastError();
+		std::printf("Memory: up to %llu MiB of no-access pages locked in RAM (KYTY_READ_GUARD=2)%s\n",
+		            static_cast<unsigned long long>(budget >> 20u), raised ? "" : ": working set refused, guard pages");
+		if (!raised) {
+			std::printf("Memory: SetProcessWorkingSetSizeEx failed (error %lu)\n", error);
+			budget = 0;
+		}
+		m_read_lock_budget = budget;
+	}
+
 	static DWORD GetProtect(VirtualMemory::Mode mode) {
 		switch (mode) {
 			case VirtualMemory::Mode::Read: return PAGE_READONLY;
@@ -1400,7 +1518,7 @@ private:
 	// this. Given back only after the lock, as it was before, a CPU write to a watched page in between went
 	// unseen. (The view keeps its own mode until here, a few system calls: one mapped read-only cannot be made writable
 	// later, and made read-only at once, the game's own writes to its unwatched pages faulted by the thousands.)
-	static void ProtectRemapped(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+	void ProtectRemapped(uint64_t vaddr, uint64_t size, uint64_t backing_offset, VirtualMemory::Mode mode) {
 		if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) return;
 		thread_local std::vector<Graphics::PageManager::WatchedRun> runs;
 		runs.clear();
@@ -1408,10 +1526,29 @@ private:
 		for (const auto& run: runs) {
 			const auto begin = std::max(run.address, vaddr);
 			const auto end   = std::min(run.address + run.size, vaddr + size);
-			if (begin < end && run.mode != mode)
+			if (begin < end && run.mode != mode &&
+			    !(run.mode == VirtualMemory::Mode::NoAccess &&
+			      ProtectReadWatched(begin, end - begin, GetBackingBase() + backing_offset + (begin - vaddr))))
 				EXIT_IF(!ApplyProtection(reinterpret_cast<void*>(begin), end - begin, run.mode));
 		}
 	}
+
+public:
+	// KYTY_READ_GUARD=2: a guest view's [vaddr, vaddr + size), whose bytes are [backing, backing + size) of the backing
+	// view, given no access as the GPU trackers' read protection, its bytes locked first (LockReads). False with another
+	// switch or when the lock fails: the caller protects it as before (a guard). The texture offload's ranges keep their
+	// guards: their pages are discarded.
+	bool ProtectReadWatched(uint64_t vaddr, uint64_t size, uint64_t backing) {
+		if (kyty_local_read_guard.load(std::memory_order_relaxed) != 2) return false;
+		if (TextureOffload::MayOverlap(vaddr, size) || !LockReads(backing, size)) {
+			LiveCounters::Add(LiveCounters::ReadLockFallbacks);
+			return false;
+		}
+		DWORD old = 0;
+		return VirtualProtect(reinterpret_cast<void*>(vaddr), size, PAGE_NOACCESS, &old) != 0;
+	}
+
+private:
 
 	void* ReplacePlaceholderView(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                             VirtualMemory::Mode mode, FailureReason* failure_reason) {
@@ -1507,6 +1644,14 @@ private:
 	// something over under 1% of such ranges within a second (96%: after 10 s or never). Their views are split for real
 	// when something is mapped over one (Materialize), or unmapped whole once nothing of them stays mapped.
 	std::map<uint64_t, uint64_t> m_parked;
+	// LockReads: a bit per 4 KiB page of the store, set while the page is locked; the bytes locked, the budget.
+	std::unique_ptr<std::atomic<uint64_t>[]> m_read_locked;
+	std::atomic<uint64_t>                    m_read_locked_bytes {0};
+	std::atomic<uint64_t>                    m_read_lock_said {0};
+	std::atomic_bool                         m_read_lock_full {false};
+	std::atomic_bool                         m_read_lock_refused {false};
+	uint64_t                                 m_read_lock_budget = 0;
+	std::once_flag                           m_read_lock_once;
 
 	std::map<uint64_t, uint64_t>::iterator FindViewUnlocked(uint64_t vaddr) {
 		const auto next = m_views.upper_bound(vaddr);
@@ -1705,6 +1850,9 @@ public:
 	bool           DiscardBacking(uint64_t address, uint64_t size) {
 		return m_backing->DiscardPages(address, size);
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	void UnlockBackingReads(uint64_t address, uint64_t size) { m_backing->UnlockReads(address, size); }
+#endif
 	bool BackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
 		return m_backing->BackingPieces(vaddr, size, pieces);
 	}
@@ -1754,7 +1902,7 @@ public:
 			const auto end   = std::min(run.address + run.size, vaddr + size);
 			if (begin >= end) continue;
 			if (at < begin && !ProtectMappedUnlocked(at, begin - at, mode)) return false;
-			if (!ProtectMappedUnlocked(begin, end - begin, run.mode)) return false;
+			if (!ProtectMappedUnlocked(begin, end - begin, run.mode, true)) return false;
 			at = end;
 		}
 		return at >= vaddr + size || ProtectMappedUnlocked(at, vaddr + size - at, mode);
@@ -1782,7 +1930,7 @@ public:
 			if (LiveCensus::g_render) LiveCounters::Add(LiveCounters::AddressSpaceWaitKtRender, waited);
 		}
 		WaitNotBusy(lock, vaddr, size);
-		return ProtectMappedUnlocked(vaddr, size, mode);
+		return ProtectMappedUnlocked(vaddr, size, mode, true);
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -2151,7 +2299,8 @@ private:
 		m_busy.erase(it);
 	}
 
-	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+	// `read_watched`: the GPU trackers' protection (ProtectView).
+	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode, bool read_watched = false) {
 		const auto end = vaddr + size;
 		auto       it  = m_mapped.upper_bound(vaddr);
 		if (it != m_mapped.begin()) {
@@ -2194,7 +2343,7 @@ private:
 			const auto  range_end   = std::min(end, region.vaddr + region.size);
 			if (range_start >= range_end) continue;
 			LiveTrace::SlowOsCallScope slow(LiveTrace::OsProtect, range_start, range_end - range_start);
-			if (!ProtectView(range_start, range_end - range_start, mode, region.type)) {
+			if (!ProtectView(range_start, range_end - range_start, mode, region.type, read_watched)) {
 				return false;
 			}
 		}
@@ -2202,17 +2351,38 @@ private:
 	}
 
 	// A guest mapping's protection; on Windows with KYTY_READ_GUARD, a view's no access as a read guard
-	// (kyty_local_read_guard: private memory is no section's).
-	static bool ProtectView(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode, MappingType type) {
+	// (kyty_local_read_guard: private memory is no section's), with KYTY_READ_GUARD=2 the GPU trackers' (`read_watched`)
+	// no access over bytes locked in RAM instead, where the lock can be had (GuestBackingStore::ProtectReadWatched).
+	bool ProtectView(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode, MappingType type, bool read_watched) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (mode == VirtualMemory::Mode::NoAccess && type == MappingType::Backing &&
-		    kyty_local_read_guard.load(std::memory_order_relaxed) != 0) {
-			DWORD old = 0;
-			return VirtualProtect(reinterpret_cast<void*>(vaddr), size, PAGE_GUARD | PAGE_READONLY, &old) != 0;
+		if (mode == VirtualMemory::Mode::NoAccess && type == MappingType::Backing) {
+			if (const auto read_guard = kyty_local_read_guard.load(std::memory_order_relaxed); read_guard != 0) {
+				if (read_watched && read_guard == 2 && ProtectReadWatchedUnlocked(vaddr, size)) return true;
+				DWORD old = 0;
+				return VirtualProtect(reinterpret_cast<void*>(vaddr), size, PAGE_GUARD | PAGE_READONLY, &old) != 0;
+			}
 		}
+#else
+		(void)read_watched;
 #endif
 		return VirtualMemory::Protect(vaddr, size, mode);
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// ProtectView's no access over locked bytes, a backing mapping at a time; false when one fails (the whole range gets
+	// a guard: one over a page already given no access is a guard all the same).
+	bool ProtectReadWatchedUnlocked(uint64_t vaddr, uint64_t size) {
+		for (uint64_t at = vaddr, end = vaddr + size; at < end;) {
+			const uint64_t piece_end = std::min(end, m_backing->MappingEndOf(at));
+			const auto*    backing   = piece_end > at ? m_backing->BackingPointer(at, piece_end - at) : nullptr;
+			if (backing == nullptr ||
+			    !m_backing->ProtectReadWatched(at, piece_end - at, reinterpret_cast<uint64_t>(backing)))
+				return false;
+			at = piece_end;
+		}
+		return true;
+	}
+#endif
 
 	// A free entry consumed with its placeholder split later (SplitPlaceholders, outside the lock).
 	struct FreeSplit {

@@ -132,6 +132,9 @@ void                   TrimGuestRange(uint64_t vaddr, uint64_t size);
 // Linux, the texture offload: the pages of [address, address + size) of the backing view freed, in
 // every view of them (a later read gets zeros). False elsewhere.
 bool DiscardBacking(uint64_t address, uint64_t size);
+// Windows, KYTY_READ_GUARD=2: the locks of the backing view's [address, address + size) taken off, before its pages are
+// discarded or get no access there (the texture offload). Nothing elsewhere.
+void UnlockBackingReads(uint64_t address, uint64_t size);
 // Linux, the file offload: the byte at `address` of the backing view in a second read-write view of
 // the backing store, which protections of the backing view leave alone. Null elsewhere.
 uint8_t* SpareBackingPointer(uint64_t address);
