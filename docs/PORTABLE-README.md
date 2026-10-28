@@ -445,8 +445,16 @@ With any of them, only your own keys work on the keyboard (none of the layout ab
   written without the space, as `LeftShift`), or `Mouse:Left`, `Mouse:Right`, `Mouse:Middle`, `Mouse:X1`, `Mouse:X2`,
   `Mouse:WheelUp`, `Mouse:WheelDown` (each notch of the wheel a short press: `"--keymap", "Up=Mouse:WheelUp"` and
   `"--keymap", "Down=Mouse:WheelDown"` switch spells and items).
-- A control takes one key and one mouse input (`Up=Up` with `Up=Mouse:WheelUp`: both work); a second key, or a second
-  mouse input, for the same control replaces the first.
+- Two at once: `<control>=<first>+<second>`, such as `"--keymap", "R2=Left Shift+Mouse:Left"`. The second pressed
+  while the first is held presses that control in place of the second's own, until the second is released: with
+  `R1=Mouse:Left` too, a left click is R1, and with Left Shift held R2. The first keeps its own control, if it has
+  one. A key whose name has a `+` (`Keypad +`) can be either. The wheel cannot be the first: a notch is not held.
+  As the second, the control is chosen once per scroll, by whether the first is held then: that scroll's notches,
+  pressed one after another, go to it. Alt+Enter (`Left Alt+Return`, `Left Alt+Keypad Enter`) stays the
+  emulator's full screen.
+- A control takes one key and one mouse input (`Up=Up` with `Up=Mouse:WheelUp`: both work), and a combo counts as a
+  key or a mouse input by its second (`R2=F` with `R2=Left Shift+Mouse:Left`: both work). A later line replaces an
+  earlier one for the same control and kind, or for exactly the same input or combo.
 - F7, F8 and F11 stay the emulator's. A line it cannot use is skipped, and the run log says which and why
   (`Input mapping skipped: ...`).
 - An update's `launch.json` replaces yours: keep a copy of your lines.

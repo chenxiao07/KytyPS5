@@ -22,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -67,10 +68,20 @@ static constexpr std::array CONTROL_INFO = {
 
 constexpr std::size_t INVALID_CONTROL = CONTROL_INFO.size();
 
-struct Binding {
+// A key or a mouse input (a button, or a wheel notch).
+struct Input {
 	SDL_Keycode key          = SDLK_UNKNOWN;
 	uint8_t     mouse_button = 0;
-	std::size_t control      = INVALID_CONTROL;
+
+	[[nodiscard]] bool Valid() const { return key != SDLK_UNKNOWN || mouse_button != 0; }
+	bool               operator==(const Input& other) const = default;
+};
+
+// A control's input, or a combo: `input` pressed while `first` is held (First+Second).
+struct Binding {
+	Input       first;
+	Input       input;
+	std::size_t control = INVALID_CONTROL;
 };
 
 constexpr int              MOUSE_POLL_INTERVAL_MS = 33;
@@ -78,6 +89,10 @@ constexpr std::string_view MOUSE_SENSITIVITY      = "MouseSensitivity=";
 // The wheel's notches as mouse "buttons" (Mouse:WheelUp, Mouse:WheelDown; past SDL's buttons).
 constexpr uint8_t MOUSE_WHEEL_UP   = 0xf0;
 constexpr uint8_t MOUSE_WHEEL_DOWN = 0xf1;
+
+bool IsWheel(const Input& input) {
+	return input.mouse_button == MOUSE_WHEEL_UP || input.mouse_button == MOUSE_WHEEL_DOWN;
+}
 
 struct MouseJoystickState {
 	bool     enabled   = false;
@@ -149,11 +164,36 @@ uint8_t MouseButtonFromName(std::string_view name) {
 	return button != buttons.end() ? button->second : 0;
 }
 
-// A control takes one key and one mouse input (Up=Up with Up=Mouse:WheelUp: both), each input one control.
+Input InputFromName(std::string_view name) {
+	Input input;
+	input.mouse_button = MouseButtonFromName(name);
+	if (input.mouse_button == 0) {
+		input.key = NormalizeKey(KeyFromName(name));
+	}
+	return input;
+}
+
+// One input, or a combo First+Second: split only at a '+' with an input on each side, so that a key named with one
+// (SDL's "Keypad +") stays whole. The wheel is never a combo's first: a notch cannot be held.
+void ParseInputs(std::string_view text, Binding& binding) {
+	binding.input = InputFromName(text);
+	for (auto plus = text.find('+'); !binding.input.Valid() && plus != std::string_view::npos;
+	     plus = text.find('+', plus + 1)) {
+		const auto first  = InputFromName(text.substr(0, plus));
+		const auto second = InputFromName(text.substr(plus + 1));
+		if (first.Valid() && second.Valid() && !(first == second) && !IsWheel(first)) {
+			binding.first = first;
+			binding.input = second;
+		}
+	}
+}
+
+// A control takes one key and one mouse input (Up=Up with Up=Mouse:WheelUp: both), a combo of its second's kind
+// (R2=F with R2=Left Shift+Mouse:Left: both); and each key, mouse input or combo one control, a plain key and a combo
+// ending in it being two.
 bool Conflicts(const Binding& first, const Binding& second) {
-	return (first.control == second.control && (first.key != SDLK_UNKNOWN) == (second.key != SDLK_UNKNOWN)) ||
-	       (first.key != SDLK_UNKNOWN && first.key == second.key) ||
-	       (first.mouse_button != 0 && first.mouse_button == second.mouse_button);
+	return (first.control == second.control && (first.input.mouse_button != 0) == (second.input.mouse_button != 0)) ||
+	       (first.first == second.first && first.input == second.input);
 }
 
 class InputMap {
@@ -172,19 +212,22 @@ public:
 
 			Binding binding;
 			if (split != std::string_view::npos) {
-				binding.control       = ControlFromName(entry.substr(0, split));
-				const auto host_input = entry.substr(split + 1);
-				binding.mouse_button  = MouseButtonFromName(host_input);
-				if (binding.mouse_button == 0) {
-					binding.key = NormalizeKey(KeyFromName(host_input));
-				}
+				binding.control = ControlFromName(entry.substr(0, split));
+				ParseInputs(entry.substr(split + 1), binding);
 			}
 
-			// The emulator's own keys: F7 the mouse camera, F8 its overlay, F11 full screen. (Space pauses unless a
-			// mapping takes it, the Pause key then; the system's dialogs see Esc first.)
-			const bool reserved = binding.key == SDLK_F7 || binding.key == SDLK_F8 || binding.key == SDLK_F11;
-			if (binding.control == INVALID_CONTROL || reserved ||
-			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
+			// The emulator's own keys: F7 the mouse camera, F8 its overlay, F11 full screen (either side of a combo
+			// too), Alt+Enter (either Enter) full screen too, which never comes here (window.cpp), and Alt+F4, which
+			// SDL turns into closing the window. (Space pauses unless a mapping takes it, the Pause key then; the
+			// system's dialogs see Esc first.)
+			const auto own_key = [](const Input& input) {
+				return input.key == SDLK_F7 || input.key == SDLK_F8 || input.key == SDLK_F11;
+			};
+			const bool reserved = own_key(binding.input) || own_key(binding.first) ||
+			                      (binding.first.key == SDLK_LALT &&
+			                       (binding.input.key == SDLK_RETURN || binding.input.key == SDLK_KP_ENTER ||
+			                        binding.input.key == SDLK_F4));
+			if (binding.control == INVALID_CONTROL || reserved || !binding.input.Valid()) {
 				// (Skipped, not the end of the start-up: the other mappings still work.)
 				std::printf("Input mapping skipped: %s (%s)\n", value.c_str(),
 				            binding.control == INVALID_CONTROL ? "no such control"
@@ -198,30 +241,39 @@ public:
 	[[nodiscard]] bool  Custom() const { return m_size != 0; }
 	[[nodiscard]] float MouseSensitivity() const { return m_mouse_sensitivity; }
 
-	[[nodiscard]] std::size_t FindKey(int key_code) const {
-		key_code = NormalizeKey(static_cast<SDL_Keycode>(key_code));
-		const auto binding =
-		    std::find_if(m_bindings.begin(), m_bindings.begin() + m_size,
-		                 [key_code](const auto& item) { return item.key == key_code; });
-		return binding != m_bindings.begin() + m_size ? binding->control : INVALID_CONTROL;
+	// The control a press of `input` starts: a combo's whose first input `held` says is down (of two such, the one
+	// given first), else its own.
+	template <typename Held>
+	[[nodiscard]] std::size_t Find(const Input& input, Held held) const {
+		std::size_t own = INVALID_CONTROL;
+		for (std::size_t index = 0; index < m_size; index++) {
+			const auto& binding = m_bindings[index];
+			if (!(binding.input == input)) {
+				continue;
+			}
+			if (!binding.first.Valid()) {
+				own = binding.control;
+			} else if (held(binding.first)) {
+				return binding.control;
+			}
+		}
+		return own;
 	}
 
-	[[nodiscard]] std::size_t FindMouseButton(uint8_t mouse_button) const {
-		const auto binding = std::find_if(
-		    m_bindings.begin(), m_bindings.begin() + m_size,
-		    [mouse_button](const auto& item) { return item.mouse_button == mouse_button; });
-		return binding != m_bindings.begin() + m_size ? binding->control : INVALID_CONTROL;
+	// The input is in a mapping, alone or in a combo.
+	[[nodiscard]] bool Uses(const Input& input) const {
+		return std::any_of(m_bindings.begin(), m_bindings.begin() + m_size, [&input](const auto& item) {
+			return item.input == input || (item.first.Valid() && item.first == input);
+		});
 	}
 
 private:
+	// (In the order given, a later one in place of an earlier one it conflicts with.)
 	void Add(const Binding& binding) {
-		for (std::size_t index = 0; index < m_size;) {
-			if (Conflicts(m_bindings[index], binding)) {
-				m_bindings[index] = m_bindings[--m_size];
-			} else {
-				index++;
-			}
-		}
+		m_size = static_cast<std::size_t>(
+		    std::remove_if(m_bindings.begin(), m_bindings.begin() + m_size,
+		                   [&binding](const auto& item) { return Conflicts(item, binding); }) -
+		    m_bindings.begin());
 		EXIT_IF(m_size >= m_bindings.size());
 		m_bindings[m_size++] = binding;
 	}
@@ -292,6 +344,10 @@ void SetStickAxis(Controller::Axis axis, bool negative, bool positive) {
 // Who holds a control: its key, its mouse input (a button or a wheel notch). It is up once neither does.
 constexpr uint8_t FROM_KEY = 1, FROM_MOUSE = 2;
 
+uint8_t Source(const Input& input) {
+	return input.mouse_button != 0 ? FROM_MOUSE : FROM_KEY;
+}
+
 void SetControl(std::size_t control, bool down, uint8_t source) {
 	if (control == INVALID_CONTROL) {
 		return;
@@ -324,6 +380,42 @@ void SetControl(std::size_t control, bool down, uint8_t source) {
 		axes[axis].negative = down;
 	}
 	SetStickAxis(info.axis, axes[axis].negative, axes[axis].positive);
+}
+
+// The inputs held down (keys and mouse buttons; a wheel notch is never held), each with the control its press started
+// (INVALID_CONTROL none): its release lets go of that control, whatever the combo's first input did in between.
+struct Press {
+	Input       input;
+	std::size_t control = INVALID_CONTROL;
+};
+std::vector<Press> g_pressed;
+
+bool IsHeld(const Input& input) {
+	return std::any_of(g_pressed.begin(), g_pressed.end(), [&input](const auto& item) { return item.input == input; });
+}
+
+void SetInput(const Input& input, bool down) {
+	const auto& map    = GetInputMap();
+	const auto  source = Source(input);
+	const auto  press  = std::find_if(g_pressed.begin(), g_pressed.end(),
+	                                  [&input](const auto& item) { return item.input == input; });
+	if (down) {
+		if (press != g_pressed.end()) {
+			// (Down again without its release: the control it started.)
+			SetControl(press->control, true, source);
+			return;
+		}
+		const auto control = map.Find(input, IsHeld);
+		g_pressed.push_back({input, control});
+		SetControl(control, true, source);
+	} else if (press != g_pressed.end()) {
+		const auto control = press->control;
+		g_pressed.erase(press);
+		SetControl(control, false, source);
+	} else {
+		// (A release without its press, held before the window had the keyboard: its own control.)
+		SetControl(map.Find(input, [](const Input&) { return false; }), false, source);
+	}
 }
 
 void DefaultKeyboardInput(int key_code, bool down) {
@@ -419,7 +511,7 @@ static bool DefaultKeysUsed() {
 void HostInputKey(int key_code, bool down) {
 	const auto& map = GetInputMap();
 	if (map.Custom()) {
-		SetControl(map.FindKey(key_code), down, FROM_KEY);
+		SetInput(Input {NormalizeKey(static_cast<SDL_Keycode>(key_code))}, down);
 	} else if (DefaultKeysUsed()) {
 		DefaultKeyboardInput(key_code, down);
 	}
@@ -427,7 +519,7 @@ void HostInputKey(int key_code, bool down) {
 
 bool HostInputMapsKey(int key_code) {
 	const auto& map = GetInputMap();
-	return map.Custom() && map.FindKey(key_code) != INVALID_CONTROL;
+	return map.Custom() && map.Uses(Input {NormalizeKey(static_cast<SDL_Keycode>(key_code))});
 }
 
 bool HostInputDefaultKeysUsed() {
@@ -437,7 +529,7 @@ bool HostInputDefaultKeysUsed() {
 void HostInputMouseButton(uint8_t mouse_button, bool down) {
 	const auto& map = GetInputMap();
 	if (map.Custom() && mouse_button != 0) {
-		SetControl(map.FindMouseButton(mouse_button), down, FROM_MOUSE);
+		SetInput(Input {SDLK_UNKNOWN, mouse_button}, down);
 	}
 }
 
@@ -478,7 +570,8 @@ static int UpdateWheel(uint64_t now) {
 void HostInputMouseWheel(int notches) {
 	const auto& map = GetInputMap();
 	if (!map.Custom() || notches == 0) return;
-	const auto control = map.FindMouseButton(notches > 0 ? MOUSE_WHEEL_UP : MOUSE_WHEEL_DOWN);
+	// (A combo's when its first input is held: Left Shift+Mouse:WheelUp.)
+	const auto control = map.Find(Input {SDLK_UNKNOWN, notches > 0 ? MOUSE_WHEEL_UP : MOUSE_WHEEL_DOWN}, IsHeld);
 	if (control == INVALID_CONTROL) return;
 	if (g_wheel.control != control) {
 		if (g_wheel.down) SetControl(g_wheel.control, false, FROM_MOUSE);
@@ -486,6 +579,21 @@ void HostInputMouseWheel(int notches) {
 	}
 	g_wheel.pending = std::min(WHEEL_QUEUED, g_wheel.pending + std::abs(notches));
 	(void)UpdateWheel(SDL_GetTicks64());
+}
+
+void HostInputReleaseHeld(bool keys) {
+	std::vector<Press> kept;
+	for (const auto& press: g_pressed) {
+		if (keys || press.input.mouse_button != 0) {
+			SetControl(press.control, false, Source(press.input));
+		} else {
+			kept.push_back(press);
+		}
+	}
+	g_pressed = std::move(kept);
+	// (The wheel's press in flight, and the notches queued after it, would reach the game behind the dialog.)
+	if (g_wheel.down) SetControl(g_wheel.control, false, FROM_MOUSE);
+	g_wheel = {};
 }
 
 void HostInputToggleMouseToJoystick() {
