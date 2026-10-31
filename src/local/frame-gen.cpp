@@ -626,18 +626,22 @@ FsrCamera FsrDecompose(const std::array<float, 16>& m) {
 	return c;
 }
 
+// Frame generation off on the swapchain: it then presents the frames as they are (before either goes).
+void FsrStopFrameGeneration() {
+	auto& s = g_fsr_state;
+	if (s.fg_context == nullptr || s.swapchain == nullptr) return;
+	ffxConfigureDescFrameGeneration config {};
+	config.header.type            = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+	config.swapChain              = static_cast<VkSwapchainKHR>(s.swapchain);
+	config.frameGenerationEnabled = false;
+	config.frameID                = ++s.frame_id;
+	(void)s.api.Configure(&s.fg_context, &config.header);
+}
+
 void FsrDestroyFrameGeneration() {
 	auto& s = g_fsr_state;
 	if (s.fg_context == nullptr) return;
-	if (s.swapchain != nullptr) {
-		// (Off before its context goes: the swapchain then presents the frames as they are.)
-		ffxConfigureDescFrameGeneration config {};
-		config.header.type            = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
-		config.swapChain              = static_cast<VkSwapchainKHR>(s.swapchain);
-		config.frameGenerationEnabled = false;
-		config.frameID                = ++s.frame_id;
-		(void)s.api.Configure(&s.fg_context, &config.header);
-	}
+	FsrStopFrameGeneration();
 	(void)s.api.DestroyContext(&s.fg_context, nullptr);
 	s.fg_context = nullptr;
 	s.mode_on    = false;
@@ -2705,14 +2709,24 @@ void DestroySwapchain(GraphicContext& graphics, vk::SwapchainKHR swapchain) {
 	(void)swapchain;
 #ifdef KYTY_FRAMEGEN_FSR
 	auto& s = g_fsr_state;
-	// (The frame generation context is made for the display size: again with the next swapchain.)
-	FsrDestroyFrameGeneration();
-	FsrHudDestroy(graphics);
+	// Frame generation off, then the swapchain: its destruction stops its present thread and waits for its presents.
+	// Then FSR's own queues (nothing else submits to them) are waited for, and only then go the frame generation context
+	// and the HUD-less images its interpolation reads. Freed before the swapchain, they could still be in use: on an RTX
+	// 5090 an F11 back to the window, frame generation on at 5120x2160 since a load, lost the device, and an F11 in the
+	// main menu froze the picture while the game ran on (issue #174).
+	FsrStopFrameGeneration();
 	if (s.swapchain_context != nullptr) {
 		(void)s.api.DestroyContext(&s.swapchain_context, nullptr); // (and its swapchain)
 		s.swapchain_context = nullptr;
 	}
 	s.swapchain = nullptr;
+	for (const vk::Queue queue: {graphics.fsr_compute_queue, graphics.fsr_present_queue, graphics.fsr_acquire_queue}) {
+		if (queue != nullptr) (void)queue.waitIdle();
+	}
+	// (The frame generation context is made for the display size: again with the next swapchain. Its swapchain gone,
+	// FsrDestroyFrameGeneration configures nothing.)
+	FsrDestroyFrameGeneration();
+	FsrHudDestroy(graphics);
 	s.functions = {};
 #endif
 }
