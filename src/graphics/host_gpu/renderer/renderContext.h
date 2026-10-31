@@ -108,10 +108,21 @@ public:
 	GpuResourceManager& GetGpuResources() { return m_gpu_resources; }
 	BufferCache&        GetBufferCache() { return m_gpu_resources.GetBufferCache(); }
 	TextureCache&       GetTextureCache() { return m_gpu_resources.GetTextureCache(); }
-	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
+	RenderExecutor&     GetRenderExecutor() { return t_executors != nullptr ? *t_executors->draw : m_render_executor; }
 	// Dispatches use their own executor, so draws do not displace their
 	// per-operation scratch and texture resolutions.
-	RenderExecutor&     GetComputeRenderExecutor() { return m_compute_render_executor; }
+	RenderExecutor&     GetComputeRenderExecutor() {
+		return t_executors != nullptr ? *t_executors->compute : m_compute_render_executor;
+	}
+	// The executors above whatever the calling thread's are (what a speculation's read: RenderExecutor::ReadCatalogOf).
+	RenderExecutor& DefaultRenderExecutor() { return m_render_executor; }
+	RenderExecutor& DefaultComputeRenderExecutor() { return m_compute_render_executor; }
+	// The calling thread's executors instead (a speculative translation's, with their own caches); null: these.
+	struct Executors {
+		RenderExecutor* draw    = nullptr;
+		RenderExecutor* compute = nullptr;
+	};
+	static void SetThreadExecutors(const Executors* executors) noexcept { t_executors = executors; }
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -122,6 +133,8 @@ private:
 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
 		int                                 event_id = 0;
 	};
+
+	inline static thread_local const Executors* t_executors = nullptr;
 
 	GraphicContext&           m_graphics;
 	RenderMutex               m_mutex;
