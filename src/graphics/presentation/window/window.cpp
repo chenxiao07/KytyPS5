@@ -976,6 +976,11 @@ static void WindowCreate(WindowContext& context) {
 
 	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
 	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
+	// Nintendo-layout pads (Switch Pro, Joy-Cons, 8BitDo in Switch mode, GameCube) by position: the bottom button Cross and
+	// the right one Circle, where the game's PlayStation glyphs put them. SDL 2 reported them by label (A, on the right,
+	// was Cross; issue #262). SDL_GAMECONTROLLER_USE_BUTTON_LABELS=1 in the environment keeps the labels (the environment
+	// wins over a hint).
+	SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
 	// Pixel-exact windows and swapchains on scaled displays: without per-monitor awareness a
