@@ -48,6 +48,8 @@
 #include "vulkan-draw-packet.h"
 #include "vulkan-recording.h"
 #include "lane-spill-verify.h"
+#include <chrono>
+#include <vulkan/vulkan_format_traits.hpp>
 #endif
 
 #include <algorithm>

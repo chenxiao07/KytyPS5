@@ -116,6 +116,8 @@ static bool TableInterchangeable(const ShaderRecompiler::IR::CompiledShaderInfo&
 	       x.table_block_dwords == y.table_block_dwords && x.user_data_registers == y.user_data_registers;
 }
 
+#include "lane-spill-verify.inc"
+
 // A stage's flat form as TableRuns makes it (TablePack packs it into the pair): every operand an index into one of
 // three arrays (the stage's user data, its block's slots, the stage's constants).
 struct RenderExecutor::TableFlatStage {
@@ -2523,35 +2525,53 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	}
 	const bool continues_chain = chain && buffer.ComputeChainPending();
 	if (storage_writes && !continues_chain) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, BindPipelineHandle(pipeline));
-	if (indirect_args != 0) {
-		vk::BufferMemoryBarrier args_barrier {};
-		args_barrier.srcAccessMask       = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite |
-		                                   vk::AccessFlagBits::eMemoryWrite;
-		args_barrier.dstAccessMask       = vk::AccessFlagBits::eIndirectCommandRead;
-		args_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		args_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		args_barrier.buffer              = indirect_buffer;
-		args_barrier.offset              = indirect_offset;
-		args_barrier.size                = 3u * sizeof(uint32_t);
-		if (!continues_chain)
-			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eDrawIndirect,
-			                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0, nullptr);
-		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
-		DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, 0, 0, 0, indirect_args);
-	} else if (thread_dimensions) {
-		// Thread counts: the groups that cover them, as the normal path's.
-		const auto& r      = cs.cs_regs;
-		const auto  groups = [](uint32_t threads, uint32_t size) { return (threads + std::max(size, 1u) - 1u) / std::max(size, 1u); };
-		vk_buffer.dispatch(groups(groups_x, r.num_thread_x), groups(groups_y, r.num_thread_y), groups(groups_z, r.num_thread_z));
-		DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash,
-		                          groups(groups_x, r.num_thread_x), groups(groups_y, r.num_thread_y),
-		                          groups(groups_z, r.num_thread_z), 0);
-	} else {
-		vk_buffer.dispatch(groups_x, groups_y, groups_z);
-		DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, groups_x, groups_y,
-		                          groups_z, 0);
+	// KYTY_LANE_LOCAL_SPILL=2 (lane-spill-verify.inc): an R1 program with its fallback pipeline made, compared for its
+	// first dispatches: the fallback's dispatch, the targets restored, then R1's (as mode 1 records it).
+	LaneSpillCompare::Pending verify;
+	const bool verifying = LaneSpillVerify::Enabled() && pair.spill_pipeline != nullptr && pair.spill_input != nullptr &&
+	                       &pipeline == pair.pipeline &&
+	                       LaneSpillCompare::Prepare(m_context.GetGraphics(), dispatch_textures, *set, program,
+	                                                 *pair.spill_input->stage.program, pipeline.pipeline_layout,
+	                                                 pair.spill_pipeline->pipeline_layout, storage_writes, verify);
+	// The dispatch with `bound` (the descriptor set and push constants stay: both pipelines have the same layout).
+	const auto emit = [&](const PipelineCache::Pipeline& bound) {
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, BindPipelineHandle(bound));
+		if (indirect_args != 0) {
+			vk::BufferMemoryBarrier args_barrier {};
+			args_barrier.srcAccessMask       = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite |
+			                                   vk::AccessFlagBits::eMemoryWrite;
+			args_barrier.dstAccessMask       = vk::AccessFlagBits::eIndirectCommandRead;
+			args_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			args_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			args_barrier.buffer              = indirect_buffer;
+			args_barrier.offset              = indirect_offset;
+			args_barrier.size                = 3u * sizeof(uint32_t);
+			if (!continues_chain)
+				vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eDrawIndirect,
+				                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0, nullptr);
+			vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
+			DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, 0, 0, 0, indirect_args);
+		} else if (thread_dimensions) {
+			// Thread counts: the groups that cover them, as the normal path's.
+			const auto& r      = cs.cs_regs;
+			const auto  groups = [](uint32_t threads, uint32_t size) { return (threads + std::max(size, 1u) - 1u) / std::max(size, 1u); };
+			vk_buffer.dispatch(groups(groups_x, r.num_thread_x), groups(groups_y, r.num_thread_y), groups(groups_z, r.num_thread_z));
+			DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash,
+			                          groups(groups_x, r.num_thread_x), groups(groups_y, r.num_thread_y),
+			                          groups(groups_z, r.num_thread_z), 0);
+		} else {
+			vk_buffer.dispatch(groups_x, groups_y, groups_z);
+			DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, groups_x, groups_y,
+			                          groups_z, 0);
+		}
+	};
+	if (verifying) {
+		LaneSpillCompare::Save(vk_buffer, verify);
+		emit(*pair.spill_pipeline);
+		LaneSpillCompare::Swap(vk_buffer, verify);
 	}
+	emit(pipeline);
+	if (verifying) LaneSpillCompare::Finish(vk_buffer, m_context.GetCommandScheduler(), std::move(verify));
 	if (chain) buffer.ContinueComputeChain();
 	else ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	m_context.GetCommandScheduler().CompleteDispatch();
