@@ -16,6 +16,14 @@
 // each set of subresources once; programs that read flat / global memory (it is read only: see Prepare).
 // fallback_wrote / r1_wrote: words of the compared images that differ from the saved state after that run (0 and 0:
 // the dispatches left every word as it was, an empty compare, marked so on the line).
+// KYTY_LANE_LOCAL_SPILL_POISON=1 (LaneSpillVerify::Poison): before each run the targets are filled with
+// LaneSpillVerify::PoisonWord instead (section 1, then section 2, filled by the transfer and copied into them: one
+// pattern per word, whatever the format), so
+//   barrier; targets -> section 0 (saved); poison -> section 1 -> the targets; barrier; FALLBACK; barrier
+//   the targets -> section 1; poison -> section 2 -> the targets; barrier; R1 (its output stays); barrier
+//   the targets -> section 2; barrier to the host and to every later command
+// and fallback_wrote / r1_wrote count the words that differ from the poison; written_both: words both runs wrote;
+// written_one: words only one run wrote (a mismatch of coverage). A program that reads its output reads the poison.
 // Not covered (the program is skipped, with a line once): a program that writes buffers, a fallback whose table form
 // or pipeline layout differs from R1's, a set made for another specialization.
 
@@ -44,6 +52,7 @@ struct Slot {
 struct Totals {
 	uint32_t started = 0, compared = 0, mismatch_lines = 0;
 	uint64_t words = 0, mismatches = 0, fallback_wrote = 0, r1_wrote = 0, busy_skips = 0;
+	uint64_t written_both = 0, written_one = 0; // (poison mode: against the poison; else against the saved state)
 	bool     reads_output = false, skip_logged = false;
 	std::chrono::steady_clock::time_point printed {};
 };
@@ -66,6 +75,7 @@ struct Pending {
 	size_t            slot    = Slots;
 	uint64_t          section = 0;
 	bool              reads_output = false;
+	bool              poison       = false; // KYTY_LANE_LOCAL_SPILL_POISON=1
 	std::vector<Copy> copies;
 	vk::Buffer        buffer = nullptr;
 };
@@ -121,6 +131,7 @@ bool Prepare(GraphicContext& graphics, TextureCache& textures, const ImageSet& s
 	// The program's outputs are its images, compared below, as for a program without flat reads.
 	pending              = {};
 	pending.hash         = hash;
+	pending.poison       = LaneSpillVerify::Poison();
 	pending.reads_output = std::ranges::any_of(program.info.images, [](const auto& item) {
 		return (item.written || item.atomic) && item.read;
 	});
@@ -217,7 +228,29 @@ bool Prepare(GraphicContext& graphics, TextureCache& textures, const ImageSet& s
 	return true;
 }
 
-// Before the fallback's dispatch: the targets saved (section 0).
+// Poison mode: section `index` filled with the poison word, then copied into the targets. The caller's last transfer
+// commands (copies out of the targets) are ordered before the copies in by the barrier after the fill; the caller
+// orders these transfer writes before the dispatch.
+inline void PoisonTargets(vk::CommandBuffer command, const Pending& pending, uint32_t index) {
+	command.fillBuffer(pending.buffer, pending.section * index, pending.section, LaneSpillVerify::PoisonWord);
+	// (The fill before the copies read it; the targets read by the copies out before they are written below.)
+	Barrier(command, vk::PipelineStageFlagBits::eTransfer,
+	        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite, vk::PipelineStageFlagBits::eTransfer,
+	        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite);
+	for (size_t c = 0; c < pending.copies.size(); ++c) {
+		const auto& copy = pending.copies[c];
+		// (An image poisoned again, other subresources that may overlap the last: its writes ordered, as Swap's.)
+		if (std::any_of(pending.copies.begin(), pending.copies.begin() + static_cast<std::ptrdiff_t>(c),
+		                [&](const Copy& other) { return other.image == copy.image; }))
+			Barrier(command, vk::PipelineStageFlagBits::eTransfer, vk::AccessFlagBits::eTransferWrite,
+			        vk::PipelineStageFlagBits::eTransfer, vk::AccessFlagBits::eTransferWrite);
+		const auto regions = Regions(copy, pending.section, index);
+		command.copyBufferToImage(pending.buffer, copy.image, vk::ImageLayout::eGeneral,
+		                          static_cast<uint32_t>(regions.size()), regions.data());
+	}
+}
+
+// Before the fallback's dispatch: the targets saved (section 0); in poison mode then poisoned (through section 1).
 inline void Save(vk::CommandBuffer command, const Pending& pending) {
 	Barrier(command, vk::PipelineStageFlagBits::eAllCommands, vk::AccessFlagBits::eMemoryWrite,
 	        vk::PipelineStageFlagBits::eTransfer, vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite);
@@ -226,19 +259,33 @@ inline void Save(vk::CommandBuffer command, const Pending& pending) {
 		command.copyImageToBuffer(copy.image, vk::ImageLayout::eGeneral, pending.buffer,
 		                          static_cast<uint32_t>(regions.size()), regions.data());
 	}
+	if (pending.poison) PoisonTargets(command, pending, 1);
 	Barrier(command, vk::PipelineStageFlagBits::eTransfer,
 	        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
 	        vk::PipelineStageFlagBits::eComputeShader, vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
 }
 
-// Between the two dispatches: the fallback's output (section 1), then the targets as they were (section 0).
+// Between the two dispatches: the fallback's output (section 1), then the targets as they were (section 0); in poison
+// mode the targets poisoned again (through section 2) instead.
 inline void Swap(vk::CommandBuffer command, const Pending& pending) {
-	Barrier(command, vk::PipelineStageFlagBits::eComputeShader, vk::AccessFlagBits::eShaderWrite,
+	// (Poison mode: section 1 also filled and read by Save's transfer before the copy below writes it.)
+	Barrier(command,
+	        pending.poison ? vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer
+	                       : vk::PipelineStageFlags {vk::PipelineStageFlagBits::eComputeShader},
+	        pending.poison ? vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite
+	                       : vk::AccessFlags {vk::AccessFlagBits::eShaderWrite},
 	        vk::PipelineStageFlagBits::eTransfer, vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite);
 	for (const auto& copy: pending.copies) {
 		const auto regions = Regions(copy, pending.section, 1);
 		command.copyImageToBuffer(copy.image, vk::ImageLayout::eGeneral, pending.buffer,
 		                          static_cast<uint32_t>(regions.size()), regions.data());
+	}
+	if (pending.poison) {
+		PoisonTargets(command, pending, 2);
+		Barrier(command, vk::PipelineStageFlagBits::eTransfer,
+		        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
+		        vk::PipelineStageFlagBits::eComputeShader, vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+		return;
 	}
 	// (The image read above before it is written below; section 0 written by Save before it is read below.)
 	Barrier(command, vk::PipelineStageFlagBits::eTransfer,
@@ -276,8 +323,13 @@ inline void Compare(const Pending& pending) {
 			const auto* fall  = reinterpret_cast<const uint32_t*>(slot.mapped + pending.section + copy.offset);
 			const auto* r1    = reinterpret_cast<const uint32_t*>(slot.mapped + 2 * pending.section + copy.offset);
 			for (uint64_t w = 0; w < words; ++w) {
-				totals.fallback_wrote += fall[w] != saved[w] ? 1u : 0u;
-				totals.r1_wrote += r1[w] != saved[w] ? 1u : 0u;
+				// (A word a run left as it found it: the poison in poison mode, else the saved state.)
+				const uint32_t before   = pending.poison ? LaneSpillVerify::PoisonWord : saved[w];
+				const bool     fall_put = fall[w] != before, r1_put = r1[w] != before;
+				totals.fallback_wrote += fall_put ? 1u : 0u;
+				totals.r1_wrote += r1_put ? 1u : 0u;
+				totals.written_both += fall_put && r1_put ? 1u : 0u;
+				totals.written_one += fall_put != r1_put ? 1u : 0u;
 				if (fall[w] == r1[w]) continue;
 				++mismatches;
 				if (totals.mismatch_lines < MismatchReport) {
@@ -297,15 +349,23 @@ inline void Compare(const Pending& pending) {
 		if (totals.compared == 1 || totals.compared == LaneSpillVerify::Limit() || mismatches != 0 ||
 		    now - totals.printed >= std::chrono::seconds(1)) {
 			totals.printed = now;
+			// (Poison mode: written_both / written_one and poison=1 added; the line of the default mode as before.)
+			char written[96] = "";
+			if (pending.poison)
+				std::snprintf(written, sizeof(written), " written_both=%llu written_one=%llu poison=1",
+				              static_cast<unsigned long long>(totals.written_both),
+				              static_cast<unsigned long long>(totals.written_one));
 			std::printf("LaneLocal verify %016llx: dispatches=%u compared_words=%llu mismatches=%llu fallback_wrote=%llu "
-			            "r1_wrote=%llu busy_skips=%llu reads_output=%d%s%s\n",
+			            "r1_wrote=%llu busy_skips=%llu reads_output=%d%s%s%s\n",
 			            static_cast<unsigned long long>(pending.hash), totals.compared,
 			            static_cast<unsigned long long>(totals.words), static_cast<unsigned long long>(totals.mismatches),
 			            static_cast<unsigned long long>(totals.fallback_wrote),
 			            static_cast<unsigned long long>(totals.r1_wrote),
-			            static_cast<unsigned long long>(totals.busy_skips), totals.reads_output ? 1 : 0,
+			            static_cast<unsigned long long>(totals.busy_skips), totals.reads_output ? 1 : 0, written,
 			            totals.fallback_wrote == 0 && totals.r1_wrote == 0
-			                ? " (empty: neither run changed a word of the saved targets, the compare proves nothing)"
+			                ? (pending.poison ? " (empty: neither run wrote a word over the poison, the compare proves nothing)"
+			                                  : " (empty: neither run changed a word of the saved targets, the compare proves "
+			                                    "nothing)")
 			                : "",
 			            totals.compared == LaneSpillVerify::Limit() ? " (done)" : "");
 			std::fflush(stdout);
@@ -317,8 +377,15 @@ inline void Compare(const Pending& pending) {
 // After R1's dispatch: its output (section 2), made visible to the host and ordered before every later command; the
 // compare once the submission's work completed.
 inline void Finish(vk::CommandBuffer command, CommandScheduler& scheduler, Pending&& pending) {
-	Barrier(command, vk::PipelineStageFlagBits::eComputeShader, vk::AccessFlagBits::eShaderWrite,
-	        vk::PipelineStageFlagBits::eTransfer, vk::AccessFlagBits::eTransferRead);
+	// (Poison mode: section 2 also filled and read by Swap's transfer before the copy below writes it.)
+	Barrier(command,
+	        pending.poison ? vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer
+	                       : vk::PipelineStageFlags {vk::PipelineStageFlagBits::eComputeShader},
+	        pending.poison ? vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite
+	                       : vk::AccessFlags {vk::AccessFlagBits::eShaderWrite},
+	        vk::PipelineStageFlagBits::eTransfer,
+	        pending.poison ? vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite
+	                       : vk::AccessFlags {vk::AccessFlagBits::eTransferRead});
 	for (const auto& copy: pending.copies) {
 		const auto regions = Regions(copy, pending.section, 2);
 		command.copyImageToBuffer(copy.image, vk::ImageLayout::eGeneral, pending.buffer,

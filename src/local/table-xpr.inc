@@ -2526,7 +2526,8 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	const bool continues_chain = chain && buffer.ComputeChainPending();
 	if (storage_writes && !continues_chain) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	// KYTY_LANE_LOCAL_SPILL=2 (lane-spill-verify.inc): an R1 program with its fallback pipeline made, compared for its
-	// first dispatches: the fallback's dispatch, the targets restored, then R1's (as mode 1 records it).
+	// first dispatches: the fallback's dispatch, the targets restored (KYTY_LANE_LOCAL_SPILL_POISON=1: poisoned before
+	// each run), then R1's (as mode 1 records it).
 	LaneSpillCompare::Pending verify;
 	const bool verifying = LaneSpillVerify::Enabled() && pair.spill_pipeline != nullptr && pair.spill_input != nullptr &&
 	                       &pipeline == pair.pipeline &&
