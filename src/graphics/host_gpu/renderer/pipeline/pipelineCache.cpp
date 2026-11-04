@@ -925,11 +925,15 @@ struct PipelineCache::ProgramCache {
 		}
 		auto key = fmt::format("{}|{}|features {}|subgroup {}", identity, build,
 		                       ShaderRecompiler::Frontend::TranslatorFeatureSet(), host_subgroup_size);
-		for (const char* name:
-		     {"KYTY_LANE_LOCAL", "KYTY_LANE_LOCAL_SPILL", "KYTY_PS_WAVE_OR", "KYTY_PS_WAVE64", "KYTY_COMPUTE_WAVE64"}) {
+		for (const char* name: {"KYTY_LANE_LOCAL", "KYTY_PS_WAVE_OR", "KYTY_PS_WAVE64", "KYTY_COMPUTE_WAVE64"}) {
 			const char* value = std::getenv(name);
 			key += fmt::format("|{}={}", name, value != nullptr ? value : "");
 		}
+		// KYTY_LANE_LOCAL_SPILL only when on (not unset, empty or "0"): a boot with it off shares the cache of a build
+		// without it.
+		if (const char* spill = std::getenv("KYTY_LANE_LOCAL_SPILL");
+		    spill != nullptr && *spill != 0 && std::string_view(spill) != "0")
+			key += fmt::format("|KYTY_LANE_LOCAL_SPILL={}", spill);
 		return key;
 	}
 
