@@ -30,6 +30,7 @@ bool CommandBuffer::IsInvalid() const {
 }
 
 vk::CommandBuffer CommandBuffer::Handle() const {
+	++m_handle_requests; // (an empty buffer: none)
 	EXIT_IF(IsInvalid());
 	FlushCopyRun();
 	if (m_compute_access_pending) {
@@ -40,6 +41,7 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 }
 
 vk::CommandBuffer CommandBuffer::ChainHandle() const {
+	++m_handle_requests; // (an empty buffer: none)
 	EXIT_IF(IsInvalid() || m_rendering);
 	FlushCopyRun();
 	return m_buffer;
@@ -88,6 +90,7 @@ void CommandBuffer::FlushCopyRun() const {
 
 vk::CommandBuffer CommandBuffer::CopyRunHandle(vk::Buffer source, uint64_t source_offset, vk::Buffer destination,
                                                uint64_t destination_offset, uint64_t size) const {
+	++m_handle_requests; // (an empty buffer: none)
 	EXIT_IF(IsInvalid() || m_rendering);
 	const auto meets = [](const CopyRunRange& range, VkBuffer buffer, uint64_t begin, uint64_t end) {
 		return range.buffer == buffer && begin < range.end && range.begin < end;
@@ -120,6 +123,7 @@ void CommandBuffer::ContinueComputeChain() const {
 }
 
 vk::CommandBuffer CommandBuffer::HandleForFullBarrier() const {
+	++m_handle_requests; // (an empty buffer: none)
 	EXIT_IF(IsInvalid());
 	// The caller records a full AllCommands memory dependency immediately (after the run's owed copies).
 	m_compute_access_pending = false;
@@ -151,6 +155,7 @@ void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
 	InvalidateGraphicsState();
 	m_barrier_work = UINT64_MAX;
+	m_handle_requests = 0;
 	m_copy_run.clear();
 	m_run_tail.clear();
 	// Not Handle(): nothing may be recorded before the buffer begins.
