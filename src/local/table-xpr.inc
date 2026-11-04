@@ -194,6 +194,13 @@ struct RenderExecutor::TablePair {
 	ShaderProgram                           compute_program;
 	const PipelineCache::Pipeline*          pipeline  = nullptr;
 	uint32_t                                sightings = 0;
+	// KYTY_LANE_LOCAL_SPILL=2 (lane-spill-verify.h): the fallback program of the dispatch's R1 program (its input:
+	// `compute` with the fallback's compiled info) and its pipeline (null while a worker makes it), for the R1 program
+	// `spill_program` (an id; 0: not asked yet). Without a fallback, `spill_input` is null.
+	std::unique_ptr<ShaderComputeInputInfo> spill_input;
+	ShaderProgram                           spill_handle;
+	const PipelineCache::Pipeline*          spill_pipeline = nullptr;
+	uint64_t                                spill_program  = 0;
 	// Per stage, the buffers whose V#s were seen in another format than the programs decode (bits by buffer): the
 	// programs are compiled again with those buffers' formats decoded at run time (`respecialize`, TableReset).
 	std::array<uint32_t, 2> portable {};
@@ -2433,6 +2440,25 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 			pair.waiting = pipelines.PipelineWaiting();
 			return false;
 		}
+	}
+	if (LaneSpillVerify::Enabled()) {
+		// KYTY_LANE_LOCAL_SPILL=2: the fallback pipeline of an R1 program, beside the R1 one (made in the background:
+		// until it is there the dispatch runs R1 alone, as mode 1).
+		if (pair.spill_program != pair.compute_program.id) {
+			pair.spill_program  = pair.compute_program.id;
+			pair.spill_pipeline = nullptr;
+			pair.spill_handle   = {};
+			pair.spill_input.reset();
+			ShaderProgram                                   handle;
+			const ShaderRecompiler::IR::CompiledShaderInfo* info = nullptr;
+			if (pipelines.LaneSpillFallback(pair.compute_program.id, handle, info) && info != nullptr) {
+				pair.spill_input                = std::make_unique<ShaderComputeInputInfo>(*pair.compute);
+				pair.spill_input->stage.program = info;
+				pair.spill_handle               = handle;
+			}
+		}
+		if (pair.spill_input != nullptr && pair.spill_pipeline == nullptr)
+			pair.spill_pipeline = pipelines.TryCreateComputePipeline(*pair.spill_input, pair.spill_handle);
 	}
 	const std::array<std::span<const uint32_t>, 2> user_data {std::span<const uint32_t> {cs.cs_user_sgpr.value},
 	                                                          std::span<const uint32_t> {}};

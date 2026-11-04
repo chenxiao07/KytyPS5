@@ -39,7 +39,16 @@ struct TranslateOptions {
 	const ShaderPixelInputInfo*   pixel          = nullptr;
 	const ShaderComputeInputInfo* compute        = nullptr;
 	const EmbeddedFetchPlan*      embedded_fetch = nullptr;
+	// KYTY_LANE_LOCAL_SPILL=2's fallback translation: the program as KYTY_LANE_LOCAL_SPILL=0 translates it (its LDS
+	// refused by the lane-local proof, two lanes per invocation), the module the verify mode compares R1's against.
+	bool                          lane_private_lds_off = false;
 };
+
+// KYTY_LANE_LOCAL_SPILL: 0 (unset, empty or any other value: LDS refused by the lane-local proof, as before), 1 (R1:
+// lane-private LDS spill slots accepted) or 2 (R1 too, plus the verify mode: each accepted program translated a second
+// time with TranslateOptions::lane_private_lds_off, the renderer comparing both outputs, lane-spill-verify.h). Read once.
+//   if (Frontend::LaneLocalSpillMode() == 2) { /* keep the fallback translation too */ }
+int LaneLocalSpillMode();
 
 IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
                              const TranslateOptions& options);

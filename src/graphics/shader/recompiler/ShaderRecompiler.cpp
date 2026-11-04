@@ -717,6 +717,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .pixel               = pixel,
 	    .compute             = compute,
 	    .embedded_fetch      = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+	    .lane_private_lds_off = options.lane_private_lds_off,
 	};
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);

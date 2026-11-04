@@ -25,6 +25,8 @@ struct CompileOptions {
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	// KYTY_LANE_LOCAL_SPILL=2: the fallback translation (Frontend::TranslateOptions::lane_private_lds_off).
+	bool                        lane_private_lds_off = false;
 };
 
 struct TranslateResult {

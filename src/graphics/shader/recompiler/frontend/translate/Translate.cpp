@@ -34,6 +34,16 @@ uint32_t TranslatorDeviceFeatures() {
 	return g_device_features.load(std::memory_order_relaxed);
 }
 
+int LaneLocalSpillMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_LANE_LOCAL_SPILL");
+		if (value == nullptr) return 0;
+		const std::string_view text(value);
+		return text == "1" ? 1 : text == "2" ? 2 : 0;
+	}();
+	return mode;
+}
+
 uint32_t TranslatorFeatureSet() {
 	// (KYTY_LANE_LOCAL_COOP=0/1: the cooperative halves off or on, KYTY_TABLE_SLOTS_AT_USE=0/1 the table slots' loads
 	// at the entry or where they are read, KYTY_NATIVE_FLOAT_MIN_MAX=0/1 the float min/max emulated or native, whatever
@@ -1012,13 +1022,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			return value == nullptr || std::string_view(value) != "0";
 		}();
 		static const bool log = std::getenv("KYTY_LANE_LOCAL_LOG") != nullptr;
-		// (KYTY_LANE_LOCAL_SPILL=1: a group of one wave whose only LDS is its lanes' own spill words (AMD's compiler's
-		// DS_WRITE/READ_ADDTID_B32 at a constant M0) is lane-local, those words per-invocation Function storage
-		// (LaneLocal.cpp PlanPrivateLds); unset or 0: LDS refused, as before. In the prefetch cache's key.)
-		static const bool spill = [] {
-			const char* value = std::getenv("KYTY_LANE_LOCAL_SPILL");
-			return value != nullptr && std::string_view(value) == "1";
-		}();
+		// (KYTY_LANE_LOCAL_SPILL=1 or 2: a group of one wave whose only LDS is its lanes' own spill words (AMD's
+		// compiler's DS_WRITE/READ_ADDTID_B32 at a constant M0) is lane-local, those words per-invocation Function storage
+		// (LaneLocal.cpp PlanPrivateLds); unset or 0: LDS refused, as before. In the prefetch cache's key. Mode 2's
+		// fallback translation (lane_private_lds_off): refused, exactly as mode 0.)
+		const bool spill = LaneLocalSpillMode() != 0 && !options.lane_private_lds_off;
 		// Cooperative halves: a group of exactly one wave on 32-wide subgroups, its halves the workgroup's two subgroups,
 		// may exchange lanes through workgroup memory (LaneLocal.cpp). Where the static pipeline store was made with them
 		// (SetTranslatorFeatures; KYTY_LANE_LOCAL_COOP=0/1 decides otherwise).

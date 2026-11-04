@@ -29,6 +29,7 @@
 #include "native-resource-state.h"
 #include "shader-warmup-cache.h"
 #include "scene-tags.h"
+#include "lane-spill-verify.h"
 #include "live-census.h"
 #include "live-counters.h"
 #include "device-fault.h"
@@ -445,6 +446,13 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::CompiledShaderInfo       info;             // the result's, taken by the worker
 		vk::ShaderModule                               module = nullptr; // the result's, made by the worker
 		std::string                                    refused;
+		// KYTY_LANE_LOCAL_SPILL=2 (lane-spill-verify.h): a result the proof accepted for its lane-private LDS spill
+		// slots, translated again as mode 0 does (lane_private_lds_off) with the same specialization and push data
+		// start: that module and its compiled info (null module: none; `fallback_refused`: why it failed).
+		ShaderRecompiler::IR::CompiledShaderInfo       fallback_info;
+		vk::ShaderModule                               fallback_module = nullptr;
+		std::string                                    fallback_refused;
+		bool                                           fallback_wanted = false; // (the result was such a program)
 		std::atomic<bool>                              done {false};
 	};
 
@@ -2187,10 +2195,33 @@ struct PipelineCache::ProgramCache {
 						auto translated = ShaderRecompiler::TranslateProgram(job->code, job->options);
 						job->result     = ShaderRecompiler::CompileProgram(std::move(translated), job->options,
 						                                                   job->specialization, job->push_data_cursor);
+						// (Read before TakeOnWorker frees the IR: the flag is the translation's final word, cleared
+						// where the lane-local form fell back.)
+						job->fallback_wanted = job->result->program.lane_private_lds && job->result->program.lane_local &&
+						                       LaneSpillVerify::Wanted(job->options.shader_hash);
 						job->module     = CreateModule(device, job->options, job->result->spirv);
 						job->info       = TakeOnWorker(*job->result);
 					} catch (const Common::RecoverableExit& refused) {
 						job->refused = refused.message;
+					}
+					if (job->fallback_wanted) {
+						// KYTY_LANE_LOCAL_SPILL=2: the fallback module, as KYTY_LANE_LOCAL_SPILL=0 makes it.
+						try {
+							Common::RecoverableExitScope recoverable;
+							auto options                 = job->options;
+							options.lane_private_lds_off = true;
+							auto translated = ShaderRecompiler::TranslateProgram(job->code, options);
+							auto fallback   = ShaderRecompiler::CompileProgram(std::move(translated), options,
+							                                                   job->specialization, job->push_data_cursor);
+							if (fallback.program.lane_private_lds) {
+								job->fallback_refused = "the fallback translation kept the spill slots";
+							} else {
+								job->fallback_module = CreateModule(device, options, fallback.spirv);
+								job->fallback_info   = TakeOnWorker(fallback);
+							}
+						} catch (const Common::RecoverableExit& refused) {
+							job->fallback_refused = refused.message;
+						}
 					}
 					job->done.store(true, std::memory_order_release);
 				});
@@ -2213,6 +2244,26 @@ struct PipelineCache::ProgramCache {
 				                                ShaderRecompiler::IR::ResourceSpecialization {table_specialization},
 				                                job->module);
 				permutation.table_mode = true;
+				if (job->fallback_wanted) {
+					// KYTY_LANE_LOCAL_SPILL=2: the fallback by the R1 permutation's id (PipelineCache::LaneSpillFallback).
+					if (job->fallback_module != nullptr && permutation.handle) {
+						auto& fallback  = spill_fallbacks[permutation.handle.id];
+						fallback.handle = {.id = ++next_shader_id, .module = job->fallback_module};
+						fallback.info   = std::make_unique<ShaderRecompiler::IR::CompiledShaderInfo>(std::move(job->fallback_info));
+						std::printf("LaneLocal verify %016llx: fallback module ready (R1 program %llu, fallback %llu)\n",
+						            static_cast<unsigned long long>(params.hash),
+						            static_cast<unsigned long long>(permutation.handle.id),
+						            static_cast<unsigned long long>(fallback.handle.id));
+					} else {
+						if (job->fallback_module != nullptr) {
+							DestroyShaderModule(device, job->fallback_module);
+							LiveCounters::g_shader_modules.fetch_sub(1, std::memory_order_relaxed);
+						}
+						std::printf("LaneLocal verify %016llx: no fallback module (%s)\n",
+						            static_cast<unsigned long long>(params.hash),
+						            job->fallback_refused.empty() ? "no R1 module" : job->fallback_refused.c_str());
+					}
+				}
 			} else {
 				static std::atomic<uint32_t> reports {0};
 				if (reports.fetch_add(1, std::memory_order_relaxed) < 200)
@@ -2744,6 +2795,13 @@ struct PipelineCache::ProgramCache {
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
+	// KYTY_LANE_LOCAL_SPILL=2: by an R1 table permutation's id, its fallback program (Get's table job). Kept for the
+	// session (the verify mode's few programs; a module per entry).
+	struct SpillFallback {
+		ShaderProgram                                             handle;
+		std::unique_ptr<ShaderRecompiler::IR::CompiledShaderInfo> info;
+	};
+	std::unordered_map<uint64_t, SpillFallback> spill_fallbacks;
 };
 
 // A pipeline a CompileWorkers thread creates; `done` publishes the finished object.
@@ -4875,6 +4933,16 @@ bool PipelineCache::TablePending() const {
 
 std::shared_ptr<const std::atomic<bool>> PipelineCache::TableWaiting() const {
 	return m_program_cache->table_waiting;
+}
+
+bool PipelineCache::LaneSpillFallback(uint64_t program_id, ShaderProgram& handle,
+                                      const ShaderRecompiler::IR::CompiledShaderInfo*& info) {
+	Common::LockGuard lock(m_mutex);
+	const auto        found = m_program_cache->spill_fallbacks.find(program_id);
+	if (found == m_program_cache->spill_fallbacks.end()) return false;
+	handle = found->second.handle;
+	info   = found->second.info.get();
+	return true;
 }
 
 PipelineCache::Pipeline* PipelineCache::TryCreateComputePipeline(const ShaderComputeInputInfo& input_info,

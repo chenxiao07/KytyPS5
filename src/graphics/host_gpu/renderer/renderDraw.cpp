@@ -47,6 +47,7 @@
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-draw-packet.h"
 #include "vulkan-recording.h"
+#include "lane-spill-verify.h"
 #endif
 
 #include <algorithm>

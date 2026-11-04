@@ -270,6 +270,13 @@ public:
 	[[nodiscard]] bool TablePending() const;
 	// When TablePending: the completion of that translation (set once it is done).
 	[[nodiscard]] std::shared_ptr<const std::atomic<bool>> TableWaiting() const;
+	// KYTY_LANE_LOCAL_SPILL=2 (local/lane-spill-verify.h): the fallback program (translated as mode 0 does) of the
+	// table mode R1 program `program_id` (a ShaderProgram::id GetComputeProgram returned): its handle and compiled
+	// info, which stay valid for the session; false when it has none (not such a program, not wanted, or it failed).
+	//   ShaderProgram fallback; const ShaderRecompiler::IR::CompiledShaderInfo* info = nullptr;
+	//   if (cache.LaneSpillFallback(program.id, fallback, info)) { /* TryCreateComputePipeline with info's input */ }
+	[[nodiscard]] bool LaneSpillFallback(uint64_t program_id, ShaderProgram& handle,
+	                                     const ShaderRecompiler::IR::CompiledShaderInfo*& info);
 	// When TryCreateGraphicsPipeline or TryCreateComputePipeline returned null: the completion of that compile.
 	[[nodiscard]] const std::shared_ptr<const std::atomic<bool>>& PipelineWaiting() const { return m_pipeline_waiting; }
 	// As TryCreateGraphicsPipeline: null while a worker compiles it; its layout takes allocated descriptor sets
