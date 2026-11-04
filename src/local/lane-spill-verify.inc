@@ -75,7 +75,9 @@ inline void Skip(Totals& totals, uint64_t hash, const char* why) {
 
 inline void Barrier(vk::CommandBuffer command, vk::PipelineStageFlags source, vk::AccessFlags source_access,
                     vk::PipelineStageFlags destination, vk::AccessFlags destination_access) {
-	const vk::MemoryBarrier barrier {source_access, destination_access};
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = source_access;
+	barrier.dstAccessMask = destination_access;
 	command.pipelineBarrier(source, destination, vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
