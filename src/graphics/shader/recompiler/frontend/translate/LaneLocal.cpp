@@ -325,8 +325,79 @@ using Syms = std::array<Sym, 128>;
 
 class Analysis {
 public:
-	Analysis(const Decoder::Program& program, const CFG::Graph& cfg, bool cooperative = false)
-	    : m_program(program), m_cfg(cfg), m_cooperative(cooperative) {}
+	// (`private_lds`: by instruction, the LDS spill instructions PlanPrivateLds accepted; null: LDS refused.)
+	Analysis(const Decoder::Program& program, const CFG::Graph& cfg, bool cooperative = false,
+	         const std::vector<bool>* private_lds = nullptr)
+	    : m_program(program), m_cfg(cfg), m_cooperative(cooperative), m_private_lds(private_lds) {}
+
+	// KYTY_LANE_LOCAL_SPILL: the LDS of a program (a group of one wave, `lds_bytes` of LDS) whose every LDS
+	// instruction is DS_WRITE_ADDTID_B32 or DS_READ_ADDTID_B32 on LDS (gds=0) with M0 set to a constant earlier in its
+	// block (S_MOVK_I32 / S_MOV_B32 of a constant, no other M0 write after it): the lane's word at a constant base
+	// (M0[15:0] + the offset field, as Translator::DS_ADDTID addresses it) plus 4 x the lane. Every slot's 64 words lie
+	// inside the group's LDS (as the GPU bounds them: none dropped for some lanes), no two slots' words overlap and no
+	// barrier is in the program. Each lane then reads and writes only its own words: no other lane, half or wave can
+	// see them (AMD's compiler's VGPR spill to LDS: Demon's Souls' fog f0dc79c3467d5e0b). `accepted` (by instruction)
+	// and `slots` (pc, byte base) on success; false and `reason` otherwise (empty: the program has no LDS).
+	static bool PlanPrivateLds(const Decoder::Program& program, const CFG::Graph& cfg, uint32_t lds_bytes,
+	                           std::vector<bool>& accepted, std::vector<std::pair<uint32_t, uint32_t>>& slots,
+	                           std::string* reason) {
+		const auto& insts = program.instructions;
+		accepted.assign(insts.size(), false);
+		slots.clear();
+		size_t spills = 0;
+		for (const auto& inst: insts) {
+			if (inst.family != Family::DS) continue;
+			if ((inst.opcode != Opcode::DS_WRITE_ADDTID_B32 && inst.opcode != Opcode::DS_READ_ADDTID_B32) || inst.gds)
+				return Refuse(reason, fmt::format("an LDS instruction other than a lane's spill (0x{:x})", inst.pc));
+			++spills;
+		}
+		if (spills == 0) return Refuse(reason, "");
+		for (const auto& inst: insts)
+			if (inst.opcode == Opcode::S_BARRIER) return Refuse(reason, fmt::format("a barrier (0x{:x})", inst.pc));
+		size_t placed = 0;
+		for (const auto& block: cfg.blocks) {
+			for (auto i = block.inst_begin; i < block.inst_end && i < insts.size(); ++i) {
+				const auto& inst = insts[i];
+				if (inst.family != Family::DS) continue;
+				// M0: the last write to it before the spill in its block, a constant.
+				bool     known = false;
+				uint32_t m0    = 0;
+				for (auto k = i; k-- > block.inst_begin;) {
+					const auto& prior = insts[k];
+					// (S_MOVRELD writes the register M0 picks; S_MOVRELS: kept out too.)
+					if (magic_enum::enum_name(prior.opcode).starts_with("S_MOVREL"))
+						return Refuse(reason, fmt::format("S_MOVREL before a spill (0x{:x})", prior.pc));
+					Scalars defs;
+					ScalarDefs(prior, false, defs);
+					if (!defs.test(M0)) continue;
+					const bool constant = (prior.opcode == Opcode::S_MOVK_I32 || prior.opcode == Opcode::S_MOV_B32) &&
+					                      ScalarIndex(prior.dst) == M0 &&
+					                      (prior.src0.kind == OperandKind::IntegerInlineConstant ||
+					                       prior.src0.kind == OperandKind::LiteralConstant);
+					if (!constant) return Refuse(reason, fmt::format("M0 not a constant at a spill (0x{:x})", inst.pc));
+					known = true;
+					m0    = prior.src0.value;
+					break;
+				}
+				if (!known) return Refuse(reason, fmt::format("M0 not set in a spill's block (0x{:x})", inst.pc));
+				const uint64_t base = (m0 & 0xffffu) + static_cast<uint64_t>(inst.offset);
+				if (base % 4u != 0u || base + 256u > lds_bytes)
+					return Refuse(reason, fmt::format("a spill slot outside the group's LDS (0x{:x})", inst.pc));
+				accepted[i] = true;
+				slots.emplace_back(inst.pc, static_cast<uint32_t>(base));
+				++placed;
+			}
+		}
+		if (placed != spills) return Refuse(reason, "a spill outside the program's graph");
+		std::vector<uint32_t> bases;
+		for (const auto& slot: slots) bases.push_back(slot.second);
+		std::ranges::sort(bases);
+		bases.erase(std::unique(bases.begin(), bases.end()), bases.end());
+		for (size_t k = 1; k < bases.size(); ++k)
+			if (bases[k] - bases[k - 1] < 256u) return Refuse(reason, "spill slots overlapping");
+		std::ranges::sort(slots);
+		return true;
+	}
 
 	bool Run(std::string* reason) {
 		const auto& blocks = m_cfg.blocks;
@@ -742,7 +813,10 @@ private:
 			cooperate = Cooperate::Exchange;
 			return nullptr;
 		}
-		if (const char* refused = RefusedOpcode(inst)) return refused;
+		if (const char* refused = RefusedOpcode(inst)) {
+			// (A lane's own LDS spill words: PlanPrivateLds.)
+			if (inst.family != Family::DS || m_private_lds == nullptr || !(*m_private_lds)[index]) return refused;
+		}
 		{
 			// EXEC is set by compares and by 64-bit mask operations (their sources checked below).
 			Scalars written;
@@ -1197,6 +1271,7 @@ private:
 	const Decoder::Program&              m_program;
 	const CFG::Graph&                    m_cfg;
 	bool                                 m_cooperative = false;
+	const std::vector<bool>*             m_private_lds = nullptr; // (PlanPrivateLds)
 	std::unordered_map<uint32_t, size_t> m_index_of;
 	std::vector<bool>                    m_exact;    // (by block) a lane-mask branch the wave decides
 	std::vector<bool>                    m_exchange; // (by instruction) a lane read the wave runs
@@ -1209,20 +1284,37 @@ bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason) {
 	return ProveWaveLaneLocal(program, false, proof, reason);
 }
 
-bool ProveWaveLaneLocal(const Decoder::Program& program, bool cooperative, LaneLocalProof& proof, std::string* reason) {
+bool ProveWaveLaneLocal(const Decoder::Program& program, bool cooperative, LaneLocalProof& proof, std::string* reason,
+                        uint32_t private_lds_bytes) {
 	// (On the program's own branches: the structured graph routes some through variables, scalar state of its own.)
 	const auto cfg = CFG::BuildGraph(program);
 	proof          = {};
-	if (Analysis(program, cfg).Run(reason)) return true;
-	if (!cooperative) return false;
+	// (KYTY_LANE_LOCAL_SPILL: LDS that is a lane's own spill words, accepted; any other LDS refused as before.)
+	std::vector<bool>                          private_lds;
+	std::vector<std::pair<uint32_t, uint32_t>> slots;
+	std::string                                spill_why;
+	const bool spill   = private_lds_bytes != 0 &&
+	                     Analysis::PlanPrivateLds(program, cfg, private_lds_bytes, private_lds, slots, &spill_why);
+	const auto* lds    = spill ? &private_lds : nullptr;
+	const auto  accept = [&] {
+		if (spill) proof.private_lds = std::move(slots);
+		return true;
+	};
+	const auto refuse = [&] {
+		if (reason != nullptr && private_lds_bytes != 0 && !spill && !spill_why.empty())
+			*reason += " (spill: " + spill_why + ")";
+		return false;
+	};
+	if (Analysis(program, cfg, false, lds).Run(reason)) return accept();
+	if (!cooperative) return refuse();
 	std::string why;
-	Analysis    analysis(program, cfg, true);
+	Analysis    analysis(program, cfg, true, lds);
 	if (!analysis.Run(&why)) {
 		if (reason != nullptr) *reason += " (cooperative: " + why + ")";
-		return false;
+		return refuse();
 	}
 	analysis.Exchanges(proof.exchange_reads, proof.wave_branches);
-	return true;
+	return accept();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

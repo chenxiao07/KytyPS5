@@ -18,9 +18,11 @@ struct FunctionLdsLayout {
 // for every access by that invocation. Distinct aligned offsets therefore identify
 // distinct slots. Keep the original address/bounds checks in the emitter; only the
 // storage indices change. Reject the entire layout if any LDS access differs.
+// A lane-local compute program's lane-private spill slots (Program::lane_private_lds, KYTY_LANE_LOCAL_SPILL) take the
+// same per-invocation storage: its subgroup is half a wave, so workgroup memory at LaneId (0-31) would mix the halves.
 inline FunctionLdsLayout PlanFunctionLdsLayout(const Program& program) {
 	FunctionLdsLayout result;
-	if (program.stage != ShaderType::Pixel) return result;
+	if (program.stage != ShaderType::Pixel && !program.lane_private_lds) return result;
 	std::vector<uint32_t>                     offsets;
 	std::unordered_map<const Inst*, uint32_t> accesses;
 	for (const auto* block: program.blocks) {

@@ -224,7 +224,10 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 			index = ConstantU32(state, state.function_lds_index_slots.at(index));
 		}
 		const auto pointer = state.builder.AllocateId();
+		// (Function LDS: graphics stages' and a lane-local program's lane-private spill slots, DefineModule.)
 		const auto storage_class = access.kind == IR::ResourceKind::Scratch ? StorageClassFunction
+		                           : access.kind == IR::ResourceKind::Lds && state.requirements.function_lds
+		                               ? StorageClassFunction
 		                           : ShaderWorkgroupInput(state.stage, state.input_info) != nullptr
 		                               ? StorageClassWorkgroup
 		                               : StorageClassFunction;

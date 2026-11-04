@@ -244,7 +244,9 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 				if (kind != IR::ResourceKind::Lds && kind != IR::ResourceKind::Gds) {
 					Fail(program, "shared operation has invalid resource kind");
 				}
-				if (program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh &&
+				// (A lane-local program's lane-private spill slots: per invocation too, IR::PlanFunctionLdsLayout.)
+				if (((program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh) ||
+				     (program.lane_private_lds && program.lane_local)) &&
 				    kind == IR::ResourceKind::Lds) {
 					requirements.function_lds = true;
 				}

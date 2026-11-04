@@ -925,7 +925,8 @@ struct PipelineCache::ProgramCache {
 		}
 		auto key = fmt::format("{}|{}|features {}|subgroup {}", identity, build,
 		                       ShaderRecompiler::Frontend::TranslatorFeatureSet(), host_subgroup_size);
-		for (const char* name: {"KYTY_LANE_LOCAL", "KYTY_PS_WAVE_OR", "KYTY_PS_WAVE64", "KYTY_COMPUTE_WAVE64"}) {
+		for (const char* name:
+		     {"KYTY_LANE_LOCAL", "KYTY_LANE_LOCAL_SPILL", "KYTY_PS_WAVE_OR", "KYTY_PS_WAVE64", "KYTY_COMPUTE_WAVE64"}) {
 			const char* value = std::getenv(name);
 			key += fmt::format("|{}={}", name, value != nullptr ? value : "");
 		}

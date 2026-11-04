@@ -855,11 +855,22 @@ bool Translator::DS_APPEND_CONSUME(const Decoder::Instruction& inst, IR::ValueOp
 }
 
 bool Translator::DS_ADDTID(const Decoder::Instruction& inst, bool write) {
-	const auto memory = MemoryInfoFromDecoded(inst);
-	const auto base =
-	    ir.BitwiseAnd(ReadU32(MemorySourceAt(inst, write ? 1u : 0u)), IR::U32(IR::Value(0xffffu)));
-	const auto lane    = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
-	const auto address = ir.IAdd(base, ir.ShiftLeftLogical(lane, IR::U32(IR::Value(2u))));
+	auto       memory = MemoryInfoFromDecoded(inst);
+	const auto lane   = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
+	IR::U32    address;
+	const auto slot = std::ranges::lower_bound(program.private_lds_slots, inst.pc, {},
+	                                           &std::pair<uint32_t, uint32_t>::first);
+	if (program.lane_private_lds && slot != program.private_lds_slots.end() && slot->first == inst.pc) {
+		// A lane-private spill slot (KYTY_LANE_LOCAL_SPILL): M0's constant base and the offset field in the offset,
+		// the lane's word the address - the same byte address, in the shape IR::PlanFunctionLdsLayout keeps per
+		// invocation.
+		memory.offset = slot->second;
+		address       = ir.ShiftLeftLogical(lane, IR::U32(IR::Value(2u)));
+	} else {
+		const auto base =
+		    ir.BitwiseAnd(ReadU32(MemorySourceAt(inst, write ? 1u : 0u)), IR::U32(IR::Value(0xffffu)));
+		address = ir.IAdd(base, ir.ShiftLeftLogical(lane, IR::U32(IR::Value(2u))));
+	}
 	if (write) {
 		ir.Emit(IR::ValueOpcode::WriteSharedU32,
 		        {address, ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},

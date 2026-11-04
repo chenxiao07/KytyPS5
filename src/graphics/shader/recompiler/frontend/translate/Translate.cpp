@@ -1012,6 +1012,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			return value == nullptr || std::string_view(value) != "0";
 		}();
 		static const bool log = std::getenv("KYTY_LANE_LOCAL_LOG") != nullptr;
+		// (KYTY_LANE_LOCAL_SPILL=1: a group of one wave whose only LDS is its lanes' own spill words (AMD's compiler's
+		// DS_WRITE/READ_ADDTID_B32 at a constant M0) is lane-local, those words per-invocation Function storage
+		// (LaneLocal.cpp PlanPrivateLds); unset or 0: LDS refused, as before. In the prefetch cache's key.)
+		static const bool spill = [] {
+			const char* value = std::getenv("KYTY_LANE_LOCAL_SPILL");
+			return value != nullptr && std::string_view(value) == "1";
+		}();
 		// Cooperative halves: a group of exactly one wave on 32-wide subgroups, its halves the workgroup's two subgroups,
 		// may exchange lanes through workgroup memory (LaneLocal.cpp). Where the static pipeline store was made with them
 		// (SetTranslatorFeatures; KYTY_LANE_LOCAL_COOP=0/1 decides otherwise).
@@ -1022,8 +1029,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		    std::max(group->threads_num[0], 1u) * std::max(group->threads_num[1], 1u) * std::max(group->threads_num[2], 1u) == 64u;
 		std::string    reason;
 		LaneLocalProof proof;
-		result.lane_local =
-		    enabled && ProveWaveLaneLocal(decoded, cooperative_enabled && one_wave, proof, log ? &reason : nullptr);
+		const uint32_t private_lds_bytes = spill && one_wave ? group->lds_size_dwords * 4u : 0u;
+		result.lane_local = enabled && ProveWaveLaneLocal(decoded, cooperative_enabled && one_wave, proof,
+		                                                  log ? &reason : nullptr, private_lds_bytes);
+		if (result.lane_local && !proof.private_lds.empty()) {
+			result.lane_private_lds  = true;
+			result.private_lds_slots = std::move(proof.private_lds);
+		}
 		if (result.lane_local && proof.Cooperative()) {
 			result.lane_cooperative     = true;
 			result.cooperative_reads    = std::move(proof.exchange_reads);
@@ -1037,7 +1049,16 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                                                             result.cooperative_reads.size(),
 			                                                             result.cooperative_branches.size())
 			                                               : std::string("yes");
-			std::printf("LaneLocal CS %016llx: %s\n", static_cast<unsigned long long>(options.shader_hash), verdict.c_str());
+			std::string spilled;
+			if (result.lane_private_lds) {
+				std::vector<uint32_t> bases;
+				for (const auto& slot: result.private_lds_slots) bases.push_back(slot.second);
+				std::ranges::sort(bases);
+				const auto slots = static_cast<size_t>(std::unique(bases.begin(), bases.end()) - bases.begin());
+				spilled = fmt::format(" (lane-private LDS spill: {} slot{})", slots, slots == 1 ? "" : "s");
+			}
+			std::printf("LaneLocal CS %016llx: %s%s\n", static_cast<unsigned long long>(options.shader_hash), verdict.c_str(),
+			            spilled.c_str());
 		}
 	}
 	result.shader_hash         = options.shader_hash;
@@ -1383,6 +1404,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			            static_cast<unsigned long long>(options.shader_hash));
 			result.lane_local       = false;
 			result.lane_cooperative = false;
+			// (The spill slots' IR addresses are the same bytes: workgroup LDS, two lanes per invocation, as before.)
+			result.lane_private_lds = false;
 		}
 	}
 	if (IR::ValidationEnabled()) IR::ValidateProgram(result, false);

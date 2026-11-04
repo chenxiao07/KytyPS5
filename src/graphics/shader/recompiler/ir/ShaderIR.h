@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -705,6 +706,11 @@ struct Program: ResourcePlan {
 	bool                          lane_cooperative = false;
 	std::vector<uint32_t>         cooperative_reads;
 	std::vector<uint32_t>         cooperative_branches;
+	// Its proof accepted its LDS as lane-private spill slots (KYTY_LANE_LOCAL_SPILL, Frontend::ProveWaveLaneLocal):
+	// the DS_READ/WRITE_ADDTID_B32 at these pcs address the lane's word at this byte base (pc, base; sorted), which
+	// the SPIR-V keeps in per-invocation Function storage (IR::PlanFunctionLdsLayout), not in workgroup memory.
+	bool                                       lane_private_lds = false;
+	std::vector<std::pair<uint32_t, uint32_t>> private_lds_slots;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;

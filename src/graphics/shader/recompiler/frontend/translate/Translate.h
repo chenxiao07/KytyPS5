@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -53,10 +54,17 @@ bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason = null
 struct LaneLocalProof {
 	std::vector<uint32_t> exchange_reads;
 	std::vector<uint32_t> wave_branches;
+	// Lane-private LDS spill slots (`private_lds_bytes`): (pc, byte base) of each DS_READ/WRITE_ADDTID_B32, which
+	// reads or writes the lane's own word at that constant base. Empty: the program has no LDS.
+	std::vector<std::pair<uint32_t, uint32_t>> private_lds;
 	[[nodiscard]] bool    Cooperative() const { return !exchange_reads.empty() || !wave_branches.empty(); }
 };
+// `private_lds_bytes` (KYTY_LANE_LOCAL_SPILL; 0: LDS refused, as before): the LDS size of a group of one wave whose
+// LDS the proof may accept as lane-private spill slots (LaneLocal.cpp, PlanPrivateLds).
+//   LaneLocalProof proof;
+//   if (ProveWaveLaneLocal(decoded, false, proof, &why, group.lds_size_dwords * 4u)) { /* proof.private_lds */ }
 bool ProveWaveLaneLocal(const Decoder::Program& program, bool cooperative, LaneLocalProof& proof,
-                        std::string* reason = nullptr);
+                        std::string* reason = nullptr, uint32_t private_lds_bytes = 0);
 
 // Translation features that change the SPIR-V of shaders a static pipeline store holds pipelines for (bits). A store
 // made before one keeps its pipelines in use only while the translation leaves that feature out: no update makes a
