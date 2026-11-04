@@ -12,9 +12,12 @@
 // reads what it writes, and a word R1 fails to write shows (it keeps the saved value, not the fallback's).
 // The sections are host-visible buffers in a pool of Slots slots, each kept (grown, never shrunk) for the session; a
 // dispatch that finds every slot waiting for its compare runs R1 alone (busy_skips).
-// Covered: written storage images of color formats whose texel is a power of two, one sample, in the general layout.
-// Not covered (the program is skipped, with a line once): a program that writes buffers or flat memory, a fallback
-// whose table form or pipeline layout differs from R1's, a set made for another specialization.
+// Covered: written storage images of color formats whose texel is a power of two, one sample, in the general layout,
+// each set of subresources once; programs that read flat / global memory (it is read only: see Prepare).
+// fallback_wrote / r1_wrote: words of the compared images that differ from the saved state after that run (0 and 0:
+// the dispatches left every word as it was, an empty compare, marked so on the line).
+// Not covered (the program is skipped, with a line once): a program that writes buffers, a fallback whose table form
+// or pipeline layout differs from R1's, a set made for another specialization.
 
 namespace LaneSpillCompare {
 
@@ -110,7 +113,12 @@ bool Prepare(GraphicContext& graphics, TextureCache& textures, const ImageSet& s
 		return item.written || item.atomic;
 	});
 	if (writes_buffers || storage_writes) return Skip(totals, hash, "writes buffers (not covered)"), false;
-	if (program.table_plan.global_memory) return Skip(totals, hash, "reads or writes flat memory (not covered)"), false;
+	// Flat / global memory (table_plan.global_memory, from IR::ShaderInfo::uses_dma) is read only: the recompiler emits
+	// no store to it (Spirv::AnalyzeProgramRequirements fails a program with a FLAT/GLOBAL store that is not scratch,
+	// "writable FLAT/GLOBAL addresses require GPU ownership tracking"; there is no flat atomic), so neither run writes
+	// guest memory that way, and nothing between them does (the copies below touch the images and the slot's buffer
+	// only, and a program that writes buffers is skipped above): both runs read the same bytes through the page table.
+	// The program's outputs are its images, compared below, as for a program without flat reads.
 	pending              = {};
 	pending.hash         = hash;
 	pending.reads_output = std::ranges::any_of(program.info.images, [](const auto& item) {
@@ -290,12 +298,15 @@ inline void Compare(const Pending& pending) {
 		    now - totals.printed >= std::chrono::seconds(1)) {
 			totals.printed = now;
 			std::printf("LaneLocal verify %016llx: dispatches=%u compared_words=%llu mismatches=%llu fallback_wrote=%llu "
-			            "r1_wrote=%llu busy_skips=%llu reads_output=%d%s\n",
+			            "r1_wrote=%llu busy_skips=%llu reads_output=%d%s%s\n",
 			            static_cast<unsigned long long>(pending.hash), totals.compared,
 			            static_cast<unsigned long long>(totals.words), static_cast<unsigned long long>(totals.mismatches),
 			            static_cast<unsigned long long>(totals.fallback_wrote),
 			            static_cast<unsigned long long>(totals.r1_wrote),
 			            static_cast<unsigned long long>(totals.busy_skips), totals.reads_output ? 1 : 0,
+			            totals.fallback_wrote == 0 && totals.r1_wrote == 0
+			                ? " (empty: neither run changed a word of the saved targets, the compare proves nothing)"
+			                : "",
 			            totals.compared == LaneSpillVerify::Limit() ? " (done)" : "");
 			std::fflush(stdout);
 		}
