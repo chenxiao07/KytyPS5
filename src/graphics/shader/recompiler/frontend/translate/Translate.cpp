@@ -14,6 +14,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -34,14 +35,97 @@ uint32_t TranslatorDeviceFeatures() {
 	return g_device_features.load(std::memory_order_relaxed);
 }
 
+namespace {
+
+// R1's proven programs (KYTY_LANE_LOCAL_SPILL unset: the allowlist mode). A hash goes here only after a
+// KYTY_LANE_LOCAL_SPILL=2 verify boot compared its R1 and fallback outputs bitwise with 0 mismatches and 0 SYNC-HAZARD.
+//   f0dc79c3467d5e0b: Demon's Souls' volumetric fog (11-04: 64 dispatches, 80M words, poison mode, 0 mismatches).
+constexpr std::array<uint64_t, 1> LaneLocalSpillProven = {0xf0dc79c3467d5e0bull};
+
+// The allowlist: the built-in hashes plus KYTY_LANE_LOCAL_SPILL_HASHES=<hex,hex,...> (added to them, not replacing
+// them; "0x" prefixes and spaces allowed, a token that is not hex skipped), sorted and unique. Read once.
+const std::vector<uint64_t>& LaneLocalSpillAllowlist() {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> list(LaneLocalSpillProven.begin(), LaneLocalSpillProven.end());
+		if (const char* value = std::getenv("KYTY_LANE_LOCAL_SPILL_HASHES"); value != nullptr) {
+			std::string_view text(value);
+			while (!text.empty()) {
+				const auto comma = text.find(',');
+				auto       token = text.substr(0, comma);
+				text             = comma == std::string_view::npos ? std::string_view {} : text.substr(comma + 1);
+				while (!token.empty() && (token.front() == ' ' || token.front() == '\t')) token.remove_prefix(1);
+				while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) token.remove_suffix(1);
+				if (token.size() > 2 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X')) token.remove_prefix(2);
+				if (token.empty() || token.size() > 16) continue;
+				uint64_t hash = 0;
+				bool     hex  = true;
+				for (const char c: token) {
+					const int digit = c >= '0' && c <= '9'   ? c - '0'
+					                  : c >= 'a' && c <= 'f' ? c - 'a' + 10
+					                  : c >= 'A' && c <= 'F' ? c - 'A' + 10
+					                                         : -1;
+					if (digit < 0) {
+						hex = false;
+						break;
+					}
+					hash = (hash << 4u) | static_cast<uint64_t>(digit);
+				}
+				if (hex) list.push_back(hash);
+			}
+		}
+		std::ranges::sort(list);
+		list.erase(std::unique(list.begin(), list.end()), list.end());
+		return list;
+	}();
+	return hashes;
+}
+
+} // namespace
+
 int LaneLocalSpillMode() {
 	static const int mode = [] {
 		const char* value = std::getenv("KYTY_LANE_LOCAL_SPILL");
-		if (value == nullptr) return 0;
-		const std::string_view text(value);
-		return text == "1" ? 1 : text == "2" ? 2 : 0;
+		const std::string_view text(value != nullptr ? value : "");
+		const int parsed = text.empty() ? LaneLocalSpillAllowlisted : text == "1" ? 1 : text == "2" ? 2 : 0;
+		if (parsed == LaneLocalSpillAllowlisted) {
+			const auto& hashes = LaneLocalSpillAllowlist();
+			std::string listed;
+			for (const auto hash: hashes) listed += fmt::format("{}{:016x}", listed.empty() ? "" : ",", hash);
+			std::printf("LaneLocal spill: allowlist mode (KYTY_LANE_LOCAL_SPILL unset), %zu hash%s: %s\n",
+			            hashes.size(), hashes.size() == 1 ? "" : "es", listed.c_str());
+		}
+		return parsed;
 	}();
 	return mode;
+}
+
+bool LaneLocalSpillAllowed(uint64_t shader_hash) {
+	switch (LaneLocalSpillMode()) {
+		case 1:
+		case 2: return true;
+		case LaneLocalSpillAllowlisted: return std::ranges::binary_search(LaneLocalSpillAllowlist(), shader_hash);
+		default: return false;
+	}
+}
+
+std::string LaneLocalSpillCacheTag() {
+	static const std::string tag = [] {
+		switch (LaneLocalSpillMode()) {
+			case 1:
+			case 2: return fmt::format("|KYTY_LANE_LOCAL_SPILL={}", LaneLocalSpillMode());
+			case LaneLocalSpillAllowlisted: {
+				uint64_t digest = 0xcbf29ce484222325ull; // FNV-1a over the sorted hashes' bytes
+				for (const auto hash: LaneLocalSpillAllowlist()) {
+					for (uint32_t byte = 0; byte < 8u; byte++) {
+						digest = (digest ^ ((hash >> (byte * 8u)) & 0xffu)) * 0x100000001b3ull;
+					}
+				}
+				return fmt::format("|lane_spill=allow:{}:{:016x}", LaneLocalSpillAllowlist().size(), digest);
+			}
+			default: return std::string();
+		}
+	}();
+	return tag;
 }
 
 uint32_t TranslatorFeatureSet() {
@@ -1024,9 +1108,15 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		static const bool log = std::getenv("KYTY_LANE_LOCAL_LOG") != nullptr;
 		// (KYTY_LANE_LOCAL_SPILL=1 or 2: a group of one wave whose only LDS is its lanes' own spill words (AMD's
 		// compiler's DS_WRITE/READ_ADDTID_B32 at a constant M0) is lane-local, those words per-invocation Function storage
-		// (LaneLocal.cpp PlanPrivateLds); unset or 0: LDS refused, as before. In the prefetch cache's key. Mode 2's
-		// fallback translation (lane_private_lds_off): refused, exactly as mode 0.)
-		const bool spill = LaneLocalSpillMode() != 0 && !options.lane_private_lds_off;
+		// (LaneLocal.cpp PlanPrivateLds); unset: the same for the allowlisted hashes only (LaneLocalSpillAllowed), the
+		// others refused as mode 0 does; 0: LDS refused, as before. In the prefetch cache's key
+		// (LaneLocalSpillCacheTag).
+		// Mode 2's fallback translation (lane_private_lds_off): refused, exactly as mode 0.)
+		const bool spill_on = LaneLocalSpillMode() != 0 && !options.lane_private_lds_off;
+		const bool spill    = spill_on && LaneLocalSpillAllowed(options.shader_hash);
+		// The allowlist mode's other programs with KYTY_LANE_LOCAL_LOG: the proof run once more with the spill, for the
+		// log only (the translation is mode 0's either way).
+		const bool spill_probe = spill_on && !spill && log && LaneLocalSpillMode() == LaneLocalSpillAllowlisted;
 		// Cooperative halves: a group of exactly one wave on 32-wide subgroups, its halves the workgroup's two subgroups,
 		// may exchange lanes through workgroup memory (LaneLocal.cpp). Where the static pipeline store was made with them
 		// (SetTranslatorFeatures; KYTY_LANE_LOCAL_COOP=0/1 decides otherwise).
@@ -1051,6 +1141,20 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			std::ranges::sort(result.cooperative_reads);
 			std::ranges::sort(result.cooperative_branches);
 		}
+		const auto count_slots = [](const std::vector<std::pair<uint32_t, uint32_t>>& slots) {
+			std::vector<uint32_t> bases;
+			for (const auto& slot: slots) bases.push_back(slot.second);
+			std::ranges::sort(bases);
+			return static_cast<size_t>(std::unique(bases.begin(), bases.end()) - bases.begin());
+		};
+		size_t not_allowlisted_slots = 0; // the spill slots of a program refused only for not being listed
+		if (spill_probe && enabled && !result.lane_local && one_wave) {
+			LaneLocalProof probe;
+			const uint32_t lds_bytes = group->lds_size_dwords * 4u;
+			if (ProveWaveLaneLocal(decoded, cooperative_enabled && one_wave, probe, nullptr, lds_bytes) &&
+			    !probe.private_lds.empty())
+				not_allowlisted_slots = count_slots(probe.private_lds);
+		}
 		if (log) {
 			const auto verdict = !result.lane_local        ? reason
 			                     : result.lane_cooperative ? fmt::format("yes (cooperative: {} lane reads, {} branches)",
@@ -1059,11 +1163,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                                               : std::string("yes");
 			std::string spilled;
 			if (result.lane_private_lds) {
-				std::vector<uint32_t> bases;
-				for (const auto& slot: result.private_lds_slots) bases.push_back(slot.second);
-				std::ranges::sort(bases);
-				const auto slots = static_cast<size_t>(std::unique(bases.begin(), bases.end()) - bases.begin());
-				spilled = fmt::format(" (lane-private LDS spill: {} slot{})", slots, slots == 1 ? "" : "s");
+				const auto  slots  = count_slots(result.private_lds_slots);
+				const char* listed = LaneLocalSpillMode() == LaneLocalSpillAllowlisted ? ", allowlisted" : "";
+				spilled = fmt::format(" (lane-private LDS spill: {} slot{}{})", slots, slots == 1 ? "" : "s", listed);
+			} else if (not_allowlisted_slots != 0) {
+				spilled = fmt::format(" (lane-private LDS spill: {} slot{}, spill pattern accepted, not allowlisted: "
+				                      "fallback)",
+				                      not_allowlisted_slots, not_allowlisted_slots == 1 ? "" : "s");
 			}
 			std::printf("LaneLocal CS %016llx: %s%s\n", static_cast<unsigned long long>(options.shader_hash), verdict.c_str(),
 			            spilled.c_str());

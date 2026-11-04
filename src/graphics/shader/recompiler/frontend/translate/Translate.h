@@ -44,11 +44,26 @@ struct TranslateOptions {
 	bool                          lane_private_lds_off = false;
 };
 
-// KYTY_LANE_LOCAL_SPILL: 0 (unset, empty or any other value: LDS refused by the lane-local proof, as before), 1 (R1:
-// lane-private LDS spill slots accepted) or 2 (R1 too, plus the verify mode: each accepted program translated a second
-// time with TranslateOptions::lane_private_lds_off, the renderer comparing both outputs, lane-spill-verify.h). Read once.
+// KYTY_LANE_LOCAL_SPILL: LaneLocalSpillAllowlisted (unset or empty: R1's lane-private LDS spill slots accepted for the
+// allowlisted program hashes only, the others' LDS refused as mode 0 does; prints "LaneLocal spill: allowlist mode ..."
+// once), 0 ("0" or any other value: LDS refused by the lane-local proof, as before R1), 1 (R1 for every program the
+// proof accepts) or 2 (R1 too, plus the verify mode: each accepted program translated a second time with
+// TranslateOptions::lane_private_lds_off, the renderer comparing both outputs, lane-spill-verify.h). Read once.
+// Thread-safe (function-local statics).
 //   if (Frontend::LaneLocalSpillMode() == 2) { /* keep the fallback translation too */ }
+inline constexpr int LaneLocalSpillAllowlisted = 3;
 int LaneLocalSpillMode();
+
+// Whether R1 may apply to the program `shader_hash` (TranslateOptions::shader_hash): modes 1 and 2 every program, the
+// allowlist mode the built-in proven hashes (Translate.cpp LaneLocalSpillProven) plus KYTY_LANE_LOCAL_SPILL_HASHES=
+// <hex,hex,...> (added to the built-in ones, read once), mode 0 none.
+//   const bool spill = Frontend::LaneLocalSpillAllowed(options.shader_hash);
+bool LaneLocalSpillAllowed(uint64_t shader_hash);
+
+// The prefetch cache key's part for the mode (empty in mode 0, as a build without R1; "|KYTY_LANE_LOCAL_SPILL=1" or
+// "=2"; the allowlist mode "|lane_spill=allow:<count>:<FNV-1a digest of the sorted hashes>"). Read once.
+//   key += Frontend::LaneLocalSpillCacheTag();
+std::string LaneLocalSpillCacheTag();
 
 IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
                              const TranslateOptions& options);

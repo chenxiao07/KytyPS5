@@ -937,11 +937,11 @@ struct PipelineCache::ProgramCache {
 			const char* value = std::getenv(name);
 			key += fmt::format("|{}={}", name, value != nullptr ? value : "");
 		}
-		// KYTY_LANE_LOCAL_SPILL only when on (not unset, empty or "0"): a boot with it off shares the cache of a build
-		// without it.
-		if (const char* spill = std::getenv("KYTY_LANE_LOCAL_SPILL");
-		    spill != nullptr && *spill != 0 && std::string_view(spill) != "0")
-			key += fmt::format("|KYTY_LANE_LOCAL_SPILL={}", spill);
+		// KYTY_LANE_LOCAL_SPILL's mode (LaneLocalSpillCacheTag): nothing for "0" (a boot with R1 off shares the cache
+		// of a build without it); the default allowlist mode "|lane_spill=allow:<count>:<digest>" (its listed programs
+		// translate otherwise: a KYTY_PREFETCH_CACHE_BUILD id kept across builds must not hand it mode 0's modules);
+		// "|KYTY_LANE_LOCAL_SPILL=1" or "=2", as before.
+		key += ShaderRecompiler::Frontend::LaneLocalSpillCacheTag();
 		return key;
 	}
 
