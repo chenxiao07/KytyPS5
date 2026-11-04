@@ -27,6 +27,7 @@ struct Copy {
 	vk::Format                       format = vk::Format::eUndefined;
 	uint64_t                         offset = 0, bytes = 0; // in a section
 	std::vector<vk::BufferImageCopy> regions;               // offsets in a section
+	uint32_t                         level0 = 0, levels = 0, layer0 = 0, layers = 0;
 };
 
 struct Slot {
@@ -140,6 +141,18 @@ bool Prepare(GraphicContext& graphics, TextureCache& textures, const ImageSet& s
 		const auto layer0   = volume ? 0u : dep.range.base_layer;
 		const auto layers   = volume ? 1u
 		                             : std::min(dep.range.layer_count, backing.layers > layer0 ? backing.layers - layer0 : 0u);
+		// (The same subresources twice: one copy. TableResolveSet marks every binding of an image that is bound both as
+		// a texture and as storage `storage` (force_general: the image's shader_write), so such an image came twice, and
+		// its two restores were two unordered transfer writes of one image: Swap's SYNC-HAZARD-WRITE-AFTER-WRITE.)
+		if (std::ranges::any_of(pending.copies, [&](const Copy& other) {
+			    return other.image == copy.image && other.level0 == level0 && other.levels == levels &&
+			           other.layer0 == layer0 && other.layers == layers;
+		    }))
+			continue;
+		copy.level0 = level0;
+		copy.levels = levels;
+		copy.layer0 = layer0;
+		copy.layers = layers;
 		const uint64_t align = std::max<uint64_t>(texel, 4);
 		offset               = (offset + SectionAlign - 1) & ~(SectionAlign - 1);
 		copy.offset          = offset;
@@ -223,7 +236,13 @@ inline void Swap(vk::CommandBuffer command, const Pending& pending) {
 	Barrier(command, vk::PipelineStageFlagBits::eTransfer,
 	        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite, vk::PipelineStageFlagBits::eTransfer,
 	        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite);
-	for (const auto& copy: pending.copies) {
+	for (size_t c = 0; c < pending.copies.size(); ++c) {
+		const auto& copy = pending.copies[c];
+		// (An image restored again, other subresources that may overlap the last: its writes ordered.)
+		if (std::any_of(pending.copies.begin(), pending.copies.begin() + static_cast<std::ptrdiff_t>(c),
+		                [&](const Copy& other) { return other.image == copy.image; }))
+			Barrier(command, vk::PipelineStageFlagBits::eTransfer, vk::AccessFlagBits::eTransferWrite,
+			        vk::PipelineStageFlagBits::eTransfer, vk::AccessFlagBits::eTransferWrite);
 		const auto regions = Regions(copy, pending.section, 0);
 		command.copyBufferToImage(pending.buffer, copy.image, vk::ImageLayout::eGeneral,
 		                          static_cast<uint32_t>(regions.size()), regions.data());
