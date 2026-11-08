@@ -104,3 +104,8 @@ powershell -ExecutionPolicy Bypass -File tools\local\windows\pgo-multi.ps1 -Spec
 （`<存档>+KYTY_SCOUT=0+KYTY_SPECULATE=4`）。`llvm-profdata merge` 把同一函数的计数相加：模式 0 走的函数仍然带着
 模式 0 五次的计数（加上模式 4 里同样经过它们的次数），只在模式 4 运行的函数多了计数。前五个原始 profile 单独合并，
 就是不带 `-Speculate` 的 profile。
+
+8 Nov 在 PR #293 上测过两种 profile（竞技场，同一份代码，各自的 exe）：带 `-Speculate` 的十次 profile 让模式 0 的渲染线程
+每帧多约 0.45 ms，而只用默认五次（模式 0）的 profile 让模式 0 和 main 持平（9.60 对 9.61 ms）；模式 0 的 profile 在模式 4
+下几乎没有代价（94.08 对 94.27 fps，渲染 8.97 对 8.82 ms）。所以 PR 的 profile 按默认五次训练，不加 `-Speculate`。
+`-Speculate` 保留为选项，用来给推测线程的路径做 profile 分析。
