@@ -44,6 +44,10 @@ sealed class KeyboardLayout {
 		settings.Set("keyboard_mouse_sensitivity", Sensitivity);
 	}
 	public static bool Supported(string input) {
+		string first, second;
+		return SupportedSingle(input) || SplitCombo(input, out first, out second);
+	}
+	static bool SupportedSingle(string input) {
 		if (input == null)
 			return false;
 		if (input.Length == 1 && "-=[]\\;'`,./".Contains(input))
@@ -60,6 +64,20 @@ sealed class KeyboardLayout {
 		"Up","Down","Left","Right","Home","End","PageUp","PageDown","Insert","Delete","CapsLock",
 		"Mouse:Left","Mouse:Right","Mouse:Middle","Mouse:X1","Mouse:X2","Mouse:WheelUp","Mouse:WheelDown"}.Contains(input);
 	}
+	// A combo is two inputs joined by '+' ("Left Shift+E"): the first is held while the second is pressed.
+	static bool SplitCombo(string input, out string first, out string second) {
+		for (int i = 1; input != null && i < input.Length - 1; i++) {
+			if (input[i] != '+')
+				continue;
+			first = input.Substring(0, i);
+			second = input.Substring(i + 1);
+			// A wheel notch cannot be held, the emulator keeps Alt+Enter for fullscreen, and Alt+F4 closes the window.
+			if (SupportedSingle(first) && SupportedSingle(second) && first != second && !first.StartsWith("Mouse:Wheel") && !(first == "Left Alt" && second == "Return") && !(first == "Left Alt" && second == "F4"))
+				return true;
+		}
+		first = second = null;
+		return false;
+	}
 	public void Validate() {
 		var used = new HashSet<string>();
 		foreach (var control in Controls) {
@@ -75,7 +93,7 @@ sealed class KeyboardLayout {
 	}
 	public string Assign(string control, string input) {
 		if (!Bindings.ContainsKey(control) || !Supported(input))
-			throw new IOException("Unsupported key. F7, F8, F11 and Pause are reserved for the emulator.");
+			throw new IOException("Unsupported key. F7, F8, F11, Pause, Alt+Enter and Alt+F4 are reserved for the emulator.");
 		var other = Bindings.FirstOrDefault(p => p.Key != control && p.Value == input).Key;
 		if (other != null)
 			Bindings[other] = Bindings[control];
@@ -132,6 +150,9 @@ sealed class KeyboardLayout {
 			case "Right":
 				return "\u2192";
 		}
+		string first, second;
+		if (SplitCombo(input, out first, out second))
+			return Label(first) + "+" + Label(second);
 		return input.Replace("Keypad ", "NUM ").ToUpperInvariant();
 	}
 	public string IconLabel(string name) {

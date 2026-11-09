@@ -393,6 +393,9 @@ The launchers (Windows and Linux) also offer **Game → Keyboard and mouse promp
 For an extracted PPSA01341 v1.07 game folder, it applies 22 English key/mouse icons and matching
 keyboard/mouse bindings on Play. **Game → Keyboard controls → Edit controls…** lets you change
 keys, mouse buttons, wheel directions and sensitivity; the prompts follow the saved layout.
+In the Windows launcher's editor, hold one input and press another to bind the two together (the
+second pressed while the first is held), shown as `Left Shift+Mouse:Left`; the first keeps its own
+control.
 Press **F7** to capture/release the mouse for camera control. Disabling the option restores
 backed-up original icons on the next Play and stops applying these bindings; `launch.json`
 is not rewritten. The keyboard labels remain visible when using a controller.
@@ -451,7 +454,7 @@ With any of them, only your own keys work on the keyboard (none of the layout ab
   one. A key whose name has a `+` (`Keypad +`) can be either. The wheel cannot be the first: a notch is not held.
   As the second, the control is chosen once per scroll, by whether the first is held then: that scroll's notches,
   pressed one after another, go to it. Alt+Enter (`Left Alt+Return`, `Left Alt+Keypad Enter`) stays the
-  emulator's full screen.
+  emulator's full screen, and Alt+F4 (`Left Alt+F4`) closes the window.
 - A control takes one key and one mouse input (`Up=Up` with `Up=Mouse:WheelUp`: both work), and a combo counts as a
   key or a mouse input by its second (`R2=F` with `R2=Left Shift+Mouse:Left`: both work). A later line replaces an
   earlier one for the same control and kind, or for exactly the same input or combo.

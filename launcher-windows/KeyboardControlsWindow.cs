@@ -16,6 +16,8 @@ sealed class KeyboardControlsWindow : Window {
 	readonly TextBlock status;
 	readonly TextBox sensitivity;
 	string capturing;
+	// First input of a combo being captured; bound by itself if it is released alone.
+	string held;
 	static string T(string en, string zh) { return Strings.Language == UiLanguage.Chinese ? zh : en; }
 	static readonly string[] ChineseActions = { "互动 / 确认", "翻滚 / 返回", "使用道具", "双持武器", "防御 / 左手攻击", "招架 / 左手重击", "左摇杆按下", "攻击", "重击", "锁定", "菜单", "切换法术", "切换道具", "切换左手武器", "切换右手武器", "触摸板 / 左侧", "触摸板右侧", "向前移动", "向后移动", "向左移动", "向右移动" };
 	public KeyboardControlsWindow(Settings settings) {
@@ -33,7 +35,7 @@ sealed class KeyboardControlsWindow : Window {
 		FontSize = 14;
 		var dock = new DockPanel { Margin = new Thickness(24) };
 		Content = dock;
-		var intro = new TextBlock { Text = T("Click an action, then press a key or mouse button. Assigning an input already used by another action swaps the two. F7 captures/releases the mouse in-game; F7, F8, F11 and Pause cannot be rebound.", "点击动作后按键或鼠标按钮。若输入已用于其他动作，则交换两个动作的键位。游戏内按 F7 捕获/释放鼠标；F7、F8、F11 和 Pause 不可重新绑定。"), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 12) };
+		var intro = new TextBlock { Text = T("Click an action, then press a key or mouse button. Assigning an input already used by another action swaps the two. F7 captures/releases the mouse in-game; F7, F8, F11 and Pause cannot be rebound. Hold one input and press another to bind both at once, such as Left Shift + Mouse:Left.", "点击动作后按键或鼠标按钮。若输入已用于其他动作，则交换两个动作的键位。游戏内按 F7 捕获/释放鼠标；F7、F8、F11 和 Pause 不可重新绑定。按住一个输入再按下另一个，即可将两者一起绑定，例如 Left Shift + Mouse:Left。"), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 12) };
 		DockPanel.SetDock(intro, Dock.Top);
 		dock.Children.Add(intro);
 		var footer = new StackPanel();
@@ -48,7 +50,7 @@ sealed class KeyboardControlsWindow : Window {
 		footer.Children.Add(sens);
 		var actions = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
 		footer.Children.Add(actions);
-		actions.Children.Add(ActionButton(T("Stop capture", "停止捕获"), () => { capturing = null; Refresh(); }));
+		actions.Children.Add(ActionButton(T("Stop capture", "停止捕获"), () => { capturing = null; held = null; ReleaseMouseCapture(); Refresh(); }));
 		actions.Children.Add(ActionButton(T("Reset defaults", "恢复默认"), () => { capturing = null; layout = new KeyboardLayout(); sensitivity.Text = ""; Refresh(); status.Text = T("Default layout restored in the editor. Save to keep it.", "已在编辑器中恢复默认键位，保存后生效。"); }));
 		actions.Children.Add(ActionButton(T("Cancel", "取消"), () => Close()));
 		actions.Children.Add(ActionButton(T("Save", "保存"), Save));
@@ -62,7 +64,7 @@ sealed class KeyboardControlsWindow : Window {
 			row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(88) });
 			row.Children.Add(new TextBlock { Text = (Strings.Language == UiLanguage.Chinese ? ChineseActions[i] : KeyboardLayout.Actions[i]) + " (" + control + ")", VerticalAlignment = VerticalAlignment.Center });
 			var button = new Button { Style = (Style)Application.Current.FindResource("FlatButton"), MinHeight = 34, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(4), Content = layout.Bindings[control] };
-			button.Click += (s, e) => { capturing = control; Refresh(); status.Text = T("Press a key, mouse button or scroll wheel. Use Stop capture to cancel.", "请按键、鼠标按钮或滚轮；点击停止捕获取消。"); };
+			button.Click += (s, e) => { capturing = control; held = null; Refresh(); status.Text = T("Press a key, mouse button or scroll wheel. Use Stop capture to cancel.", "请按键、鼠标按钮或滚轮；点击停止捕获取消。"); };
 			buttons.Add(control, button);
 			Grid.SetColumn(button, 1);
 			row.Children.Add(button);
@@ -73,9 +75,11 @@ sealed class KeyboardControlsWindow : Window {
 			rows.Children.Add(row);
 		}
 		PreviewKeyDown += OnKey;
+		PreviewKeyUp += OnKeyRelease;
 		PreviewMouseDown += OnMouse;
-		PreviewMouseWheel += (s, e) => { if (capturing != null) { Assign(e.Delta > 0 ? "Mouse:WheelUp" : "Mouse:WheelDown"); e.Handled = true; } };
-		Deactivated += (s, e) => { if (capturing != null) { capturing = null; Refresh(); } };
+		PreviewMouseUp += OnMouseRelease;
+		PreviewMouseWheel += (s, e) => { if (capturing != null) { var wheel = e.Delta > 0 ? "Mouse:WheelUp" : "Mouse:WheelDown"; Assign(held == null ? wheel : held + "+" + wheel); e.Handled = true; } };
+		Deactivated += (s, e) => { if (capturing != null) { capturing = null; held = null; ReleaseMouseCapture(); Refresh(); } };
 		Refresh();
 		try { layout.Validate(); }
 		catch (IOException error) { status.Text = error.Message + T(" You can repair it here or reset defaults.", " 可在此修复或恢复默认设置。"); }
@@ -87,7 +91,7 @@ sealed class KeyboardControlsWindow : Window {
 	}
 	void Refresh() {
 		foreach (var pair in buttons) {
-			pair.Value.Content = capturing == pair.Key ? T("Press an input…", "请按键…") : layout.Bindings[pair.Key];
+			pair.Value.Content = capturing == pair.Key ? (held == null ? T("Press an input…", "请按键…") : held + " + …") : layout.Bindings[pair.Key];
 			using (var bitmap = PromptTexture.Draw(KeyboardLayout.Label(layout.Bindings[pair.Key])))
 			using (var stream = new MemoryStream()) {
 				bitmap.Save(stream, System.Drawing.Imaging.ImageFormat.Png);
@@ -103,13 +107,31 @@ sealed class KeyboardControlsWindow : Window {
 		}
 	}
 	void Assign(string input) {
+		held = null;
+		ReleaseMouseCapture();
 		try {
 			var other = layout.Assign(capturing, input);
 			capturing = null;
 			Refresh();
 			status.Text = other == null ? T("Binding updated. Save to keep it.", "键位已更新，保存后生效。") : T("Swapped with ", "已交换键位：") + other;
 		}
-		catch (IOException error) { status.Text = error.Message; }
+		catch (IOException error) { Refresh(); status.Text = error.Message; }
+	}
+	void Pressed(string input) {
+		if (held == null && !KeyboardLayout.Supported(input)) {
+			Assign(input);
+			return;
+		}
+		if (held == null) {
+			held = input;
+			Refresh();
+			status.Text = string.Format(T("Holding {0}: press another with it for a combo, or release it to bind {0} alone.", "正在按住 {0}：同时按下另一个输入可设为组合键，松开则单独绑定 {0}。"), input);
+		} else if (input != held)
+			Assign(held + "+" + input);
+	}
+	void Released(string input) {
+		if (held != null && input == held)
+			Assign(held);
 	}
 	internal static string InputName(Key key) {
 		if (key >= Key.A && key <= Key.Z)
@@ -177,23 +199,41 @@ sealed class KeyboardControlsWindow : Window {
 				return key.ToString();
 		}
 	}
+	static string InputName(MouseButton button) {
+		return "Mouse:" + (button == MouseButton.XButton1 ? "X1" : button == MouseButton.XButton2 ? "X2" : button.ToString());
+	}
 	void OnKey(object sender, KeyEventArgs e) {
 		if (capturing == null)
 			return;
 		e.Handled = true;
 		if (!e.IsRepeat)
-			Assign(InputName(e.Key == Key.System ? e.SystemKey : e.Key));
+			Pressed(InputName(e.Key == Key.System ? e.SystemKey : e.Key));
+	}
+	void OnKeyRelease(object sender, KeyEventArgs e) {
+		if (capturing == null)
+			return;
+		e.Handled = true;
+		Released(InputName(e.Key == Key.System ? e.SystemKey : e.Key));
 	}
 	void OnMouse(object sender, MouseButtonEventArgs e) {
 		if (capturing == null)
 			return;
 		for (var node = e.OriginalSource as DependencyObject; node != null;) {
 			var button = node as Button;
-			if (button != null && (string)button.Tag == "editor-command") { capturing = null; Refresh(); return; }
+			if (button != null && (string)button.Tag == "editor-command") { capturing = null; held = null; ReleaseMouseCapture(); Refresh(); return; }
 			node = node is Visual ? VisualTreeHelper.GetParent(node) : LogicalTreeHelper.GetParent(node);
 		}
 		e.Handled = true;
-		Assign("Mouse:" + (e.ChangedButton == MouseButton.XButton1 ? "X1" : e.ChangedButton == MouseButton.XButton2 ? "X2" : e.ChangedButton.ToString()));
+		Pressed(InputName(e.ChangedButton));
+		// Held, so its release reaches OnMouseRelease even outside the window.
+		if (held != null)
+			CaptureMouse();
+	}
+	void OnMouseRelease(object sender, MouseButtonEventArgs e) {
+		if (capturing == null)
+			return;
+		e.Handled = true;
+		Released(InputName(e.ChangedButton));
 	}
 	public void SaveScreenshot(string path) {
 		var content = (FrameworkElement)Content;
