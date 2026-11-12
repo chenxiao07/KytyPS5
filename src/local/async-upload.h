@@ -276,6 +276,7 @@ private:
 		// (KYTY_UPLOAD_LANES, read once a batch. Only the worker splits: a helping render thread would wait on the second
 		// thread, the stall Help exists to avoid, and the second thread takes its creator's priority and CPUs.)
 		const uint32_t lanes = helper ? 1u : kyty_local_upload_lanes.load(std::memory_order_relaxed);
+		m_progress           = !helper && ProgressOn(); // (KYTY_UPLOAD_PROGRESS: the worker's batches)
 		while (done < head) {
 			if (const Job& job = m_jobs[done % Capacity]; job.call != nullptr && !job.protection) {
 				if (helper) break;
@@ -283,6 +284,7 @@ private:
 				call(job);
 				LiveCounters::Add(LiveCounters::UploadCallUs, since(called));
 				++done;
+				if (m_progress) Publish(done);
 				continue;
 			}
 			// The jobs up to the next other call (which keeps its place): their write protections first, in their
@@ -299,7 +301,14 @@ private:
 			const auto protecting = std::chrono::steady_clock::now();
 			Protections(done, end, lanes);
 			LiveCounters::Add(LiveCounters::UploadCallUs, since(protecting));
-			CopyRun(done, end, bytes);
+			// (KYTY_UPLOAD_PROGRESS: the run's protections all done, published up to its first copy; the copies from there:
+			// a slot below a published value may be refilled by Add at once, so none is read again.)
+			uint64_t copies_from = done;
+			if (m_progress) {
+				while (copies_from < end && m_jobs[copies_from % Capacity].call != nullptr) ++copies_from;
+				Publish(copies_from);
+			}
+			CopyRun(copies_from, end, bytes);
 			done = end;
 		}
 		if (!helper) LiveCounters::Add(LiveCounters::UploadBusyUs, since(start));
@@ -309,6 +318,25 @@ private:
 	}
 
 	static void CallJob(const Job& job) { job.call(job.context, reinterpret_cast<uint64_t>(job.destination), job.size); }
+
+	// KYTY_UPLOAD_PROGRESS (live upload_progress; -1, the default: on under KYTY_SPECULATE=4; 1 on, 0 off): m_done
+	// published as the batch goes, in its order (each call, a run's protections, each copy or the done prefix of a
+	// shared run's chunks), not only at its end: a DrainRange waits for its range's jobs, not for the rest of the batch
+	// they fell in (1.3-3.5 ms in a spike frame). Every job below a published value is done.
+	static bool ProgressOn() {
+		static auto& on    = LiveSwitch::Find("upload_progress", -1);
+		const auto   value = on.load(std::memory_order_relaxed);
+		return value >= 0 ? value != 0 : kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+	}
+	// (Monotonic: a later value only; any thread inside Process, the shared run's helpers included.)
+	void Publish(uint64_t done) {
+		uint64_t at = m_done.load(std::memory_order_relaxed);
+		while (at < done)
+			if (m_done.compare_exchange_weak(at, done, std::memory_order_seq_cst, std::memory_order_relaxed)) {
+				if (m_waiters.load(std::memory_order_seq_cst) != 0) m_done.notify_all();
+				return;
+			}
+	}
 
 	// KYTY_UPLOAD_LANES: the jobs each lane needs at least for a run to be split: the second thread's wake-up (~3-4 us)
 	// plus the waker's FUTEX_WAKE (~2-3 us) against ~3 us a protection; lane 1 runs late by the wake-up, so it needs more.
@@ -440,8 +468,10 @@ private:
 		if (bytes == 0) return;
 		if (bytes < 4 * Chunk) {
 			for (; first < last; ++first)
-				if (const Job& job = m_jobs[first % Capacity]; job.call == nullptr)
+				if (const Job& job = m_jobs[first % Capacity]; job.call == nullptr) {
 					CopyFrom(job.destination, job.source, job.guest, job.size);
+					if (m_progress) Publish(first + 1); // (KYTY_UPLOAD_PROGRESS)
+				}
 			return;
 		}
 		// The run's copies, each at its offset in the run's bytes.
@@ -450,14 +480,27 @@ private:
 		for (; first < last; ++first) {
 			const Job& job = m_jobs[first % Capacity];
 			if (job.call != nullptr) continue;
-			m_run.push_back({offset, job.destination, job.source, job.guest});
+			m_run.push_back({offset, job.destination, job.source, job.guest, first});
 			offset += job.size;
 		}
-		m_run.push_back({offset, nullptr, nullptr, 0});
+		m_run.push_back({offset, nullptr, nullptr, 0, last});
+		// (KYTY_UPLOAD_PROGRESS: a flag a chunk, the done prefix in chunks.)
+		const uint64_t chunks = (bytes + Chunk - 1) / Chunk;
+		if (m_progress) {
+			if (m_chunk_flags_size < chunks) {
+				m_chunk_flags      = std::make_unique<std::atomic<uint8_t>[]>(chunks);
+				m_chunk_flags_size = chunks;
+			}
+			for (uint64_t c = 0; c < chunks; ++c) m_chunk_flags[c].store(0, std::memory_order_relaxed);
+			m_chunk_prefix.store(0, std::memory_order_relaxed);
+		}
+		m_run_chunks = chunks;
 		LiveCounters::Add(LiveCounters::UploadSharedRuns);
 		static auto* const pool = new ParallelPages::Pool(7, "Kyty.UploadCopy"); // (never destroyed)
 		pool->For(bytes, Chunk, [](void* at, uint64_t from, uint64_t to) {
-			const auto& run = *static_cast<const std::vector<RunCopy>*>(at);
+			auto&       self  = *static_cast<Worker*>(at);
+			const auto& run   = self.m_run;
+			const auto  chunk = from / Chunk;
 			// The copy holding byte `from`, then the ones after it up to `to`.
 			auto it = std::prev(std::upper_bound(run.begin(), std::prev(run.end()), from,
 			                                     [](uint64_t at_byte, const RunCopy& copy) { return at_byte < copy.offset; }));
@@ -467,7 +510,8 @@ private:
 				CopyFrom(it->destination + skip, it->source + skip, it->guest + skip, end - from);
 				from = end;
 			}
-		}, &m_run);
+			if (self.m_progress) self.ChunkDone(chunk);
+		}, this);
 	}
 
 	// The guest's bytes read through its own mapping where it can (Windows): a page of the backing view faults on its
@@ -492,7 +536,30 @@ private:
 		uint8_t*       destination;
 		const uint8_t* source;
 		uint64_t       guest;
+		uint64_t       job; // (its queue index; the end entry: the run's end)
 	};
+	// KYTY_UPLOAD_PROGRESS: shared-run chunk `chunk` done (on the thread that copied it). The done prefix extended by
+	// whoever finds the next chunk flagged; its first unfinished copy published (the copies before it, and the run's
+	// protections, done).
+	void ChunkDone(uint64_t chunk) {
+		constexpr uint64_t Chunk = uint64_t {256} << 10u;
+		// (seq_cst: two finishers each flagging and then scanning see each other's flag, no stalled prefix.)
+		m_chunk_flags[chunk].store(1, std::memory_order_seq_cst);
+		uint64_t prefix = m_chunk_prefix.load(std::memory_order_seq_cst);
+		while (prefix < m_run_chunks && m_chunk_flags[prefix].load(std::memory_order_seq_cst) != 0)
+			if (m_chunk_prefix.compare_exchange_weak(prefix, prefix + 1, std::memory_order_acq_rel, std::memory_order_acquire))
+				++prefix;
+		const uint64_t done_bytes = std::min(prefix * Chunk, m_run.back().offset);
+		// (Entry k's offset is copy k-1's end. The first entry k >= 1 whose offset is past done_bytes: copy k-1 is the
+		// first not wholly done, the ones before it are. None: every copy done, the end entry's job, the run's end.)
+		const auto it = std::upper_bound(std::next(m_run.begin()), m_run.end(), done_bytes,
+		                                 [](uint64_t at_byte, const RunCopy& copy) { return at_byte < copy.offset; });
+		Publish(std::prev(it)->job);
+	}
+	bool                                     m_progress = false; // (the batch's KYTY_UPLOAD_PROGRESS, under m_process)
+	std::unique_ptr<std::atomic<uint8_t>[]>  m_chunk_flags;
+	uint64_t                                 m_chunk_flags_size = 0, m_run_chunks = 0;
+	alignas(64) std::atomic<uint64_t>        m_chunk_prefix {0};
 	std::vector<RunCopy>               m_run; // (the worker's)
 	// KYTY_UPLOAD_LANES: the run's jobs per lane (written under m_process before a post, read by the second thread until it
 	// finishes that post), the second thread, its post / finish generations, and whether the poster sleeps on the finish.
