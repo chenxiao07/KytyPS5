@@ -351,9 +351,9 @@ private:
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
 
 public:
-	// spec_buffer_ahead (live; -1, the default: 1 under KYTY_SPECULATE=4, 0 otherwise; 2 also posts a V# range left
-	// pending): a speculation's thread posts a range no buffer covers (PostAhead: once, at most 512 waiting); the GPU
-	// thread registers the posted ranges nothing overlaps (ServeAhead, at each commit).
+	// spec_buffer_ahead (under KYTY_SPECULATE=4 only; a V# range left pending is posted too): a speculation's thread
+	// posts a range no buffer covers (PostAhead: once, at most 512 waiting); the
+	// GPU thread registers the posted ranges nothing overlaps (ServeAhead, at each commit).
 	void PostAhead(uint64_t vaddr, uint64_t size);
 	// The table path's call site of a speculation's lookup (0 other): spec_ring_index's index ranges.
 	static inline thread_local int t_ahead_site = 0;

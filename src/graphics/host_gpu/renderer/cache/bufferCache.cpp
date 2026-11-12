@@ -2168,12 +2168,10 @@ BufferId BufferCache::FindBufferSpec(uint64_t vaddr, uint64_t size) {
 	return Spec::Refuse("buffer registration"), NULL_BUFFER_ID;
 }
 
-// (Live spec_buffer_ahead; -1, the default: 1 under KYTY_SPECULATE=4, 0 otherwise.)
+// (spec_buffer_ahead: 2 under KYTY_SPECULATE=4, 0 otherwise.)
 static int64_t BufferAhead() {
-	static auto& value = LiveSwitch::Find("spec_buffer_ahead", -1);
 	if (!Spec::On()) return 0;
-	const auto v = value.load(std::memory_order_relaxed);
-	return v >= 0 ? v : kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 1 : 0;
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 2 : 0;
 }
 
 void BufferCache::PostAhead(uint64_t vaddr, uint64_t size) {
@@ -2789,6 +2787,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSpec(Spec::State& spec, ui
 		if (Spec::t_pending_ok && !(is_texel_buffer && m_texture_cache.HasGpuWrittenImageOverlap(vaddr, size)) &&
 		    !spec.open_journal_set.Intersects(vaddr, size) && !(is_written && spec.open_copy_sources.Intersects(vaddr, size))) {
 			Spec::t_pending_hit = true;
+			// spec_buffer_ahead (under KYTY_SPECULATE=4): posted at first sight as well, for ServeAhead to
+			// register at the next commit's start (no joins; one overlapping a buffer is skipped and left to the commit, as
+			// before).
+			if (BufferAhead() >= 2) PostAhead(vaddr, size);
 			if (is_written) spec.NoteWritten(vaddr, size);
 			return {nullptr, 0};
 		}
