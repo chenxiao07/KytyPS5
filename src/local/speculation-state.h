@@ -1162,7 +1162,32 @@ struct EffectsLog {
 	[[nodiscard]] uint64_t End() const noexcept { return end.load(std::memory_order_acquire); }
 	WriteStamps<8>         stamps;      // GPU and host writes
 	WriteStamps<12>        host_stamps; // host writes
+	// spec_log_index (under KYTY_SPECULATE=4 only, the mode read at each Add): per 4 MiB
+	// granule, the ascending log indices of the
+	// writes over it, so a walk visits the entries of the read's granules only, not every entry since `from` (the stamps'
+	// false positives walked the whole log: 0.6-1.2 ms a frame of the late walk). `index_wide`: the writes over more than
+	// 256 granules; `index_from`: the first index appended while indexing (UINT64_MAX: off). The thread that commits alone
+	// appends and walks.
+	static constexpr uint64_t IndexGranuleBits = 22, IndexWideGranules = 256;
+	std::unordered_map<uint64_t, std::vector<uint64_t>> index;
+	std::vector<uint64_t>                               index_wide;
+	uint64_t                                            index_from = UINT64_MAX, index_pruned = 0;
+	[[nodiscard]] static int64_t IndexSwitch() {
+		return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 1 : 0;
+	}
 	void                   Add(Kind kind, uint64_t address, uint64_t size) {
+		                  if (IndexSwitch() != 0) {
+			                  const uint64_t at = base + entries.size();
+			                  if (index_from == UINT64_MAX) index_from = at;
+			                  if (kind != Kind::RetiredSet && size != 0) {
+				                  const uint64_t g0 = address >> IndexGranuleBits, g1 = (address + size - 1) >> IndexGranuleBits;
+				                  if (g1 - g0 >= IndexWideGranules) index_wide.push_back(at);
+				                  else
+					                  for (uint64_t g = g0; g <= g1; ++g) index[g].push_back(at);
+			                  }
+		                  } else if (index_from != UINT64_MAX) {
+			                  index_from = UINT64_MAX, index.clear(), index_wide.clear(); // (off: the next on starts afresh)
+		                  }
 		                  if (kind != Kind::RetiredSet) stamps.Stamp(address, size, base + entries.size() + 1);
 		                  if (kind == Kind::HostWrite) host_stamps.Stamp(address, size, base + entries.size() + 1);
 		                  entries.push_back({kind, t_effect_source, address, size});
@@ -1170,12 +1195,43 @@ struct EffectsLog {
 	}
 	// The first write logged from `from` on over the range (null: none).
 	[[nodiscard]] const Entry* FirstWriteOver(uint64_t from, uint64_t address, uint64_t size) const {
+		if (const auto* indexed = IndexedWalk(from, address, size, false); indexed != reinterpret_cast<const Entry*>(1))
+			return indexed;
 		for (auto i = std::max(from, base); i < base + entries.size(); ++i) {
 			const auto& entry = entries[i - base];
 			if (entry.kind != Kind::RetiredSet && entry.address < address + size && address < entry.address + entry.size)
 				return &entry;
 		}
 		return nullptr;
+	}
+	// spec_log_index: the first entry from `from` on over the range (`gpu_only`: a GPU write), through the granules'
+	// indices: in each granule the range touches, the first index >= max(from, base) over it, the smallest of those (the
+	// linear walk's answer). (const Entry*)1 when the index cannot answer (off, entries from `from` on not all indexed, or a
+	// range over more than 256 granules).
+	[[nodiscard]] const Entry* IndexedWalk(uint64_t from, uint64_t address, uint64_t size, bool gpu_only) const {
+		const auto on = IndexSwitch();
+		if (on == 0 || index_from == UINT64_MAX || from < index_from || size == 0) return reinterpret_cast<const Entry*>(1);
+		const uint64_t g0 = address >> IndexGranuleBits, g1 = (address + size - 1) >> IndexGranuleBits;
+		if (g1 - g0 >= IndexWideGranules) return reinterpret_cast<const Entry*>(1);
+		const uint64_t first = std::max(from, base), end = base + entries.size();
+		uint64_t       best = UINT64_MAX;
+		const auto     over = [&](uint64_t i) {
+			const auto& entry = entries[i - base];
+			return (gpu_only ? entry.kind == Kind::GpuWrite : entry.kind != Kind::RetiredSet) && entry.address < address + size &&
+			       address < entry.address + entry.size;
+		};
+		const auto scan = [&](const std::vector<uint64_t>& list) {
+			for (auto it = std::lower_bound(list.begin(), list.end(), first); it != list.end() && *it < best && *it < end; ++it) {
+				if (over(*it)) {
+					best = *it;
+					break;
+				}
+			}
+		};
+		for (uint64_t g = g0; g <= g1; ++g)
+			if (const auto found = index.find(g); found != index.end()) scan(found->second);
+		scan(index_wide);
+		return best == UINT64_MAX ? nullptr : &entries[best - base];
 	}
 	// KYTY_SPEC_WALK_FROM_STAMP: a write logged from `from` on over the range: the one its latest stamp names when that
 	// one is over it (the GPU and host stamps', `stamps`), else the first (FirstWriteOver). Null: none. `direct`: the
@@ -1196,6 +1252,8 @@ struct EffectsLog {
 	}
 	// The first GPU write logged from `from` on over the range (null: none).
 	[[nodiscard]] const Entry* FirstGpuWriteOver(uint64_t from, uint64_t address, uint64_t size) const {
+		if (const auto* indexed = IndexedWalk(from, address, size, true); indexed != reinterpret_cast<const Entry*>(1))
+			return indexed;
 		for (auto i = std::max(from, base); i < base + entries.size(); ++i) {
 			const auto& entry = entries[i - base];
 			if (entry.kind == Kind::GpuWrite && entry.address < address + size && address < entry.address + entry.size)
@@ -1216,10 +1274,20 @@ struct EffectsLog {
 		}
 	}
 	// What no speculation began before.
-	void DropBefore(uint64_t index) {
-		while (base < index && !entries.empty()) {
+	void DropBefore(uint64_t drop) {
+		while (base < drop && !entries.empty()) {
 			entries.pop_front();
 			++base;
+		}
+		// (spec_log_index: the dropped indices out of the granules' lists, now and then.)
+		if (index_from != UINT64_MAX && base >= index_pruned + 4096) {
+			index_pruned = base;
+			for (auto it = index.begin(); it != index.end();) {
+				auto& list = it->second;
+				list.erase(list.begin(), std::lower_bound(list.begin(), list.end(), base));
+				it = list.empty() ? index.erase(it) : std::next(it);
+			}
+			index_wide.erase(index_wide.begin(), std::lower_bound(index_wide.begin(), index_wide.end(), base));
 		}
 	}
 };
