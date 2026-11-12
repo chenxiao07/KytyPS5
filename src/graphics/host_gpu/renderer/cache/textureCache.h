@@ -311,10 +311,17 @@ private:
 	void                      UntrackImageTail(ImageId id);
 	// Partial CPU writes of large images (KYTY_PARTIAL_IMAGE_DIRTY). Caller holds m_lock.
 	[[nodiscard]] static bool PartialDirtyCandidate(const Image& image);
+	// A CPU write into the image now would take it partially (TryInvalidatePartial's precondition).
+	[[nodiscard]] static bool TakesPartialDirty(const Image& image);
 	// `granule`: the released span grows to these boundaries (counted from the image start).
 	[[nodiscard]] bool TryInvalidatePartial(Image& image, uint64_t address, uint64_t size,
 	                                        uint64_t granule);
-	void               UntrackImagePages(Image& image, uint64_t begin, uint64_t end);
+	// True when it released a page the image still watched.
+	bool               UntrackImagePages(Image& image, uint64_t begin, uint64_t end);
+	// KYTY_WRITE_WINDOW_IMAGES (BufferCache::TryInvalidateCpuWriteWindow): every image over [begin, begin + size) lets the
+	// CPU write window through; then their CPU-dirty notice, their dirty ranges unchanged.
+	[[nodiscard]] bool WriteWindowPassesImages(const ImageIds& images, uint64_t begin, uint64_t size) const;
+	void               NoteWriteWindowImages(const ImageIds& images, uint64_t begin, uint64_t size);
 	void               RetrackHoles(Image& image);
 	// The holes' pages inside [begin, end) only (page-aligned); the others stay released.
 	void               RetrackHoles(Image& image, uint64_t begin, uint64_t end);

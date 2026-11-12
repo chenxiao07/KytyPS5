@@ -1129,16 +1129,17 @@ void TextureCache::UntrackImage(ImageId id, const char* why) {
 	}
 }
 
-void TextureCache::UntrackImagePages(Image& image, uint64_t begin, uint64_t end) {
+bool TextureCache::UntrackImagePages(Image& image, uint64_t begin, uint64_t end) {
 	const auto tracked_begin = image.track_addr & ~(TRACKER_PAGE_SIZE - 1);
 	const auto tracked_end =
 	    (image.track_addr_end + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 	begin = std::max(begin, tracked_begin);
 	end   = std::min(end, tracked_end);
 	if (begin >= end) {
-		return;
+		return false;
 	}
-	auto cursor = begin;
+	bool released = false;
+	auto cursor   = begin;
 	for (const auto& [hole_begin, hole_end]: image.untracked_holes) {
 		if (hole_end <= cursor) {
 			continue;
@@ -1148,13 +1149,16 @@ void TextureCache::UntrackImagePages(Image& image, uint64_t begin, uint64_t end)
 		}
 		if (cursor < hole_begin) {
 			m_page_manager.UpdatePageWatchers<false>(cursor, hole_begin - cursor);
+			released = true;
 		}
 		cursor = std::max(cursor, hole_end);
 	}
 	if (cursor < end) {
 		m_page_manager.UpdatePageWatchers<false>(cursor, end - cursor);
+		released = true;
 	}
 	Image::AddRange(image.untracked_holes, begin, end);
+	return released;
 }
 
 void TextureCache::RetrackHoles(Image& image) {
@@ -1219,15 +1223,20 @@ bool TextureCache::PartialDirtyCandidate(const Image& image) {
 // its free layers to the texture streamer, which remaps one layer at a time and tiles textures into it from the CPU
 // while shadows render into others: the whole array went to the GPU again every few seconds (100-270 ms frames) and the
 // rendered layers were lost.
-bool TextureCache::TryInvalidatePartial(Image& image, uint64_t address, uint64_t size,
-                                        uint64_t granule) {
+bool TextureCache::TakesPartialDirty(const Image& image) {
 	const auto& info = image.info;
 	// (With GPU buffer writes over known ranges of it too: a refresh uploads those with the dirty ranges, InitializeImage.
 	// One written all over, or where not known, goes up whole anyway.)
-	if (!PartialDirtyCandidate(image) || !image.registered || !image.IsTracked() ||
-	    image.track_addr != info.data.address || image.track_addr_end != info.data.End() ||
-	    !image.CanTakePartialDirty() || (image.IsBufferModified() && image.BufferModifiedRanges().empty()) ||
-	    image.IsStencilModified()) {
+	return PartialDirtyCandidate(image) && image.registered && image.IsTracked() &&
+	       image.track_addr == info.data.address && image.track_addr_end == info.data.End() &&
+	       image.CanTakePartialDirty() && !(image.IsBufferModified() && image.BufferModifiedRanges().empty()) &&
+	       !image.IsStencilModified();
+}
+
+bool TextureCache::TryInvalidatePartial(Image& image, uint64_t address, uint64_t size,
+                                        uint64_t granule) {
+	const auto& info = image.info;
+	if (!TakesPartialDirty(image)) {
 		return false;
 	}
 	const auto base  = info.data.address;
@@ -1242,8 +1251,12 @@ bool TextureCache::TryInvalidatePartial(Image& image, uint64_t address, uint64_t
 	const auto page_end   = (granule_end + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 	// The released pages are dirty wherever they hold image bytes.
 	image.InvalidateCpuWritePartial(std::max(page_begin, base), std::min(page_end, info.data.End()));
-	UntrackImagePages(image, page_begin, page_end);
-	LiveCounters::Add(LiveCounters::PartialDirtyFaults);
+	// Counted where it released pages only: a write fault into a granule already released (the fault being another
+	// watcher's, a buffer's) marked it again and counted again (in a partial-dirty storm the counter then read about
+	// the write faults' count).
+	if (UntrackImagePages(image, page_begin, page_end)) {
+		LiveCounters::Add(LiveCounters::PartialDirtyFaults);
+	}
 	return true;
 }
 
@@ -4867,14 +4880,85 @@ TextureCache::ReadOnlyBufferOverlap TextureCache::ClassifyReadOnlyBufferOverlap(
 	return images.empty() ? ReadOnlyBufferOverlap::None : ReadOnlyBufferOverlap::CpuSampled;
 }
 
+namespace {
+
+// [begin, end) inside the union of sorted, disjoint [first, second) ranges.
+[[nodiscard]] bool RangesCover(const std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t begin,
+                               uint64_t end) {
+	for (const auto& [from, to]: ranges) {
+		if (begin >= end) break;
+		if (to <= begin) continue;
+		if (from > begin) return false;
+		begin = to;
+	}
+	return begin >= end;
+}
+
+} // namespace
+
+// KYTY_WRITE_WINDOW_IMAGES (live write_window_images; -1, the default: on under KYTY_SPECULATE=4; 1 on, 0 off). A buffer the CPU
+// rewrites every frame under a large image's released granule (the shadow-map pool's free layers stay released until a
+// binding covers them, RefreshDepthLayers) faulted one page at a time every frame: any image over the window refused it
+// (~1 boot in 6: 150-380 write faults a frame, ~1 ms). An image lets the window through when a write into it would take it
+// partially, every window page holding its bytes is among its released holes (it watches none of them) and its bytes
+// there are already dirty: the window hides no write from it and marks nothing of it dirty that was not (the bytes the GPU
+// rendered stay outside its dirty ranges). Off: any image refuses.
+bool TextureCache::WriteWindowPassesImages(const ImageIds& images, uint64_t begin, uint64_t size) const {
+	static auto& on    = LiveSwitch::Find("write_window_images", -1);
+	const int64_t mode = on.load(std::memory_order_relaxed);
+	if (mode == 0 || (mode < 0 && ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4)) {
+		return false;
+	}
+	const auto end = begin + size;
+	for (const auto id: images) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr) {
+			continue;
+		}
+		const auto& info = image->info;
+		if (!TakesPartialDirty(*image)) {
+			return false;
+		}
+		const auto page_begin = std::max(begin, info.data.address & ~(TRACKER_PAGE_SIZE - 1));
+		const auto page_end   = std::min(end, (info.data.End() + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1));
+		if (page_begin >= page_end || !RangesCover(image->untracked_holes, page_begin, page_end)) {
+			return false;
+		}
+		const auto byte_begin = std::max(begin, info.data.address);
+		const auto byte_end   = std::min(end, info.data.End());
+		if (byte_begin >= byte_end || !image->IsPartiallyCpuDirty() ||
+		    !RangesCover(image->CpuDirtyRanges(), byte_begin, byte_end)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// The CPU-dirty notice a write fault into their released pages gave (validity, the CPU-dirty epoch): the ranges are dirty
+// already (WriteWindowPassesImages, under the same lock), so they do not change.
+void TextureCache::NoteWriteWindowImages(const ImageIds& images, uint64_t begin, uint64_t size) {
+	for (const auto id: images) {
+		auto* image = m_slot_images.try_get(id);
+		if (image == nullptr) {
+			continue;
+		}
+		const auto& info = image->info;
+		image->InvalidateCpuWritePartial(std::max(begin, info.data.address), std::min(begin + size, info.data.End()));
+	}
+}
+
 bool BufferCache::TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size) {
 	if (!GuestRange {begin, size}.Valid()) return false;
 	// Follow image -> buffer-region -> page lock order. Hold the image lock
 	// through invalidation so registration cannot introduce an alias in between.
 	std::unique_lock lock(m_texture_cache.m_lock);
-	if (!m_texture_cache.FindImagesInRegion(begin, size, true).empty()) return false;
+	// (An image over the window refuses it, but with write_window_images one partially dirty there that watches none of
+	// its pages: TextureCache::WriteWindowPassesImages.)
+	const auto images = m_texture_cache.FindImagesInRegion(begin, size, true);
+	if (!images.empty() && !m_texture_cache.WriteWindowPassesImages(images, begin, size)) return false;
 	// (Nor a page a pending image download holds: its write fault goes to the texture cache, which lets it go.)
 	if (m_texture_cache.HasPendingDownload(begin, size)) return false;
+	if (!images.empty()) m_texture_cache.NoteWriteWindowImages(images, begin, size);
 	// Registration takes the image lock and then this region lock, so handing the image
 	// lock over once the region lock is held keeps the check and the state change atomic
 	// for it, while the page protection change no longer blocks image lookups.
