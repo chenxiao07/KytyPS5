@@ -2792,6 +2792,24 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSpec(Spec::State& spec, ui
 			if (is_written) spec.NoteWritten(vaddr, size);
 			return {nullptr, 0};
 		}
+		// spec_ring_index (under KYTY_SPECULATE=4 only): an index range no buffer holds yet, served from the speculation's
+		// ring as the small range above is, and posted ahead for the GPU thread to register (an area change: ~220 index
+		// lookup holes in one frame, each cutting a segment).
+		if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && !is_written && !is_texel_buffer &&
+		    t_ahead_site == 3 && size <= (uint64_t {4} << 20u) &&
+		    !IsRegionGpuModified(vaddr, size) && m_memory_tracker.IsRegionCpuModified(vaddr, size) &&
+		    !spec.JournalIntersects(vaddr, size) && !spec.WrittenIntersects(vaddr, size)) {
+			auto&      upload    = GetShaderUploadBuffer();
+			const auto alignment = std::max<uint64_t>(
+			    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 4);
+			auto [mapped, offset] = upload.Map(size, alignment, false);
+			if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(vaddr, mapped, size)) {
+				upload.Commit();
+				spec.NoteCleanRead(vaddr, size);
+				PostAhead(vaddr, size);
+				return {&upload, offset};
+			}
+		}
 		PostAhead(vaddr, size);
 		return Spec::Refuse("buffer lookup"), std::pair<Buffer*, uint64_t> {nullptr, 0};
 	}
