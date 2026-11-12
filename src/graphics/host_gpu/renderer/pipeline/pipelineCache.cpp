@@ -698,7 +698,9 @@ struct PipelineCache::ProgramCache {
 	// completion. Per thread (spec_worker_sets: a speculation's set build looks programs up beside the GPU
 	// thread; each reads the answer of its own lookup).
 	static inline thread_local bool                                     table_pending = false;
-	static inline thread_local std::shared_ptr<const std::atomic<bool>> table_waiting;
+	// (Defined out of the class, below: an inline thread_local shared_ptr member made lld-link fail an instrumented
+	// ThinLTO build with "Associative COMDAT symbol ... table_waiting".)
+	static thread_local std::shared_ptr<const std::atomic<bool>> table_waiting;
 
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
@@ -2762,6 +2764,7 @@ struct PipelineCache::ProgramCache {
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 };
+thread_local std::shared_ptr<const std::atomic<bool>> PipelineCache::ProgramCache::table_waiting;
 
 // A pipeline a CompileWorkers thread creates; `done` publishes the finished object.
 struct PipelineCache::PendingComputePipeline {
