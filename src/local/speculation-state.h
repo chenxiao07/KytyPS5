@@ -454,7 +454,8 @@ struct State {
 	std::vector<MemoryWrite>                 writes;
 	std::vector<std::pair<Image*, uint64_t>> touched_images; // and the serial
 	// spec_worker_sets: the image sets this speculation built itself (RenderExecutor::TableResolveSet,
-	// read only), by the catalog's pair and the words' hash; `segment`: the open segment then. Published into the
+	// read only), by the catalog's pair and the words' hash; `segment`: the open segment then (or, when that one was
+	// re-run as a hole, the segment after: Speculation::CommitSegments). Published into the
 	// catalog when a segment from it on is committed (Speculation::After: settle(true)); else kept aside, never freed (a
 	// draw that holds one may still be recorded): settle(false) when the record is cleared.
 	struct ProposedSet {
