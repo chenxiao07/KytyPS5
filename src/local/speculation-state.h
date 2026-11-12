@@ -33,6 +33,7 @@
 #include <deque>
 #include <functional>
 #include <immintrin.h>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -252,6 +253,16 @@ inline bool ReadOneSetOn() {
 // draw).
 inline bool InheritLazyOn() {
 	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+}
+// Live owner_index (KYTY_OWNER_INDEX; -1, the default: on under KYTY_SPECULATE=4; 1 on, 0 off): State::Inherit also
+// builds the chain's owners by range (for each range a state of the chain journals or writes, the nearest such state), so
+// ReadWord and ReadCopyRun find the state their walk would stop at with one search and a check of the links to it, in
+// place of two RangeSet searches a state walked (~49 chain steps a draw at a spike). Read at Inherit: a flip takes effect
+// at the next speculation.
+inline bool OwnerIndexOn() {
+	static auto& on = LiveSwitch::Find("owner_index", -1);
+	const auto   v  = on.load(std::memory_order_relaxed);
+	return v > 0 || (v < 0 && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4);
 }
 // KYTY_SPEC_READ_ONE_SET_VERIFY (live spec_read_one_set_verify N, default 0): every Nth read pending_set clears also put
 // through the four searches, a disagreement counted (spec_one_set_mismatch; State::VerifyOneSet).
@@ -516,6 +527,15 @@ struct State {
 	// state's Inherit takes this one's union when its chain beyond this one is still these, in order.
 	std::vector<const State*> chain_members;
 	bool                      chain_ready = false;
+	// (owner_index) The chain's owners by range as Inherit found it: sorted, disjoint spans, each the depth in
+	// chain_members (0: `previous`) of the nearest state whose journal_set or written_set covers it. Those sets no
+	// longer change (see Inherit); a link that changed since is caught at the lookup (IndexedState). Ready: built.
+	struct OwnerSpan {
+		uint64_t begin = 0, end = 0;
+		uint32_t depth = 0;
+	};
+	std::vector<OwnerSpan> owner_index;
+	bool                   owner_index_ready = false;
 	// The granules of journal_set, written_set, chain_journal and chain_written (a look before their searches).
 	GranuleFilter pending;
 	// KYTY_SPEC_READ_ONE_SET: those four sets in one, kept as they grow (they only grow until Inherit or Clear), so a
@@ -587,10 +607,11 @@ struct State {
 		for (const State* state = previous.load(); state != nullptr; state = state->previous.load()) chain.push_back(state);
 		one_set = ReadOneSetOn();
 		const State* before = chain.empty() ? nullptr : chain.front();
-		const bool   fast   = InheritLazyOn() && before != nullptr && before->chain_ready &&
-		                   before->chain_members.size() + 1 == chain.size() &&
-		                   std::equal(before->chain_members.begin(), before->chain_members.end(), chain.begin() + 1) &&
-		                   (!one_set || before->one_set);
+		// (The chain beyond the state before it still the one that state inherited: compared only for a switch that uses it.)
+		const bool   beyond_same = (InheritLazyOn() || OwnerIndexOn()) && before != nullptr && before->chain_ready &&
+		                         before->chain_members.size() + 1 == chain.size() &&
+		                         std::equal(before->chain_members.begin(), before->chain_members.end(), chain.begin() + 1);
+		const bool   fast = InheritLazyOn() && beyond_same && (!one_set || before->one_set);
 		// (Today's merge, over the chain walked above.)
 		const auto merge_all = [&](RangeSet& journal, RangeSet& written, RangeSet& merged, GranuleFilter* filter) {
 			journal.Clear();
@@ -622,6 +643,84 @@ struct State {
 		}
 		chain_members.assign(chain.begin(), chain.end());
 		chain_ready = true;
+		owner_index.clear();
+		owner_index_ready = false;
+		if (OwnerIndexOn() && !chain.empty()) {
+			BuildOwnerIndex(chain, beyond_same && before->owner_index_ready ? before : nullptr);
+			owner_index_ready = true;
+		}
+	}
+	// (owner_index) `from`: the state before it, whose index holds exactly the chain beyond it (one level deeper here):
+	// its spans under its own sets' (depth 0). Null: built from the whole chain, nearest first, each state's ranges
+	// where no nearer state's are.
+	void BuildOwnerIndex(const std::vector<const State*>& chain, const State* from) {
+		thread_local std::vector<OwnerSpan> mine, pieces, merged;
+		const auto spans_of = [&](const State& state, uint32_t depth) {
+			mine.clear();
+			state.journal_set.ForEach([&](uint64_t begin, uint64_t end) { mine.push_back({begin, end, depth}); });
+			state.written_set.ForEach([&](uint64_t begin, uint64_t end) { mine.push_back({begin, end, depth}); });
+			std::sort(mine.begin(), mine.end(), [](const OwnerSpan& a, const OwnerSpan& b) { return a.begin < b.begin; });
+			size_t kept = 0;
+			for (const auto& span: mine) {
+				if (kept != 0 && span.begin <= mine[kept - 1].end) mine[kept - 1].end = std::max(mine[kept - 1].end, span.end);
+				else mine[kept++] = span;
+			}
+			mine.resize(kept);
+		};
+		// out = top, and bottom's spans (depth + add) where top has none.
+		const auto under = [&](const std::vector<OwnerSpan>& top, const std::vector<OwnerSpan>& bottom, uint32_t add,
+		                       std::vector<OwnerSpan>& out) {
+			pieces.clear();
+			size_t j = 0;
+			for (const auto& span: bottom) {
+				uint64_t at = span.begin;
+				while (j < top.size() && top[j].end <= at) ++j;
+				for (size_t k = j; k < top.size() && top[k].begin < span.end; ++k) {
+					if (top[k].begin > at) pieces.push_back({at, top[k].begin, span.depth + add});
+					at = std::max(at, top[k].end);
+				}
+				if (at < span.end) pieces.push_back({at, span.end, span.depth + add});
+			}
+			out.clear();
+			std::merge(top.begin(), top.end(), pieces.begin(), pieces.end(), std::back_inserter(out),
+			           [](const OwnerSpan& a, const OwnerSpan& b) { return a.begin < b.begin; });
+		};
+		if (from != nullptr) {
+			spans_of(*from, 0);
+			under(mine, from->owner_index, 1, owner_index);
+			return;
+		}
+		owner_index.clear();
+		for (uint32_t depth = 0; depth < chain.size(); ++depth) {
+			spans_of(*chain[depth], depth);
+			under(owner_index, mine, 0, merged);
+			owner_index.swap(merged);
+		}
+	}
+	// (owner_index) The state the chain walk from `previous` stops at for [address, address + bytes) (the first whose
+	// journal_set or written_set intersects it), from the index: the nearest span's depth, the links from here to it
+	// still those Inherit found (the states nearer have none of their sets over it: they do not change). Null: no index,
+	// no span over it, or a link changed (unlinked or relinked to a record since): the walk decides.
+	[[nodiscard]] const State* IndexedState(uint64_t address, uint64_t bytes) const {
+		if (!owner_index_ready) return nullptr;
+		const uint64_t end   = address + bytes;
+		uint32_t       depth = UINT32_MAX;
+		for (auto it = std::upper_bound(owner_index.begin(), owner_index.end(), address,
+		                                [](uint64_t at, const OwnerSpan& span) { return at < span.end; });
+		     it != owner_index.end() && it->begin < end; ++it)
+			depth = std::min(depth, it->depth);
+		if (depth == UINT32_MAX) {
+			return nullptr;
+		}
+		const State* state = previous.load();
+		for (uint32_t k = 0;; ++k) {
+			if (state != chain_members[k]) {
+				return nullptr;
+			}
+			if (k == depth) break;
+			state = state->previous.load();
+		}
+		return state;
 	}
 	// An image as the latest speculation before it leaves it (null: none used it).
 	[[nodiscard]] const ImageEntry* ChainImage(const Image* image, uint64_t serial) const {
@@ -859,9 +958,19 @@ struct State {
 		if (journal_set.Intersects(at, 4)) return Resolve(*this, at, value, by);
 		if (written_set.Intersects(at, 4)) return false;
 		if (chain_journal.Intersects(at, 4)) {
-			for (const State* state = previous.load(); state != nullptr; state = state->previous.load()) {
+			// (owner_index: the state the walk below stops at, found by the index; neither set over it cannot happen
+			// there, the walk decides then.)
+			if (const State* state = IndexedState(at, 4); state != nullptr) {
 				if (state->journal_set.Intersects(at, 4)) return Resolve(*state, at, value, by);
 				if (state->written_set.Intersects(at, 4)) return false;
+			}
+			for (const State* state = previous.load(); state != nullptr; state = state->previous.load()) {
+				if (state->journal_set.Intersects(at, 4)) {
+					return Resolve(*state, at, value, by);
+				}
+				if (state->written_set.Intersects(at, 4)) {
+					return false;
+				}
 			}
 			// (Its speculation or record unlinked since it began: a late read, the log's end taken before it.)
 			if (log_end != nullptr && LateReads() && !chain_written.Intersects(at, 4))
@@ -884,9 +993,20 @@ struct State {
 			owner = this;
 		} else {
 			if (written_set.Intersects(address, bytes) || !chain_journal.Intersects(address, bytes)) return Run::NotOne;
-			for (const State* state = previous.load(); state != nullptr && owner == nullptr; state = state->previous.load()) {
+			// (owner_index: the state the walk below stops at, found by the index; neither set over it cannot happen
+			// there, the walk decides then.)
+			bool decided = false;
+			if (const State* state = IndexedState(address, bytes); state != nullptr) {
 				if (state->written_set.Intersects(address, bytes)) return Run::NotOne;
-				if (state->journal_set.Intersects(address, bytes)) owner = state;
+				if (state->journal_set.Intersects(address, bytes)) owner = state, decided = true;
+			}
+			if (!decided) {
+				for (const State* state = previous.load(); state != nullptr && owner == nullptr; state = state->previous.load()) {
+					if (state->written_set.Intersects(address, bytes)) {
+						return Run::NotOne;
+					}
+					if (state->journal_set.Intersects(address, bytes)) owner = state;
+				}
 			}
 			if (owner == nullptr) return Run::NotOne;
 		}
@@ -1012,6 +1132,8 @@ struct State {
 		chain_written.Clear();
 		chain_members.clear();
 		chain_ready = false;
+		owner_index.clear();
+		owner_index_ready = false;
 		pending.Clear();
 		pending_set.Clear();
 		one_set = ReadOneSetOn();
