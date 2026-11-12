@@ -16,6 +16,8 @@
 //   timecensus <seconds>          time-related HLE calls per guest caller (time-census.h)
 //   glide <x> <y> <z> <speed>     Demon's Souls 01.007.000: the player walks there (warp requests, no input)
 //   pad <lx> <ly> <rx> <ry> <buttons> <seconds>   scripted pad input (sticks 0..255, -1 the host's; buttons hex)
+//   where / place <x> <y> <z> <yaw>   the player's position and yaw / the player put there (tools/local/SPIKE-WALK.md)
+//   flipsx <count> <path>         as flips, with the buffer registrations of each frame
 //   screenshot <path>             the next frame shown, read back from the GPU, as a PPM file (screenshot.h)
 //   screenshots <path> <count>    the next <count> frames shown, 320 pixels wide, in one file (the flicker check)
 //   set <name> <value>            a live switch (live-switch.h), e.g. fsr_jitter_mode 1
@@ -78,6 +80,9 @@ inline std::atomic_uint64_t g_flips {0};
 // The steady-clock time (ns) of flip n at [n % FlipTimes], for frame-time percentiles (Measure).
 constexpr size_t             FlipTimes = 8192;
 inline std::atomic<int64_t>  g_flip_times[FlipTimes] {};
+// The buffer registrations counter at flip n at [n % FlipTimes] (live `flipsx`: the spike walk's crossing frame,
+// tools/local/SPIKE-WALK.md). Two relaxed loads and a store a flip.
+inline std::atomic<uint64_t> g_flip_registrations[FlipTimes] {};
 inline std::atomic_bool     g_render_known {false};
 // pthread_t on Linux, a thread HANDLE on Windows (LocalPlatform::CurrentThreadHandle).
 inline uint64_t              g_render_thread {};
@@ -110,6 +115,8 @@ inline void Flip() {
 	                         std::chrono::steady_clock::now().time_since_epoch())
 	                         .count();
 	g_flip_times[flip % FlipTimes].store(flip_ns, std::memory_order_relaxed);
+	g_flip_registrations[flip % FlipTimes].store(LiveCounters::Value(LiveCounters::BufferRegistrations),
+	                                             std::memory_order_relaxed);
 	g_flips.store(flip + 1, std::memory_order_release);
 	// (KYTY_FPS_HUD's frame-time graph: the frame and the render thread's busy part of it.)
 	PerfOverlay::NoteFlip(flip_ns, g_render_idle_ns);
@@ -394,7 +401,24 @@ inline void Run(uint64_t id, const std::string& line) {
 				                                                    g_flip_times[(flip - 1) % FlipTimes].load()) / 1000));
 			std::fclose(out);
 		}
-		std::printf("LIVE_FLIPS id=%" PRIu64 " count=%llu path=%s\n", id, static_cast<unsigned long long>(count), arg2);
+		std::printf("LIVE_FLIPS id=%" PRIu64 " count=%llu last=%llu path=%s\n", id, static_cast<unsigned long long>(count),
+		            static_cast<unsigned long long>(last), arg2);
+	} else if (cmd == "flipsx" && n == 3) {
+		// flipsx <count> <path>: as flips, each line the interval (us) and the buffer registrations in it; a header first.
+		const auto last  = g_flips.load();
+		const auto count = std::min<uint64_t>({std::strtoull(arg1, nullptr, 10), FlipTimes - 1, last ? last - 1 : 0});
+		if (auto* out = std::fopen(arg2, "w")) {
+			std::fprintf(out, "frame_us buffer_registrations\n");
+			for (auto flip = last - count; flip < last; ++flip)
+				std::fprintf(out, "%lld %llu\n",
+				             static_cast<long long>((g_flip_times[flip % FlipTimes].load() -
+				                                     g_flip_times[(flip - 1) % FlipTimes].load()) / 1000),
+				             static_cast<unsigned long long>(g_flip_registrations[flip % FlipTimes].load() -
+				                                             g_flip_registrations[(flip - 1) % FlipTimes].load()));
+			std::fclose(out);
+		}
+		std::printf("LIVE_FLIPSX id=%" PRIu64 " count=%llu last=%llu path=%s\n", id, static_cast<unsigned long long>(count),
+		            static_cast<unsigned long long>(last), arg2);
 	} else if ((cmd == "prof" || cmd == "profp" || cmd == "profw") && n == 3) {
 		Profile(id, std::strtod(arg1, nullptr), arg2, cmd == "profp", cmd == "profw");
 	} else if (cmd == "profbg" && n == 3) {
@@ -665,7 +689,9 @@ inline void Run(uint64_t id, const std::string& line) {
 		const bool   parsed  = std::sscanf(line.c_str(), "%*s %d %d %d %d %x %lf", &axes[0], &axes[1], &axes[2], &axes[3],
 		                                   &buttons, &seconds) == 6;
 		if (parsed) Libs::Controller::SetScriptedInput(axes[0], axes[1], axes[2], axes[3], buttons, seconds);
-		std::printf("LIVE_PAD id=%" PRIu64 " ok=%d\n", id, parsed ? 1 : 0);
+		// (flip: the flip count when the input was set, so a reader places it on a flips dump's last=.)
+		std::printf("LIVE_PAD id=%" PRIu64 " ok=%d flip=%llu\n", id, parsed ? 1 : 0,
+		            static_cast<unsigned long long>(g_flips.load(std::memory_order_relaxed)));
 	} else if (cmd == "touch" && n >= 3) {
 		// touch X Y [SECONDS]: the touch pad clicked with a finger at X, Y (0..1 of its width and height) for SECONDS
 		// (0.2 by default), as the keyboard's Backspace and Tab click it (hostInput.cpp).
@@ -716,6 +742,18 @@ inline void Run(uint64_t id, const std::string& line) {
 			ok    = SDL_JoystickDetachVirtual(s_index) == 0;
 		}
 		std::printf("LIVE_VPAD id=%" PRIu64 " %s ok=%d\n", id, arg1, ok ? 1 : 0);
+	} else if (cmd == "where") {
+		// where: the player's position and body yaw (radians: atan2(-dx, -dz); loader/demonsSoulsWarp.h).
+		float      xyz[3] {}, yaw = 0;
+		const bool ok = Loader::DemonsSoulsWarp::PlayerPlace(xyz, &yaw);
+		std::printf("LIVE_WHERE id=%" PRIu64 " ok=%d x=%.4f y=%.4f z=%.4f yaw=%.5f\n", id, ok ? 1 : 0, xyz[0], xyz[1], xyz[2],
+		            yaw);
+	} else if (cmd == "place") {
+		// place X Y Z YAW: the player put there facing YAW (radians), the next frame (loader/demonsSoulsWarp.h).
+		float      x = 0, y = 0, z = 0, yaw = 0;
+		const bool parsed = std::sscanf(line.c_str(), "%*s %f %f %f %f", &x, &y, &z, &yaw) == 4;
+		const bool ok     = parsed && Loader::DemonsSoulsWarp::Place(x, y, z, yaw);
+		std::printf("LIVE_PLACE id=%" PRIu64 " ok=%d x=%.4f y=%.4f z=%.4f yaw=%.5f\n", id, ok ? 1 : 0, x, y, z, yaw);
 	} else if (cmd == "fatal") {
 		// fatal: a fatal error on this thread, the path a crash takes (log, then the process ends).
 		EXIT("live fatal: a test of the fatal-error exit\n");

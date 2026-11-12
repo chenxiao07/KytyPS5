@@ -32,6 +32,10 @@ void     RecordWaypoint();
 uint32_t RecordedWaypoints();
 // The player's position and yaw (01.007.000; false: another build, or no character loaded).
 bool PlayerPlace(float xyz[3], float* yaw);
+// Live `place X Y Z YAW` (the spike walk's start, tools/local/SPIKE-WALK.md): the player put there facing YAW (radians,
+// the body's: atan2(-dx, -dz)) by the game's warp request, applied the next frame; false: no player, another build. The
+// camera stays where it was: the recipe resets it behind the player (the pad's R3 with nothing to lock on).
+bool Place(float x, float y, float z, float yaw);
 // A line in the panel (HudText) for `seconds`.
 void ShowNotice(std::string message, int seconds);
 // Live `glide X Y Z SPEED` (01.007.000, automated tours): the player moved there in a straight line at SPEED m/s by the
