@@ -480,6 +480,26 @@ LauncherContext::LauncherContext() {
 	mangohud_       = Platform::HasProgram("mangohud");
 }
 
+fs::path LauncherContext::Fsr4Folder() const {
+	std::vector<fs::path> folders;
+	if (const char* dir = std::getenv("KYTY_FSR4_DIR"); dir != nullptr && *dir != 0) {
+		folders.emplace_back(dir);
+	} else if (!emulator.empty()) {
+		// (The emulator looks next to its real file.)
+		std::error_code error;
+		const auto      real = fs::canonical(emulator, error);
+		const auto      dir  = (error ? emulator : real).parent_path();
+		folders.push_back(dir);
+		folders.push_back(dir / "fsr4");
+	}
+	for (const auto& folder: folders) {
+		if (Exists(folder / "libffx_vk_linux.so") && Exists(folder / "amdvkffx64.dll") &&
+		    (Exists(folder / "amd_fidelityfx_loader_vk.dll") || Exists(folder / "amd_fidelityfx_upscaler_vk.dll")))
+			return folder;
+	}
+	return {};
+}
+
 fs::path LauncherContext::DlssLibrary() const {
 	std::vector<fs::path> folders;
 	if (const char* dir = std::getenv("KYTY_DLSS_DIR"); dir != nullptr && *dir != 0) {

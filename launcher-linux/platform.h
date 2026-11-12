@@ -51,6 +51,11 @@ public:
 	// or empty.
 	[[nodiscard]] fs::path DlssLibrary() const;
 	[[nodiscard]] bool     DlssAvailable() const { return rtx && !DlssLibrary().empty(); }
+	// The folder holding everything FSR 4 needs where the emulator looks (KYTY_FSR4_DIR, next to it, its fsr4 folder):
+	// libffx_vk_linux.so (get-fsr4-linux.sh) and AMD's DLLs (amd_fidelityfx_loader_vk.dll or
+	// amd_fidelityfx_upscaler_vk.dll, and amdvkffx64.dll: the user's own), or empty.
+	[[nodiscard]] fs::path Fsr4Folder() const;
+	[[nodiscard]] bool     Fsr4Available() const { return amd && !Fsr4Folder().empty(); }
 	// The terminal chosen on the Advanced page, else the first found; nullptr without one.
 	[[nodiscard]] const Terminal* ChosenTerminal() const;
 	[[nodiscard]] fs::path        LogsFolder() const;

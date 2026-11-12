@@ -503,6 +503,37 @@ SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/Exa
 Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and
 debugging options.
 
+### FSR 4 on Linux (AMD Radeon, experimental)
+
+On Linux the emulator's FSR upscaler is FSR 3, built in. FSR 4 (FSR Upscaling 4.1.2, which AMD's FSR SDK 2.4 brought to
+Vulkan, with an INT8 model for the RX 6000 series) is only shipped as signed Windows DLLs, so it is run natively by
+[ffx-vk-linux](https://github.com/DuIslingr/ffx-vk-linux) (MIT: a small PE loader, no Wine). The DLLs are yours to
+supply: AMD's licence allows redistribution in binary form only, so nothing of AMD's is in this repository or its
+packages.
+
+1. `./get-fsr4-linux.sh` checks out and builds ffx-vk-linux under `_Build/deps` and puts `libffx_vk_linux.so` in
+   `_Build/linux/fsr4` (it needs the development packages of Vulkan, OpenSSL, libdrm with libdrm_amdgpu and
+   SPIRV-Tools; the top of the script lists them).
+2. Copy into the same `fsr4` folder `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` (FSR SDK 2.4,
+   `Kits/FidelityFX/signedbin`) and `amdvkffx64.dll` (from AMD's Windows Adrenalin driver, which carries the FSR 4 model).
+3. Build the emulator again (`./build-linux.sh`; CMake finds `_Build/deps/ffx-vk-linux` and says "FSR 4 on Linux:
+   ffx-vk-linux headers found").
+4. Choose **FSR 4** as the upscaler in the launcher, or run with `KYTY_UPSCALER=fsr KYTY_FSR4=1`.
+
+`get-fsr4-linux.sh` builds one fixed ffx-vk-linux commit (`PINNED_REF` in the script: the one the OpenSSL 4 patch in
+`tools/local/fsr4/` was made against and that was built with the emulator), so what is built does not change under you;
+`FFX_VK_LINUX_REF=<commit, tag or branch>` tries another one (untested, and the patch may not apply). The release
+packages are built without ffx-vk-linux, so FSR 4 needs a build from source: with `KYTY_FSR4` set they say "FSR 4: this
+build was made without ffx-vk-linux ..." and use FSR 3.
+
+The log says which one runs ("Super resolution: AMD FSR 4 ..."). When FSR 4 cannot start (library or DLLs missing, a GPU
+the DLLs do not take, a failed context) it says why and FSR 3 built in takes over. `KYTY_FSR4_DIR` names another folder
+for the library and the DLLs. `KYTY_FSR_DEBUG=1` adds AMD's own messages. ffx-vk-linux was tested on an RX 7900 XTX with
+Mesa RADV (SDK 2.4.0, Adrenalin 26.10.1) and is itself marked experimental: other Radeon generations, including RDNA 2,
+are untested there. With `KYTY_FSR4=1` the Vulkan device also enables float16/int8 arithmetic, the integer dot product,
+storage-image reads without a format and compute shader derivatives where the GPU has them, which a device made without
+the variable does not.
+
 ### AI Use
 
 AI tools may be used for research, reverse engineering, and development assistance. Contributors

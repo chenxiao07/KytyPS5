@@ -474,6 +474,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/anti-lag.cpp"
 	"${KYTY_SOURCE_DIR}/local/fsr-native.h"
 	"${KYTY_SOURCE_DIR}/local/fsr-native.cpp"
+	"${KYTY_SOURCE_DIR}/local/fsr4-linux.h"
+	"${KYTY_SOURCE_DIR}/local/fsr4-linux.cpp"
 	"${KYTY_SOURCE_DIR}/local/perf-overlay.h"
 	"${KYTY_SOURCE_DIR}/local/perf-overlay.cpp"
 	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.h"
@@ -994,6 +996,24 @@ elseif (LINUX)
 	# code.
 	set_property(SOURCE "${KYTY_SOURCE_DIR}/local/frame-gen.cpp" APPEND PROPERTY
 	             COMPILE_DEFINITIONS KYTY_FRAMEGEN_NGX=1)
+	# FSR 4 (KYTY_FSR4=1, src/local/fsr4-linux.h): AMD's Windows FSR SDK 2.4 DLLs run natively by ffx-vk-linux
+	# (github.com/DuIslingr/ffx-vk-linux, MIT), the library loaded at run time (dlopen): only its headers, and AMD's API
+	# headers it carries (MIT), are used here. get-fsr4-linux.sh checks it out under _Build/deps and builds the library.
+	# The DLLs are the user's, never part of the repository.
+	set(KYTY_FFX_VK_LINUX "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/ffx-vk-linux" CACHE PATH
+	    "ffx-vk-linux checkout (its include and third_party/ffx headers) for FSR 4 on Linux")
+	if (EXISTS "${KYTY_FFX_VK_LINUX}/include/ffx_vk_linux.h" AND
+	    EXISTS "${KYTY_FFX_VK_LINUX}/third_party/ffx/api/include/ffx_api.h")
+		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/fsr4-linux.cpp" APPEND PROPERTY
+		             INCLUDE_DIRECTORIES "${KYTY_FFX_VK_LINUX}/include"
+		             "${KYTY_FFX_VK_LINUX}/third_party/ffx/api/include"
+		             "${KYTY_FFX_VK_LINUX}/third_party/ffx/upscalers/include")
+		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/fsr4-linux.cpp" APPEND PROPERTY
+		             COMPILE_DEFINITIONS KYTY_FSR4_LINUX=1)
+		message(STATUS "FSR 4 on Linux: ffx-vk-linux headers found in ${KYTY_FFX_VK_LINUX}")
+	else()
+		message(STATUS "FSR 4 on Linux: off (run get-fsr4-linux.sh, then configure again)")
+	endif()
 endif()
 
 clang_tidy_check(kyty_emulator "" "${check_headers}" "${inc_headers}")

@@ -1,0 +1,45 @@
+diff --git a/src/win32_security.cpp b/src/win32_security.cpp
+index e11a1f3..a2efcc1 100644
+--- a/src/win32_security.cpp
++++ b/src/win32_security.cpp
+@@ -166,7 +166,7 @@ bool verifyPeDigest(const PeFile& pe, PKCS7* p7) {
+     const auto* sequence = indirect->d.other->value.sequence;
+     const unsigned char *body = nullptr, *first = nullptr;
+     size_t bodySize = 0, firstSize = 0;
+-    if (!payload(sequence->data, sequence->length, body, bodySize) || !payload(body, bodySize, first, firstSize)) return false;
++    if (!payload(ASN1_STRING_get0_data(sequence), size_t(ASN1_STRING_length(sequence)), body, bodySize) || !payload(body, bodySize, first, firstSize)) return false;
+     const size_t firstTotal = size_t(first - body) + firstSize;
+     if (firstTotal >= bodySize) return false;
+     const unsigned char* cursor = body + firstTotal;
+@@ -200,8 +200,8 @@ bool verifyPeDigest(const PeFile& pe, PKCS7* p7) {
+     if (!add(hashed, pe.certificate) || !add(size_t(pe.certificate) + pe.certificateSize, pe.bytes.size())) return false;
+     std::array<unsigned char, EVP_MAX_MD_SIZE> actual{};
+     unsigned actualSize = 0;
+-    return EVP_DigestFinal_ex(hash.get(), actual.data(), &actualSize) == 1 && actualSize == unsigned(expected->length) &&
+-           CRYPTO_memcmp(actual.data(), expected->data, actualSize) == 0;
++    return EVP_DigestFinal_ex(hash.get(), actual.data(), &actualSize) == 1 && actualSize == unsigned(ASN1_STRING_length(expected)) &&
++           CRYPTO_memcmp(actual.data(), ASN1_STRING_get0_data(expected), actualSize) == 0;
+ }
+ std::unique_ptr<SignedFile> signedFile(const char16_t* path) {
+     PeFile pe;
+@@ -218,7 +218,7 @@ std::unique_ptr<SignedFile> signedFile(const char16_t* path) {
+     const auto* sequence = p7->d.sign->contents->d.other->value.sequence;
+     const unsigned char* body = nullptr;
+     size_t bodySize = 0;
+-    if (!result->signer || !payload(sequence->data, sequence->length, body, bodySize)) return {};
++    if (!result->signer || !payload(ASN1_STRING_get0_data(sequence), size_t(ASN1_STRING_length(sequence)), body, bodySize)) return {};
+     const EVP_MD* md = EVP_get_digestbyobj(si->digest_alg->algorithm);
+     if (!md) return {};
+     BIO* hash = BIO_new(BIO_f_md());
+@@ -236,9 +236,9 @@ std::unique_ptr<SignedFile> signedFile(const char16_t* path) {
+     if (n <= 0) return {};
+     result->issuer.assign(encoded, encoded + n); OPENSSL_free(encoded);
+     const ASN1_INTEGER* serial = X509_get0_serialNumber(result->signer);
+-    result->serial.assign(serial->data, serial->data + serial->length);
++    result->serial.assign(ASN1_STRING_get0_data(serial), ASN1_STRING_get0_data(serial) + ASN1_STRING_length(serial));
+     std::reverse(result->serial.begin(),result->serial.end()); // CRYPT_INTEGER_BLOB is little endian.
+-    X509_PUBKEY* spki = X509_get_X509_PUBKEY(result->signer);
++    const X509_PUBKEY* spki = X509_get_X509_PUBKEY(result->signer);
+     const unsigned char* key = nullptr;
+     int keySize = 0;
+     if (!X509_PUBKEY_get0_param(nullptr,&key,&keySize,nullptr,spki) || keySize <= 0) return {};
