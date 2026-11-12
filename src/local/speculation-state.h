@@ -906,8 +906,17 @@ struct State {
 		bda_all = checkpoint_bda_all;
 	}
 
+	// A translation's own number (never 0, never reused: Clear takes a new one), which the image sets it proposes carry
+	// (TableImageSet::proposer): another translation does not take them from a role's last / previous set.
+	[[nodiscard]] static uint64_t NextId() noexcept {
+		static std::atomic<uint64_t> next {0};
+		return next.fetch_add(1, std::memory_order_relaxed) + 1;
+	}
+	uint64_t id = NextId();
+
 	void Clear() {
 		command_begin = command_end = 0;
+		id            = NextId();
 		current.clear();
 		written.clear();
 		invalidated.clear();

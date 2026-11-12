@@ -108,6 +108,13 @@ struct RenderExecutor::TableImageSet {
 		vk::ImageLayout         layout  = vk::ImageLayout::eShaderReadOnlyOptimal;
 	};
 	std::vector<PendingImage> pending_images;
+	// A speculation's proposal (spec_worker_sets): the Spec::State::id of the translation that built it (0: the owner's),
+	// set before the set is reachable and never changed; `published` once the commit puts it in the catalog (under the
+	// catalog's write). Until then only that translation takes it from a role's last / previous set (TableSet): its
+	// pending slots are filled only if that translation commits the segment that proposed it (a worker's next translation
+	// bound a set its first one then forgot unfilled: null image slots).
+	uint64_t              proposer = 0;
+	std::atomic<bool>     published {false};
 	vk::DescriptorSet     set  = nullptr;
 	vk::DescriptorPool    pool = nullptr;
 	std::vector<Image>    images;
@@ -1071,6 +1078,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			set->ValidatedFrame(Role())  = set->validated_frame;
 			set->ResolutionEpoch(Role()) = set->resolution_epoch;
 			set->validated_frame         = UINT64_MAX; // (the owner proves it in full at its first use)
+			set->proposer                = spec->id;   // (before it is reachable: TableSet's foreign-proposal check)
 			auto* const raw      = set.get();
 			auto* const owner    = &Catalog();
 			auto* const target   = &pair;
@@ -1093,6 +1101,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 					                               if (table != nullptr && table->epoch == since) {
 						                               auto& slot = target->sets[words_hash];
 						                               if (!slot) {
+							                               (*holder)->published.store(true, std::memory_order_release);
 							                               slot = std::move(*holder);
 							                               return;
 						                               }
@@ -1102,6 +1111,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 							                               owner->NativeXprRetireSet(slot->pool, slot->set);
 							                               target->ClearSets();
 							                               ++table->epoch;
+							                               (*holder)->published.store(true, std::memory_order_release);
 							                               slot = std::move(*holder);
 							                               return;
 						                               }
@@ -1826,12 +1836,22 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 	const auto& words = table.words;
 	const auto  frame = m_context.FrameNumber();
 	auto*       set   = pair.LastSet(Role());
-	if (set == nullptr || set->words != words) {
+	// (A set another translation proposed and its commit has not published: not taken from these caches, which only the
+	// role's own translations fill: its pending slots are filled only if that translation commits its segment. Looked up
+	// again below: the catalog holds only published ones.)
+	const auto* const spec    = Spec::Current();
+	const auto        foreign = [spec](const TableImageSet* s) {
+		if (s == nullptr || s->proposer == 0 || (spec != nullptr && s->proposer == spec->id) ||
+		    s->published.load(std::memory_order_acquire))
+			return false;
+		return true;
+	};
+	if (set == nullptr || set->words != words || foreign(set)) {
 		auto* const last     = set;
 		auto* const previous = pair.PreviousSet(Role());
 		auto* const memo     = std::exchange(table.memo_set, nullptr); // (KYTY_TABLE_MEMO: the set the pair and key drew with)
 		const bool  verify   = std::exchange(table.memo_verify, false);
-		if (memo != nullptr && memo != last && !memo->refused && memo->words == words) {
+		if (memo != nullptr && memo != last && !memo->refused && memo->words == words && !foreign(memo)) {
 			set = memo;
 			// (KYTY_TABLE_MEMO_VERIFY: the set the words' lookup finds, read only; another one is taken as the full
 			// path would take it.)
@@ -1847,7 +1867,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 			}
 		// (The set before the last next, without the words' hash or the map's cold bucket and node.)
 		} else if ((kyty_local_table_mru.load(std::memory_order_relaxed) & 4u) != 0 && previous != nullptr && previous != last &&
-		    !previous->refused && previous->words == words) {
+		    !previous->refused && previous->words == words && !foreign(previous)) {
 			set = previous;
 		} else {
 			const auto found = pair.sets.find(XXH3_64bits(words.data(), words.size() * sizeof(uint32_t)));
