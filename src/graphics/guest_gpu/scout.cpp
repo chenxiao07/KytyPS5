@@ -39,6 +39,46 @@ namespace Libs::Graphics::Scout {
 
 namespace {
 
+// The words the render thread and the scout share, grouped by the thread that writes them and how often, each group on
+// cache lines no other variable shares (alignas(128): a struct's size is then a multiple of 128, the pair of 64-byte
+// lines the cores' adjacent-line prefetcher fetches together). Packed by declaration they shared two lines: the scout's
+// store at every draw it evaluated and every pause of its idle spin (Quiesce) and its ring tail took them from the
+// render thread's core, whose read of g_running at every command packet and loads of the ring head and the write clock
+// at every table draw then missed (1-1, 120 Hz cap: ~1.2% of the render thread's samples on those loads).
+struct alignas(128) RenderPosition {
+	std::atomic<uint64_t> render {0};    // the render thread's position (g_render), at every draw
+	std::atomic<uint64_t> ring_head {0}; // the tickets it has passed, at every draw
+};
+struct alignas(128) RenderFeed {
+	std::atomic<uint64_t> feed_tail {0}; // the submissions fed, at every submission (the idle scout's spin reads it)
+	std::atomic<uint32_t> wake {0};      // moves with each feed and the stop (the idle scout waits on it)
+};
+struct alignas(128) ScoutWritten {
+	std::atomic<uint64_t> ring_tail {0}; // the tickets made, at every ticket
+	std::atomic<uint64_t> feed_head {0}; // the submissions taken
+	std::atomic<uint64_t> quiescent {0}; // the retire clock at the scout's last quiescent point (Quiesce)
+};
+struct alignas(128) ReadMostly {
+	std::atomic<bool>     running {false}, stop {false};
+	std::atomic<uint64_t> retire_clock {0}; // moves when the render thread retires a view
+};
+struct alignas(128) RenderOwn {
+	uint64_t        render_sequence = 0;
+	uint32_t        render_count    = 0;
+	const uint32_t* render_packet   = nullptr;
+	uint64_t        known_tail      = 0;
+	uint64_t        version         = 0;
+};
+struct alignas(128) AnyWriter {
+	std::atomic<uint64_t> write_clock {0}; // NoteHostWrite's, from any thread
+};
+RenderPosition g_render_position;
+RenderFeed     g_render_feed;
+ScoutWritten   g_scout_written;
+ReadMostly     g_read_mostly;
+RenderOwn      g_render_own;
+AnyWriter      g_any_writer;
+
 // Submissions fed and not yet walked.
 struct FeedEntry {
 	uint64_t        sequence = 0;
@@ -48,21 +88,23 @@ struct FeedEntry {
 };
 constexpr uint64_t                 FeedEntries = 1024;
 std::array<FeedEntry, FeedEntries> g_feed;
-std::atomic<uint64_t>              g_feed_tail {0}, g_feed_head {0};
-std::atomic<uint32_t>              g_wake {0}; // moves with each feed and the stop (the idle scout waits on it)
+constexpr auto&                    g_feed_tail = g_render_feed.feed_tail;
+constexpr auto&                    g_feed_head = g_scout_written.feed_head;
+constexpr auto&                    g_wake      = g_render_feed.wake;
 
 // Tickets, in stream order; the scout stays at most Lead draws ahead of the render thread.
 constexpr uint64_t                RingSlots = 128;
 constexpr int64_t                 Lead      = 64;
 std::array<Ticket, RingSlots>     g_ring;
-std::atomic<uint64_t>             g_ring_tail {0}, g_ring_head {0};
+constexpr auto&                   g_ring_tail = g_scout_written.ring_tail;
+constexpr auto&                   g_ring_head = g_render_position.ring_head;
 
 // The render thread's position: its submission's sequence number << 24 | the draws it has reached in it. Its own
 // copies, and the packet of its current draw.
-std::atomic<uint64_t> g_render {0};
-uint64_t              g_render_sequence = 0;
-uint32_t              g_render_count    = 0;
-const uint32_t*       g_render_packet   = nullptr;
+constexpr auto& g_render          = g_render_position.render;
+constexpr auto& g_render_sequence = g_render_own.render_sequence;
+constexpr auto& g_render_count    = g_render_own.render_count;
+constexpr auto& g_render_packet   = g_render_own.render_packet;
 
 // Words the command processor wrote (direct-mapped by address, across frames). At KYTY_SCOUT=2 also the value each
 // held after its write (the GPU thread's only: CheckWait).
@@ -82,9 +124,9 @@ struct HostWrite {
 };
 constexpr uint64_t                  WriteEntries = 4096;
 std::array<HostWrite, WriteEntries> g_writes;
-std::atomic<uint64_t>               g_write_clock {0};
+constexpr auto&                     g_write_clock = g_any_writer.write_clock;
 // The ring's tail as the render thread last read it (the line the scout writes at every ticket).
-uint64_t                            g_known_tail = 0;
+constexpr auto&                     g_known_tail = g_render_own.known_tail;
 
 // The scout's reason for each draw it reached (Reason): submission << 40 | draw << 8 | reason, by the draw's number.
 constexpr size_t                              ReasonEntries = 4096;
@@ -94,11 +136,13 @@ std::array<std::atomic<uint64_t>, ReasonEntries> g_reasons {};
 // (4096 entries lost 8-14% of the evaluated draws to other pairs' views, by launch: the shaders' addresses differ.)
 constexpr size_t                                 DirectoryEntries = 65536;
 std::array<std::atomic<View*>, DirectoryEntries> g_directory {};
-std::atomic<uint64_t>                            g_retire_clock {0}, g_quiescent {0};
+constexpr auto&                                  g_retire_clock = g_read_mostly.retire_clock;
+constexpr auto&                                  g_quiescent    = g_scout_written.quiescent;
 std::vector<View*>                               g_retired;
-uint64_t                                         g_version = 0;
+constexpr auto&                                  g_version = g_render_own.version;
 
-std::atomic<bool>   g_running {false}, g_stop {false};
+constexpr auto&     g_running = g_read_mostly.running;
+constexpr auto&     g_stop    = g_read_mostly.stop;
 std::thread*        g_thread = nullptr; // (on the heap: a game-initiated exit() must not find a static one joinable; Stop() deletes it)
 GpuResourceManager* g_resources = nullptr;
 
@@ -144,7 +188,11 @@ bool TestValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
 }
 
 void Quiesce() {
-	g_quiescent.store(g_retire_clock.load(std::memory_order_seq_cst), std::memory_order_seq_cst);
+	// (Stored only when the clock moved: with no view retired since the last value published, the scout holds none the
+	// render thread could free, and the same value again frees nothing more. It was a store at every draw evaluated and
+	// every pause of the idle spin.)
+	const auto clock = g_retire_clock.load(std::memory_order_seq_cst);
+	if (g_quiescent.load(std::memory_order_relaxed) != clock) g_quiescent.store(clock, std::memory_order_seq_cst);
 }
 
 void FreeRetired() {
