@@ -3315,6 +3315,10 @@ void TextureCache::HoldLayers(ImageInfo& info, uint32_t& first) {
 			return;
 		}
 	}
+	// (A speculation's thread building an image set (spec_worker_sets) only reads: growing the image inserts, tracks,
+	// copies and uploads through the buffer cache's staging, all the GPU thread's. The set is refused; the GPU thread
+	// builds it and grows the image there.)
+	if (t_read_only) return ReadOnlyFail("worker set: hold layers");
 	// (Guest memory current before its bytes are uploaded, as FindImage does.)
 	m_buffer_cache.DrainGuestReadback(grown.data.address, grown.data.size);
 	std::scoped_lock lock {m_lock};
