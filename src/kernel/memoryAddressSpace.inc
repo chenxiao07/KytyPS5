@@ -38,6 +38,9 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 
 // Kyty.Trim's trim of a parked range: GuestAddressSpace::TrimParked while the address space lives (below).
 static void TrimParkedRange(uint64_t vaddr, uint64_t size);
+// (trim_idle's bound: the bytes queued for Kyty.Trim not trimmed yet; over live trim_idle_cap_mb, 2048 the default, a chunk
+// no longer waits for the GPU thread's idle, which a stretch with the GPU thread always busy never gives.)
+static std::atomic<uint64_t> g_trim_backlog_bytes {0};
 // A parked whole view released off the game's thread (memory.cpp: under the guest memory operations' lock, through
 // GuestAddressSpace::ReleaseParkedView).
 static void ReleaseParkedView(uint64_t vaddr, uint64_t size);
@@ -132,6 +135,7 @@ public:
 			std::lock_guard lock(trimmer->m_mutex);
 			trimmer->m_ranges.emplace_back(vaddr, size);
 		}
+		g_trim_backlog_bytes.fetch_add(size, std::memory_order_relaxed);
 		trimmer->m_ready.notify_one();
 	}
 
@@ -147,7 +151,10 @@ private:
 					m_ready.wait(lock, [this] { return !m_ranges.empty(); });
 					ranges.swap(m_ranges);
 				}
-				for (const auto& [vaddr, size]: ranges) TrimParkedRange(vaddr, size);
+				for (const auto& [vaddr, size]: ranges) {
+					TrimParkedRange(vaddr, size);
+					g_trim_backlog_bytes.fetch_sub(size, std::memory_order_relaxed);
+				}
 				ranges.clear();
 			}
 		}).detach();
@@ -2368,10 +2375,27 @@ public:
 	// Kyty.Trim's trim of a parked range (VirtualUnlock), 16 MiB at a time, each busy meanwhile: no map or unmap runs in
 	// its page-table pages then, nor it during theirs (it ran unlocked before, during a view's map again too: one of the
 	// overlaps of the bug check above). No lock is held during the trim.
+	// KYTY_TRIM_IDLE (live trim_idle; -1, the default: on under KYTY_SPECULATE=4, off otherwise; 1 on, 0 off): with
+	// every protection change waiting for any busy range (BusyUnlocked), a chunk held busy while the GPU thread works made
+	// its protects wait (8.9 ms of an 83 ms frame in a Demon's Souls area transition). A chunk now starts only while the
+	// GPU thread sits in its idle wait (GpuIdle) and nothing waits on a busy range: a state, no timer; the parked memory
+	// stays in the working set meanwhile (the backlog, g_trim_backlog_bytes).
 	void TrimParked(uint64_t vaddr, uint64_t size) {
-		constexpr uint64_t Chunk = uint64_t {16} << 20u;
+		constexpr uint64_t Chunk       = uint64_t {16} << 20u;
+		static auto&       idle_switch = LiveSwitch::Find("trim_idle", -1);
 		for (uint64_t at = vaddr, end = vaddr + size; at < end;) {
 			const uint64_t next = std::min(end, (at & ~(Chunk - 1u)) + Chunk);
+			if (const auto idle = idle_switch.load(std::memory_order_relaxed);
+			    idle > 0 || (idle < 0 && ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4)) {
+				static auto& cap   = LiveSwitch::Find("trim_idle_cap_mb", 2048);
+				const auto   ready = [&] {
+					return (GpuIdle::g_idle.load(std::memory_order_acquire) &&
+					        m_busy_waiters.load(std::memory_order_acquire) == 0) ||
+					       g_trim_backlog_bytes.load(std::memory_order_relaxed) >
+					           (static_cast<uint64_t>(std::max<int64_t>(cap.load(std::memory_order_relaxed), 0)) << 20u);
+				};
+				while (!ready()) std::this_thread::sleep_for(std::chrono::microseconds(200));
+			}
 			{
 				ExclusiveLock lock(m_mutex);
 				m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(at, next - at); });
@@ -2397,7 +2421,9 @@ private:
 		if (t_batch_section || !BusyUnlocked(vaddr, size)) return; // (batch_busy_once: its own section)
 		LiveCounters::Add(LiveCounters::AddressSpaceBusyWaits);
 		const auto start = __rdtsc();
+		m_busy_waiters.fetch_add(1, std::memory_order_acq_rel); // (trim_idle: a thread waits on a busy range)
 		m_busy_done.wait(lock, [&] { return !BusyUnlocked(vaddr, size); });
+		m_busy_waiters.fetch_sub(1, std::memory_order_acq_rel);
 		LiveCounters::Add(LiveCounters::AddressSpaceBusyWaitKt, (__rdtsc() - start) >> 10u);
 	}
 
@@ -3138,6 +3164,7 @@ private:
 	// operation mutex).
 	std::vector<std::pair<uint64_t, uint64_t>> m_busy;
 	std::condition_variable_any                m_busy_done;
+	std::atomic<int32_t>                       m_busy_waiters {0}; // (trim_idle: the threads asleep in WaitNotBusy)
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	// Moves with every change of m_mapped (under m_mutex exclusive): a region a thread found earlier is still m_mapped's
