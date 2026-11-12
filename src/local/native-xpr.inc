@@ -3223,8 +3223,32 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 			if (written(image->info.data.address, image->info.data.size) ||
 			    (meta.kind != ImageMetadataKind::None && written(meta.range.address, meta.range.size)))
 				return false;
-			auto        desc      = std::make_shared<TextureCache::ImageDesc>(seen);
 			const auto& rendering = draw_state.rendering;
+			// (Folded: this worker sees the image's metadata as it was at translation, never as the commit's acquisition
+			// leaves it, so every later draw of the slice was an entry too: ~1,300 acquisitions a frame at the commit against
+			// 62 when the first was a hole. A draw whose last pending entry is this image's identical layers2 entry (same
+			// range, metadata, data address, area, clear value) is that entry's: the normal path's acquisition at this draw
+			// finds the metadata already the draw's (FindDepthTarget changes nothing; the clean check is the entry's), the
+			// slice's clear consumed by the entry's TouchMeta (IsMetaCleared false: no clear). Nothing between them may touch
+			// the image: the last entry of all, and the refusals above (clear, mixed use, written bytes / HTile) already
+			// passed for this draw.)
+			if (spec->pending_targets.size() > spec->Sealed().pending_targets) {
+				const auto& last = spec->pending_targets.back();
+				if (last.depth_layers2 && last.image == image && last.id == target.id && last.serial == target.serial &&
+				    last.base_level == r.base_level && last.level_count == r.level_count && last.base_layer == r.base_layer &&
+				    last.layer_count == r.layer_count && last.layers2_width == rendering.width &&
+				    last.layers2_height == rendering.height && last.layers2_layers == rendering.num_layers &&
+				    last.layers2_db_depth_clear == command->GetRegisters().GetDepthClearValue() && last.depth_desc != nullptr) {
+					const auto& had = *static_cast<const TextureCache::ImageDesc*>(last.depth_desc.get());
+					if (had.info.metadata == seen.info.metadata && had.info.data.address == seen.info.data.address &&
+					    had.view_info.base_level == seen.view_info.base_level &&
+					    had.view_info.level_count == seen.view_info.level_count &&
+					    had.view_info.base_layer == seen.view_info.base_layer &&
+					    had.view_info.layer_count == seen.view_info.layer_count)
+						return true;
+				}
+			}
+			auto desc = std::make_shared<TextureCache::ImageDesc>(seen);
 			spec->pending_targets.push_back({.id                     = target.id,
 			                                 .image                  = image,
 			                                 .serial                 = target.serial,
