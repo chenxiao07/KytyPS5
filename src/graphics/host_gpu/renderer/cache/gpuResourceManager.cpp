@@ -441,8 +441,18 @@ int GpuResourceManager::UnmappedSinceByList(uint64_t epoch, uint64_t vaddr, uint
 	return it != m_unmap_list.end() && it->first < end ? 1 : 0;
 }
 
+// KYTY_BDA_SPAN_CAP (live bda_span_cap; -1, the default: 4096 under KYTY_SPECULATE=4, else 0; 0: 256 as before; N: N): the
+// registration spans one refresh takes incrementally; past them it rebuilds the requests over the whole address space
+// (a commit's batch of registrations in an area's first frame passed 64 / 256 and paid the full rebuild, ~1 ms).
+static size_t BdaSpanCap() {
+	static auto& span_cap = LiveSwitch::Find("bda_span_cap", -1);
+	const auto   cap      = span_cap.load(std::memory_order_relaxed);
+	if (cap >= 0) return cap > 0 ? static_cast<size_t>(cap) : 256u;
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 4096u : 256u;
+}
+
 void GpuResourceManager::NoteBdaSpan(uint64_t vaddr, uint64_t size) {
-	if (m_bda_spans.size() < 256) {
+	if (m_bda_spans.size() < BdaSpanCap()) {
 		m_bda_spans.push_back({vaddr, size});
 	} else {
 		m_bda_rebuild = true;
@@ -450,7 +460,7 @@ void GpuResourceManager::NoteBdaSpan(uint64_t vaddr, uint64_t size) {
 }
 
 void GpuResourceManager::RefreshBdaRanges() {
-	if (!m_buffer_cache.TakeRegistrationSpans(m_bda_spans) || m_bda_spans.size() > 256) m_bda_rebuild = true;
+	if (!m_buffer_cache.TakeRegistrationSpans(m_bda_spans) || m_bda_spans.size() > BdaSpanCap()) m_bda_rebuild = true;
 	if (!m_bda_rebuild && m_bda_spans.empty()) return;
 	LiveCounters::Add(LiveCounters::BdaRebuilds);
 	// The tracker regions to collect again, as merged [begin, end) windows (requests lie in one region each).

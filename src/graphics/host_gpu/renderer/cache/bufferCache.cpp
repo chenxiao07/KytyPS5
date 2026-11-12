@@ -1200,7 +1200,13 @@ void BufferCache::ChangeRegister(BufferId id) {
 				leaf[g & leaf_mask] = epoch;
 			}
 	}
-	if (m_registration_spans.size() < 64) {
+	// KYTY_BDA_SPAN_CAP (live bda_span_cap; -1, the default: 4096 under KYTY_SPECULATE=4, else 0; 0: 64 as before; N: N)
+	// the spans kept for the BDA preparation; past them it rebuilds its requests over the whole address space.
+	static auto& span_cap = LiveSwitch::Find("bda_span_cap", -1);
+	const auto   cap      = span_cap.load(std::memory_order_relaxed);
+	const size_t keep     = cap > 0 ? static_cast<size_t>(cap) : cap == 0 ? 64u
+	                      : kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 4096u : 64u;
+	if (m_registration_spans.size() < keep) {
 		m_registration_spans.push_back({m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size()});
 	} else {
 		m_registration_spans_lost = true;
