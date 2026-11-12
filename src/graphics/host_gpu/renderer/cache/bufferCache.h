@@ -347,6 +347,24 @@ private:
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
+
+public:
+	// spec_buffer_ahead (live; -1, the default: 1 under KYTY_SPECULATE=4, 0 otherwise; 2 also posts a V# range left
+	// pending): a speculation's thread posts a range no buffer covers (PostAhead: once, at most 512 waiting); the GPU
+	// thread registers the posted ranges nothing overlaps (ServeAhead, at each commit).
+	void PostAhead(uint64_t vaddr, uint64_t size);
+	// The table path's call site of a speculation's lookup (0 other): spec_ring_index's index ranges.
+	static inline thread_local int t_ahead_site = 0;
+	struct AheadSite {
+		int old;
+		explicit AheadSite(int site): old(t_ahead_site) { t_ahead_site = site; }
+		~AheadSite() { t_ahead_site = old; }
+	};
+	void ServeAhead();
+
+private:
+	std::mutex                                 m_ahead_mutex;
+	std::vector<std::pair<uint64_t, uint64_t>> m_ahead;
 	void                   Register(BufferId id);
 	void Unregister(BufferId id);
 	template <bool insert>

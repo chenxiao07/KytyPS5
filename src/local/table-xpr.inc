@@ -1730,11 +1730,32 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 	};
 	if (table.gathered != &pair) TableGather(pair, user_data);
 	table.gathered = nullptr; // (taken: a later draw or dispatch gathers its own)
+	// spec_pending_buffers: the stage's V#s left to the commit (their dword in the block, range, written, texel).
+	// (spec_reloc_refs: the V#s of found game buffers too, with the epoch their address was proven at.)
+	struct PendingHere {
+		uint32_t dword;
+		uint64_t address, size;
+		bool     written, texel;
+		bool     pending = true;
+		uint64_t since   = 0;
+	};
+	std::vector<PendingHere> pending_here;
+	const bool               pending_ok = Spec::Current() != nullptr && Spec::PendingBuffersOn();
+	const bool               reloc      = pending_ok && Spec::RelocRefsOn();
+	// (spec_reloc_refs: the V#'s own lookups note no buffer range, the entry stands for it; restored on every return.)
+	struct NoRange {
+		bool old;
+		explicit NoRange(bool on): old(Spec::t_no_range) { Spec::t_no_range = on; }
+		~NoRange() { Spec::t_no_range = old; }
+		NoRange(const NoRange&)            = delete;
+		NoRange& operator=(const NoRange&) = delete;
+	};
 	for (uint32_t st = 0; st < stages; ++st) {
 		const auto& program = *pair.programs[st];
 		const auto& plan    = program.table_plan;
 		auto&       block   = table.blocks[st];
 		auto&       entries = table.entries[st];
+		pending_here.clear();
 		// The buffers it writes first: a range it also reads through another V# is GPU-written by then, as the
 		// normal path's second lookup (RebindBuffers) sees it (not a copy of the guest's bytes in the ring).
 		for (size_t n = 0; n < 2 * plan.buffers.size(); ++n) {
@@ -1771,12 +1792,33 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						if (image_starts(address)) return false;
 						proof.image_checked = true;
 					}
+					const BufferCache::AheadSite ahead_site(2); // (the lookup's site: spec_ring_index)
+					const auto    written_since = buffer_cache.RegistrationEpoch(); // (spec_reloc_refs: before its lookup)
+					const NoRange no_range(reloc);
+					Spec::t_pending_ok         = pending_ok;
+					Spec::t_pending_hit        = false;
 					const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, true, formatted);
+					Spec::t_pending_ok         = false;
 					region_epochs.fill({UINT64_MAX, 0}); // (its uploads may have moved them)
+					if (owner == nullptr && Spec::t_pending_hit) {
+						// (spec_pending_buffers: the null buffer, size 0, until the commit writes the range's.)
+						if (formatted) textures.InvalidateMemoryFromGPU(address, size, "storage-buffer");
+						pending_here.push_back({plan.BufferDword(i), address, size, true, formatted});
+						const auto [word, stride]      = word_of(words4);
+						block[plan.BufferDword(i)]     = static_cast<uint32_t>(null_device);
+						block[plan.BufferDword(i) + 1] = static_cast<uint32_t>(null_device >> 32u);
+						block[plan.BufferDword(i) + 2] = 0;
+						block[plan.BufferDword(i) + 3] = word;
+						block[plan.BufferDword(i) + 4] = stride;
+						continue;
+					}
 					if (owner == nullptr || buffer_cache.GetBufferIfLive(buffer_cache.FindBuffer(address, size)) != owner)
 						return false;
 					if (formatted) textures.InvalidateMemoryFromGPU(address, size, "storage-buffer");
 					device = owner->BufferDeviceAddress() + offset;
+					// (spec_reloc_refs: proven at the epoch read before its lookup.)
+					if (reloc)
+						pending_here.push_back({plan.BufferDword(i), address, size, true, formatted, false, written_since});
 				}
 				const auto [word, stride]      = word_of(words4);
 				block[plan.BufferDword(i)]     = static_cast<uint32_t>(device);
@@ -1901,8 +1943,25 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 					}
 					if (cpu_written) buffer_cache.EnsureBufferContents(address, size);
 					const auto registration_before = buffer_cache.RegistrationEpoch(); // (a speculation's: before its lookup)
+					const BufferCache::AheadSite ahead_site(1); // (the lookup's site)
+					const NoRange no_range(reloc);
+					Spec::t_pending_ok         = pending_ok;
+					Spec::t_pending_hit        = false;
 					const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, false, formatted);
+					Spec::t_pending_ok         = false;
 					region_epochs.fill({UINT64_MAX, 0});
+					if (owner == nullptr && Spec::t_pending_hit) {
+						// (spec_pending_buffers: the null buffer, size 0, until the commit writes the range's; nothing
+						// held, nothing noted: the commit obtains the range itself.)
+						pending_here.push_back({plan.BufferDword(i), address, size, false, formatted});
+						const auto [word, stride]      = word_of(words4);
+						block[plan.BufferDword(i)]     = static_cast<uint32_t>(null_device);
+						block[plan.BufferDword(i) + 1] = static_cast<uint32_t>(null_device >> 32u);
+						block[plan.BufferDword(i) + 2] = 0;
+						block[plan.BufferDword(i) + 3] = word;
+						block[plan.BufferDword(i) + 4] = stride;
+						continue;
+					}
 					// (The epoch before the dirty check: a write after it moves the epoch.)
 					fresh.cpu_epoch = buffer_cache.CpuModificationEpoch(address, size);
 					if (owner == nullptr || buffer_cache.GetBufferIfLive(buffer_cache.FindBuffer(address, size)) != owner ||
@@ -1920,7 +1979,15 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				held = fresh;
 			}
 			// (A speculation's: the buffer of the range its device address is in.)
-			if (auto* spec = Spec::Current(); spec != nullptr && held.size != 0) spec->NoteBufferRange(held.address, held.size);
+			// (spec_reloc_refs: an entry instead, proven at its held proof's epoch: the commit looks again only when a
+			// buffer was registered or unregistered over its range since that, and writes the address it finds then.)
+			if (auto* spec = Spec::Current(); spec != nullptr && held.size != 0) {
+				if (reloc)
+					pending_here.push_back({plan.BufferDword(i), held.address, held.size, false,
+					                        program.info.buffers[i].formatted, false, held.registration});
+				else
+					spec->NoteBufferRange(held.address, held.size);
+			}
 			const auto [word, stride]      = word_of(words4);
 			block[plan.BufferDword(i)]     = static_cast<uint32_t>(held.device);
 			block[plan.BufferDword(i) + 1] = static_cast<uint32_t>(held.device >> 32u);
@@ -1935,6 +2002,21 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 			                        : upload.TryCopy(block.data(), block.size() * sizeof(uint32_t), 16);
 			if (!copied) return Spec::Refuse("table: upload ring busy"), false;
 			blocks[st] = upload.BufferDeviceAddress() + *copied;
+			// (spec_pending_buffers: where the commit writes each one's buffer.)
+			if (!pending_here.empty()) {
+				auto& pending = Spec::Current()->pending_buffers;
+				for (const auto& here: pending_here) {
+					pending.push_back({.address = here.address,
+					                   .size    = here.size,
+					                   .ring    = &upload,
+					                   .offset  = *copied + uint64_t {here.dword} * 4u,
+					                   .written = here.written,
+					                   .texel   = here.texel,
+					                   .pending = here.pending,
+					                   .since   = here.since});
+					Spec::Current()->NoteTableRange(here.address, here.size);
+				}
+			}
 		}
 	}
 	return true;
@@ -2397,6 +2479,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		LiveCensus::Scope miss(LiveCensus::DrawPhase, 0x7ab1e, &held == &table.args ? 10 : 11);
 		prepare();
 		const auto registration_before = buffer_cache.RegistrationEpoch(); // (a speculation's: before its lookup)
+		const BufferCache::AheadSite ahead_site(&held == &table.args ? 4 : 3); // (the lookup's site)
 		const auto result = buffer_cache.ObtainBuffer(address, size, false);
 		region_epochs.fill({UINT64_MAX, 0}); // (its uploads may have moved them)
 		const auto owner  = spec_state != nullptr ? buffer_cache.RegisteredBuffer(address, size)
@@ -3083,6 +3166,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	if (indirect_args != 0) {
 		// As DispatchDirect's: the arguments' owner, made current.
 		cache.EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
+		const BufferCache::AheadSite ahead_site(5); // (the lookup's site)
 		const auto id = cache.FindBuffer(indirect_args, 3u * sizeof(uint32_t));
 		if (Spec::Current() != nullptr && Spec::Current()->refused != nullptr) return false;
 		auto& owner     = cache.GetBuffer(id);

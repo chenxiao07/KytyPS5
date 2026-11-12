@@ -2157,11 +2157,55 @@ BufferId BufferCache::FindBufferSpec(uint64_t vaddr, uint64_t size) {
 		const auto* buffer = m_slot_buffers.try_get(owner);
 		if (buffer == nullptr) return Spec::Refuse("buffer registration (unregistered meanwhile)"), NULL_BUFFER_ID;
 		if (buffer->IsInBounds(vaddr, size)) {
-			Spec::Current()->NoteBufferRange(vaddr, size);
+			if (!Spec::t_no_range) Spec::Current()->NoteBufferRange(vaddr, size); // (spec_reloc_refs: the caller records it)
 			return owner;
 		}
 	}
+	PostAhead(vaddr, size);
 	return Spec::Refuse("buffer registration"), NULL_BUFFER_ID;
+}
+
+// (Live spec_buffer_ahead; -1, the default: 1 under KYTY_SPECULATE=4, 0 otherwise.)
+static int64_t BufferAhead() {
+	static auto& value = LiveSwitch::Find("spec_buffer_ahead", -1);
+	if (!Spec::On()) return 0;
+	const auto v = value.load(std::memory_order_relaxed);
+	return v >= 0 ? v : kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 1 : 0;
+}
+
+void BufferCache::PostAhead(uint64_t vaddr, uint64_t size) {
+	if (BufferAhead() == 0 || !GuestRange {vaddr, size}.Valid()) return;
+	std::scoped_lock lock(m_ahead_mutex);
+	if (m_ahead.size() >= 512) return;
+	for (const auto& [a, b]: m_ahead)
+		if (vaddr >= a && vaddr + size <= a + b) return; // (posted already)
+	m_ahead.emplace_back(vaddr, size);
+}
+
+// The GPU thread, at a commit (a command buffer open): each posted range still without a buffer and overlapping none is
+// registered as CreateBuffer registers one (the caching pages it spans), without the joins CreateBuffer makes (their
+// copies); one that overlaps a buffer is left to its use in order.
+void BufferCache::ServeAhead() {
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	{
+		std::scoped_lock lock(m_ahead_mutex);
+		if (m_ahead.empty()) return;
+		ranges.swap(m_ahead);
+	}
+	for (auto [vaddr, size]: ranges) {
+		const auto end = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
+		vaddr &= ~(CACHING_PAGESIZE - 1);
+		size               = end - vaddr;
+		const auto overlap = ResolveOverlaps(vaddr, size);
+		if (overlap.first != overlap.last || overlap.begin != vaddr || overlap.end != end) {
+			continue;
+		}
+		const auto id = m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, vaddr,
+		                                      AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
+		SetVulkanObjectNameF(m_graphics.device, m_slot_buffers[id].Handle(), "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x} ahead]",
+		                     vaddr, size);
+		Register(id);
+	}
 }
 
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
@@ -2735,8 +2779,19 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSpec(Spec::State& spec, ui
 	const BufferId owner_id = LoadOwner(m_page_table.Find(vaddr >> PageTable::kPageBits)); // (one read: LoadOwner)
 	const auto*    owner    = &owner_id; // (its later use names the buffer found here, not a re-read)
 	auto*          buffer   = owner_id ? m_slot_buffers.try_get(owner_id) : nullptr;
-	if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size))
+	if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size)) {
+		// spec_pending_buffers: a table V#'s range (the caller allows it) left to the commit, which obtains it in order,
+		// unless what refuses a found buffer below refuses it too (its processor's writes over it; a texel range over a
+		// GPU-written image).
+		if (Spec::t_pending_ok && !(is_texel_buffer && m_texture_cache.HasGpuWrittenImageOverlap(vaddr, size)) &&
+		    !spec.open_journal_set.Intersects(vaddr, size) && !(is_written && spec.open_copy_sources.Intersects(vaddr, size))) {
+			Spec::t_pending_hit = true;
+			if (is_written) spec.NoteWritten(vaddr, size);
+			return {nullptr, 0};
+		}
+		PostAhead(vaddr, size);
 		return Spec::Refuse("buffer lookup"), std::pair<Buffer*, uint64_t> {nullptr, 0};
+	}
 	// A texel buffer over an image GPU work wrote: the normal path copies the image in at the draw. Its commit does that
 	// before its work (KYTY_SPECULATE_TEXEL_SYNC) when its work does not use the image itself, nor writes the buffer;
 	// else the draw is a hole. (Storage and target images over memory the game reads as texel buffers: 160-360 such
@@ -2754,7 +2809,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSpec(Spec::State& spec, ui
 	else if (m_memory_tracker.IsRegionCpuModified(vaddr, size) || spec.JournalIntersects(vaddr, size))
 		spec.NoteCurrent(vaddr, size);
 	if (spec.touched_buffers.empty() || spec.touched_buffers.back() != *owner) spec.touched_buffers.push_back(*owner);
-	spec.NoteBufferRange(vaddr, size);
+	if (!Spec::t_no_range) spec.NoteBufferRange(vaddr, size); // (spec_reloc_refs: the caller records it)
 	return {buffer, buffer->Offset(vaddr)};
 }
 

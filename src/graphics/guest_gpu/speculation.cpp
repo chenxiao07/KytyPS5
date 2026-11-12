@@ -944,6 +944,11 @@ const char* Speculation::Changed(const Result& result, size_t index) const {
 				return "commit: memory unmapped";
 		}
 	if (mapping) {
+		// (spec_pending_buffers / spec_reloc_refs: the table V# entries, noted as no buffer range, unmapped as any.)
+		for (size_t i = from.table_ranges; i < segment.end.table_ranges; ++i) {
+			const auto& range = state.table_ranges[i];
+			if (resources.UnmappedSince(epochs.mapping, range.begin, range.end - range.begin)) return "commit: memory unmapped";
+		}
 		for (size_t i = from.clean_reads; i < segment.end.clean_reads; ++i) {
 			const auto& read = state.clean_reads[i];
 			if (resources.UnmappedSince(epochs.mapping, read.begin, read.end - read.begin)) return "commit: memory unmapped";
@@ -983,6 +988,7 @@ static bool CommitVerifyDue() {
 }
 
 Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcessor& cp) {
+	m_renderer.GetBufferCache().ServeAhead(); // (spec_buffer_ahead: the ranges speculations found no buffer over)
 	auto&       scheduler = m_renderer.GetCommandScheduler();
 	const auto& state     = result.state;
 	const auto  segments  = state.closed.size();
@@ -1135,6 +1141,46 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		// the recorded work leaves it reading a destroyed one. The work after it is translated in order.)
 		if (CurrentEpochs() != prepared && Changed(result, index) != nullptr)
 			return ++m_stop_reasons["commit: preparation registered buffers"], Progress::Stopped;
+		if (std::exchange(result.state.target_failed, false)) // (spec_commit_targets)
+			return ++m_stop_reasons["commit: a pending target not acquired"], Progress::Stopped;
+		if (std::exchange(result.state.images_failed, false)) // (spec_worker_images)
+			return ++m_stop_reasons["commit: a pending image not completed"], Progress::Stopped;
+		// spec_pending_buffers / spec_reloc_refs: the table V# entries, after Before's registrations. A pending one, one
+		// Before had to obtain, and (spec_reloc_refs) one with a buffer registered or unregistered over its range since
+		// its proof are looked up as they are now and written into the block; the others are left as they are (no
+		// lookup). Every entry that needs it, or the segment stops before it is spliced: a block never reaches the GPU
+		// unpatched.
+		if (const auto pfrom = index == 0 ? size_t {0} : state.closed[index - 1].end.pending_buffers,
+		    pto = state.closed[index].end.pending_buffers;
+		    pto != pfrom) {
+			auto&                pbuffers = m_renderer.GetBufferCache();
+			size_t               patched = 0, required = 0;
+			const auto           registration_now = pbuffers.RegistrationEpoch();
+			const auto           now = [&](const Spec::PendingBuffer& entry) -> uint64_t {
+                const auto* owner = pbuffers.GetBufferIfLive(pbuffers.RegisteredBuffer(entry.address, entry.size));
+                return owner != nullptr && owner->HasDeviceAddress() ? owner->BufferDeviceAddress() + owner->Offset(entry.address)
+				                                                                : 0;
+			};
+			for (size_t i = pfrom; i < pto; ++i) {
+				const auto& entry = state.pending_buffers[i];
+				const bool  moved = !entry.pending && entry.obtained && entry.since < registration_now &&
+				                   pbuffers.RegisteredSince(entry.address, entry.size, entry.since) &&
+				                   pbuffers.RegisteredSinceExact(entry.address, entry.size, entry.since);
+				if (!entry.pending && entry.obtained && !moved) continue;
+				++required;
+				const auto device = entry.obtained ? now(entry) : 0;
+				if (device == 0 || entry.ring == nullptr) continue;
+				const auto mapped = entry.ring->Mapped();
+				if (entry.offset + 3 * sizeof(uint32_t) > mapped.size()) continue;
+				const uint32_t words[3] = {static_cast<uint32_t>(device), static_cast<uint32_t>(device >> 32u),
+				                           static_cast<uint32_t>(std::min<uint64_t>(entry.size / 4, UINT32_MAX))};
+				std::memcpy(mapped.data() + entry.offset, words, sizeof(words));
+				entry.ring->Flush(entry.offset, sizeof(words));
+				pbuffers.TouchSpeculated(pbuffers.RegisteredBuffer(entry.address, entry.size));
+				++patched;
+			}
+			if (patched != required) return ++m_stop_reasons["commit: a pending buffer unpatched"], Progress::Stopped;
+		}
 		// KYTY_SPEC_DRAW_INDIRECT_VERIFY: its sampled DRAW_INDIRECT table draws, here where their arguments are current.
 		for (const auto& entry: state.draw_verifies)
 			if (entry.segment == index) VerifyDrawIndirect(m_renderer, entry);
@@ -1176,6 +1222,28 @@ void Speculation::Before(Result& result, size_t index) {
 	// (their CPU-dirty pages uploaded, then GPU-owned), those it reads made current, its BDA reads prepared, and each
 	// image where the work found it.
 	RenderLockGuard lock(m_renderer.GetMutex());
+	// spec_pending_buffers: the V# ranges it found no buffer for, obtained in order first (made or joined, uploaded), so
+	// the check after Before (preparation registered buffers) sees what that moved under the segment's other ranges.
+	const auto registration_now = buffers.RegistrationEpoch(); // (an entry proven at it or after: nothing moved under it)
+	for (size_t i = from.pending_buffers; i < to.pending_buffers; ++i) {
+		// (As the owner's table path: the range's game buffer, made or joined, then made current, then obtained, which
+		// then gives that buffer, not a copy in the shader ring (no device address: an exit in a long run). Anything but
+		// the range's live game buffer is left unobtained: the patch step then stops the segment.)
+		auto& entry   = state.pending_buffers[i];
+		// (spec_reloc_refs: a found buffer's entry still over a live game buffer needs nothing here: a join copied its
+		// bytes; the patch step decides whether its address moved. None any more: obtained as a pending one.)
+		if (!entry.pending && (entry.since >= registration_now ||
+		                       buffers.GetBufferIfLive(buffers.RegisteredBuffer(entry.address, entry.size)) != nullptr)) {
+			entry.obtained = true;
+			continue;
+		}
+		(void)buffers.FindBuffer(entry.address, entry.size);
+		if (!entry.written) buffers.EnsureBufferContents(entry.address, entry.size);
+		const auto [owner, offset] = buffers.ObtainBuffer(entry.address, entry.size, entry.written, entry.texel);
+		(void)offset;
+		const auto* game = buffers.GetBufferIfLive(buffers.RegisteredBuffer(entry.address, entry.size));
+		entry.obtained   = owner != nullptr && owner == game && game->HasDeviceAddress();
+	}
 	for (size_t i = from.written; i < to.written; ++i) {
 		const auto& range = state.written[i];
 		(void)buffers.ObtainBuffer(range.begin, range.end - range.begin, true);
@@ -1199,6 +1267,19 @@ void Speculation::Before(Result& result, size_t index) {
 				buffers.EnsureBufferContents(written.address, written.size);
 			});
 		}
+	// (spec_reloc_refs: the table V# entries, noted as no buffer range: the same for theirs.)
+	for (size_t i = from.table_ranges; i < to.table_ranges; ++i) {
+		const auto& entry = state.table_ranges[i];
+		if (m_effects.stamped) {
+			if (m_log.End() > result.effects_from)
+				m_log.ForEachHostWriteOver(result.effects_from, entry.begin, entry.end - entry.begin,
+				                           [&](uint64_t address, uint64_t size) { buffers.EnsureBufferContents(address, size); });
+		} else if (!m_effects.host_writes.Empty()) {
+			m_effects.host_writes.ForEachIntersection(entry.begin, entry.end - entry.begin, [&](RangeSet::Range written) {
+				buffers.EnsureBufferContents(written.address, written.size);
+			});
+		}
+	}
 	// The texel buffers it reads over images GPU work wrote (KYTY_SPECULATE_TEXEL_SYNC), synchronized from them as the
 	// normal path does at the draw: after the uploads above (the image's bytes win, as there), before the work (what it
 	// writes over them lands after the copy, as in order).

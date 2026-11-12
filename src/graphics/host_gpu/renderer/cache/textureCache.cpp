@@ -3771,6 +3771,37 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	return view;
 }
 
+bool TextureCache::AcquireTargetAtCommit(ImageId id, uint64_t serial, uint32_t base_level, uint32_t level_count,
+                                         uint32_t base_layer, uint32_t layer_count, bool clear) {
+	std::scoped_lock lock {m_lock};
+	auto*            image = m_slot_images.try_get(id);
+	if (image == nullptr || image->serial != serial || !image->registered || image->depth_id || image->binding.needs_rebind)
+		return false;
+	TouchImage(*image);
+	image->MarkGpuModified();
+	const bool depth = image->info.IsDepth();
+	auto&      used  = depth ? image->usage.depth_target : image->usage.render_target;
+	if (!used) ++image->validity;
+	used = true;
+	if (!depth && image->info.metadata.kind == ImageMetadataKind::Dcc) {
+		// (The draw's own metadata, as the worker found it equal to the image's.)
+		ImageDesc desc;
+		desc.type                  = BindingType::RenderTarget;
+		desc.info                  = image->info;
+		desc.view_info.base_level  = base_level;
+		desc.view_info.level_count = level_count;
+		desc.view_info.base_layer  = base_layer;
+		desc.view_info.layer_count = layer_count;
+		PrepareDccClear(id, desc);
+	} else if (clear) {
+		return false; // (only a color DCC clear is the acquisition's)
+	}
+	RefreshImage(id);
+	CommitGpuWrite(*image);
+	TrackImageDownload(id, *image);
+	return image->SafeToDownload();
+}
+
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.type != BindingType::RenderTarget) {
 		EXIT("TextureCache: invalid color-target binding\n");

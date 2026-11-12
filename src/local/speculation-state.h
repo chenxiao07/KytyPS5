@@ -25,11 +25,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <set>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <immintrin.h>
 #include <memory>
 #include <mutex>
@@ -83,8 +85,36 @@ struct WaitCheck {
 struct Counts {
 	size_t current = 0, written = 0, bda = 0, invalidated = 0, writes = 0, touched_images = 0, touched_buffers = 0,
 	       clean_reads = 0, feedbacks = 0, buffer_ranges = 0, sets = 0, chain_reads = 0, waits = 0, cpu_copies = 0,
-	       late_reads = 0, texel_syncs = 0, indexed_draws = 0, scenes = 0, used_pairs = 0;
+	       late_reads = 0, texel_syncs = 0, pending_buffers = 0, table_ranges = 0, pending_targets = 0, indexed_draws = 0,
+	       scenes = 0, used_pairs = 0;
 };
+
+// spec_pending_buffers (under KYTY_SPECULATE=4 only): a table V#'s range with no
+// buffer when the speculation translated its draw, left to its commit: the block carries the null buffer (size 0) until
+// the commit obtains the range in order and writes the buffer's address and size at `offset` in `ring` (the
+// speculation's table ring, fenced with its pending tick: not reused before then).
+// spec_reloc_refs (live; -1, the default: on under KYTY_SPECULATE=4; with spec_pending_buffers): every table V# of a
+// game buffer is such an entry too (`pending` false), with `since`, the registration epoch its address was proven at
+// (held entries: their proof; a fresh lookup: the epoch read before it). Its range is not noted as a buffer range: at
+// commit, an entry whose range had a buffer registered or unregistered over it since `since` (RegisteredSinceExact, the
+// granule epochs only mode 4 keeps) is looked up again by the owner and its address written into the ring, instead of
+// the segment stopping; one with none is left as it is.
+struct PendingBuffer {
+	uint64_t      address = 0, size = 0;
+	StreamBuffer* ring    = nullptr;
+	uint64_t      offset  = 0;
+	bool          written = false, texel = false;
+	bool          pending = true; // (no buffer when translated; else a found one, spec_reloc_refs)
+	uint64_t      since   = 0;    // (spec_reloc_refs: its proof's registration epoch)
+	// (The commit's, between its two steps: whether the range's game buffer was obtained.)
+	bool          obtained = false;
+};
+inline thread_local bool t_pending_ok  = false; // (TableBlocks: a missing buffer may be left pending)
+inline thread_local bool t_pending_hit = false; // (ObtainBufferSpec: it was)
+inline thread_local bool t_no_range    = false; // (spec_reloc_refs: the V#'s lookups note no buffer range; the caller records it)
+// spec_nofault_journal: CopyGuest's reader while a no-fault read is served through the journal (the page's clean backing,
+// never a fault; a failure refuses the read, not the speculation).
+inline thread_local bool (*t_backing_copy)(void* out, uint64_t address, uint64_t bytes) = nullptr;
 
 #if !defined(_WIN32)
 // (Linux, WorkerCopy.) Whether [address, address + bytes) is in the backing view (a command buffer rebased through it,
@@ -160,6 +190,41 @@ struct Counts {
 #else
 	return Common::GuardedCopy(out, from, bytes);
 #endif
+}
+
+// spec_commit_targets (under KYTY_SPECULATE=4 only): a target left to its commit's
+// acquisition (Speculation::Before).
+struct PendingTarget {
+	Common::SlotId id;
+	Image*         image  = nullptr;
+	uint64_t       serial = 0;
+	uint32_t       base_level = 0, level_count = 1, base_layer = 0, layer_count = 1;
+	bool           clear = false;
+};
+// (A switch of these four: -1, the default, on under KYTY_SPECULATE=4 and off in modes 1-3, read with the mode at each
+// use, as spec_reloc_refs still is; the three below are that default with no switch.)
+[[nodiscard]] inline bool ModeFour() {
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+}
+[[nodiscard]] inline bool CommitTargetsOn() {
+	return ModeFour();
+}
+[[nodiscard]] inline bool NoFaultJournalOn() {
+	return ModeFour();
+}
+[[nodiscard]] inline bool PendingBuffersOn() {
+	return ModeFour();
+}
+// (spec_reloc_refs re-proves a V# entry by the granule epochs, which only mode 4 keeps: outside it the switch is ignored
+// whatever its value, so a forced 1 cannot leave a moved entry unpatched; said once.)
+[[nodiscard]] inline bool RelocRefsOn() {
+	static auto&       on   = LiveSwitch::Find("spec_reloc_refs", -1);
+	static std::atomic said {false};
+	const auto         v    = on.load(std::memory_order_relaxed);
+	const bool         mode4 = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+	if (v > 0 && !mode4 && !said.exchange(true, std::memory_order_relaxed))
+		std::printf("Speculation: spec_reloc_refs=1 ignored outside KYTY_SPECULATE=4 (no granule epochs there)\n");
+	return v != 0 && mode4 && PendingBuffersOn();
 }
 
 // A late read (State::late_reads): the range, and the effects log's end before it was read.
@@ -375,6 +440,11 @@ struct State {
 	//   the commit synchronizes them from the images before its work, as the normal path does at the draw
 	//   (BufferCache::EnsureTexelContents).
 	std::vector<Range> texel_syncs;
+	std::vector<PendingBuffer> pending_buffers; // (spec_pending_buffers)
+	std::vector<Range>         table_ranges;    // (their ranges, merged as notes are: the commit's host-write and unmap checks)
+	std::vector<PendingTarget> pending_targets; // (spec_commit_targets)
+	bool                       target_failed = false; // (spec_commit_targets: the commit's Before could not acquire one)
+	bool                       images_failed = false; // (spec_worker_images: a set's pending slot not completed)
 	std::vector<LateRead>        late_reads;
 	const std::atomic<uint64_t>* log_end    = nullptr; // (the effects log's end: Speculation::m_log)
 	bool                         late       = false;   // (ReadWord: the word it read was such a read; late_since before it)
@@ -451,8 +521,8 @@ struct State {
 		return {current.size(),        written.size(),         bda.size(),         invalidated.size(), writes.size(),
 		        touched_images.size(), touched_buffers.size(), clean_reads.size(), feedbacks.size(), buffer_ranges.size(),
 		        sets.size(),           chain_reads.size(),     waits.size(),       cpu_copies.size(),
-		        late_reads.size(),     texel_syncs.size(),     indexed_draws,      scenes,
-		        used_pairs.size()};
+		        late_reads.size(),     texel_syncs.size(),     pending_buffers.size(), table_ranges.size(), pending_targets.size(),
+		        indexed_draws,         scenes,                 used_pairs.size()};
 	}
 	// Its pending guest memory writes or a previous speculation's over the range; the ranges its work or a previous
 	// one's writes.
@@ -518,6 +588,7 @@ struct State {
 		if (command_end > command_begin) NoteCleanRead(command_begin, command_end - command_begin);
 		command_begin = command_end = 0;
 	}
+	void NoteTableRange(uint64_t address, uint64_t size) { (void)Note(table_ranges, Sealed().table_ranges, address, size); }
 	void NoteCpuCopy(uint64_t address, uint64_t size) { (void)Note(cpu_copies, Sealed().cpu_copies, address, size); }
 	void NoteTexelSync(uint64_t address, uint64_t size) { (void)Note(texel_syncs, Sealed().texel_syncs, address, size); }
 	void NoteLateRead(uint64_t address, uint64_t size, uint64_t since) {
@@ -661,6 +732,7 @@ struct State {
 	// holding the catalog's shared lock while the GPU thread waited for it exclusively (10-31). The callers' page
 	// checks race with watchers added meanwhile.
 	[[nodiscard]] bool CopyGuest(void* out, uint64_t address, uint64_t bytes) noexcept {
+		if (t_backing_copy != nullptr) return t_backing_copy(out, address, bytes); // (spec_nofault_journal)
 		// (KYTY_WRITE_GUARD_SPEC: a page a guest write of the GPU thread guards, through the backing view: its bytes.)
 		if (const auto* backing = WriteGuard::GuardedBacking(address, bytes)) {
 			std::memcpy(out, backing, bytes);
@@ -801,6 +873,9 @@ struct State {
 		cpu_copies.resize(std::min(cpu_copies.size(), checkpoint.cpu_copies));
 		late_reads.resize(std::min(late_reads.size(), checkpoint.late_reads));
 		texel_syncs.resize(std::min(texel_syncs.size(), checkpoint.texel_syncs));
+		pending_buffers.resize(std::min(pending_buffers.size(), checkpoint.pending_buffers));
+		table_ranges.resize(std::min(table_ranges.size(), checkpoint.table_ranges));
+		pending_targets.resize(std::min(pending_targets.size(), checkpoint.pending_targets));
 		indexed_draws = std::min(indexed_draws, checkpoint.indexed_draws);
 		scenes        = std::min(scenes, checkpoint.scenes);
 		used_pairs.resize(std::min(used_pairs.size(), checkpoint.used_pairs));
@@ -821,6 +896,11 @@ struct State {
 		cpu_copies.clear();
 		late_reads.clear();
 		texel_syncs.clear();
+		pending_buffers.clear();
+		table_ranges.clear();
+		pending_targets.clear();
+		target_failed = false;
+		images_failed = false;
 		draw_verifies.clear();
 		indexed_draws = 0;
 		scenes        = 0;

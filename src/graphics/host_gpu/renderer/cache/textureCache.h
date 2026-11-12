@@ -57,6 +57,11 @@ public:
 	// `may_fail` (a sampled texture's lookup): no image when the GPU cannot make one (its memory full, or more layers or
 	// bytes than the format allows), an invalid id, and none tried again for that memory for a while.
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false, bool may_fail = false);
+	[[nodiscard]] ImageId FindImageReadOnly(const ImageDesc& desc, bool exact_format); // (t_read_only)
+	// spec_commit_targets: a speculation's target acquired at its commit, as FindRenderTarget / FindDepthTarget do
+	// (the color DCC clear over the view's layers when `clear`); false: not that image any more, or not safe after.
+	[[nodiscard]] bool AcquireTargetAtCommit(ImageId id, uint64_t serial, uint32_t base_level, uint32_t level_count,
+	                                         uint32_t base_layer, uint32_t layer_count, bool clear);
 	// An image of exactly this guest texture is registered (what FindImage takes first; no lookup side effects).
 	[[nodiscard]] bool          HoldsImage(const ImageInfo& info);
 	// The layers of a one-level array a sampled view reads, `info` (slices one after another: descriptors.cpp

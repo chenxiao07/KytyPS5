@@ -3168,7 +3168,33 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 		if (image == nullptr || image->serial != target.serial || !image->registered)
 			return Spec::Refuse("table: target released"), false;
 		if (image->binding.needs_rebind) return Spec::Refuse("table: target rebind"), false;
-		if (!image->SafeToDownload()) return Spec::Refuse("table: target download"), false;
+		// spec_commit_targets: a target the commit can acquire (one whole-image state, defined; its metadata the draw's; no
+		// depth link) is left to it, recorded once a segment.
+		const auto acquirable = [&] {
+			return spec != nullptr && Spec::CommitTargetsOn() && !image->depth_id &&
+			       image->backing.subresource_states.empty() && image->backing.state.layout != vk::ImageLayout::eUndefined &&
+			       image->info.metadata == target.requested.metadata;
+		};
+		const auto leave = [&](bool clear) {
+			auto& pending = spec->pending_targets;
+			for (size_t i = spec->Sealed().pending_targets; i < pending.size(); ++i)
+				if (pending[i].image == image) {
+					pending[i].clear |= clear;
+					return;
+				}
+			pending.push_back({.id          = target.id,
+			                   .image       = image,
+			                   .serial      = target.serial,
+			                   .base_level  = target.range.base_level,
+			                   .level_count = target.range.level_count,
+			                   .base_layer  = target.range.base_layer,
+			                   .layer_count = target.range.layer_count,
+			                   .clear       = clear});
+		};
+		if (!image->SafeToDownload()) {
+			if (!acquirable()) return Spec::Refuse("table: target download"), false;
+			leave(false);
+		}
 		// (A speculation asks each time: its answers are noted.)
 		if (target.metadata != 0 && (spec != nullptr || draw_state.meta_epoch != meta_epoch) &&
 		    textures.IsMetaCleared(target.metadata, target.slice, nullptr, nullptr,
@@ -3176,7 +3202,10 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 			// The normal path clears it first. A speculation's draw is a hole that does: the draws after it find it
 			// cleared (speculation-state.h).
 			if (spec != nullptr) spec->ConsumeMeta(target.metadata, target.slice);
-			return Spec::Refuse("table: cleared target"), false;
+			// (spec_commit_targets: a color DCC clear is the acquisition's; a depth HTile one the draw's load: refused.)
+			if (!acquirable() || target.requested.IsDepth() || target.requested.metadata.kind != ImageMetadataKind::Dcc)
+				return Spec::Refuse("table: cleared target"), false;
+			leave(true);
 		}
 	}
 	// (Not a speculation's answer: it holds as after holes the commit may not reach.)

@@ -1397,7 +1397,22 @@ bool TryReadGuestNoFault(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
 	    (!g_gpu_resources->HasReadWatchers(vaddr, size) && SpeculationReadsClean(vaddr, size)))
 		return CopyUnwatched(vaddr, data, size);
-	return TryReadGpuCleanBackingToHost(vaddr, data, size);
+	if (TryReadGpuCleanBackingToHost(vaddr, data, size)) return true;
+	// spec_nofault_journal: refused only for the speculations' pending processor writes over it (none of their GPU work's,
+	// no GPU-dirty bytes): the words as ReadJournaled gives them, over the clean backing.
+	if (auto* spec = Graphics::Spec::Current(); spec != nullptr && Graphics::Spec::NoFaultJournalOn() && vaddr % 4 == 0 &&
+	                                            size % 4 == 0 && size <= 64 &&
+	                                            !GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) &&
+	                                            !GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size) &&
+	                                            spec->JournalIntersects(vaddr, size) && !spec->WrittenIntersects(vaddr, size)) {
+		Graphics::Spec::t_backing_copy = [](void* out, uint64_t address, uint64_t bytes) {
+			return TryReadBackingToHost(address, out, bytes);
+		};
+		const bool served = spec->ReadJournaled(vaddr, static_cast<uint32_t>(size / 4), static_cast<uint32_t*>(data));
+		Graphics::Spec::t_backing_copy = nullptr;
+		return served;
+	}
+	return false;
 }
 
 bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean) {
