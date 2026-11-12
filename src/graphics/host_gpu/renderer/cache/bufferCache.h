@@ -199,14 +199,16 @@ public:
 	// commit that asks). False also when nothing was marked (another mode).
 	[[nodiscard]] bool RegisteredSinceExact(uint64_t vaddr, uint64_t size, uint64_t epoch) const {
 		if (size == 0) return false;
+		// (Each leaf looked up once for its granules.)
 		constexpr uint64_t leaf_mask = (uint64_t {1} << RegLeafBits) - 1;
-		for (uint64_t g = vaddr >> RegGranuleBits, last = (vaddr + size - 1) >> RegGranuleBits; g <= last; ++g) {
-			const auto it = m_reg_granule_epochs.find(g >> RegLeafBits);
-			if (it == m_reg_granule_epochs.end()) {
-				g |= leaf_mask; // (none of the leaf's granules marked)
-				continue;
+		for (uint64_t g = vaddr >> RegGranuleBits, last = (vaddr + size - 1) >> RegGranuleBits; g <= last;) {
+			const auto stop = std::min(last, g | leaf_mask);
+			if (const auto it = m_reg_granule_epochs.find(g >> RegLeafBits); it != m_reg_granule_epochs.end()) {
+				const auto* epochs = it->second.get();
+				for (auto i = g & leaf_mask; i <= (stop & leaf_mask); ++i)
+					if (epochs[i] > epoch) return true;
 			}
-			if (it->second[g & leaf_mask] > epoch) return true;
+			g = stop + 1;
 		}
 		return false;
 	}
