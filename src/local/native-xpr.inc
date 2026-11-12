@@ -3475,6 +3475,12 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	    (indexed && (index_base == 0 || index_bytes == 0)) ||
 	    (direct != nullptr && direct->indirect && (direct->indexed || commands.size() != 1)))
 		return false;
+	// (A speculation never takes a draw whose DB_RENDER_CONTROL asks for a depth or stencil clear: neither the table /
+	// record draw nor the commit's target acquisition applies the clear the normal path's load op does.)
+	if (Spec::Current() != nullptr) {
+		const auto& rc = buffer.GetRegisters().GetRenderControl();
+		if (rc.depth_clear_enable || rc.stencil_clear_enable) return Spec::Refuse("table: DB clear"), false;
+	}
 	m_context.GetCommandScheduler().PopPendingOperations();
 	// (The GPU thread's: a speculation's thread does not take it.)
 	std::optional<RenderLockGuard> lock;
