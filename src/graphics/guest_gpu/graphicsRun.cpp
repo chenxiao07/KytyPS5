@@ -84,6 +84,7 @@ static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_mutex_owned   = false;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
+static thread_local BufferCache*      g_gpu_buffers       = nullptr; // (the GPU thread's: spec_label_cpu_backing)
 
 struct DrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
@@ -809,6 +810,23 @@ static void TouchForWrite(uint64_t address) {
 // KYTY_WRITE_GUARD (local/write-guard.h): the write made at once and hidden from the game until the upload jobs pending
 // now are done. False: the caller drains them and writes, as without it (no older job is pending, so there is nothing
 // to hide the write behind; or the form does not apply).
+// A guarded write's bytes through the backing view. Under KYTY_SPECULATE=4 only (spec_label_cpu_backing): where no
+// page of the range is GPU-modified, as the CPU-owned writer (TryWriteCpuBacking: its own mutex and fence) instead of
+// as a data
+// writer (TryWriteBacking: the data mutex it shares with the readbacks' write-backs, which the guarded labels waited
+// behind, 0.65 ms in a spike frame). Exact: the data writers write GPU results only to pages the
+// tracker still holds GPU-modified (BufferCache::WriteBackGpuOwned), and every write-back gives a page back only after
+// writing it; only this thread (the GPU thread) marks a page GPU-modified, so a range it finds unmodified has no data
+// writer now or until it marks it. (The test creates no region manager: Iterate<false>.) False as before: the caller
+// drains and writes through the guest mapping.
+static bool WriteGuardedBacking(uint64_t address, const void* data, uint64_t size) {
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 &&
+	    g_gpu_buffers != nullptr &&
+	    !g_gpu_buffers->IsRegionGpuModified(address, size) && Libs::LibKernel::Memory::TryWriteCpuBacking(address, data, size))
+		return true;
+	return Libs::LibKernel::Memory::TryWriteBacking(address, data, size);
+}
+
 static bool GuardedWrite(void* dst, const void* src, uint32_t size) {
 	// (Not under a speculation's translation, whose writes are journaled, nor in mode 4, whose threads read the
 	// processor's writes: KYTY_SPECULATE=0, the default, only.)
@@ -909,7 +927,7 @@ static bool GuardedWrite(void* dst, const void* src, uint32_t size) {
 	for (uint64_t page = first; page < end; page += WriteGuard::Page)
 		(void)worker.PushCall(LiftGuardCall, nullptr, page, token, 0, 1);
 	worker.Kick();
-	const bool written = armed && Libs::LibKernel::Memory::TryWriteBacking(address, bytes.data(), size);
+	const bool written = armed && WriteGuardedBacking(address, bytes.data(), size);
 	// (Not written: the caller's drain waits for the lifts too, then writes through the guest mapping.)
 	if (!written) return false;
 	RebaseGuardedCommands(g_current_execution);
@@ -962,7 +980,7 @@ size_t CommitGuardedWriteRun(const uint64_t* addresses, const uint64_t* values, 
 	if (!armed) return 0;
 	size_t written = 0;
 	for (; written < count; ++written) {
-		if (!Libs::LibKernel::Memory::TryWriteBacking(addresses[written], &values[written], sizes[written])) break;
+		if (!WriteGuardedBacking(addresses[written], &values[written], sizes[written])) break;
 		if (Scout::Running()) Scout::NoteWrite(reinterpret_cast<void*>(addresses[written]), sizes[written], &values[written]);
 	}
 	if (written != 0) RebaseGuardedCommands(g_current_execution);
@@ -1284,6 +1302,7 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
+	g_gpu_buffers = &gpu->m_renderer.GetBufferCache();
 	PageManager::DeferReadProtection(true);
 	gpu->m_renderer.GetMutex().BecomeOwner();
 	BdaDirtyRegions::g_translating = true;
@@ -1503,6 +1522,7 @@ void GuestGpu::ThreadRun(void* data) {
 			gpu->m_gfx_cp->BufferWait();
 			gpu->m_renderer.GetMutex().ResignOwner();
 			g_gpu_state  = nullptr;
+			g_gpu_buffers = nullptr;
 			g_gpu_thread = false;
 			return;
 		}
