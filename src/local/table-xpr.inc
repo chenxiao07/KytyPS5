@@ -929,11 +929,55 @@ static int64_t WorkerSets() {
 	if (!Spec::On()) return 0;
 	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 1 : 0;
 }
+static thread_local bool t_table_revalidating = false; // (spec_worker_revalidate: TableResolveSet's caller)
 static void TableKeepAside(std::shared_ptr<void> holder) {
 	static std::mutex                          mutex;
 	static std::vector<std::shared_ptr<void>> kept;
 	std::scoped_lock                           lock(mutex);
 	kept.push_back(std::move(holder));
+}
+// spec_aside_release (under KYTY_SPECULATE=4; otherwise kept for good as above): a set kept
+// aside is released instead. When it goes aside, the roles' pointers to it are dropped under the catalog's write (as an
+// unpublished pending set's are: no later lookup finds it). At a commit two frames after it went aside (every speculation
+// that could still bind it is done), the GPU thread retires its descriptor set as the owner retires one
+// (NativeXprRetireSet: in flight until the
+// current tick; a speculation that bound it and commits later stops, "a hole retired a set"), and the set itself is
+// destroyed once the translations in flight then have passed (Spec::PacketsPassed).
+[[nodiscard]] static bool TableAsideReleaseOn() {
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+}
+struct TableAsideQueue {
+	struct Queued {
+		uint64_t              frame = 0; // (the frame it went aside in)
+		std::shared_ptr<void> holder;
+		std::function<void()> retire; // (its descriptor set: on the GPU thread)
+	};
+	std::mutex                                                       mutex;
+	std::vector<Queued>                                              queued;
+	std::vector<std::pair<Spec::PacketMarks, std::shared_ptr<void>>> retiring;
+};
+static TableAsideQueue& TableAside() {
+	static TableAsideQueue aside;
+	return aside;
+}
+// (The GPU thread, at a commit.)
+static void TableAsideDrain(uint64_t frame) {
+	auto&                                aside = TableAside();
+	std::vector<TableAsideQueue::Queued> due;
+	{
+		std::scoped_lock lock(aside.mutex);
+		std::erase_if(aside.retiring, [](const auto& item) { return Spec::PacketsPassed(item.first); });
+		std::erase_if(aside.queued, [&](auto& item) {
+			if (item.frame + 2 > frame) return false;
+			due.push_back(std::move(item));
+			return true;
+		});
+	}
+	if (due.empty()) return;
+	for (auto& item: due) item.retire();
+	const auto       marks = Spec::PacketNow();
+	std::scoped_lock lock(aside.mutex);
+	for (auto& item: due) aside.retiring.emplace_back(marks, std::move(item.holder));
 }
 
 // spec_worker_images: the GPU thread, at the commit of the segment that built `set` (Speculation::Before, before the replay
@@ -1027,13 +1071,15 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			set->ValidatedFrame(Role())  = set->validated_frame;
 			set->ResolutionEpoch(Role()) = set->resolution_epoch;
 			set->validated_frame         = UINT64_MAX; // (the owner proves it in full at its first use)
-			auto* const raw    = set.get();
-			auto* const owner  = &Catalog();
-			auto* const target = &pair;
-			const auto  since  = CatalogTable()->epoch;
-			auto        holder = std::make_shared<std::unique_ptr<TableImageSet>>(std::move(set));
+			auto* const raw      = set.get();
+			auto* const owner    = &Catalog();
+			auto* const target   = &pair;
+			const auto  since    = CatalogTable()->epoch;
+			const bool  replaces = t_table_revalidating; // (spec_worker_revalidate: built for a set found no longer valid)
+			auto        holder   = std::make_shared<std::unique_ptr<TableImageSet>>(std::move(set));
 			spec->proposed_sets.push_back({&pair, words_hash, raw, spec->closed.size(), false,
-			                               [owner, target, words_hash, since, holder](bool commit) {
+			                               [owner, target, words_hash, since, holder, replaces](bool commit) {
+				                               if (commit && TableAsideReleaseOn()) TableAsideDrain(owner->m_context.FrameNumber());
 				                               // (spec_worker_images: never completed, never published or kept; the roles' pointers to it
 				                               // dropped first, under the write lock their reads exclude.)
 				                               if (*holder && !(*holder)->pending_images.empty()) {
@@ -1050,7 +1096,28 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 							                               slot = std::move(*holder);
 							                               return;
 						                               }
+						                               // (spec_worker_revalidate: the slot's set replaced as the owner's own
+						                               // resolution replaces one.)
+						                               if (replaces && slot.get() != holder->get()) {
+							                               owner->NativeXprRetireSet(slot->pool, slot->set);
+							                               target->ClearSets();
+							                               ++table->epoch;
+							                               slot = std::move(*holder);
+							                               return;
+						                               }
 					                               }
+				                               }
+				                               if (*holder && TableAsideReleaseOn()) { // (spec_aside_release)
+					                               {
+						                               const auto write = owner->CatalogWrite();
+						                               target->ForgetSet(holder->get());
+					                               }
+					                               auto&            aside = TableAside();
+					                               std::scoped_lock lock(aside.mutex);
+					                               aside.queued.push_back({owner->m_context.FrameNumber(), holder, [owner, holder] {
+						                                                       owner->NativeXprRetireSet((*holder)->pool, (*holder)->set);
+					                                                       }});
+					                               return;
 				                               }
 				                               TableKeepAside(holder);
 			                               }});
@@ -1796,16 +1863,34 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 	set->used_frame.store(frame, std::memory_order_relaxed);
 	if (set->refused) return LiveCounters::Add(LiveCounters::TableRefusedSets), Spec::Refuse("table: refused set"), nullptr;
 	if (!TableValidateSet(*set)) {
-		if (Spec::Current() != nullptr) return Spec::Refuse("table: set validation"), nullptr;
-		// Resolved again at the next draw that uses it.
-		const auto write = CatalogWrite();
-		if (table.last_set == set) table.last_set = nullptr;
-		pair.ClearSets();
-		++table.epoch;
-		const auto found = pair.sets.find(XXH3_64bits(set->words.data(), set->words.size() * sizeof(uint32_t)));
-		NativeXprRetireSet(set->pool, set->set);
-		if (found != pair.sets.end() && found->second.get() == set) pair.sets.erase(found);
-		return nullptr;
+		// spec_worker_revalidate (under KYTY_SPECULATE=4 only): a speculation resolves the set afresh itself, as it does a
+		// set it finds none for (a proposed set: published at its commit, replacing the slot's, or kept aside; the
+		// worker-set checks at the commit), instead of the hole. The set found is proven as one the lookup above found
+		// (TableValidateSet); the set that just failed (one this translation proposed, found again by its words) is refused.
+		if (Spec::Current() != nullptr && Role() != 0 && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+			t_table_revalidating = true;
+			auto* const fresh    = TableResolveSet(buffer, pair, variant, draw_state, words);
+			t_table_revalidating = false;
+			if (fresh == nullptr || fresh == set) return Spec::Refuse("table: set validation"), nullptr;
+			pair.LastSet(Role()) = fresh;
+			if (fresh->refused)
+				return LiveCounters::Add(LiveCounters::TableRefusedSets), Spec::Refuse("table: refused set"), nullptr;
+			if (!TableValidateSet(*fresh)) return Spec::Refuse("table: set validation"), nullptr;
+			fresh->used_frame.store(frame, std::memory_order_relaxed);
+			set = fresh;
+		} else if (Spec::Current() != nullptr) {
+			return Spec::Refuse("table: set validation"), nullptr;
+		} else { // (the owner's path, as before)
+			// Resolved again at the next draw that uses it.
+			const auto write = CatalogWrite();
+			if (table.last_set == set) table.last_set = nullptr;
+			pair.ClearSets();
+			++table.epoch;
+			const auto found = pair.sets.find(XXH3_64bits(set->words.data(), set->words.size() * sizeof(uint32_t)));
+			NativeXprRetireSet(set->pool, set->set);
+			if (found != pair.sets.end() && found->second.get() == set) pair.sets.erase(found);
+			return nullptr;
+		}
 	}
 	// Unused image sets leave once a second (the catalog's owner drops them).
 	if (Role() == 0 && frame >= table.collected + 60) {
