@@ -1187,10 +1187,11 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		struct Held {
 			std::remove_cvref_t<decltype(variant->mapping)> mapping;
 			std::remove_cvref_t<decltype(variant->state)>   state;
+			std::remove_cvref_t<decltype(variant->pipeline)> pipeline; // (an in-place update meanwhile, below)
 			std::remove_cvref_t<decltype(pair.portable)>    portable;
 		};
 		std::optional<Held> held;
-		if (spec != nullptr) held.emplace(Held {variant->mapping, variant->state, pair.portable});
+		if (spec != nullptr) held.emplace(Held {variant->mapping, variant->state, variant->pipeline, pair.portable});
 		const auto* mapping  = held ? &held->mapping : &variant->mapping;
 		const auto* portable = held ? &held->portable : &pair.portable;
 		const auto  since    = spec != nullptr && CatalogTable() != nullptr ? CatalogTable()->epoch : 0;
@@ -1202,9 +1203,16 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		if (spec != nullptr && PipelineCache::t_no_fault_failed) return worker_refuse("worker set: program read");
 		if (unlocked) {
 			if (CatalogTable() == nullptr || CatalogTable()->epoch != since) return worker_refuse("worker set: catalog changed");
+			// (The owner's TableStore adds a variant under its write without moving the epoch: a pair's variants vector that
+			// grew meanwhile moved the variant TableDraw holds by reference, and reads after this set (its pipeline, its
+			// index as the role's last variant). Refused then, as when the variant left.)
 			const auto again = std::ranges::find(pair.variants, held->state, &TableVariant::state);
-			if (again == pair.variants.end()) return worker_refuse("worker set: catalog changed");
-			variant = &*again;
+			if (again == pair.variants.end() || &*again != variant) return worker_refuse("worker set: catalog changed");
+			// (TableStore's targets path updates a variant in place, without moving the epoch or
+			// the vector: its pipeline swapped, or null while TryCreateGraphicsPipeline is pending, or the variant refused.
+			// The set's layout and TableDraw's bind read that pipeline: refused unless it is the one held before the unlock.)
+			if (again->pipeline != held->pipeline || again->pipeline == nullptr || again->refused)
+				return worker_refuse("worker set: catalog changed");
 		}
 		if (m_context.GetPipelineCache().TablePending())
 			return spec != nullptr ? worker_refuse("worker set: program pending") : nullptr;
@@ -1881,9 +1889,18 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 			if (set == nullptr || (set->refused && retry_due(*set))) {
 				auto* const retried = set;
 				set                 = TableResolveSet(buffer, pair, variant, draw_state, words);
-				// (A retry that came back pending: the refused set is still the slot's.)
-				if (retried != nullptr && set == nullptr && TableLearnPortable() == 2 && m_context.GetPipelineCache().TablePending())
-					retried->retry_wait = m_context.GetPipelineCache().TableWaiting();
+				// (A retry that came back pending: the refused set is still the slot's.) (The GPU thread's only. A
+				// speculation's TableResolveSet drops the catalog's read for its program lookup, and the
+				// owner may destroy `retried` meanwhile (TableReset, the set collection, a publish): the write would land in
+				// freed memory; workers also wrote the shared_ptr under the shared lock while others read it.)
+				if (Spec::Current() == nullptr && retried != nullptr && set == nullptr && TableLearnPortable() == 2 &&
+				    m_context.GetPipelineCache().TablePending()) {
+					// (Under the catalog's write lock: workers read retry_wait under the shared one, and this assignment can drop
+					// the last reference to the old job's flag. The old one is released after the unlock.)
+					auto       waiting = m_context.GetPipelineCache().TableWaiting();
+					const auto write   = CatalogWrite();
+					retried->retry_wait.swap(waiting);
+				}
 			}
 		}
 		// (TableResolveSet may have cleared both: a set it replaced.)
