@@ -246,6 +246,13 @@ inline bool ReadOneSetOn() {
 	static auto& on = LiveSwitch::Find("spec_read_one_set", ModeToggle::Default("spec_read_one_set"));
 	return on.load(std::memory_order_relaxed) != 0;
 }
+// spec_inherit_lazy (under KYTY_SPECULATE=4 only, the mode read at each Inherit): State::Inherit
+// takes the chain's union from the state before it (its own chain union and its own sets) when the chain beyond that state
+// is still the one it inherited, in place of merging every state of the chain (~20 at a spike: ~0.6 us a worker table
+// draw).
+inline bool InheritLazyOn() {
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+}
 // KYTY_SPEC_READ_ONE_SET_VERIFY (live spec_read_one_set_verify N, default 0): every Nth read pending_set clears also put
 // through the four searches, a disagreement counted (spec_one_set_mismatch; State::VerifyOneSet).
 inline int64_t ReadOneSetVerifyEvery() {
@@ -505,6 +512,10 @@ struct State {
 	// stops at its next packet. Null: never.
 	const std::atomic<bool>* cancel = nullptr;
 	RangeSet                  chain_journal, chain_written;
+	// (spec_inherit_lazy) The chain Inherit merged, from `previous` on, and whether Inherit ran since Clear: the next
+	// state's Inherit takes this one's union when its chain beyond this one is still these, in order.
+	std::vector<const State*> chain_members;
+	bool                      chain_ready = false;
 	// The granules of journal_set, written_set, chain_journal and chain_written (a look before their searches).
 	GranuleFilter pending;
 	// KYTY_SPEC_READ_ONE_SET: those four sets in one, kept as they grow (they only grow until Inherit or Clear), so a
@@ -560,19 +571,57 @@ struct State {
 	}
 	// After `previous` is set: what the speculations before it not committed yet write (one committed is unlinked:
 	// memory holds its writes).
+	//
+	// spec_inherit_lazy: the chain is walked once (its pointers). When the state before it, P, inherited exactly the
+	// chain beyond it (P's chain_members equal, in order: its links change only to null or to a posted record (Unlink,
+	// Finish), never back to a recorded pointer, and a state it lost is
+	// never linked back into an older state's `previous`, so equal pointers are the same states; their sets no longer
+	// change: P and those before it are translated or passed, and none is cleared while this thread's translator holds
+	// the horizon), the union over the chain is P's sets plus P's union: chain_journal = P.journal_set + P.chain_journal,
+	// chain_written likewise; pending_set = P's pending_set (which kept P's four sets as they grew) plus this state's own
+	// sets; the granule filter takes P's, which holds its chain's. The same sets as the full merge, so every question
+	// gets the full merge's answer.
 	void Inherit() {
-		chain_journal.Clear();
-		chain_written.Clear();
-		for (const State* state = previous.load(); state != nullptr; state = state->previous.load()) {
-			state->journal_set.ForEach([&](uint64_t begin, uint64_t end) { chain_journal.Add(begin, end - begin); });
-			state->written_set.ForEach([&](uint64_t begin, uint64_t end) { chain_written.Add(begin, end - begin); });
-			pending.Merge(state->pending);
-		}
+		thread_local std::vector<const State*> chain;
+		chain.clear();
+		for (const State* state = previous.load(); state != nullptr; state = state->previous.load()) chain.push_back(state);
 		one_set = ReadOneSetOn();
-		pending_set.Clear();
-		if (one_set)
-			for (const RangeSet* set: {&journal_set, &written_set, &chain_journal, &chain_written})
-				set->ForEach([&](uint64_t begin, uint64_t end) { pending_set.Add(begin, end - begin); });
+		const State* before = chain.empty() ? nullptr : chain.front();
+		const bool   fast   = InheritLazyOn() && before != nullptr && before->chain_ready &&
+		                   before->chain_members.size() + 1 == chain.size() &&
+		                   std::equal(before->chain_members.begin(), before->chain_members.end(), chain.begin() + 1) &&
+		                   (!one_set || before->one_set);
+		// (Today's merge, over the chain walked above.)
+		const auto merge_all = [&](RangeSet& journal, RangeSet& written, RangeSet& merged, GranuleFilter* filter) {
+			journal.Clear();
+			written.Clear();
+			for (const State* state: chain) {
+				state->journal_set.ForEach([&](uint64_t begin, uint64_t end) { journal.Add(begin, end - begin); });
+				state->written_set.ForEach([&](uint64_t begin, uint64_t end) { written.Add(begin, end - begin); });
+				if (filter != nullptr) filter->Merge(state->pending);
+			}
+			merged.Clear();
+			if (one_set)
+				for (const RangeSet* set: {&journal_set, &written_set, &journal, &written})
+					set->ForEach([&](uint64_t begin, uint64_t end) { merged.Add(begin, end - begin); });
+		};
+		if (fast) {
+			chain_journal.AssignFrom(before->chain_journal);
+			before->journal_set.ForEach([&](uint64_t begin, uint64_t end) { chain_journal.Add(begin, end - begin); });
+			chain_written.AssignFrom(before->chain_written);
+			before->written_set.ForEach([&](uint64_t begin, uint64_t end) { chain_written.Add(begin, end - begin); });
+			pending.Merge(before->pending);
+			pending_set.Clear();
+			if (one_set) {
+				pending_set.AssignFrom(before->pending_set);
+				for (const RangeSet* set: {&journal_set, &written_set}) // (empty after Clear; kept for any other caller)
+					set->ForEach([&](uint64_t begin, uint64_t end) { pending_set.Add(begin, end - begin); });
+			}
+		} else {
+			merge_all(chain_journal, chain_written, pending_set, &pending);
+		}
+		chain_members.assign(chain.begin(), chain.end());
+		chain_ready = true;
 	}
 	// An image as the latest speculation before it leaves it (null: none used it).
 	[[nodiscard]] const ImageEntry* ChainImage(const Image* image, uint64_t serial) const {
@@ -961,6 +1010,8 @@ struct State {
 		previous = nullptr;
 		chain_journal.Clear();
 		chain_written.Clear();
+		chain_members.clear();
+		chain_ready = false;
 		pending.Clear();
 		pending_set.Clear();
 		one_set = ReadOneSetOn();
