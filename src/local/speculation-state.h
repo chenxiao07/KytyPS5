@@ -1299,6 +1299,18 @@ struct WriteStamps {
 		std::unique_ptr<Leaf> leaf;
 	};
 	std::vector<Granule> granules = std::vector<Granule>(AddressLimit >> GranuleBits);
+	std::vector<uint32_t> leafed; // the granules with a leaf (KYTY_SPEC_STAMP_TRIM)
+	// KYTY_SPEC_STAMP_TRIM: the leaves of granules not written since `from` freed (a granule whose latest stamp is
+	// `from` or older is passed whole by every question asked from `from` on; a write made later makes its leaf
+	// again).
+	void FreeLeavesBefore(uint64_t from) {
+		std::erase_if(leafed, [&](uint32_t g) {
+			auto& granule = granules[g];
+			if (granule.latest > from) return false;
+			granule.leaf.reset();
+			return true;
+		});
+	}
 	// (A write of 16 KiB to 1 MiB stamps its 64 KiB blocks, one over 1 MiB its granules: at most 64 stores a write.
 	// Every unit cost ~1.5 ms a frame of the render thread for the async queue's culling buffers, 10-31.)
 	void Stamp(uint64_t address, uint64_t size, uint64_t stamp) {
@@ -1313,7 +1325,10 @@ struct WriteStamps {
 		const auto bits     = by_block ? BlockBits : UnitBits;
 		for (auto at = address >> bits, last = (end - 1) >> bits; at <= last; ++at) {
 			auto& granule = granules[(at << bits) >> GranuleBits];
-			if (!granule.leaf) granule.leaf = std::make_unique<Leaf>();
+			if (!granule.leaf) {
+				granule.leaf = std::make_unique<Leaf>();
+				leafed.push_back(static_cast<uint32_t>((at << bits) >> GranuleBits));
+			}
 			if (by_block) granule.leaf->blocks[at & ((uint64_t {1} << (GranuleBits - BlockBits)) - 1)] = stamp;
 			else granule.leaf->units[at & ((uint64_t {1} << LeafBits) - 1)] = stamp;
 			granule.latest = stamp;

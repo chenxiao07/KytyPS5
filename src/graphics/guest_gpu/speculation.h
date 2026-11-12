@@ -281,6 +281,7 @@ private:
 	// queue; the frame of the last report.
 	uint64_t m_kept_ns = 0, m_lost_ns = 0, m_commit_ns = 0, m_hole_ns = 0, m_queue_ns = 0, m_report_frame = 0;
 	uint32_t m_held_commits = 0; // commits since the last flush (KYTY_SPECULATE_FLUSH_EVERY; this instance's)
+	uint32_t m_stamp_trim_commits = 0; // commits since the stamps' leaves were last looked at (KYTY_SPEC_STAMP_TRIM)
 	std::mutex m_mutex;
 	bool       m_quit  = false;
 	uint64_t   m_clock = 0; // (under m_mutex) orders translations beginning and results retired

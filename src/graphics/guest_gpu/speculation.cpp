@@ -971,6 +971,8 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 	}
 	++(outcome == Outcome::Whole || outcome == Outcome::Chunk ? m_whole : outcome == Outcome::Partly ? m_partly : m_none);
 	Finish(std::move(result), committed);
+	uint64_t trim_from = 0; // (KYTY_SPEC_STAMP_TRIM: the bound, taken under the lock; the leaves freed after it)
+	bool     trim      = false;
 	{
 		// What no result began before: of those translated ahead (in the order they were done, not begun) and those
 		// being translated (from when their translator took them: its current result's until then).
@@ -981,6 +983,22 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 			if (translator->translating != 0 && translator->current != nullptr)
 				oldest = std::min(oldest, translator->current->effects_from);
 		m_log.DropBefore(oldest);
+		// KYTY_SPEC_STAMP_TRIM (live spec_stamp_trim; 0, the default: off): every 1024 commits, the stamps' leaves
+		// (128 KiB and 8.5 KiB, one a 4 MiB granule written, kept for good without it) of granules nothing was written
+		// over since what no result began before (nor the one waiting at a wait hole) freed: every question is asked
+		// from a result's beginning or later. (This thread made them: the thread that commits alone stamps.) The bound is
+		// taken here; the leaves are freed after the lock (up to ~270 MiB the first time, which workers would otherwise
+		// wait out on m_mutex): only this thread stamps and reads them (workers read the log's end alone).
+		static auto& stamp_trim = LiveSwitch::Find("spec_stamp_trim", 0);
+		if (stamp_trim.load(std::memory_order_relaxed) != 0 && ++m_stamp_trim_commits >= 1024) {
+			m_stamp_trim_commits = 0;
+			trim                 = true;
+			trim_from            = m_blocked ? std::min(oldest, m_blocked->effects_from) : oldest;
+		}
+	}
+	if (trim) {
+		m_log.stamps.FreeLeavesBefore(trim_from);
+		m_log.host_stamps.FreeLeavesBefore(trim_from);
 	}
 	Report();
 	return outcome;
