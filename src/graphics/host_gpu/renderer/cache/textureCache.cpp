@@ -998,6 +998,12 @@ void TextureCache::FreeGuestAliases(ImageId written) {
 
 void TextureCache::TouchImage(Image& image) {
 	if (auto* spec = Spec::Current()) { // (touched when the speculative translation is committed)
+		// spec_touch_null_skip (under KYTY_SPECULATE=4): the null image
+		// (GetNullImage: no guest memory, never registered) is not one its commit must find still resolved; recorded, its
+		// commit always stopped ("images registered").
+		if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && !image.registered &&
+		    image.info.data.address == 0 && image.info.data.size == 0)
+			return;
 		auto& touched = spec->touched_images;
 		if (touched.empty() || touched.back().first != &image) touched.emplace_back(&image, image.serial);
 		return;
