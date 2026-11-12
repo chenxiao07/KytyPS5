@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include <array>
+#include <deque>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -134,6 +135,23 @@ private:
 	static constexpr uint64_t UnmapGranuleBits = 14, UnmapLeafBits = 16;
 	std::unordered_map<uint64_t, std::unique_ptr<uint64_t[]>> m_unmap_epochs;
 	uint64_t m_unmap_latest = 0; // the latest unmap's mapping epoch
+	// spec_unmap_list (under KYTY_SPECULATE=4 only, the mode read at each use): the unmaps
+	// in epoch order, rounded out to granules (GPU
+	// thread); `m_unmap_log_dropped` the newest epoch dropped from its front. The commit's Changed asks for one `since` (the
+	// result's mapping epoch) over every range it read, ~40,000 a frame in an area transition, each a hash lookup and a
+	// granule walk; from the merged ranges unmapped after `since` (built once a (since, latest unmap)) each is a span test
+	// and a binary search, whatever the range's size. Only inside Changed (t_unmap_list_site): other callers ask with their
+	// own epochs, which would rebuild the list between the commit's checks.
+	struct UnmapLogEntry {
+		uint64_t epoch, begin, end;
+	};
+	std::deque<UnmapLogEntry>                          m_unmap_log;
+	uint64_t                                           m_unmap_log_dropped = 0;
+	mutable std::vector<std::pair<uint64_t, uint64_t>> m_unmap_list;
+	mutable uint64_t                                   m_unmap_list_since = UINT64_MAX, m_unmap_list_latest = 0;
+	mutable bool                                       m_unmap_list_ok = false;
+	// 1: unmapped (by the list), 0: not, -1: the list cannot answer.
+	[[nodiscard]] int UnmappedSinceByList(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept;
 	// The spans whose part of RefreshBdaRanges' list (registered buffers' mapped parts) may have changed since it
 	// last ran: mapping changes over a registered buffer and buffers (un)registered. Only their tracker regions are
 	// collected again: the whole list (0.4 ms over ~2200 buffers) was, several times a frame while the game streams

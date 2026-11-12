@@ -322,6 +322,17 @@ void GpuResourceManager::UnmapOnGpuThread(uint64_t vaddr, uint64_t size, bool re
 	if (registered) NoteBdaSpan(vaddr, size);
 	if (size == 0) return;
 	m_unmap_latest = epoch;
+	{ // (spec_unmap_list, under KYTY_SPECULATE=4: the unmap in the log, rounded out to granules, the granule walk's grain;
+	  // otherwise nothing logged and the log marked incomplete up to here, so a list after a flip to mode 4 answers only
+	  // what it saw)
+		if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+			constexpr uint64_t granule = uint64_t {1} << UnmapGranuleBits;
+			m_unmap_log.push_back({epoch, vaddr & ~(granule - 1), (vaddr + size + granule - 1) & ~(granule - 1)});
+			while (m_unmap_log.size() > 65536) m_unmap_log_dropped = m_unmap_log.front().epoch, m_unmap_log.pop_front();
+		} else {
+			m_unmap_log_dropped = epoch;
+		}
+	}
 	constexpr uint64_t leaf_mask = (uint64_t {1} << UnmapLeafBits) - 1;
 	for (uint64_t g = vaddr >> UnmapGranuleBits, last = (vaddr + size - 1) >> UnmapGranuleBits; g <= last; ++g) {
 		auto& leaf = m_unmap_epochs[g >> UnmapLeafBits];
@@ -371,20 +382,63 @@ void GpuResourceManager::FreedByGame(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+thread_local bool t_unmap_list_site = false; // (spec_unmap_list: set while the commit's Changed runs)
+
 bool GpuResourceManager::UnmappedSince(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept {
 	// (Nothing unmapped since: mostly so. Else each leaf the range spans looked up once.)
 	if (size == 0 || m_unmap_latest <= epoch) return false;
-	constexpr uint64_t leaf_mask = (uint64_t {1} << UnmapLeafBits) - 1;
-	for (uint64_t g = vaddr >> UnmapGranuleBits, last = (vaddr + size - 1) >> UnmapGranuleBits; g <= last;) {
-		const auto stop = std::min(last, g | leaf_mask);
-		if (const auto leaf = m_unmap_epochs.find(g >> UnmapLeafBits); leaf != m_unmap_epochs.end()) {
-			const auto* epochs = leaf->second.get();
-			for (auto i = g & leaf_mask; i <= (stop & leaf_mask); ++i)
-				if (epochs[i] > epoch) return true;
+	const auto by_granule = [&] {
+		constexpr uint64_t leaf_mask = (uint64_t {1} << UnmapLeafBits) - 1;
+		for (uint64_t g = vaddr >> UnmapGranuleBits, last = (vaddr + size - 1) >> UnmapGranuleBits; g <= last;) {
+			const auto stop = std::min(last, g | leaf_mask);
+			if (const auto leaf = m_unmap_epochs.find(g >> UnmapLeafBits); leaf != m_unmap_epochs.end()) {
+				const auto* epochs = leaf->second.get();
+				for (auto i = g & leaf_mask; i <= (stop & leaf_mask); ++i)
+					if (epochs[i] > epoch) return true;
+			}
+			g = stop + 1;
 		}
-		g = stop + 1;
+		return false;
+	};
+	if (t_unmap_list_site && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+		if (const int answer = UnmappedSinceByList(epoch, vaddr, size); answer >= 0) return answer != 0;
 	}
-	return false;
+	return by_granule();
+}
+
+int GpuResourceManager::UnmappedSinceByList(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept {
+	if (epoch < m_unmap_log_dropped) return -1; // (an unmap after `epoch` may be gone from the log)
+	if (m_unmap_list_since != epoch || m_unmap_list_latest != m_unmap_latest) {
+		m_unmap_list_since  = epoch;
+		m_unmap_list_latest = m_unmap_latest;
+		m_unmap_list.clear();
+		// (The log is in epoch order: the entries after `epoch` are its tail.)
+		auto first = std::upper_bound(m_unmap_log.begin(), m_unmap_log.end(), epoch,
+		                              [](uint64_t e, const UnmapLogEntry& entry) { return e < entry.epoch; });
+		m_unmap_list_ok = static_cast<size_t>(m_unmap_log.end() - first) <= 8192;
+		if (m_unmap_list_ok) {
+			for (auto it = first; it != m_unmap_log.end(); ++it) m_unmap_list.emplace_back(it->begin, it->end);
+			std::sort(m_unmap_list.begin(), m_unmap_list.end());
+			size_t out = 0;
+			for (size_t i = 0; i < m_unmap_list.size(); ++i) {
+				if (out != 0 && m_unmap_list[i].first <= m_unmap_list[out - 1].second)
+					m_unmap_list[out - 1].second = std::max(m_unmap_list[out - 1].second, m_unmap_list[i].second);
+				else
+					m_unmap_list[out++] = m_unmap_list[i];
+			}
+			m_unmap_list.resize(out);
+		}
+	}
+	if (!m_unmap_list_ok) return -1;
+	if (m_unmap_list.empty()) return 0;
+	// (The range rounded out to granules, as the granule walk reads it.)
+	constexpr uint64_t granule = uint64_t {1} << UnmapGranuleBits;
+	const uint64_t     begin = vaddr & ~(granule - 1), end = (vaddr + size + granule - 1) & ~(granule - 1);
+	if (end <= m_unmap_list.front().first || begin >= m_unmap_list.back().second) return 0;
+	// The first merged range ending after `begin`: over the range when it starts before `end`.
+	const auto it = std::upper_bound(m_unmap_list.begin(), m_unmap_list.end(), begin,
+	                                 [](uint64_t b, const std::pair<uint64_t, uint64_t>& r) { return b < r.second; });
+	return it != m_unmap_list.end() && it->first < end ? 1 : 0;
 }
 
 void GpuResourceManager::NoteBdaSpan(uint64_t vaddr, uint64_t size) {

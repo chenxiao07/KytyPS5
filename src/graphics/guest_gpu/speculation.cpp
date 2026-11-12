@@ -914,6 +914,11 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 }
 
 const char* Speculation::Changed(const Result& result, size_t index) const {
+	extern thread_local bool t_unmap_list_site; // (spec_unmap_list: its checks share one `since`)
+	struct ListSite {
+		ListSite() { t_unmap_list_site = true; }
+		~ListSite() { t_unmap_list_site = false; }
+	} list_site;
 	auto&       buffers  = m_renderer.GetBufferCache();
 	auto&       textures = m_renderer.GetTextureCache();
 	const auto& state    = result.state;
