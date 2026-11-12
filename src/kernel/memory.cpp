@@ -1,6 +1,8 @@
 #include "kernel/memory.h"
 #include "live-census.h"
 #include "live-counters.h"
+#include "gpu-idle.h"
+#include "hoist-watch.h"
 #include "live-trace.h"
 #include "time-census.h"
 #include "fresh-memory.h"
@@ -35,6 +37,7 @@
 #include <memory>
 #include <mutex>
 #include <condition_variable>
+#include <deque>
 #include <shared_mutex>
 #include <thread>
 #include <vector>
@@ -1208,6 +1211,16 @@ static std::atomic<uint64_t>              g_memory_pool_committed = 0;
 static void                               MemoryPoolSubtractCommitted(uint64_t len);
 // Keep host mappings, physical blocks, placeholders, and virtual ranges in step.
 static std::recursive_mutex g_memory_operation_mutex;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// park_whole_views: one parked view released under the guest memory operations' lock (a guest map waiting for a busy
+// range holds it: the release must not mark its view busy first), one view per acquisition (a guest call waits for at
+// most one release).
+static void ReleaseParkedView(uint64_t vaddr, uint64_t size) {
+	std::lock_guard<std::recursive_mutex> lock(g_memory_operation_mutex);
+	if (g_guest_address_space != nullptr) g_guest_address_space->ReleaseParkedView(vaddr, size);
+}
+#endif
 
 // The base address the PS5 kernel hands out for hint-less user mappings. Guest code can
 // assume mappings it did not place explicitly are at or above this (Sony's libc rejects a

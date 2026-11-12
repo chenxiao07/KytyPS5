@@ -38,6 +38,78 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 
 // Kyty.Trim's trim of a parked range: GuestAddressSpace::TrimParked while the address space lives (below).
 static void TrimParkedRange(uint64_t vaddr, uint64_t size);
+// A parked whole view released off the game's thread (memory.cpp: under the guest memory operations' lock, through
+// GuestAddressSpace::ReleaseParkedView).
+static void ReleaseParkedView(uint64_t vaddr, uint64_t size);
+// A live switch's value, -1 (its default) meaning `on4` under KYTY_SPECULATE=4 and 0 otherwise.
+static int64_t ModeFourDefault(const std::atomic<int64_t>& value, int64_t on4) {
+	const auto v = value.load(std::memory_order_relaxed);
+	if (v >= 0) return v;
+	return ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? on4 : 0;
+}
+// KYTY_PARK_WHOLE_VIEWS (live park_whole_views; -1, the default: 50 under KYTY_SPECULATE=4, 0 otherwise; 0 off): N > 0:
+// a guest unmap of a whole view (UnmapOne How::Whole, and a view emptied of its last mapping, How::Release) parks the view
+// and queues its release, which Kyty.Release makes N ms later or after.
+static int64_t ParkWholeViewsMs() {
+	static auto& value = LiveSwitch::Find("park_whole_views", -1);
+	return ModeFourDefault(value, 50);
+}
+// KYTY_RELEASE_TRICKLE (live release_trickle; -1, the default: 200 under KYTY_SPECULATE=4, 0 otherwise; 0 off): N > 0:
+// once a parked view is due, Kyty.Release releases it only while the GPU thread is in its idle wait (GpuIdle), waiting up
+// to N ms for one, then releases it anyway: the release holds the address space busy, and the GPU thread's protection
+// changes wait for any busy range process-wide (BusyUnlocked, issues #5 / #50), 8 ms of a 56 ms frame in a Demon's
+// Souls area load.
+static int64_t ReleaseTrickleMs() {
+	static auto& value = LiveSwitch::Find("release_trickle", -1);
+	return ModeFourDefault(value, 200);
+}
+class ParkedViewReleaser {
+public:
+	static void Queue(uint64_t vaddr, uint64_t size) {
+		auto& r = Get();
+		{
+			std::lock_guard lock(r.m_mutex);
+			r.m_views.push_back({vaddr, size, std::chrono::steady_clock::now()});
+		}
+		r.m_ready.notify_one();
+	}
+
+private:
+	struct View {
+		uint64_t                              vaddr = 0, size = 0;
+		std::chrono::steady_clock::time_point parked {};
+	};
+	static ParkedViewReleaser& Get() {
+		static auto* releaser = new ParkedViewReleaser; // (never destroyed: its thread may outlive static destructors)
+		return *releaser;
+	}
+	ParkedViewReleaser() {
+		std::thread([this] {
+			LocalPlatform::SetThreadName("Kyty.Release");
+			for (;;) {
+				View view {};
+				{
+					std::unique_lock lock(m_mutex);
+					m_ready.wait(lock, [this] { return !m_views.empty(); });
+					view = m_views.front();
+				}
+				const auto delay = std::chrono::milliseconds(std::max<int64_t>(ParkWholeViewsMs(), 1));
+				std::this_thread::sleep_until(view.parked + delay);
+				if (const auto trickle = ReleaseTrickleMs(); trickle > 0 && !GpuIdle::g_idle.load(std::memory_order_acquire)) {
+					const auto give_up = std::chrono::steady_clock::now() + std::chrono::milliseconds(trickle);
+					while (!GpuIdle::g_idle.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < give_up)
+						std::this_thread::sleep_for(std::chrono::microseconds(200));
+				}
+				ReleaseParkedView(view.vaddr, view.size);
+				std::lock_guard lock(m_mutex);
+				m_views.pop_front();
+			}
+		}).detach();
+	}
+	std::mutex              m_mutex;
+	std::condition_variable m_ready;
+	std::deque<View>        m_views;
+};
 
 // Ranges parked in their views (GuestBackingStore::UnmapOne) taken out of the working set by a thread of its own: mapped,
 // their pages stayed counted in use (~1.5 GB of the game's freed streaming memory at a time), and dropping them costs
@@ -716,6 +788,8 @@ public:
 		enum class How { Whole, Split, Park, Release };
 		const auto park_mode = kyty_local_park_unmaps.load(std::memory_order_relaxed);
 		const bool park_new  = park_mode != 0;
+		const bool park_whole    = ParkWholeViewsMs() > 0; // (park_whole_views)
+		bool       release_later = false;
 		MapEntry   old {};
 		uint64_t   view_base = 0, view_size = 0;
 		How        how = How::Whole;
@@ -737,7 +811,7 @@ public:
 			view_size             = view->second;
 			const bool whole_view = old.vaddr == view_base && old.size == view_size;
 			const bool exact      = vaddr == old.vaddr && size == old.size;
-			how                   = !whole_view ? How::Park : exact ? How::Whole : park_new ? How::Park : How::Split;
+			how = !whole_view ? How::Park : exact ? (park_whole ? How::Park : How::Whole) : park_new ? How::Park : How::Split;
 			BackingWriteFence fence(*this);
 			InvalidateMappingLookup();
 			MapsErase(entry);
@@ -752,7 +826,13 @@ public:
 					                               old.backing_offset + (right - old.vaddr), old.mode}));
 				}
 				const auto view_end = view_base + view_size;
-				if (const auto live = m_maps.lower_bound(view_base); live == m_maps.end() || live->first >= view_end) {
+				const auto live  = m_maps.lower_bound(view_base);
+				const bool empty = live == m_maps.end() || live->first >= view_end;
+				if (empty && park_whole) {
+					// (park_whole_views: the emptied view stays mapped, parked whole; Kyty.Release releases it.)
+					ParkUnlocked(vaddr, size, view_base, view_end);
+					release_later = true;
+				} else if (empty) {
 					how = How::Release;
 					m_parked.erase(m_parked.lower_bound(view_base), m_parked.lower_bound(view_end));
 					m_views.erase(view);
@@ -762,6 +842,12 @@ public:
 			}
 		}
 
+		if (how == How::Park && release_later) {
+			ParkedViewReleaser::Queue(view_base, view_size);
+			if (parked != nullptr) *parked = true;
+			if (placeholder_preserved != nullptr) *placeholder_preserved = true;
+			return true;
+		}
 		if (how == How::Park) {
 			// The range keeps its protection: the guest has no mapping there (a map over it splits the view first), and the
 			// emulator's reads and writes of guest memory find none either (m_maps). Made no-access, ~0.5 us per 4 KiB page
@@ -2273,6 +2359,10 @@ private:
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 public:
+	// park_whole_views: Kyty.Release's release of a parked view (its caller holds the guest memory operations' lock, as a
+	// guest map that materializes one does).
+	void ReleaseParkedView(uint64_t vaddr, uint64_t size) { MaterializeParked(vaddr, size); }
+
 	// Kyty.Trim's trim of a parked range (VirtualUnlock), 16 MiB at a time, each busy meanwhile: no map or unmap runs in
 	// its page-table pages then, nor it during theirs (it ran unlocked before, during a view's map again too: one of the
 	// overlaps of the bug check above). No lock is held during the trim.
