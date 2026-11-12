@@ -1330,24 +1330,28 @@ inline thread_local EffectsLog* t_effects = nullptr;
 // lookup finds it) is destroyed after the packets it may have been looked up in: PacketNow when it is released,
 // WaitPacketPassed before it is destroyed.
 inline constexpr size_t                                MaxPacketSlots = 12; // (the graphics queue's threads, then the async queue's)
-inline std::array<std::atomic<uint64_t>, MaxPacketSlots> g_packet {};
+// (Each slot on its own cache line: every worker packet stores to its slot.)
+struct alignas(64) PacketSlot {
+	std::atomic<uint64_t> value {0};
+};
+inline std::array<PacketSlot, MaxPacketSlots>          g_packet {};
 inline thread_local size_t                             t_packet_slot = 0;
 inline thread_local uint64_t                           t_packets     = 0;
-inline void EnterPacket() noexcept { g_packet[t_packet_slot].store(++t_packets, std::memory_order_seq_cst); }
-inline void LeavePackets() noexcept { g_packet[t_packet_slot].store(0, std::memory_order_seq_cst); }
+inline void EnterPacket() noexcept { g_packet[t_packet_slot].value.store(++t_packets, std::memory_order_seq_cst); }
+inline void LeavePackets() noexcept { g_packet[t_packet_slot].value.store(0, std::memory_order_seq_cst); }
 using PacketMarks = std::array<uint64_t, MaxPacketSlots>;
 [[nodiscard]] inline PacketMarks PacketNow() noexcept {
 	if (!On()) return {}; // (mode 0: no speculation thread, no packet; no fence)
 	std::atomic_thread_fence(std::memory_order_seq_cst); // (after the release: a later packet does not find it)
 	PacketMarks marks {};
-	for (size_t i = 0; i < MaxPacketSlots; ++i) marks[i] = g_packet[i].load(std::memory_order_seq_cst);
+	for (size_t i = 0; i < MaxPacketSlots; ++i) marks[i] = g_packet[i].value.load(std::memory_order_seq_cst);
 	return marks;
 }
 // (Not waited for: the thread that releases may hold what a packet waits for. What a packet may still read waits in
 // a list of the cache's, destroyed once the packets passed: BufferCache::EraseRetired, TextureCache::EraseRetired.)
 [[nodiscard]] inline bool PacketsPassed(const PacketMarks& marks) noexcept {
 	for (size_t i = 0; i < MaxPacketSlots; ++i)
-		if (marks[i] != 0 && g_packet[i].load(std::memory_order_acquire) == marks[i]) return false;
+		if (marks[i] != 0 && g_packet[i].value.load(std::memory_order_acquire) == marks[i]) return false;
 	return true;
 }
 
