@@ -484,6 +484,12 @@ private:
 	// before its program was prepared, and its dispatches since (every 64th takes the normal path again).
 	std::atomic<uint64_t> m_linear_copy_shader {0}, m_linear_copy_generation {0};
 	uint32_t              m_linear_copy_uses = 0;
+	// (spec_linear_copy_identity) the learned shader's identity beside the generation: the shader map's code size and
+	// user-data pointer at its address and its code hash (ShaderHashAt), stored before the address and generation.
+	std::atomic<uint64_t> m_linear_copy_size {0}, m_linear_copy_user_data {0}, m_linear_copy_hash {0};
+	// Is the shader at `data_addr` the learned linear copy shader: today's rule (the generation it was learned under), or
+	// on a speculation's thread / a state pass under KYTY_SPECULATE=4, its identity proven again.
+	[[nodiscard]] bool LinearCopyKnown(uint64_t data_addr, bool other_thread);
 	// The metadata surfaces compute dispatches cleared (TryConsumeComputeMetaClear), by their shader and user data: a
 	// speculation's hole of such a dispatch clears it (Spec::State::PredictClear). (Not the DCC fills
 	// TryConsumeComputeImageClear tracks: the normal path consumes those only where it can clear the image, 10-06.)

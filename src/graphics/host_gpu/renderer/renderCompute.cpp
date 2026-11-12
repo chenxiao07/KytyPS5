@@ -675,12 +675,44 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	return true;
 }
 
+// spec_linear_copy_identity (under KYTY_SPECULATE=4 only, the mode read at each use): any shader the game
+// registers moves the shader map's generation, and under the generation rule a speculation refused every linear copy
+// ("linear copy", a hole on the GPU thread) until the GPU thread's full path learned the shader again: in an area
+// transition, 16 holes over a 3 KiB table the next draws read and ~50 stops with their tails. The rule here proves the
+// shader at the address the same one (the map's entry and the code hash), once per thread and generation.
+static bool LinearCopyIdentityOn() {
+	return ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+}
+
+bool RenderExecutor::LinearCopyKnown(uint64_t data_addr, bool other_thread) {
+	auto& learned = Catalog();
+	if (data_addr != learned.m_linear_copy_shader.load(std::memory_order_acquire)) return false;
+	const auto generation = ShaderMapGeneration();
+	if (generation == learned.m_linear_copy_generation.load(std::memory_order_acquire)) return true;
+	if (!other_thread || !LinearCopyIdentityOn()) return false;
+	thread_local uint64_t proved_address = 0, proved_generation = UINT64_MAX;
+	const auto            size = learned.m_linear_copy_size.load(std::memory_order_acquire);
+	const auto            user = learned.m_linear_copy_user_data.load(std::memory_order_acquire);
+	const auto            hash = learned.m_linear_copy_hash.load(std::memory_order_acquire);
+	if (hash == 0) return false;
+	if (proved_address != data_addr || proved_generation != generation) {
+		ShaderMappedData data {};
+		const bool       no_fault = GuestGpu::IsTranslatingThread() && !GuestGpu::IsGpuThread(); // (no read that can fault)
+		if (!ShaderLookupMappedData(data_addr, &data) || data.code_size_bytes != size ||
+		    reinterpret_cast<uint64_t>(data.user_data) != user ||
+		    (ShaderHashNoFaultScope {no_fault}, ShaderHashAt(data_addr)) != hash)
+			return false;
+		proved_address = data_addr, proved_generation = generation;
+	}
+	return true;
+}
+
 void RenderExecutor::PredictDispatch(const HW::Shader& sh_ctx, uint32_t thread_group_x, uint32_t thread_group_y,
                                      uint32_t thread_group_z, uint32_t mode, Spec::State& record) {
 	auto&       learned = Catalog();
 	const auto& cs      = sh_ctx.GetCs();
 	const auto& regs    = cs.cs_regs;
-	if (regs.data_addr == learned.m_linear_copy_shader && ShaderMapGeneration() == learned.m_linear_copy_generation) {
+	if (LinearCopyKnown(regs.data_addr, true)) {
 		const DemonsSouls::LinearCopyDispatch dispatch {
 		    .user_data          = std::span<const uint32_t> {cs.cs_user_sgpr.value, regs.user_sgpr},
 		    .threads            = {regs.num_thread_x, regs.num_thread_y, regs.num_thread_z},
@@ -816,8 +848,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// The linear copy shader, while its code stands: checked from the registers without its program (700+ small
 	// copies a frame in Boletaria, each preparing the same program).
 	// (Another executor's catalog: its owner proves the program now and then.)
-	if (indirect_args == 0 && cs_regs.cs_regs.data_addr == learned.m_linear_copy_shader &&
-	    ShaderMapGeneration() == learned.m_linear_copy_generation && ((++m_linear_copy_uses & 63u) != 0 || Role() != 0) &&
+	if (indirect_args == 0 && LinearCopyKnown(cs_regs.cs_regs.data_addr, Spec::Current() != nullptr) &&
+	    ((++m_linear_copy_uses & 63u) != 0 || Role() != 0) &&
 	    !FrameCapture::Active()) {
 		const auto&                           regs = cs_regs.cs_regs;
 		const DemonsSouls::LinearCopyDispatch dispatch {
@@ -909,6 +941,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                                                     thread_group_x, thread_group_y,
 	                                                     thread_group_z, mode)) {
 		if (FrameCapture::Active()) FrameCapture::g_call.consumed = "linear_copy";
+		if (LinearCopyIdentityOn()) { // (spec_linear_copy_identity: the identity first)
+			ShaderMappedData data {};
+			if (ShaderLookupMappedData(sh_ctx.GetCs().cs_regs.data_addr, &data)) {
+				m_linear_copy_hash      = 0;
+				m_linear_copy_size      = data.code_size_bytes;
+				m_linear_copy_user_data = reinterpret_cast<uint64_t>(data.user_data);
+				m_linear_copy_hash      = program.shader_hash;
+			}
+		}
 		m_linear_copy_shader     = sh_ctx.GetCs().cs_regs.data_addr;
 		m_linear_copy_generation = shader_generation;
 		TableDispatchSeen(sh_ctx.GetCs(), "dispatch: linear copy", use_thread_dimensions);
