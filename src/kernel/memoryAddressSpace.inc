@@ -44,6 +44,7 @@ static std::atomic<uint64_t> g_trim_backlog_bytes {0};
 // A parked whole view released off the game's thread (memory.cpp: under the guest memory operations' lock, through
 // GuestAddressSpace::ReleaseParkedView).
 static void ReleaseParkedView(uint64_t vaddr, uint64_t size);
+static bool TryReleaseParkedView(uint64_t vaddr, uint64_t size); // (release_gate)
 // A live switch's value, -1 (its default) meaning `on4` under KYTY_SPECULATE=4 and 0 otherwise.
 static int64_t ModeFourDefault(const std::atomic<int64_t>& value, int64_t on4) {
 	const auto v = value.load(std::memory_order_relaxed);
@@ -57,14 +58,20 @@ static int64_t ParkWholeViewsMs() {
 	static auto& value = LiveSwitch::Find("park_whole_views", -1);
 	return ModeFourDefault(value, 50);
 }
-// KYTY_RELEASE_TRICKLE (live release_trickle; -1, the default: 200 under KYTY_SPECULATE=4, 0 otherwise; 0 off): N > 0:
-// once a parked view is due, Kyty.Release releases it only while the GPU thread is in its idle wait (GpuIdle), waiting up
-// to N ms for one, then releases it anyway: the release holds the address space busy, and the GPU thread's protection
-// changes wait for any busy range process-wide (BusyUnlocked, issues #5 / #50), 8 ms of a 56 ms frame in a Demon's
-// Souls area load.
-static int64_t ReleaseTrickleMs() {
-	static auto& value = LiveSwitch::Find("release_trickle", -1);
-	return ModeFourDefault(value, 200);
+// KYTY_RELEASE_GATE (live release_gate; -1, the default: on under KYTY_SPECULATE=4, off otherwise; 1 on, 0 off): a
+// parked view's release starts only when no guest thread waits on the guest memory-operations lock and the lock is free.
+// (It replaces a wait for the GPU thread's idle, which is when the game's job threads are busiest: in a Demon's Souls
+// area transition a job thread's virtual-range reserves waited 21 ms of an 83 ms frame on releases.) Off: a due release
+// is made at once.
+static bool ReleaseGateOn() {
+	static auto& value = LiveSwitch::Find("release_gate", -1);
+	return ModeFourDefault(value, 1) != 0;
+}
+// (release_gate's bound, live release_gate_cap_mb, 1024 the default: with more parked than that, a release waits its turn on
+// the lock as without the gate; the gate's own wait has no end while guest threads keep the lock busy.)
+static uint64_t ReleaseGateCapBytes() {
+	static auto& value = LiveSwitch::Find("release_gate_cap_mb", 1024);
+	return static_cast<uint64_t>(std::max<int64_t>(value.load(std::memory_order_relaxed), 0)) << 20u;
 }
 class ParkedViewReleaser {
 public:
@@ -73,6 +80,7 @@ public:
 		{
 			std::lock_guard lock(r.m_mutex);
 			r.m_views.push_back({vaddr, size, std::chrono::steady_clock::now()});
+			r.m_parked_bytes += size;
 		}
 		r.m_ready.notify_one();
 	}
@@ -98,20 +106,35 @@ private:
 				}
 				const auto delay = std::chrono::milliseconds(std::max<int64_t>(ParkWholeViewsMs(), 1));
 				std::this_thread::sleep_until(view.parked + delay);
-				if (const auto trickle = ReleaseTrickleMs(); trickle > 0 && !GpuIdle::g_idle.load(std::memory_order_acquire)) {
-					const auto give_up = std::chrono::steady_clock::now() + std::chrono::milliseconds(trickle);
-					while (!GpuIdle::g_idle.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < give_up)
+				if (ReleaseGateOn()) {
+					while (!TryReleaseParkedView(view.vaddr, view.size)) {
+						bool over = false;
+						{
+							std::lock_guard lock(m_mutex); // (not held across the release: a guest call parking a view takes it)
+							over = m_parked_bytes > ReleaseGateCapBytes();
+						}
+						if (over) {
+							ReleaseParkedView(view.vaddr, view.size); // (the bound: queued behind the guest's calls)
+							break;
+						}
 						std::this_thread::sleep_for(std::chrono::microseconds(200));
+					}
+					std::lock_guard lock(m_mutex);
+					m_views.pop_front();
+					m_parked_bytes -= view.size;
+					continue;
 				}
 				ReleaseParkedView(view.vaddr, view.size);
 				std::lock_guard lock(m_mutex);
 				m_views.pop_front();
+				m_parked_bytes -= view.size;
 			}
 		}).detach();
 	}
 	std::mutex              m_mutex;
 	std::condition_variable m_ready;
 	std::deque<View>        m_views;
+	uint64_t                m_parked_bytes = 0; // (release_gate's bound)
 };
 
 // Ranges parked in their views (GuestBackingStore::UnmapOne) taken out of the working set by a thread of its own: mapped,

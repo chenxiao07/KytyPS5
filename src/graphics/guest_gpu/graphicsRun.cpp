@@ -1382,7 +1382,7 @@ void GuestGpu::ThreadRun(void* data) {
 				LiveTrace::Event(LiveTrace::RenderIdle, 1, 0);
 				const auto idle = std::chrono::steady_clock::now();
 				LiveControl::NoteRenderIdle(idle.time_since_epoch().count());
-				GpuIdle::g_idle.store(true, std::memory_order_release); // (release_trickle)
+				GpuIdle::g_idle.store(true, std::memory_order_release); // (gpu-idle.h)
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 				GpuIdle::g_idle.store(false, std::memory_order_release);
 				LiveControl::g_render_idle_ns += (std::chrono::steady_clock::now() - idle).count();
@@ -1418,7 +1418,7 @@ void GuestGpu::ThreadRun(void* data) {
 					LiveTrace::Event(LiveTrace::RenderIdle, 1, 1);
 					const auto idle = std::chrono::steady_clock::now();
 					LiveControl::NoteRenderIdle(idle.time_since_epoch().count());
-					GpuIdle::g_idle.store(true, std::memory_order_release); // (release_trickle)
+					GpuIdle::g_idle.store(true, std::memory_order_release); // (gpu-idle.h)
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					GpuIdle::g_idle.store(false, std::memory_order_release);
 					LiveControl::g_render_idle_ns += (std::chrono::steady_clock::now() - idle).count();

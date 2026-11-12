@@ -1,7 +1,7 @@
 #pragma once
-// release_trickle: whether the GPU thread is in one of its idle waits (GuestGpu::ThreadRun), for
-// Kyty.Release (kernel/memoryAddressSpace.inc), which then releases a parked view without holding the address space
-// busy under the GPU thread's protection changes.
+// Whether the GPU thread is in one of its idle waits (GuestGpu::ThreadRun), for the address space's work on parked
+// memory off the game's thread (kernel/memoryAddressSpace.inc), which then runs without holding the address space busy
+// under the GPU thread's protection changes.
 
 #include <atomic>
 
