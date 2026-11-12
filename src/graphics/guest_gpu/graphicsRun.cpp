@@ -2185,6 +2185,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth) {
 	// (Behind a plain global: KYTY_SPECULATE unset, no thread-local read.)
 	auto* const spec = kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr;
+	// (A speculation's translation off the GPU thread: its command words among its segment's reads, Spec::State::
+	// NoteCommandWords. The GPU thread's holes read them when they run.)
+	const bool note_words = spec != nullptr && !GuestGpu::IsGpuThread();
 	// A speculation's refused packet suspends the execution there (speculation.cpp goes on past it, or stops).
 	const auto refuse = [&](const char* why) {
 		Spec::Refuse(why);
@@ -2250,6 +2253,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		}
 
 		if (packet_header == 0x80000000u) {
+			if (note_words) spec->NoteCommandWords(reinterpret_cast<uint64_t>(cursor.Position() + cursor.offset_dw), 4u);
 			cursor.offset_dw++;
 			execution.m_made_progress = true;
 			continue;
@@ -2292,6 +2296,9 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 					     dst, val, packet[1], packet[2]);
 				}
 			}
+			if (note_words)
+				spec->NoteCommandWords(reinterpret_cast<uint64_t>(cursor.Position() + cursor.offset_dw),
+				                       uint64_t {packet_dw} * 4u);
 			cursor.offset_dw += packet_dw;
 			execution.m_made_progress = true;
 			continue;
@@ -2316,6 +2323,9 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			++m_chunk_work;
 		}
 		m_chunk_last_opcode = opcode;
+		if (note_words)
+			spec->NoteCommandWords(reinterpret_cast<uint64_t>(cursor.Position() + cursor.offset_dw),
+			                       uint64_t {KYTY_PM4_LEN(packet_header)} * 4u);
 		if (spec != nullptr) {
 			if (!GuestGpu::IsGpuThread()) Spec::EnterPacket();
 			spec->Mark(LocalVulkanRecording::RecordedWrites());
@@ -2406,6 +2416,11 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 				const auto consumed =
 				    TryNativeXprDraws({packet, remaining_dw}, DrawStateObserver::g_shadow.last_clean);
 				if (consumed) {
+					// (The run's other packets: their words noted too, after the first's.)
+					if (note_words && consumed > KYTY_PM4_LEN(packet_header))
+						spec->NoteCommandWords(
+						    reinterpret_cast<uint64_t>(cursor.Position() + cursor.offset_dw + KYTY_PM4_LEN(packet_header)),
+						    uint64_t {consumed - KYTY_PM4_LEN(packet_header)} * 4u);
 					m_draw_run_skip = 0;
 					if (Scout::Running() && !IsAsyncComputeQueue()) Scout::SkipDraws(consumed / 5u - 1u);
 					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
@@ -2493,6 +2508,11 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		if (packet_header == 0xc0032500u && !GraphicsRunDebugDumpEnabled()) {
 			const auto consumed = TryDrawIndirectRun({packet, remaining_dw});
 			if (consumed) {
+				// (The run's other packets: their words noted too, after the first's.)
+				if (note_words && consumed > KYTY_PM4_LEN(packet_header))
+					spec->NoteCommandWords(
+					    reinterpret_cast<uint64_t>(cursor.Position() + cursor.offset_dw + KYTY_PM4_LEN(packet_header)),
+					    uint64_t {consumed - KYTY_PM4_LEN(packet_header)} * 4u);
 				// (KYTY_SPEC_CHUNK_IN_ORDER: the run's other draws counted as the state pass counts them, one a packet, so
 				// the in-order chunk ends where the pass cut it.)
 				if (m_chunk_every != 0) m_chunk_work += consumed / 5u - 1u;

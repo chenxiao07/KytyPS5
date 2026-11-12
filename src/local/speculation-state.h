@@ -348,6 +348,8 @@ struct State {
 	Counts   checkpoint;
 	bool     checkpoint_bda_all = false;
 	uint64_t checkpoint_work    = 0; // LocalVulkanRecording::RecordedWrites()
+	// (NoteCommandWords: the run of command words not noted yet.)
+	uint64_t command_begin = 0, command_end = 0;
 
 	[[nodiscard]] Counts Sizes() const noexcept {
 		return {current.size(),        written.size(),         bda.size(),         invalidated.size(), writes.size(),
@@ -403,6 +405,22 @@ struct State {
 	void NoteInvalidated(uint64_t address, uint64_t size) { (void)Note(invalidated, Sealed().invalidated, address, size); }
 	void NoteCleanRead(uint64_t address, uint64_t size) { (void)Note(clean_reads, Sealed().clean_reads, address, size); }
 	void NoteBufferRange(uint64_t address, uint64_t size) { (void)Note(buffer_ranges, Sealed().buffer_ranges, address, size); }
+	// The command words a speculation's thread translated (ProcessPm4Spec, at their guest addresses): clean reads of
+	// the segment they are in, a range for each run of consecutive packets (no command word was in any read set, so a
+	// write into a command buffer between translation and commit, by the work committed before it, went unseen).
+	void NoteCommandWords(uint64_t address, uint64_t size) {
+		if (command_end != 0 && address == command_end) {
+			command_end += size;
+			return;
+		}
+		FlushCommandWords();
+		command_begin = address;
+		command_end   = address + size;
+	}
+	void FlushCommandWords() {
+		if (command_end > command_begin) NoteCleanRead(command_begin, command_end - command_begin);
+		command_begin = command_end = 0;
+	}
 	void NoteCpuCopy(uint64_t address, uint64_t size) { (void)Note(cpu_copies, Sealed().cpu_copies, address, size); }
 	void NoteTexelSync(uint64_t address, uint64_t size) { (void)Note(texel_syncs, Sealed().texel_syncs, address, size); }
 	void NoteLateRead(uint64_t address, uint64_t size, uint64_t since) {
@@ -690,6 +708,7 @@ struct State {
 	}
 
 	void Clear() {
+		command_begin = command_end = 0;
 		current.clear();
 		written.clear();
 		invalidated.clear();
@@ -734,6 +753,7 @@ struct State {
 	// The open segment ends (its command buffers: the recorder's first `recorded_count`): its image uses taken from
 	// the overlay.
 	void CloseSegment(size_t recorded_count) {
+		FlushCommandWords(); // (the segment's command words among its reads)
 		auto& segment    = closed.emplace_back();
 		segment.end      = Sizes();
 		segment.bda_all  = bda_all;
