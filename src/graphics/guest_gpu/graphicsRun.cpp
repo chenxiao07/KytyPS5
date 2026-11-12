@@ -2330,6 +2330,8 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 	// (A speculation's translation off the GPU thread: its command words among its segment's reads, Spec::State::
 	// NoteCommandWords. The GPU thread's holes read them when they run.)
 	const bool note_words = spec != nullptr && !GuestGpu::IsGpuThread();
+	// (spec_flush_keep: read once a call; mode 4 only.)
+	const bool flush_keep = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 	// A speculation's refused packet suspends the execution there (speculation.cpp goes on past it, or stops).
 	const auto refuse = [&](const char* why) {
 		Spec::Refuse(why);
@@ -2695,7 +2697,14 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 
 		// Only state, draws and dispatches keep the deferred read protections pending: before a label, a memory write,
 		// a wait or anything else the pages GPU work writes are protected (PageManager::DeferReadProtection).
-		if (!KeepsDeferredProtection(opcode)) PageManager::FlushDeferredProtection();
+		// spec_flush_keep (KYTY_SPECULATE=4 only): an EVENT_WRITE other than the occlusion dump (0x39, which
+		// writes guest memory) keeps them pending too. CommandProcessor::TriggerEvent: its other types record a barrier,
+		// break a compute chain or end the process; none writes guest memory, raises an interrupt or reads guest memory on
+		// the CPU, so the guest learns nothing from one (the observation epoch keeps its meaning) and the next label, write
+		// or wait still flushes first. (EVENT_WRITE asked for 45-57 % of the non-empty flushes.)
+		if (!KeepsDeferredProtection(opcode) &&
+		    !(flush_keep && opcode == Pm4::IT_EVENT_WRITE && KYTY_PM4_LEN(packet_header) >= 2u && (packet[1] & 0x3fu) != 0x39u))
+			PageManager::FlushDeferredProtection();
 		auto handler = g_cp_op_func[opcode];
 		LiveCounters::AddPm4(opcode);
 		// (A speculation off the GPU thread, which AddPm4 does not count: its indexed draws, which its commit counts for
