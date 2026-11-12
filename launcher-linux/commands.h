@@ -29,8 +29,10 @@ public:
 
 	// DLSS chosen and able to run (an NVIDIA RTX graphics card, libkyty_dlss.so).
 	[[nodiscard]] bool Dlss() const;
-	// FSR 3 upscaling (built into the emulator: any graphics card).
+	// FSR upscaling: FSR 3 (built into the emulator: any graphics card), or FSR 4 (which falls back to it).
 	[[nodiscard]] bool FsrUpscaler() const;
+	// FSR 4 chosen and ready to run (an AMD graphics card, libffx_vk_linux.so and AMD's DLLs: KYTY_FSR4=1).
+	[[nodiscard]] bool Fsr4() const;
 	// The game's 1080p output: chosen, or Automatic for a 16:9 window at most 1080 lines high.
 	[[nodiscard]] bool HdOutput() const;
 	// Game output "1440p", with DLSS or FSR 3 only: the PS5 Pro path's output at 2560x1440

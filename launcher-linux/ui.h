@@ -146,6 +146,7 @@ private:
 
 	std::string extra_text_;
 	bool        dlss_available_ = false;
+	bool        fsr4_available_ = false; // libffx_vk_linux.so and AMD's DLLs in place (LauncherContext::Fsr4Available)
 
 	// Dialogs.
 	std::string                       message_;

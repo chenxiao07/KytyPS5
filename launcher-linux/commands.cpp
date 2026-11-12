@@ -37,6 +37,7 @@ const std::vector<std::string>& GameVariables() {
 	                                             "KYTY_FRAMEGEN",
 	                                             "KYTY_FRAMEGEN_BACKEND",
 	                                             "KYTY_UPSCALER",
+	                                             "KYTY_FSR4",
 	                                             "KYTY_HD_OUTPUT",
 	                                             "KYTY_OUTPUT_HEIGHT",
 	                                             "KYTY_GPU",
@@ -121,7 +122,12 @@ bool Commands::Dlss() const {
 }
 
 bool Commands::FsrUpscaler() const {
-	return S().Str("upscaler") == "fsr";
+	const auto upscaler = S().Str("upscaler");
+	return upscaler == "fsr" || upscaler == "fsr4";
+}
+
+bool Commands::Fsr4() const {
+	return S().Str("upscaler") == "fsr4" && context_.Fsr4Available();
 }
 
 int Commands::WindowHeight(const std::string& resolution, bool fullscreen, int display) {
@@ -279,8 +285,12 @@ Launch Commands::Play(const GameInfo& game, bool direct) const {
 	}
 	if (dlss)
 		Put(set, "KYTY_UPSCALER", "dlss");
-	else if (FsrUpscaler())
+	else if (FsrUpscaler()) {
+		// (FSR 4 is FSR upscaling with the emulator told to try AMD's DLLs first: without them, or on a GPU they do not
+		// take, the emulator says so in its log and uses FSR 3.)
 		Put(set, "KYTY_UPSCALER", "fsr");
+		if (Fsr4()) Put(set, "KYTY_FSR4", "1");
+	}
 	// (With DLSS too: its PS5 Pro path then makes the 1080p output, the 3D at most 1080 high.)
 	if (HdOutput())
 		Put(set, "KYTY_HD_OUTPUT", "1");

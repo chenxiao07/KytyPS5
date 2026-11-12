@@ -1,6 +1,7 @@
 #include "local/fsr-native.h"
 
 #include "graphics/host_gpu/graphicContext.h"
+#include "local/fsr4-linux.h"
 #include "local/live-switch.h"
 
 #include <cfloat>
@@ -495,8 +496,10 @@ Interpolator& TheInterpolator() {
 } // namespace
 
 bool Upscale(GraphicContext& graphics, vk::CommandBuffer command, const FrameGen::UpscaleInputs& inputs) {
-	// AMD's runtime where there is one (Windows, FSR SDK 2: FSR 4 on the Radeon cards AMD lists for it), else built in.
+	// AMD's runtime where there is one (Windows, FSR SDK 2: FSR 4 on the Radeon cards AMD lists for it; Linux: AMD's DLLs
+	// through ffx-vk-linux with KYTY_FSR4=1, fsr4-linux.h), else built in.
 	return UpscalerRequested() && (FrameGen::UpscaleWithAmdRuntime(graphics, command, inputs) ||
+	                               Fsr4Linux::Upscale(graphics, command, inputs) ||
 	                               TheUpscaler().Record(graphics, command, inputs));
 }
 

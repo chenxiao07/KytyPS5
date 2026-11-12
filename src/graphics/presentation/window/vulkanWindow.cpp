@@ -29,6 +29,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "local/anti-lag.h"
+#include "local/fsr4-linux.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -979,6 +980,24 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		fragment_barycentric.pNext = supported_features2.pNext;
 		supported_features2.pNext  = &fragment_barycentric;
 	}
+	// KYTY_FSR4=1: what AMD's FSR 4 shaders need beyond the emulator's own (ffx-vk-linux's probe enables the same): compute
+	// shader derivatives, AMD's coherent memory where advertised; float16 and int8 arithmetic, the integer dot product and
+	// storage images read without a format come from the core structures queried above. Only then, so that the device of
+	// everyone else stays as it was (a device's features may enter its pipeline keys).
+	const bool fsr4_device = Fsr4Linux::Requested();
+	const bool derivatives_extension =
+	    fsr4_device && HasExtension(device_extensions, "VK_KHR_compute_shader_derivatives");
+	const bool coherent_extension = fsr4_device && HasExtension(device_extensions, "VK_AMD_device_coherent_memory");
+	vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR supported_derivatives {};
+	vk::PhysicalDeviceCoherentMemoryFeaturesAMD           supported_coherent {};
+	if (derivatives_extension) {
+		supported_derivatives.pNext = supported_features2.pNext;
+		supported_features2.pNext   = &supported_derivatives;
+	}
+	if (coherent_extension) {
+		supported_coherent.pNext  = supported_features2.pNext;
+		supported_features2.pNext = &supported_coherent;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.copy_memory_indirect_enabled = copy_indirect_extension && supported_copy_indirect.indirectCopy;
 	graphics.pipeline_statistics_enabled  = executable_extension && supported_executables.pipelineExecutableInfo;
@@ -1128,6 +1147,22 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl = subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 	features13.pipelineCreationCacheControl = supported_features13.pipelineCreationCacheControl;
+	// KYTY_FSR4=1: the arithmetic and image access FSR 4's shaders declare, each only where the GPU has it (the RX 6000
+	// series does: RADV on RDNA 2).
+	if (fsr4_device) {
+		features12.shaderFloat16 = supported_features12.shaderFloat16;
+		features12.shaderInt8    = supported_features12.shaderInt8;
+		features13.shaderIntegerDotProduct = supported_features13.shaderIntegerDotProduct;
+		device_features.shaderStorageImageReadWithoutFormat = supported_features2.features.shaderStorageImageReadWithoutFormat;
+		std::printf("Vulkan: FSR 4 device features: float16 %u, int8 %u, integer dot product %u, storage image read without "
+		            "format %u, compute shader derivatives %u, coherent memory %u\n",
+		            supported_features12.shaderFloat16, supported_features12.shaderInt8,
+		            supported_features13.shaderIntegerDotProduct,
+		            supported_features2.features.shaderStorageImageReadWithoutFormat,
+		            derivatives_extension && (supported_derivatives.computeDerivativeGroupQuads ||
+		                                      supported_derivatives.computeDerivativeGroupLinear),
+		            coherent_extension && supported_coherent.deviceCoherentMemory);
+	}
 	graphics.pipeline_cache_control_enabled = features13.pipelineCreationCacheControl == VK_TRUE;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
@@ -1205,6 +1240,19 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		fault_features.deviceFault = VK_TRUE;
 		fault_features.pNext       = const_cast<void*>(create_info.pNext);
 		create_info.pNext          = &fault_features;
+	}
+	vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives {};
+	if (derivatives_extension) {
+		derivatives.computeDerivativeGroupQuads  = supported_derivatives.computeDerivativeGroupQuads;
+		derivatives.computeDerivativeGroupLinear = supported_derivatives.computeDerivativeGroupLinear;
+		derivatives.pNext                        = const_cast<void*>(create_info.pNext);
+		create_info.pNext                        = &derivatives;
+	}
+	vk::PhysicalDeviceCoherentMemoryFeaturesAMD coherent {};
+	if (coherent_extension && supported_coherent.deviceCoherentMemory) {
+		coherent.deviceCoherentMemory = VK_TRUE;
+		coherent.pNext                = const_cast<void*>(create_info.pNext);
+		create_info.pNext             = &coherent;
 	}
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
@@ -1714,6 +1762,8 @@ void WindowContext::CreateVulkan() {
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
 		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
 		AntiLag::AddDeviceExtension(available_extensions, device_extensions); // (KYTY_LOW_LATENCY)
+		// KYTY_FSR4=1 (Linux): the extensions AMD's FSR 4 shaders and Vulkan backend use (fsr4-linux.h).
+		Fsr4Linux::AddDeviceExtensions(available_extensions, device_extensions);
 		// KYTY_PIPELINE_STATS=<hash,...> (diagnostic): the driver's statistics of those compute programs' pipelines
 		// (registers, spills, waves per SIMD: PIPESTATS lines, CreatePipelineInternal).
 		if (std::getenv("KYTY_PIPELINE_STATS") != nullptr &&

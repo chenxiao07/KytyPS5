@@ -101,6 +101,9 @@ int main(int argc, char* argv[]) {
 		std::printf("dlss:       %s\n", context.DlssAvailable() ? context.DlssLibrary().c_str()
 		                                : context.rtx ? "no libkyty_dlss.so (get-dlss-linux.sh)"
 		                                              : "no NVIDIA RTX graphics card");
+		std::printf("fsr 4:      %s\n", context.Fsr4Available() ? context.Fsr4Folder().c_str()
+		                                : context.amd ? "no libffx_vk_linux.so with AMD's DLLs (get-fsr4-linux.sh)"
+		                                              : "no AMD graphics card");
 		std::printf("prompts:    %s\n", commands.KeyboardPromptsReport().c_str());
 		std::printf("e-cores:    %s\nterminal:   %s\ngame:       %s %s %s\n\n",
 		            context.efficiency_cpus.empty() ? "-" : context.efficiency_cpus.c_str(),
