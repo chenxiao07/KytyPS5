@@ -683,6 +683,18 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	auto&                                      scheduler = m_renderer.GetCommandScheduler();
 	std::unique_ptr<Result>                    result;
 	std::vector<std::pair<uint64_t, uint64_t>> resolved;
+	// KYTY_SPEC_RESULT_POOL_CAP (live spec_result_pool_cap; 0, the default: off): a translator keeps at most that many
+	// finished results for reuse. Without it `free` only grows: a translation finds none to reuse while a translation
+	// going on began before they were retired (a long one, a burst: a level load), makes one, and keeps it (two
+	// processor copies and its hole states, ~55 KB each). The rest is freed a few at a time as translations begin, on
+	// the thread that translates with them (that made them, their recorder's pool its own), only one no translation
+	// going on reaches (retired before the horizon, as reuse) whose command buffers the GPU is done with.
+	// KYTY_SPEC_HOLE_STATES_CAP (live spec_hole_states_cap; 0, the default: off): a result reused keeps at most that many
+	// hole states (more than its holes: kept for reuse; a translation with more makes them again).
+	static auto&            pool_cap        = LiveSwitch::Find("spec_result_pool_cap", 0);
+	static auto&            hole_states_cap = LiveSwitch::Find("spec_hole_states_cap", 0);
+	static constexpr size_t FreedATranslation = 4;
+	std::vector<std::unique_ptr<Result>> surplus;
 	{
 		std::lock_guard lock(m_mutex);
 		if (translator.since == 0) translator.since = ++m_clock;
@@ -693,10 +705,39 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 			result = std::move(*reusable);
 			translator.free.erase(reusable);
 		}
+		if (const auto cap = pool_cap.load(std::memory_order_relaxed); cap > 0) {
+			const auto& master = scheduler.GetMasterSemaphore();
+			for (auto it = translator.free.begin(); it != translator.free.end() &&
+			                                        translator.free.size() > static_cast<uint64_t>(cap) &&
+			                                        surplus.size() < FreedATranslation;) {
+				const auto& kept = **it;
+				// (Its recorder's pool: destroyed on the kind of thread that recorded with it last. Not the translator's
+				// current result: Unlink relinks it, the log's DropBefore reads it.)
+				const bool done = kept.retired < horizon && &kept != translator.current &&
+				                  // (A worker's recorder only, freed on a worker: a GPU-thread recorder's discarded buffers read
+				                  // tick 0 while their reset still waits on the Record stream, modes 1-3.)
+				                  kept.recorder->own_thread && !GuestGpu::IsGpuThread() &&
+				                  std::ranges::all_of(kept.recorder->buffers, [&](const auto& buffer) {
+					                  // (UINT64_MAX: being recorded or recorded, not yet submitted: not done; DestroyRecorder
+					                  // would not wait for it.)
+					                  return buffer.second != UINT64_MAX && (buffer.second == 0 || master.IsFree(buffer.second));
+				                  });
+				if (!done) {
+					++it;
+					continue;
+				}
+				surplus.push_back(std::move(*it));
+				it = translator.free.erase(it);
+			}
+		}
 		resolved.swap(translator.resolved);
 	}
+	for (auto& freed: surplus) FreeResult(std::move(freed));
 	// (What the commits released of its rings, released on the thread that uses them.)
 	for (const auto& [pending, tick]: resolved) ResolvePending(translator, pending, tick);
+	if (const auto cap = hole_states_cap.load(std::memory_order_relaxed);
+	    result && cap > 0 && result->hole_states.size() > static_cast<uint64_t>(cap))
+		result->hole_states.resize(static_cast<size_t>(cap));
 	if (!result) {
 		result              = std::make_unique<Result>();
 		result->owner       = &translator;
@@ -1661,6 +1702,11 @@ void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {
 	kyty_local_speculations_live.fetch_sub(1, std::memory_order_seq_cst);
 	r.retired = ++m_clock;
 	owner.free.push_back(std::move(result));
+}
+
+void Speculation::FreeResult(std::unique_ptr<Result> result) {
+	result->state.Clear(); // (as a reuse would: what it held of the caches let go)
+	m_renderer.GetCommandScheduler().DestroyRecorder(std::move(result->recorder));
 }
 
 void Speculation::ResolvePending(Translator& translator, uint64_t pending, uint64_t tick) {

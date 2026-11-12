@@ -256,6 +256,9 @@ private:
 	// The segments from `first` on dropped (none of them submitted), and what the result fenced given the tick of the
 	// scheduler's open command buffer (after all it submitted); the result kept for reuse.
 	void Finish(std::unique_ptr<Result> result, size_t first);
+	// KYTY_SPEC_RESULT_POOL_CAP: a result taken out of a translator's `free` freed (its recorder destroyed; on the
+	// thread that translates with it).
+	void FreeResult(std::unique_ptr<Result> result);
 	void Report();
 
 	RenderContext&                           m_renderer;
