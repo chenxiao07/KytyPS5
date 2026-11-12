@@ -89,6 +89,17 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 
 namespace Libs::Graphics {
 
+// Every read of the buffer page table goes through LoadOwner: one 8-byte load of the entry.
+// A speculation's thread reads a page-table entry once, as one 8-byte load: the GPU thread may clear it (an unregister)
+// between two plain reads, and a second read then names no slot (SlotVector::operator[]'s EXIT on a worker, a
+// terminate).
+static BufferId LoadOwner(const BufferId* owner) noexcept {
+	static_assert(sizeof(BufferId) == sizeof(uint64_t) && std::is_trivially_copyable_v<BufferId>);
+	if (owner == nullptr) return {};
+	// (seq_cst: after EnterPacket's store)
+	return std::bit_cast<BufferId>(__atomic_load_n(reinterpret_cast<const uint64_t*>(owner), __ATOMIC_SEQ_CST));
+}
+
 namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
@@ -224,7 +235,8 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	// fault, a request and a copy each otherwise. Only a wider window that is one mapping with no
 	// GPU-written image is taken; else the window stays this buffer's, as without the switch.
 	const auto owner_at = [&](uint64_t at) -> Buffer* {
-		const auto* owner = m_page_table.Find(at >> PageTable::kPageBits);
+		const BufferId owner_snapshot = LoadOwner(m_page_table.Find(at >> PageTable::kPageBits)); // (one read: LoadOwner)
+		const auto*    owner          = owner_snapshot ? &owner_snapshot : nullptr;
 		if (owner == nullptr || !*owner) return nullptr;
 		auto& next = m_slot_buffers[*owner];
 		return !next.is_deleted && next.IsInBounds(at, 1) ? &next : nullptr;
@@ -861,7 +873,8 @@ void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
 	    !LibKernel::Memory::IsUniqueGuestBackingRange(vaddr, size)) {
 		return;
 	}
-	const auto* owner_id = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	const BufferId owner_snapshot = LoadOwner(m_page_table.Find(vaddr >> PageTable::kPageBits)); // (one read: LoadOwner)
+	const auto*    owner_id       = owner_snapshot ? &owner_snapshot : nullptr;
 	auto* owner = owner_id && *owner_id ? m_slot_buffers.try_get(*owner_id) : nullptr;
 	if (!owner || owner->is_deleted || !owner->IsInBounds(vaddr, size)) {
 		return;
@@ -2125,7 +2138,8 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid buffer discovery request\n");
 	}
-	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	const BufferId owner_snapshot = LoadOwner(m_page_table.Find(vaddr >> PageTable::kPageBits)); // (one read: LoadOwner)
+	const auto*    owner          = owner_snapshot ? &owner_snapshot : nullptr;
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
@@ -2137,14 +2151,6 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 
 // A speculative translation's FindBuffer: no drain (its work reads the buffer on the GPU, after its commit), the range
 // noted (its commit checks nothing registered over it since), nothing registered.
-// A speculation's thread reads a page-table entry once, as one 8-byte load: the GPU thread may clear it (an unregister)
-// between two plain reads, and a second read then names no slot (SlotVector::operator[]'s EXIT on a worker, a
-// terminate).
-static BufferId LoadOwner(const BufferId* owner) noexcept {
-	static_assert(sizeof(BufferId) == sizeof(uint64_t) && std::is_trivially_copyable_v<BufferId>);
-	if (owner == nullptr) return {};
-	return std::bit_cast<BufferId>(__atomic_load_n(reinterpret_cast<const uint64_t*>(owner), __ATOMIC_SEQ_CST));
-}
 
 BufferId BufferCache::RegisteredBuffer(uint64_t vaddr, uint64_t size) {
 	const BufferId owner = LoadOwner(m_page_table.Find(vaddr >> PageTable::kPageBits)); // (one read: LoadOwner)
@@ -2693,7 +2699,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 void BufferCache::EnsureBdaReadable(std::span<const GuestRange> ranges) {
 	constexpr uint64_t HeadBytes = uint64_t {64} << 10u;
 	const auto         held      = [this](uint64_t page) {
-        const auto* owner = m_page_table.Find(page);
+        const BufferId owner_snapshot = LoadOwner(m_page_table.Find(page)); // (one read: LoadOwner)
+        const auto*    owner          = owner_snapshot ? &owner_snapshot : nullptr;
         return owner != nullptr && *owner;
 	};
 	for (const auto& range: ranges) {
@@ -2931,7 +2938,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
 	}
-	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	const BufferId owner_snapshot = LoadOwner(m_page_table.Find(vaddr >> PageTable::kPageBits)); // (one read: LoadOwner)
+	const auto*    owner          = owner_snapshot ? &owner_snapshot : nullptr;
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
@@ -3042,8 +3050,8 @@ bool BufferCache::RefillImageStaging(const Buffer& ring, uint64_t offset, uint64
 	    !ring.IsCoherent())
 		return false;
 	DrainGuestReadback(vaddr, size);
-	if (const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
-	    owner != nullptr && *owner && m_slot_buffers[*owner].IsInBounds(vaddr, size))
+	if (const BufferId owner = LoadOwner(m_page_table.Find(vaddr >> PageTable::kPageBits)); // (one read: LoadOwner)
+	    owner && m_slot_buffers[owner].IsInBounds(vaddr, size))
 		return false;
 	if (IsRegionGpuModified(vaddr, size)) return false;
 	(void)PushImageStagingCopies(ring.Mapped().data() + offset, vaddr, size);
@@ -3074,7 +3082,9 @@ std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<Sta
 		// buffer only takes CPU writes from it. Pieces in one refused before, and the whole image was uploaded: the
 		// shadow-map pool at 4-2, inside a buffer over a texture pool, 320 MiB at every layer the game streamed.)
 		if (IsRegionGpuModified(piece.vaddr, piece.size)) {
-			const auto* owner = m_page_table.Find(piece.vaddr >> PageTable::kPageBits);
+			// (One read: LoadOwner.)
+			const BufferId owner_snapshot = LoadOwner(m_page_table.Find(piece.vaddr >> PageTable::kPageBits));
+			const auto*    owner          = owner_snapshot ? &owner_snapshot : nullptr;
 			return refuse("gpu", piece.vaddr, piece.size, owner != nullptr && *owner ? &m_slot_buffers[*owner] : nullptr);
 		}
 	}
@@ -3301,7 +3311,7 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	if (const auto first = vaddr >> PageTable::kPageBits, last = (vaddr + size - 1) >> PageTable::kPageBits;
 	    last - first < 4) {
 		for (auto page = first; page <= last; ++page)
-			if (const auto* owner = m_page_table.Find(page); owner != nullptr && *owner) return true;
+			if (LoadOwner(m_page_table.Find(page))) return true; // (one read: LoadOwner)
 		return false;
 	}
 	// Cached buffers are ordered and non-overlapping. The last buffer beginning before the query

@@ -74,8 +74,9 @@ public:
 	// FindBuffer's speculative-translation form, out of line (bufferCache.cpp).
 	[[gnu::noinline]] [[nodiscard]] BufferId FindBufferSpec(uint64_t vaddr, uint64_t size);
 	// FindBuffer's registered buffer over the range, none registered: the null id (a speculative translation's
-	// question whether ObtainBuffer gave the range's buffer). Out of line (bufferCache.cpp): its page-table entry read
-	// once (LoadOwner), as on any speculation thread.
+	// question whether ObtainBuffer gave the range's buffer).
+	// (Out of line, bufferCache.cpp: its page-table entry read once, LoadOwner; a worker calls it, table-xpr.inc's held
+	// index / indirect args lookup.)
 	[[nodiscard]] BufferId RegisteredBuffer(uint64_t vaddr, uint64_t size);
 	void                   EnsureBufferContents(uint64_t vaddr, uint64_t size);
 	// As EnsureBufferContents, for a texel buffer: an image GPU work wrote over the range is copied in (SynchronizeBuffer).
