@@ -916,6 +916,59 @@ static bool GuardedWrite(void* dst, const void* src, uint32_t size) {
 	return true;
 }
 
+// after_guard_batch (under KYTY_SPECULATE=4): a commit's labels on one 4 KiB guard page, in their order:
+// GuardedWrite's steps once for the page (the drain over the run's span, the guard lookups, one TouchForWrite, one Arm, one
+// lift job, one rebase), then each label's bytes through the backing view. Returns how many were written, in order (0:
+// none; the caller writes the rest as before).
+size_t CommitGuardedWriteRun(const uint64_t* addresses, const uint64_t* values, const uint32_t* sizes, size_t count) {
+	if (count == 0 || !WriteGuard::Enabled() || !AsyncUpload::g_used.load(std::memory_order_relaxed) ||
+	    !GuestGpu::IsGpuThread() ||
+	    (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && !WriteGuard::InSpeculation()))
+		return 0;
+	auto&    worker = AsyncUpload::Get();
+	uint64_t low = UINT64_MAX, high = 0;
+	for (size_t i = 0; i < count; ++i) {
+		if (sizes[i] == 0) return 0;
+		low  = std::min(low, addresses[i]);
+		high = std::max(high, addresses[i] + sizes[i]);
+	}
+	const uint64_t page = low & ~(WriteGuard::Page - 1);
+	if (((high - 1) & ~(WriteGuard::Page - 1)) != page) return 0;
+	if (worker.Pushed() <= worker.Done()) return 0;
+	if (Libs::LibKernel::Memory::TryGetBackingPointer(low, high - low) == nullptr) return 0;
+	if (WriteGuard::g_upload_done == nullptr) WriteGuard::g_upload_done = [] { return AsyncUpload::Get().Done(); };
+	AsyncUpload::DrainRange(low, high - low); // (the pending copies of these bytes take their old values)
+	if (worker.Pushed() <= worker.Done()) return 0;
+	bool guarded = false;
+	{
+		std::shared_lock lock(WriteGuard::g_lock);
+		if (const auto it = WriteGuard::g_pages.find(page); it != WriteGuard::g_pages.end()) {
+			if (it->second.saved != Common::VirtualMemory::Mode::ReadWrite &&
+			    it->second.saved != Common::VirtualMemory::Mode::ExecuteReadWrite)
+				return 0;
+			guarded = true;
+		}
+	}
+	if (!guarded) TouchForWrite(low);
+	uint64_t token = 0;
+	bool     armed = false;
+	{
+		std::unique_lock lock(WriteGuard::g_lock);
+		token = WriteGuard::NextToken();
+		armed = WriteGuard::Arm(page, token);
+	}
+	(void)worker.PushCall(LiftGuardCall, nullptr, page, token, 0, 1);
+	worker.Kick();
+	if (!armed) return 0;
+	size_t written = 0;
+	for (; written < count; ++written) {
+		if (!Libs::LibKernel::Memory::TryWriteBacking(addresses[written], &values[written], sizes[written])) break;
+		if (Scout::Running()) Scout::NoteWrite(reinterpret_cast<void*>(addresses[written]), sizes[written], &values[written]);
+	}
+	if (written != 0) RebaseGuardedCommands(g_current_execution);
+	return written;
+}
+
 // KYTY_WRITE_GUARD_SPEC: a commit's guest memory write (Speculation::After) guarded as the normal path's are; false: the
 // caller drains and writes, as before.
 bool CommitGuardedWrite(void* dst, const void* src, uint32_t size) {

@@ -40,6 +40,8 @@ volatile std::atomic_uint32_t kyty_local_pipelines_evicting {0};
 namespace Libs::Graphics {
 
 bool CommitGuardedWrite(void* dst, const void* src, uint32_t size); // (graphicsRun.cpp: KYTY_WRITE_GUARD_SPEC)
+// (after_guard_batch)
+size_t CommitGuardedWriteRun(const uint64_t* addresses, const uint64_t* values, const uint32_t* sizes, size_t count);
 
 // KYTY_SPECULATE_FLUSH_EVERY (live speculate_flush_every N; 8 by default under KYTY_SPECULATE=4, else 0; 0 and 1:
 // every commit): a commit's held segment buffers go to the GPU at its end only every Nth commit; the rest wait for the
@@ -1387,8 +1389,40 @@ void Speculation::After(Result& result, size_t index) {
 		m_renderer.GetCommandScheduler().FlushRecorded();
 		if (!guard) drain();
 	}
+	// after_guard_batch (under KYTY_SPECULATE=4 only): a run of labels on one guard page, guarded once for the page
+	// (graphicsRun.cpp).
+	const int64_t batch = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 1 : 0;
 	for (size_t i = from.writes; i < to.writes; ++i) {
 		const auto& write = state.writes[i];
+		if (batch != 0 && guard && !write.copy) {
+			const uint64_t page = write.address >> 12u;
+			size_t         end  = i;
+			while (end < to.writes && !state.writes[end].copy && (state.writes[end].address >> 12u) == page &&
+			       ((state.writes[end].address + state.writes[end].size - 1) >> 12u) == page)
+				++end;
+			if (end - i >= 2) {
+				thread_local std::vector<uint64_t> addresses, values;
+				thread_local std::vector<uint32_t> sizes;
+				addresses.clear(), values.clear(), sizes.clear();
+				for (size_t k = i; k < end; ++k) {
+					addresses.push_back(state.writes[k].address);
+					values.push_back(state.writes[k].value);
+					sizes.push_back(state.writes[k].size);
+				}
+				const size_t done = CommitGuardedWriteRun(addresses.data(), values.data(), sizes.data(), end - i);
+				for (size_t k = i; k < end; ++k) {
+					const auto& w = state.writes[k];
+					if (k >= i + done && !CommitGuardedWrite(reinterpret_cast<void*>(w.address), &w.value, w.size)) {
+						drain();
+						std::memcpy(reinterpret_cast<void*>(w.address), &w.value, w.size);
+					}
+					Spec::NoteHostWrite(w.address, w.size);
+					Spec::NoteLabel(w.address);
+				}
+				i = end - 1;
+				continue;
+			}
+		}
 		if (write.copy) {
 			drain();
 			buffers.CopyGuestMemory(write.address, write.value, write.size);
