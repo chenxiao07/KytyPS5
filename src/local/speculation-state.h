@@ -201,9 +201,46 @@ struct PendingTarget {
 	uint64_t       serial = 0;
 	uint32_t       base_level = 0, level_count = 1, base_layer = 0, layer_count = 1;
 	bool           clear = false;
+	// spec_depth_layers2: a layered depth target's draw, one entry per draw in record order (depth_desc: the
+	// TextureCache::ImageDesc the normal path acquires it with, the draw state's). The worker recorded the draw loading; the
+	// commit acquires the target as FindDepthTarget does, decides the load as AcquireRenderTargets does
+	// (htile_load_decision) and, when that is a clear, records it itself: an empty rendering of the draw's view over the
+	// draw's area, its depth load op CLEAR with the decided value (`width`, `height`, `layers`: the draw state's rendering;
+	// `db_depth_clear`: DB_DEPTH_CLEAR at the draw, the value when the HTile fill does not give one).
+	std::shared_ptr<void> depth_desc;
+	bool                  depth_layers2 = false;
+	uint32_t              layers2_width = 0, layers2_height = 0, layers2_layers = 0;
+	float                 layers2_db_depth_clear = 0.0f;
 };
-// (A switch of these four: -1, the default, on under KYTY_SPECULATE=4 and off in modes 1-3, read with the mode at each
-// use, as spec_reloc_refs still is; the three below are that default with no switch.)
+// spec_depth_layers2 (under KYTY_SPECULATE=4 only): a layered
+// depth target (no stencil) whose draw a speculation would refuse ('table: target download', 'table: cleared target') is
+// left to the commit, one entry per draw: the commit makes the normal path's own calls (FindDepthTarget, IsMetaCleared,
+// the load rule, TouchMeta) in record order and performs the draw's load-op clear itself, or stops the segment before
+// acting on that entry (Speculation::Before).
+[[nodiscard]] inline bool DepthLayers2On() {
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+}
+// spec_depth_layers2: the layouts a depth target's own draws leave its layers in.
+[[nodiscard]] inline bool DepthAttachmentLayout(vk::ImageLayout layout) noexcept {
+	return layout == vk::ImageLayout::eDepthAttachmentOptimal || layout == vk::ImageLayout::eDepthStencilAttachmentOptimal ||
+	       layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+}
+// spec_depth_layers2: a segment moved one of an image's states, from where it found it, to a layout that is not a depth
+// attachment's: it used the image otherwise (sampled, storage, a copy, General). (A layer it did not move is not seen: a
+// use in the layout it was found in needs no transition; such a use of a layer the commit clears is what the worker's
+// check before the entry and the commit's after it cannot see.)
+[[nodiscard]] inline bool UsedOtherwise(const VulkanImageState& found, const std::vector<VulkanImageState>& found_sub,
+                                        const VulkanImageState& now, const std::vector<VulkanImageState>& now_sub) noexcept {
+	const auto other = [](const VulkanImageState& was, const VulkanImageState& is) {
+		return (is.layout != was.layout || is.access_mask != was.access_mask) && !DepthAttachmentLayout(is.layout);
+	};
+	const size_t n = std::max(found_sub.size(), now_sub.size());
+	if (n == 0) return other(found, now);
+	for (size_t i = 0; i < n; ++i)
+		if (other(i < found_sub.size() ? found_sub[i] : found, i < now_sub.size() ? now_sub[i] : now)) return true;
+	return false;
+}
+// (These three: on under KYTY_SPECULATE=4 and off in modes 1-3, read with the mode at each use.)
 [[nodiscard]] inline bool ModeFour() {
 	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 }

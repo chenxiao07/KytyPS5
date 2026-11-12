@@ -141,6 +141,8 @@ public:
 	[[nodiscard]] bool RenderingWith(const RenderState& state) const;
 	// A render pass is in progress.
 	[[nodiscard]] bool Rendering() const noexcept { return m_rendering; }
+	// The render pass in progress (none: nullptr), as BeginRendering began it (spec_depth_layers2's commit).
+	[[nodiscard]] const RenderState* OpenRendering() const noexcept { return m_rendering ? &m_render_state : nullptr; }
 	// Raw internal graphics operations must invalidate the values recorded by
 	// the ordinary draw path. Compute and transfer commands do not alter them.
 	void InvalidateGraphicsState() const noexcept;
@@ -546,8 +548,9 @@ private:
 	void NativeXprCaptureState(CommandBuffer& buffer, const DrawRenderState& state, const RenderState& rendering,
 	                           uint64_t state_key);
 	[[nodiscard]] bool NativeXprTargetsCurrent(const NativeXprDrawState& draw_state);
+	// (`command`: the draw's command buffer, its registers for spec_depth_layers2; none: no target is left to the commit.)
 	[[nodiscard]] bool NativeXprEmitTargets(const NativeXprDrawState& draw_state, vk::CommandBuffer vk_buffer,
-	                                        const TableImageSet* reading = nullptr);
+	                                        const TableImageSet* reading = nullptr, const CommandBuffer* command = nullptr);
 	// The shader access a table image set adds to target `id` (KYTY_TABLE_TARGET_READ; none: empty).
 	[[nodiscard]] static vk::AccessFlags2 TableTargetRead(const TableImageSet& set, ImageId id);
 

@@ -144,6 +144,19 @@ public:
 	}
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
+	// spec_depth_layers2: a layered depth target's draw acquired at a speculation's commit as the normal path does at the
+	// draw (FindDepthTarget: the layers' upload, the metadata, the HTile entry), then its HTile clear state as the normal
+	// path reads it next (IsMetaCleared with the fill, after the acquisition). False when the image is not the one the
+	// worker left (serial, registration, a depth link, a rebind, stencil), or the draw's layers are not CPU-clean after the
+	// acquisition: the segment stops, and what was done is the normal path's own first step for this draw (its re-run
+	// finds nothing to do).
+	struct DepthDrawState {
+		vk::ImageView view;                 // (FindDepthTarget's, as the normal path's draw gets it)
+		bool          meta_cleared = false;
+		uint32_t      fill         = 0;
+		bool          fill_known   = false;
+	};
+	[[nodiscard]] bool AcquireDepthDrawAtCommit(ImageId id, uint64_t serial, const ImageDesc& desc, DepthDrawState* out);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);

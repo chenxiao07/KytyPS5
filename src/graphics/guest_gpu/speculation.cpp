@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h" // (spec_depth_layers2: htile_load_decision)
 #include "async-upload.h"
 #include "draw-state-observer.h"
 #include "frame-gen.h"
@@ -19,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -1363,9 +1365,80 @@ void Speculation::Before(Result& result, size_t index) {
 	// states are restored to those its barriers start from (the acquisition's upload and clear stay: RestoreState
 	// transitions from them). A target found Undefined or per subresource, or not acquired, fails the segment (the
 	// caller stops it before the splice).
+	std::vector<std::pair<const Image*, uint32_t>> layers2_drawn; // (spec_depth_layers2: the (image, layer)s acted on)
 	for (size_t i = from.pending_targets; i < to.pending_targets; ++i) {
 		const auto& pending = state.pending_targets[i];
 		const auto  use     = std::ranges::find(segment.images, pending.image, &Spec::ImageUse::image);
+		if (pending.depth_layers2) {
+			// spec_depth_layers2: this draw's acquisition and load, as the normal path makes them at the draw, in record
+			// order, ahead of the segment's replay: FindDepthTarget (the layers' upload, the metadata, the HTile entry), the
+			// clean check, IsMetaCleared, the load rule (htile_load_decision, AcquireRenderTargets' own), the clear (an empty
+			// rendering of the draw's view over its area, depth load op CLEAR: the draw's load op exactly), TouchMeta. Each
+			// act is one the normal path makes for this draw; a stop before an entry's acts leaves the earlier entries' acts,
+			// which the segment's re-run on the normal path repeats identically (FindDepthTarget finds nothing to do; a
+			// consumed clear loads the bytes the commit cleared). Stopped (nothing more done, from the first failure on): not
+			// on the GPU thread; an earlier pending target failed; the image used otherwise in the segment (its state left in
+			// a layout that is not a depth attachment's); a second clear of a layer an earlier entry drew (it would come
+			// after that draw's replay); an open rendering of the view that already clears it (BeginRendering would continue
+			// it: the normal path would not clear again); the image found Undefined (the acquisition's upload / clear would be
+			// discarded by RestoreState's barrier back to Undefined, and the replayed draw would load garbage).
+			const auto stop = [&] { state.target_failed = true; };
+			if (state.target_failed || !GuestGpu::IsGpuThread() || use == segment.images.end() ||
+			    Spec::UsedOtherwise(use->found, use->found_subresources, use->left, use->left_subresources) ||
+			    (use->found_subresources.empty() ? use->found.layout == vk::ImageLayout::eUndefined
+			                                     : std::ranges::any_of(use->found_subresources, [](const auto& s) {
+				                                       return s.layout == vk::ImageLayout::eUndefined;
+			                                       }))) {
+				stop();
+				continue;
+			}
+			const auto& desc = *static_cast<const TextureCache::ImageDesc*>(pending.depth_desc.get());
+			TextureCache::DepthDrawState drawn {};
+			if (!textures.AcquireDepthDrawAtCommit(pending.id, pending.serial, desc, &drawn)) {
+				stop();
+				continue;
+			}
+			const auto key      = std::make_pair(static_cast<const Image*>(pending.image), desc.view_info.base_layer);
+			const bool repeated = std::ranges::find(layers2_drawn, key) != layers2_drawn.end();
+			if (!repeated) layers2_drawn.push_back(key);
+			const auto decision = htile_load_decision(drawn.meta_cleared, drawn.fill, drawn.fill_known,
+			                                          desc.info.metadata.stencil_compressed);
+			if (decision.depth_meta_clear) {
+				auto&       command = scheduler.Current();
+				const auto* open    = command.OpenRendering();
+				if (repeated || (open != nullptr && open->depth_stencil_attachment.image_view == drawn.view &&
+				                 open->depth_stencil_attachment.depth_clear)) {
+					stop();
+					continue;
+				}
+				const auto& view   = desc.view_info;
+				const auto  layout = vk::ImageLayout::eDepthAttachmentOptimal;
+				command.EndRendering();
+				pending.image->Transit(
+				    layout, vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+				    ImageSubresourceRange {view.base_level, view.level_count, view.base_layer, view.layer_count},
+				    command.Handle());
+				RenderState clear {};
+				clear.width                 = pending.layers2_width;
+				clear.height                = pending.layers2_height;
+				clear.num_layers            = pending.layers2_layers;
+				clear.num_color_attachments = 0;
+				auto& depth                 = clear.depth_stencil_attachment;
+				depth.image_view            = drawn.view;
+				depth.image_layout          = layout;
+				depth.clear_value[0]        = std::bit_cast<uint32_t>(decision.depth_uniform ? decision.uniform_value
+				                                                                             : pending.layers2_db_depth_clear);
+				depth.has_depth             = true;
+				depth.depth_clear           = true;
+				command.BeginRendering(clear);
+				command.EndRendering();
+			}
+			if (drawn.meta_cleared && !textures.TouchMeta(desc.info.metadata.range.address, desc.view_info.base_layer, false)) {
+				stop(); // (cannot happen after FindDepthTarget made the entry HTile; slices >= 32 are never cleared)
+				continue;
+			}
+			continue;
+		}
 		const bool  ok      = use != segment.images.end() && use->found.layout != vk::ImageLayout::eUndefined &&
 		                use->found_subresources.empty() &&
 		                textures.AcquireTargetAtCommit(pending.id, pending.serial, pending.base_level, pending.level_count,

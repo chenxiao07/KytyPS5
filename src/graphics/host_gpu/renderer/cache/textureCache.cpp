@@ -3912,6 +3912,38 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	return view;
 }
 
+bool TextureCache::AcquireDepthDrawAtCommit(ImageId id, uint64_t serial, const ImageDesc& desc, DepthDrawState* out) {
+	{
+		std::scoped_lock lock {m_lock};
+		auto*            image = m_slot_images.try_get(id);
+		if (image == nullptr || image->serial != serial || !image->registered || image->depth_id || image->binding.needs_rebind ||
+		    !image->info.IsDepth() || desc.info.HasStencil())
+			return false;
+	}
+	// (The normal path's acquisition: its own upload choice, metadata and entry, and the draw's view.)
+	const auto view = FindDepthTarget(id, desc);
+	{
+		std::scoped_lock lock {m_lock};
+		auto&            image  = m_slot_images[id];
+		const auto&      info   = image.info;
+		const auto       layers = std::max(info.resources.layers, 1u);
+		bool             clean  = !image.IsCpuDirty();
+		if (!clean && image.IsPartiallyCpuDirty() && info.data.size % layers == 0) {
+			const uint64_t slice = info.data.size / layers;
+			const uint64_t begin = info.data.address + slice * desc.view_info.base_layer;
+			clean = !IntersectsRanges(image.CpuDirtyRanges(), begin, begin + slice * desc.view_info.layer_count);
+		}
+		if (!clean || !(image.info.metadata == desc.info.metadata)) return false;
+	}
+	*out      = {};
+	out->view = view;
+	if (!view) return false;
+	const auto& metadata = desc.info.metadata;
+	if (metadata.kind == ImageMetadataKind::Htile)
+		out->meta_cleared = IsMetaCleared(metadata.range.address, desc.view_info.base_layer, &out->fill, &out->fill_known);
+	return true;
+}
+
 vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.type != BindingType::DepthTarget) {
 		EXIT("TextureCache: invalid depth-target binding\n");

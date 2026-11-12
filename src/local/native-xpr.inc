@@ -289,6 +289,9 @@ struct RenderExecutor::NativeXprDrawState {
 	uint64_t                         capture_id      = 0;
 	// The targets' ids alone, in a line or two: what the serial sums read (a Target holds an ImageInfo, lines of it).
 	std::vector<ImageId>             target_ids;
+	// spec_depth_layers2 (mode 4 only): the depth target as the normal path resolved it at the capture. Immutable once
+	// captured (a capture again replaces the state): a worker reads it under the catalog's read lock and keeps the pointer.
+	std::shared_ptr<const RenderDepthInfo> depth_info;
 	// The frame a draw last used it (NativeXprCollect lets one go that none used for NativeXprCache::StateKeepFrames).
 	mutable uint64_t                 used_frame = 0;
 	void Use(uint64_t frame) const { std::atomic_ref<uint64_t>(used_frame).store(frame, std::memory_order_relaxed); }
@@ -1879,6 +1882,8 @@ void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRend
 	        ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eDepth}
 	        : vk::ImageAspectFlags {});
 	draw_state.dynamic_hash = XXH3_64bits(&draw_state.dynamic, sizeof(draw_state.dynamic));
+	if (Spec::DepthLayers2On()) // (spec_depth_layers2)
+		draw_state.depth_info = std::make_shared<const RenderDepthInfo>(state.depth_info);
 	draw_state.resolved     = ResolveGraphicsDynamicParams(draw_state.dynamic.buffer, draw_state.dynamic.indexed_viewports,
 	                                                       draw_state.dynamic.colors, draw_state.dynamic.color_count,
 	                                                       draw_state.dynamic.depth);
@@ -3167,7 +3172,7 @@ struct RenderExecutor::NativeXprDirect {
 // GPU-owned (so CPU reads download it) and CPU-clean, and no fast clear is pending in its metadata.
 // Otherwise the normal path acquires. Then the targets in the state's layouts.
 bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, vk::CommandBuffer vk_buffer,
-                                          const TableImageSet* reading) {
+                                          const TableImageSet* reading, const CommandBuffer* command) {
 	auto&      textures   = m_context.GetTextureCache();
 	const auto meta_epoch = textures.MetaEpoch();
 	auto*      spec       = Spec::Current();
@@ -3176,6 +3181,66 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 		if (image == nullptr || image->serial != target.serial || !image->registered)
 			return Spec::Refuse("table: target released"), false;
 		if (image->binding.needs_rebind) return Spec::Refuse("table: target rebind"), false;
+		// spec_depth_layers2: a layered depth target's draw the checks below would refuse ('table: target download', 'table:
+		// cleared target') is left to the commit instead, one entry per draw, the draw recorded loading (the captured
+		// state's clears are zeroed). THE RULE THAT KEEPS IT EXACT: the commit (Speculation::Before) makes, for this draw and
+		// in record order, the normal path's own calls at the draw (FindDepthTarget, IsMetaCleared, the load rule
+		// htile_load_decision, TouchMeta) and records the draw's load-op clear itself, all ahead of the segment's replay.
+		// That equals the normal path only if nothing in the open segment before this draw uses the image otherwise or
+		// writes its bytes or its HTile (refused here: the draw keeps the refusal), and nothing after it uses the image
+		// otherwise (stopped at the commit). A DB clear (its clear lives inside its own read-only rendering, DepthStoreOp
+		// NONE) and a stencil are refused, as are read-only layouts. Otherwise the commit stops the segment before acting on
+		// the entry, and the draw re-runs on the normal path.
+		const auto leave_layers2 = [&]() -> bool {
+			if (spec == nullptr || command == nullptr || !Spec::DepthLayers2On() || !Spec::CommitTargetsOn() ||
+			    !image->info.IsDepth() || !target.requested.IsDepth() || image->depth_id || image->backing.layers <= 1 ||
+			    draw_state.depth_info == nullptr || draw_state.depth_info->image_id != target.id)
+				return false;
+			// (The desc the normal path acquires it with: the draw state's own, its view the target's range.)
+			const auto& r    = target.range;
+			const auto& seen = draw_state.depth_info->desc;
+			if (seen.view_info.base_level != r.base_level || seen.view_info.level_count != r.level_count ||
+			    seen.view_info.base_layer != r.base_layer || seen.view_info.layer_count != r.layer_count ||
+			    !(seen.info.metadata == target.requested.metadata) || seen.info.data.address != target.requested.data.address)
+				return false;
+			const auto& rc = command->GetRegisters().GetRenderControl();
+			if (rc.depth_clear_enable || rc.stencil_clear_enable || target.requested.HasStencil() ||
+			    draw_state.rendering.depth_stencil_attachment.has_stencil || !Spec::DepthAttachmentLayout(target.layout))
+				return false;
+			if (const auto found = spec->overlay_index.find(image); found != spec->overlay_index.end()) {
+				const auto& entry = spec->overlay[found->second];
+				if (entry.used && Spec::UsedOtherwise(entry.found, entry.found_subresources, entry.state, entry.subresources))
+					return false;
+			}
+			const auto written = [&](uint64_t address, uint64_t size) {
+				if (size == 0) return false;
+				if (spec->open_journal_set.Intersects(address, size)) return true;
+				for (size_t i = spec->Sealed().written; i < spec->written.size(); ++i)
+					if (spec->written[i].begin < address + size && address < spec->written[i].end) return true;
+				return false;
+			};
+			const auto& meta = target.requested.metadata;
+			if (written(image->info.data.address, image->info.data.size) ||
+			    (meta.kind != ImageMetadataKind::None && written(meta.range.address, meta.range.size)))
+				return false;
+			auto        desc      = std::make_shared<TextureCache::ImageDesc>(seen);
+			const auto& rendering = draw_state.rendering;
+			spec->pending_targets.push_back({.id                     = target.id,
+			                                 .image                  = image,
+			                                 .serial                 = target.serial,
+			                                 .base_level             = r.base_level,
+			                                 .level_count            = r.level_count,
+			                                 .base_layer             = r.base_layer,
+			                                 .layer_count            = r.layer_count,
+			                                 .depth_desc             = std::move(desc),
+			                                 .depth_layers2          = true,
+			                                 .layers2_width          = rendering.width,
+			                                 .layers2_height         = rendering.height,
+			                                 .layers2_layers         = rendering.num_layers,
+			                                 .layers2_db_depth_clear = command->GetRegisters().GetDepthClearValue()});
+			return true;
+		};
+		bool left2 = false; // (spec_depth_layers2: the commit owns this target's acquisition and clear)
 		// spec_commit_targets: a target the commit can acquire (one whole-image state, defined; its metadata the draw's; no
 		// depth link) is left to it, recorded once a segment.
 		const auto acquirable = [&] {
@@ -3186,7 +3251,8 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 		const auto leave = [&](bool clear) {
 			auto& pending = spec->pending_targets;
 			for (size_t i = spec->Sealed().pending_targets; i < pending.size(); ++i)
-				if (pending[i].image == image) {
+				// (Not into a layers2 entry: a plain acquisition folded into it would be lost.)
+				if (pending[i].image == image && !pending[i].depth_layers2) {
 					pending[i].clear |= clear;
 					return;
 				}
@@ -3200,13 +3266,21 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 			                   .clear       = clear});
 		};
 		if (!image->SafeToDownload()) {
-			if (!acquirable()) return Spec::Refuse("table: target download"), false;
-			leave(false);
+			if (spec == nullptr) return Spec::Refuse("table: target download"), false; // (mode 0: the base's refusal first)
+			if (acquirable()) leave(false);
+			else if (!(left2 = leave_layers2())) return Spec::Refuse("table: target download"), false;
 		}
-		// (A speculation asks each time: its answers are noted.)
-		if (target.metadata != 0 && (spec != nullptr || draw_state.meta_epoch != meta_epoch) &&
+		// (A speculation asks each time: its answers are noted.) (spec_depth_layers2: not for a target left to the commit,
+		// which reads and consumes the clear itself.)
+		if (!left2 && target.metadata != 0 && (spec != nullptr || draw_state.meta_epoch != meta_epoch) &&
 		    textures.IsMetaCleared(target.metadata, target.slice, nullptr, nullptr,
 		                           target.requested.metadata.kind == ImageMetadataKind::Dcc)) {
+			// spec_depth_layers2: a cleared depth target the commit acquires and clears as the draw would (no consume
+			// noted: the commit's TouchMeta is the consume, and the speculation's later draws on the slice are entries too).
+			if (spec != nullptr &&
+			    (!acquirable() || target.requested.IsDepth() || target.requested.metadata.kind != ImageMetadataKind::Dcc) &&
+			    leave_layers2())
+				continue;
 			// The normal path clears it first. A speculation's draw is a hole that does: the draws after it find it
 			// cleared (speculation-state.h).
 			if (spec != nullptr) spec->ConsumeMeta(target.metadata, target.slice);
@@ -3388,7 +3462,7 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 
 	auto& textures  = m_context.GetTextureCache();
 	auto& scheduler = m_context.GetCommandScheduler();
-	if (!NativeXprEmitTargets(draw_state, vk_buffer)) return false;
+	if (!NativeXprEmitTargets(draw_state, vk_buffer, nullptr, &buffer)) return false;
 	for (const auto& dep: record.images) {
 		auto* image = textures.m_slot_images.try_get(dep.id);
 		if (image == nullptr) return false;

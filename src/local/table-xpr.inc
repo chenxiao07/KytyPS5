@@ -2948,7 +2948,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		const bool due_targets   = serials == 1 ? sum_targets : epoch_targets;
 		if (serials != 0 && epoch_targets != sum_targets)
 			LiveCounters::Add(sum_targets ? LiveCounters::SerialsExtra : LiveCounters::SerialsSkipped);
-		if (due_targets && !NativeXprEmitTargets(draw_state, vk_buffer, set)) {
+		if (due_targets && !NativeXprEmitTargets(draw_state, vk_buffer, set, &buffer)) {
 			if (serials == 2 && !sum_targets) TableSerialsUnsafe("targets refused");
 			return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: targets"), TableResult::Native;
 		}
