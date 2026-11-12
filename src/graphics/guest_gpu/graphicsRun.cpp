@@ -916,7 +916,7 @@ static bool GuardedWrite(void* dst, const void* src, uint32_t size) {
 	uint64_t token = 0;
 	bool     armed = true;
 	{
-		std::unique_lock lock(WriteGuard::g_lock);
+		auto lock = WriteGuard::TakeArm(); // (KYTY_GUARD_SPIN)
 		token = WriteGuard::NextToken();
 		for (uint64_t page = first, i = 0; page < end; page += WriteGuard::Page, ++i) {
 			const bool ok = WriteGuard::Arm(page, token);
@@ -971,7 +971,7 @@ size_t CommitGuardedWriteRun(const uint64_t* addresses, const uint64_t* values, 
 	uint64_t token = 0;
 	bool     armed = false;
 	{
-		std::unique_lock lock(WriteGuard::g_lock);
+		auto lock = WriteGuard::TakeArm(); // (KYTY_GUARD_SPIN)
 		token = WriteGuard::NextToken();
 		armed = WriteGuard::Arm(page, token);
 	}
