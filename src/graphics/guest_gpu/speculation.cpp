@@ -791,6 +791,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 			hole.packet = packet;
 			hole.dwords = dwords;
 			hole.reason = r.state.refused;
+			hole.at     = spec; // (spec_stop_as_hole)
 			CommandProcessor::SkipSuspendedPacket(spec);
 			hole.after = spec;
 			scheduler.EndRecording(*r.recorder);
@@ -999,7 +1000,16 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		// cleared since; the guest memory it read as no GPU work had written it not written since (the effects
 		// logged since it began); the words it read from a speculation before it in memory now; the waits it found
 		// satisfied satisfied.
-		if (const char* why = Changed(result, index)) return ++m_stop_reasons[why], Progress::Stopped;
+		if (const char* why = Changed(result, index)) {
+			// (spec_stop_as_hole: the segment run the normal way as a hole, its recorded work dropped; the hole after it as
+			// after any segment.)
+			if (!SegmentAsHole(result, cp, index)) return ++m_stop_reasons[why], Progress::Stopped;
+			result.next    = index + 1;
+			const auto run = RunHole(result, cp, index);
+			if (run == HoleRun::Blocked) return result.blocked = index, Progress::Blocked;
+			if (run == HoleRun::Changed) return Progress::Stopped;
+			continue;
+		}
 		// The images it uses as it found them: none written through a buffer since (a hole's storage-buffer write, fill or
 		// copy over its memory, or an earlier segment's, replayed in its Before). The normal path's binding uploads such an
 		// image from those bytes before the work; this work was recorded without the upload and would read it as it was
@@ -1040,7 +1050,8 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 						} else {
 							write = m_log.FirstWriteOver(result.effects_from, read.begin, size);
 						}
-						if (write != nullptr) return ++m_stop_reasons[WroteWhatItRead(write)], Progress::Stopped;
+						if (write != nullptr)
+							return ++m_stop_reasons[WroteWhatItRead(write)], Progress::Stopped;
 					}
 				}
 				// (KYTY_SPEC_LATE_READS: a late read, by the processor's writes logged after it was read, and GPU work's since
@@ -1320,6 +1331,39 @@ Speculation::HoleRun Speculation::RunHole(Result& result, CommandProcessor& cp, 
 	// and retired: Spec::Effects, checked before each segment.)
 	if (!cp.SameDrawState(state)) return ++m_stop_reasons["commit: a hole changed the draw state"], HoleRun::Changed;
 	return HoleRun::Done;
+}
+
+bool Speculation::SegmentAsHole(Result& result, CommandProcessor& cp, size_t index) {
+	// (Under KYTY_SPECULATE=4 only; otherwise the stop stands.)
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4 || index >= result.holes.size()) return false;
+	const auto& state = result.state;
+	const auto  from  = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
+	const auto& to    = state.closed[index].end;
+	// (A wait inside it: the GPU thread could block there, before the hole it must stop at.)
+	if (to.waits != from.waits) return false;
+	// From the segment's start (the chunk's, or past the hole before it: `cp` is in that state, the commit checked the
+	// chunk's start state and ran the hole) up to its hole's packet.
+	Pm4Execution execution = index == 0 ? result.start_at : result.holes[index - 1].after;
+	if (!execution.Started() || !result.holes[index].at.Started()) return false;
+	// Its recorded work dropped, never submitted: the GPU thread records it again.
+	m_renderer.GetCommandScheduler().DiscardFirst(*result.recorder, state.closed[index].recorded - result.submitted);
+	result.submitted = state.closed[index].recorded;
+	const Spec::EffectSourceScope source(Spec::EffectSource::Hole);
+	auto&                         executor = m_renderer.GetRenderExecutor();
+	DrawStateObserver::Invalidate();
+	executor.NativeXprForgetState();
+	const auto stop = result.holes[index].at;
+	cp.SetStopAt(&stop);
+	const auto start     = NowNs();
+	const auto processed = cp.Process(execution, {});
+	m_hole_ns += NowNs() - start;
+	cp.SetStopAt(nullptr);
+	const bool reached = cp.TakeStopReached();
+	DrawStateObserver::Invalidate();
+	executor.NativeXprForgetState();
+	if (!reached)
+		EXIT("Speculation: a segment run as a hole did not reach its hole (processed %d)\n", static_cast<int>(processed));
+	return true;
 }
 
 void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {

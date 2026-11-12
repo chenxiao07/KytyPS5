@@ -119,6 +119,7 @@ private:
 		uint32_t        dwords = 0;
 		const char*     reason = nullptr;
 		Pm4Execution    after;
+		Pm4Execution    at; // the execution at the packet (spec_stop_as_hole stops there)
 	};
 	enum class Progress { Complete, Stopped, Blocked };
 	enum class HoleRun { Done, Changed, Blocked };
@@ -221,6 +222,9 @@ private:
 	void After(Result& result, size_t index);
 	// The hole translated the normal way: changed what the work after it assumed, or a wait not satisfied yet.
 	[[nodiscard]] HoleRun RunHole(Result& result, CommandProcessor& cp, size_t index);
+	// Under KYTY_SPECULATE=4: segment `index`, which Changed stopped, run by `cp` the normal way
+	// as a hole (its recorded work dropped), so the commit can go on; false: not taken (the stop stands).
+	bool SegmentAsHole(Result& result, CommandProcessor& cp, size_t index);
 	// KYTY_SPECULATE=4: a speculation thread; the state pass of a submission (the state it starts from, null: none to
 	// translate, or the pass could not follow it); the state pass on from the GPU thread's last submission when it
 	// cannot follow or is behind (under m_mutex).

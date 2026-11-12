@@ -39,6 +39,8 @@ enum class ContextStateOperation : uint32_t {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	// A position within a command buffer (not an empty execution that Process begins at its commands).
+	[[nodiscard]] bool Started() const noexcept { return !m_buffer_stack.empty(); }
 	// Each buffer's commands through `rebase`, which gives another view of the same bytes back (KYTY_WRITE_GUARD). The
 	// guest view's address is kept: a position is the buffer's guest address and offset, whichever view reads it
 	// (SamePosition; 4 Nov wg6: compared by the view's pointer, a rebased in-order run missed its chunk's end).

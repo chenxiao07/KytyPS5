@@ -1145,6 +1145,12 @@ void CommandScheduler::DiscardOne(Recorder& recorder, const Recorder::Recorded& 
 	recorder.buffers[recorded.index].second = 0;
 }
 
+void CommandScheduler::DiscardFirst(Recorder& recorder, size_t count) {
+	EXIT_IF(count > recorder.recorded.size());
+	for (size_t i = 0; i < count; ++i) DiscardOne(recorder, recorder.recorded[i]);
+	recorder.recorded.erase(recorder.recorded.begin(), recorder.recorded.begin() + static_cast<ptrdiff_t>(count));
+}
+
 void CommandScheduler::DiscardRecorded(Recorder& recorder) {
 	EndRecording(recorder);
 	for (const auto& recorded: recorder.recorded) DiscardOne(recorder, recorded);
