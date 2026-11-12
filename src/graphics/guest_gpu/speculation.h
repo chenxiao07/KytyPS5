@@ -51,7 +51,11 @@ class Speculation {
 public:
 	// `interrupt_id`: the queue's processor's (0: the graphics queue; an async compute queue's: KYTY_SPECULATE_ASYNC);
 	// `base`: the first speculation thread's packet slot and executor role less one (after another speculation's).
-	explicit Speculation(RenderContext& renderer, int interrupt_id = 0, uint32_t base = 0, uint32_t threads = 0);
+	// `pass_thread`: KYTY_SPEC_PASS_THREAD, one translator after the `threads` that takes only the state pass.
+	explicit Speculation(RenderContext& renderer, int interrupt_id = 0, uint32_t base = 0, uint32_t threads = 0,
+	                     bool pass_thread = false);
+	// Its translators (the workers and the pass thread): the next instance's packet slots and roles start after them.
+	[[nodiscard]] uint32_t TranslatorCount() const { return static_cast<uint32_t>(m_translators.size()); }
 	~Speculation();
 	KYTY_CLASS_NO_COPY(Speculation);
 	// (Tooling, the live mode toggle: on the GPU thread, between submissions.) The threads stopped and every result not
@@ -168,6 +172,7 @@ private:
 	struct Translator {
 		explicit Translator(RenderContext& renderer, uint32_t number, int interrupt_id);
 		uint32_t                                   index = 0;
+		bool                                       pass_only = false; // (KYTY_SPEC_PASS_THREAD: the state pass's own thread)
 		std::unique_ptr<RenderExecutor>            draw, compute;
 		RenderContext::Executors                   executors;
 		std::unique_ptr<CommandProcessor>          cp;
@@ -255,6 +260,7 @@ private:
 
 	RenderContext&                           m_renderer;
 	std::vector<std::unique_ptr<Translator>> m_translators;
+	bool                                     m_pass_thread = false; // (KYTY_SPEC_PASS_THREAD: the last of m_translators)
 	std::deque<std::unique_ptr<Result>>      m_ahead;     // translated ahead (under m_mutex in mode 4)
 	std::unique_ptr<Result>                  m_blocked;   // a commit waiting at a wait hole
 	std::unique_ptr<CommandProcessor>        m_chain;     // mode 3: the state the next one ahead starts from

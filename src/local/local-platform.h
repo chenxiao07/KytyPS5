@@ -19,6 +19,8 @@ uint32_t ThreadId();
 // Pins the calling thread to a comma-separated CPU list ("1,2,3"); an empty or invalid
 // list leaves the affinity alone.
 void PinThreadToCpuList(const char* list);
+// As PinThreadToCpuList; false: not pinned (no list, or the OS refused it: no CPU of the list the process may run on).
+bool TryPinThreadToCpuList(const char* list);
 
 // Pins a thread (a CurrentThreadHandle) to a CPU list; false if the list or the call fails.
 bool PinThreadHandleToCpuList(uint64_t handle, const char* list);
@@ -32,6 +34,10 @@ bool SetProcessDefaultCpuList(const char* list);
 // "8,9,10,11,12,13,14,15" on an 8 P-core + 16 E-core part (P-cores 1-7, CPUs 2-15, in the render list). "" when
 // there is none. Linux: "".
 std::string SpeculationCpuList();
+// Windows: one logical CPU of the lowest efficiency class the process may run on (an E-core), outside the CPU list
+// `avoid` where there is one, the lowest-numbered first: "16" on an 8 P-core + 16 E-core part. "" where every core is
+// alike or the query fails. Linux: "".
+std::string EfficiencyCpu(const char* avoid);
 // The logical CPUs of the performance cores (the highest efficiency class; all of them where every core is alike) the
 // process may run on; 0 where that is not known (Linux). KYTY_SIMULATE_PCORES=<n> stands in for it (a test).
 uint32_t PerformanceLogicalCpus();

@@ -1323,7 +1323,12 @@ void GuestGpu::ThreadRun(void* data) {
 	};
 	// (Mode 4's machinery: at the start, and again on a live `mode 4` (mode-toggle.h, below).)
 	const auto start_speculation = [gpu] {
-		gpu->m_speculation = std::make_unique<Speculation>(gpu->m_renderer);
+		// KYTY_SPEC_PASS_THREAD (unset: on, mode 4 only as all of this; 0 off): the state pass on its own thread
+		// (Speculation::AheadRun), its packet slot after the workers'.
+		const char* pass_env    = std::getenv("KYTY_SPEC_PASS_THREAD");
+		const bool  pass_thread = (pass_env == nullptr || std::atoi(pass_env) > 0) &&
+		                          kyty_local_speculate_threads.load(std::memory_order_relaxed) + 1 < Spec::MaxPacketSlots;
+		gpu->m_speculation = std::make_unique<Speculation>(gpu->m_renderer, 0, 0, 0, pass_thread);
 		gpu->m_ahead.store(gpu->m_speculation.get(), std::memory_order_release);
 		// (The async queue's threads take the packet slots after the graphics queue's: none left, no async speculation.)
 		// KYTY_SPECULATE_ASYNC unset: the compute queue 49 (Demon's Souls' async compute; a queue a game does not use
@@ -1331,10 +1336,10 @@ void GuestGpu::ThreadRun(void* data) {
 		const char* async_value = std::getenv("KYTY_SPECULATE_ASYNC");
 		const int   async       = async_value != nullptr ? std::atoi(async_value) : 49;
 		if (async > 0 && static_cast<uint32_t>(async) < QueueCount &&
-		    kyty_local_speculate_threads.load(std::memory_order_relaxed) < Spec::MaxPacketSlots) {
+		    gpu->m_speculation->TranslatorCount() < Spec::MaxPacketSlots) {
 			const auto  queue   = static_cast<uint32_t>(async);
 			const char* threads = std::getenv("KYTY_SPECULATE_ASYNC_THREADS");
-			const auto  base    = kyty_local_speculate_threads.load(std::memory_order_relaxed);
+			const auto  base    = gpu->m_speculation->TranslatorCount(); // (its translators, the workers and the pass thread)
 			gpu->m_speculation_async = std::make_unique<Speculation>(
 			    gpu->m_renderer, static_cast<int>(ComputeQueueBase + queue - 1), base,
 			    threads != nullptr && std::atoi(threads) > 0 ? static_cast<uint32_t>(std::atoi(threads))

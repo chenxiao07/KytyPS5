@@ -113,7 +113,7 @@ Speculation::Translator::Translator(RenderContext& renderer, uint32_t number, in
 	compute->ReadCatalogOf(renderer.DefaultComputeRenderExecutor(), 1 + number);
 }
 
-Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t base, uint32_t threads)
+Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t base, uint32_t threads, bool pass_thread)
     : m_renderer(renderer), m_chain(std::make_unique<CommandProcessor>(renderer, interrupt_id)),
       m_state(std::make_unique<CommandProcessor>(renderer, interrupt_id)), m_interrupt_id(interrupt_id) {
 	m_state->SetStateOnly(true);
@@ -124,6 +124,12 @@ Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t bas
 	// (Packet slots and executor roles: Spec::MaxPacketSlots, RenderExecutor::Roles less the GPU thread's.)
 	threads = std::clamp<uint32_t>(threads, 1u, static_cast<uint32_t>(Spec::MaxPacketSlots) - std::min<uint32_t>(base, Spec::MaxPacketSlots - 1));
 	for (uint32_t i = 0; i < threads; ++i) m_translators.push_back(std::make_unique<Translator>(renderer, base + i, interrupt_id));
+	// KYTY_SPEC_PASS_THREAD: the state pass's own translator, last (the caller left it a packet slot).
+	if (pass_thread && base + threads < Spec::MaxPacketSlots) {
+		m_translators.push_back(std::make_unique<Translator>(renderer, base + threads, interrupt_id));
+		m_translators.back()->pass_only = true;
+		m_pass_thread                   = true;
+	}
 }
 
 void Speculation::Stop() {
@@ -352,18 +358,39 @@ static void PinSpeculationWorker(int64_t mask) {
 	}
 }
 
+// KYTY_SPEC_PASS_CPUS: the state pass thread's CPUs. Unset: one CPU of the lowest efficiency class the process may run
+// on, outside the workers' CPUs where there is one (LocalPlatform::EfficiencyCpu: an E-core, 16 on an 8 P-core + 16
+// E-core part); where every core is alike (or on Linux) none, and the thread is not pinned.
+static const std::string& PassCpus() {
+	static const std::string cpus = [] {
+		const char* list = std::getenv("KYTY_SPEC_PASS_CPUS");
+		return list != nullptr && *list != 0 ? std::string(list) : LocalPlatform::EfficiencyCpu(SpeculationCpus().first.c_str());
+	}();
+	return cpus;
+}
+
 void Speculation::AheadRun(Translator& translator) {
-	LocalPlatform::SetThreadName("Kyty.Speculation");
+	LocalPlatform::SetThreadName(translator.pass_only ? "Kyty.SpecPass" : "Kyty.Speculation");
 	// (Worker packets, live spec_worker_packets: its segments recorded as packets, spliced at commit. Armed only
 	// inside a segment recorded so: otherwise its calls go to the driver as before.)
 	const LocalVulkanRecording::PassiveProducerScope passive_producer;
 	static auto& live_cpus    = LiveSwitch::Find("speculate_cpus", 0);
 	int64_t      applied_cpus = live_cpus.load(std::memory_order_relaxed);
-	PinSpeculationWorker(applied_cpus);
+	if (translator.pass_only) {
+		// (Normal priority; never re-pinned live. The CPUs said are those the pin took, or none.)
+		const auto& cpus   = PassCpus();
+		const bool  pinned = !cpus.empty() && LocalPlatform::TryPinThreadToCpuList(cpus.c_str());
+		std::printf("Speculation: the state pass on its own thread, %s%s (KYTY_SPEC_PASS_THREAD; the workers take only "
+		            "chunks)\n",
+		            pinned ? "CPUs " : "not pinned", pinned ? cpus.c_str() : "");
+	} else {
+		PinSpeculationWorker(applied_cpus);
+	}
 	if (translator.index == 0) {
 		const auto& cpus   = SpeculationCpus();
 		const char* render = std::getenv("KYTY_RENDER_CPUS");
-		std::printf("Speculation: %u workers on CPUs %s (%s); render threads on CPUs %s\n", static_cast<unsigned>(m_translators.size()),
+		std::printf("Speculation: %u workers on CPUs %s (%s); render threads on CPUs %s\n",
+		            static_cast<unsigned>(m_translators.size() - (m_pass_thread ? 1u : 0u)),
 		            cpus.first.empty() ? "off the render threads' CPUs" : cpus.first.c_str(), cpus.first.empty() ? "no list" : cpus.second,
 		            render != nullptr && *render != 0 ? render : "any");
 	}
@@ -379,8 +406,11 @@ void Speculation::AheadRun(Translator& translator) {
 		m_ahead_wake.wait(lock, [&] {
 			if (m_quit) return true;
 			ResyncStatePass();
-			pass = !m_state_busy && !m_broken ? EntryOf(m_state_serial + 1) : nullptr;
-			work = nullptr;
+			// (KYTY_SPEC_PASS_THREAD: only its thread takes the pass, and it takes nothing else.)
+			const bool takes_pass = translator.pass_only || !m_pass_thread;
+			pass                  = takes_pass && !m_state_busy && !m_broken ? EntryOf(m_state_serial + 1) : nullptr;
+			work                  = nullptr;
+			if (translator.pass_only) return pass != nullptr;
 			if (pass == nullptr)
 				for (auto& entry: m_jobs) {
 					if (entry.pass != m_pass || entry.job.serial <= m_done_serial) continue;
@@ -394,7 +424,7 @@ void Speculation::AheadRun(Translator& translator) {
 			return pass != nullptr || work != nullptr;
 		});
 		if (m_quit) return;
-		if (const auto mask = live_cpus.load(std::memory_order_relaxed); mask != applied_cpus) {
+		if (const auto mask = live_cpus.load(std::memory_order_relaxed); !translator.pass_only && mask != applied_cpus) {
 			applied_cpus = mask;
 			PinSpeculationWorker(mask);
 		}

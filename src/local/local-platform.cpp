@@ -169,6 +169,11 @@ void PinThreadToCpuList(const char* list) {
 	if (const auto mask = CpuListMask(list); mask != 0) (void)SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(mask));
 }
 
+bool TryPinThreadToCpuList(const char* list) {
+	const auto mask = CpuListMask(list);
+	return mask != 0 && SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(mask)) != 0;
+}
+
 bool PinThreadHandleToCpuList(uint64_t handle, const char* list) {
 	const auto mask = CpuListMask(list);
 	return handle != 0 && mask != 0 &&
@@ -236,6 +241,42 @@ std::string SpeculationCpuList() {
 		if (std::find(cores.begin(), cores.end(), cpu.core) != cores.end())
 			list += (list.empty() ? "" : ",") + std::to_string(cpu.index);
 	return list;
+}
+
+std::string EfficiencyCpu(const char* avoid) {
+	DWORD_PTR process = 0, system = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) == 0) process = ~DWORD_PTR(0);
+	ULONG length = 0;
+	(void)GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+	std::vector<uint8_t> buffer(length);
+	auto* first = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data());
+	if (length == 0 || !GetSystemCpuSetInformation(first, length, &length, GetCurrentProcess(), 0)) return {};
+	struct Cpu {
+		uint32_t index, efficiency;
+	};
+	std::vector<Cpu> cpus;
+	uint32_t         lowest = UINT32_MAX, highest = 0;
+	for (ULONG offset = 0; offset < length;) {
+		const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+		if (info->Type == CpuSetInformation && info->CpuSet.Group == 0 && info->CpuSet.LogicalProcessorIndex < 64 &&
+		    ((process >> info->CpuSet.LogicalProcessorIndex) & 1u) != 0) {
+			cpus.push_back({info->CpuSet.LogicalProcessorIndex, info->CpuSet.EfficiencyClass});
+			lowest  = std::min<uint32_t>(lowest, info->CpuSet.EfficiencyClass);
+			highest = std::max<uint32_t>(highest, info->CpuSet.EfficiencyClass);
+		}
+		offset += info->Size;
+	}
+	if (cpus.empty() || lowest == highest) return {}; // (every core alike: no pin)
+	const uint64_t avoid_mask = CpuListMask(avoid);
+	uint32_t       pick = UINT32_MAX;
+	bool           pick_avoided = true;
+	for (const auto& cpu: cpus) {
+		if (cpu.efficiency != lowest) continue;
+		const bool avoided = ((avoid_mask >> cpu.index) & 1u) != 0;
+		if (pick == UINT32_MAX || (pick_avoided && !avoided) || (avoided == pick_avoided && cpu.index < pick))
+			pick = cpu.index, pick_avoided = avoided;
+	}
+	return pick == UINT32_MAX ? std::string {} : std::to_string(pick);
 }
 
 uint32_t PerformanceLogicalCpus() {
@@ -2137,7 +2178,16 @@ void PinThreadToCpuList(const char* list) {
 	if (MaskToSet(CpuListMask(list), &set)) (void)sched_setaffinity(0, sizeof(set), &set);
 }
 
+bool TryPinThreadToCpuList(const char* list) {
+	cpu_set_t set;
+	return MaskToSet(CpuListMask(list), &set) && sched_setaffinity(0, sizeof(set), &set) == 0;
+}
+
 std::string SpeculationCpuList() {
+	return {};
+}
+
+std::string EfficiencyCpu(const char* /*avoid*/) {
 	return {};
 }
 
