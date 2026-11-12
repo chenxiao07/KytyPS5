@@ -23,7 +23,9 @@
 #include <memory>
 #include <shared_mutex>
 #include <span>
+#include <unordered_map>
 #include <utility>
+#include <mutex>
 #include <vector>
 
 namespace ReadbackQueue { class Queue; }
@@ -190,6 +192,22 @@ public:
 	[[nodiscard]] bool RegisteredSince(uint64_t vaddr, uint64_t size, uint64_t epoch) const {
 		for (auto region = vaddr / TRACKER_REGION_SIZE, last = (vaddr + size - 1) / TRACKER_REGION_SIZE; region <= last; ++region)
 			if (RegionRegistrationEpoch(region * TRACKER_REGION_SIZE) > epoch) return true;
+		return false;
+	}
+	// spec_exact_reg_stop: as RegisteredSince, over the range's 16 KiB granules: a buffer registered or
+	// unregistered over the range itself since `epoch` (KYTY_SPECULATE=4 marks them; the render thread's, as the
+	// commit that asks). False also when nothing was marked (another mode).
+	[[nodiscard]] bool RegisteredSinceExact(uint64_t vaddr, uint64_t size, uint64_t epoch) const {
+		if (size == 0) return false;
+		constexpr uint64_t leaf_mask = (uint64_t {1} << RegLeafBits) - 1;
+		for (uint64_t g = vaddr >> RegGranuleBits, last = (vaddr + size - 1) >> RegGranuleBits; g <= last; ++g) {
+			const auto it = m_reg_granule_epochs.find(g >> RegLeafBits);
+			if (it == m_reg_granule_epochs.end()) {
+				g |= leaf_mask; // (none of the leaf's granules marked)
+				continue;
+			}
+			if (it->second[g & leaf_mask] > epoch) return true;
+		}
 		return false;
 	}
 	// The registration epoch of the last change of a buffer covering the tracker region of `vaddr`: a region
@@ -404,6 +422,9 @@ private:
 	// Per tracker region, see RegionRegistrationEpoch.
 	std::unique_ptr<std::atomic<uint64_t>[]> m_region_registrations =
 	    std::make_unique<std::atomic<uint64_t>[]>(TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE);
+	// spec_exact_reg_stop: per 16 KiB granule, the epoch of the last registration change over it (RegisteredSinceExact).
+	static constexpr uint64_t                                 RegGranuleBits = 14, RegLeafBits = 16;
+	std::unordered_map<uint64_t, std::unique_ptr<uint64_t[]>> m_reg_granule_epochs;
 	std::vector<GuestRange> m_registration_spans; // see TakeRegistrationSpans
 	bool                    m_registration_spans_lost = true;
 	struct SyncBuffer {

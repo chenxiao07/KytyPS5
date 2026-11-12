@@ -923,7 +923,22 @@ const char* Speculation::Changed(const Result& result, size_t index) const {
 	if (mapping || buffers.RegistrationEpoch() != epochs.buffers)
 		for (size_t i = from.buffer_ranges; i < segment.end.buffer_ranges; ++i) {
 			const auto& range = state.buffer_ranges[i];
-			if (buffers.RegisteredSince(range.begin, range.end - range.begin, epochs.buffers)) return "commit: buffers registered";
+			if (buffers.RegisteredSince(range.begin, range.end - range.begin, epochs.buffers)) {
+				// The 4 MiB region changed over the range itself, or only beside it (live spec_exact_reg_stop; -1, the default,
+				// and 1: on under KYTY_SPECULATE=4; 0 off: only a change over the range stops). Only mode 4 keeps the granule
+				// epochs RegisteredSinceExact reads, so outside it the switch is ignored whatever its value (a forced 1 there
+				// would let a registration over the read range pass): every region change stops, as without the switch.
+				static auto&       exact_stop = LiveSwitch::Find("spec_exact_reg_stop", -1);
+				static std::atomic exact_said {false};
+				const auto         exact_v    = exact_stop.load(std::memory_order_relaxed);
+				const bool         mode4      = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+				if (exact_v > 0 && !mode4 && !exact_said.exchange(true, std::memory_order_relaxed))
+					std::printf("Speculation: spec_exact_reg_stop=1 ignored outside KYTY_SPECULATE=4"
+					            " (no granule epochs there)\n");
+				const bool exact_on = exact_v != 0 && mode4;
+				if (!exact_on || buffers.RegisteredSinceExact(range.begin, range.end - range.begin, epochs.buffers))
+					return "commit: buffers registered";
+			}
 			if (mapping && resources.UnmappedSince(epochs.mapping, range.begin, range.end - range.begin))
 				return "commit: memory unmapped";
 		}
@@ -941,10 +956,20 @@ const char* Speculation::Changed(const Result& result, size_t index) const {
 				return "commit: memory unmapped";
 	}
 	if (textures.ResolutionEpoch() == epochs.images) return nullptr;
+	// (Live spec_exact_image_stop: the registration log's exact ranges; -1, the default: on under KYTY_SPECULATE=4; 1 on,
+	// 0 off.)
+	static auto& exact_image = LiveSwitch::Find("spec_exact_image_stop", -1);
+	const auto   exact_v     = exact_image.load(std::memory_order_relaxed);
+	const bool   exact_on    = exact_v > 0 || (exact_v < 0 && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4);
+	const auto   resolved    = [&](const auto& image, uint64_t serial) {
+		return exact_on ? textures.StillResolvedExact(image, serial, epochs.images)
+		                : textures.StillResolved(image, serial, epochs.images);
+	};
 	for (const auto& use: segment.images)
-		if (!textures.StillResolved(*use.image, use.serial, epochs.images)) return "commit: images registered";
+		if (!resolved(*use.image, use.serial))
+			return "commit: images registered";
 	for (size_t i = from.touched_images; i < segment.end.touched_images; ++i)
-		if (!textures.StillResolved(*state.touched_images[i].first, state.touched_images[i].second, epochs.images))
+		if (!resolved(*state.touched_images[i].first, state.touched_images[i].second))
 			return "commit: images registered";
 	return nullptr;
 }

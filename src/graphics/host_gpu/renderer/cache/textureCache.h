@@ -74,6 +74,9 @@ public:
 	// The image (of `serial`) still registered, and no image registered or unregistered over its pages since `epoch`
 	// (a speculation's work used it: speculation.cpp).
 	[[nodiscard]] bool StillResolved(const Image& image, uint64_t serial, uint64_t epoch) const;
+	// spec_exact_image_stop (GPU thread): as StillResolved, the pages' stamps refined by the registration log's exact ranges:
+	// no image registered or unregistered over the image's bytes since `epoch` (false when the log does not reach back).
+	[[nodiscard]] bool StillResolvedExact(const Image& image, uint64_t serial, uint64_t epoch) const;
 	[[nodiscard]] uint64_t ResolutionEpoch() const {
 		return m_resolution_epoch.load(std::memory_order_acquire);
 	}

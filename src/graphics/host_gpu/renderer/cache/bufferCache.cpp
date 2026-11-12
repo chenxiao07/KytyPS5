@@ -1187,6 +1187,18 @@ void BufferCache::ChangeRegister(BufferId id) {
 		__atomic_store_n(reinterpret_cast<uint64_t*>(&m_page_table[page]), std::bit_cast<uint64_t>(entry), __ATOMIC_RELEASE);
 	}
 	const auto epoch = m_registration_epoch.load(std::memory_order_relaxed) + 1;
+	// spec_exact_reg_stop: the granules' epochs, for RegisteredSinceExact (KYTY_SPECULATE=4 only).
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+		constexpr uint64_t leaf_mask = (uint64_t {1} << RegLeafBits) - 1;
+		const auto         begin     = m_slot_buffers[id].CpuAddress();
+		const auto         bytes     = m_slot_buffers[id].Size();
+		if (bytes != 0)
+			for (uint64_t g = begin >> RegGranuleBits, last = (begin + bytes - 1) >> RegGranuleBits; g <= last; ++g) {
+				auto& leaf = m_reg_granule_epochs[g >> RegLeafBits];
+				if (!leaf) leaf = std::make_unique<uint64_t[]>(leaf_mask + 1);
+				leaf[g & leaf_mask] = epoch;
+			}
+	}
 	if (m_registration_spans.size() < 64) {
 		m_registration_spans.push_back({m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size()});
 	} else {

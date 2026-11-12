@@ -715,6 +715,17 @@ bool TextureCache::StillResolved(const Image& image, uint64_t serial, uint64_t e
 	       !RegistrationsSince(image.info.data.address, image.info.data.size, epoch);
 }
 
+bool TextureCache::StillResolvedExact(const Image& image, uint64_t serial, uint64_t epoch) const {
+	if (image.serial != serial || !image.registered) return false;
+	if (!RegistrationsSince(image.info.data.address, image.info.data.size, epoch)) return true;
+	const auto& log     = m_registration_log;
+	const auto  address = image.info.data.address, end = image.info.data.End();
+	if (!log.empty() && log.front().epoch > epoch + 1) return false; // (the log does not reach back to the proof)
+	for (auto entry = log.rbegin(); entry != log.rend() && entry->epoch > epoch; ++entry)
+		if (entry->begin < end && address < entry->end) return false;
+	return true;
+}
+
 bool TextureCache::RegistrationsSince(uint64_t address, uint64_t size, uint64_t epoch) const {
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) return true;
