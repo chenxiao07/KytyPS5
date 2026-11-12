@@ -465,6 +465,7 @@ struct State {
 		bool                      settled = false;
 		std::function<void(bool)> settle;
 		std::function<bool()>     complete; // (spec_worker_images: its pending slots, at its segment's commit; empty: none)
+		std::function<bool()>     check; // (spec_proposed_check: still current at its segment's commit)
 	};
 	std::vector<ProposedSet> proposed_sets;
 	void SettleProposedSets(size_t committed_segment, bool all) {

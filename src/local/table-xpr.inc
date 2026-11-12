@@ -1123,6 +1123,17 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			                               }});
 			if (!raw->pending_images.empty())
 				spec->proposed_sets.back().complete = [owner, raw] { return owner->TableCompletePendingImages(*raw); };
+			// (spec_proposed_check: what TableValidateSet's first steps ask, at the commit: the BDA page table's generation
+			// the set's, and each image the one it was built with.)
+			spec->proposed_sets.back().check = [owner, raw] {
+				if (raw->bda_generation != BufferCache::BdaTableGeneration()) return false;
+				auto& textures = owner->m_context.GetTextureCache();
+				for (const auto& dep: raw->images) {
+					const auto* image = textures.m_slot_images.try_get(dep.id);
+					if (image == nullptr || image->serial != dep.serial) return false;
+				}
+				return true;
+			};
 			return raw;
 		}
 		const auto write = CatalogWrite();

@@ -1309,6 +1309,14 @@ void Speculation::Before(Result& result, size_t index) {
 	}
 	// spec_worker_images: the sets its worker built with pending slots, completed by the owner now (the set is bound by
 	// the replay after this; their images are not among the segment's, which RestoreState below restores).
+	// KYTY_SPEC_PROPOSED_CHECK (live spec_proposed_check; -1, the default: on under KYTY_SPECULATE=4; 1 on, 0 off):
+	// the sets its worker proposed in this segment (bound by the replay after this) still current: the BDA page table's
+	// generation theirs, their images the ones they were built with. One not stops the segment.
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4)
+		for (const auto& proposed: state.proposed_sets)
+			if (proposed.segment == index && proposed.check) {
+				if (!proposed.check()) state.images_failed = true;
+			}
 	for (auto& proposed: state.proposed_sets)
 		if (proposed.segment == index && proposed.complete) {
 			if (!proposed.complete()) state.images_failed = true;
