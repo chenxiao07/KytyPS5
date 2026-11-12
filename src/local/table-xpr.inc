@@ -659,6 +659,16 @@ static void TablePrefetchNext(Pair*& previous, Pair& pair) {
 // spec_worker_sets: the catalog read lock the speculation's table draw or dispatch holds (TableTry, TableDispatch,
 // TableContinue), so the set build can release it around the program lookup (a fault there waits for the GPU thread).
 static thread_local std::shared_lock<std::shared_mutex>* t_catalog_read = nullptr;
+// catalog_writer_first: before a worker's table try takes the catalog shared, it waits while the owner waits to write
+// (pause, then yield), unless this thread holds the catalog shared already.
+static void CatalogGate(const std::atomic<int32_t>& writer_waiting, bool on) {
+	if (!on || writer_waiting.load(std::memory_order_acquire) == 0) return;
+	if (t_catalog_read != nullptr && t_catalog_read->owns_lock()) return;
+	for (uint32_t spins = 0; writer_waiting.load(std::memory_order_acquire) != 0; ++spins) {
+		if (spins < 64) _mm_pause();
+		else std::this_thread::yield();
+	}
+}
 struct CatalogReadScope {
 	std::shared_lock<std::shared_mutex>* old;
 	explicit CatalogReadScope(std::shared_lock<std::shared_mutex>* lock): old(t_catalog_read) {
@@ -677,7 +687,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	auto& table = OwnTable();
 	// (Another executor's catalog is read under its lock.)
 	std::shared_lock<std::shared_mutex> catalog_read;
-	if (Role() != 0) catalog_read = CatalogRead();
+	if (Role() != 0) CatalogGate(Catalog().m_catalog_writer_waiting, CatalogWriterFirst()), catalog_read = CatalogRead();
 	const CatalogReadScope catalog_read_scope(&catalog_read); // (spec_worker_sets)
 	DropStaleCatalog();
 	TableSweepPairs();
@@ -868,7 +878,7 @@ bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64
                                    uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct) {
 	if (kyty_local_table_xpr_mode.load(std::memory_order_relaxed) < 2 || !m_table_xpr || !m_native_xpr) return false;
 	std::shared_lock<std::shared_mutex> catalog_read;
-	if (Role() != 0) catalog_read = CatalogRead();
+	if (Role() != 0) CatalogGate(Catalog().m_catalog_writer_waiting, CatalogWriterFirst()), catalog_read = CatalogRead();
 	const CatalogReadScope catalog_read_scope(&catalog_read); // (spec_worker_sets)
 	DropStaleCatalog();
 	auto& table = OwnTable();
@@ -3255,7 +3265,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	m_dispatch_declined = "dispatch: nothing learned";
 	if (catalog == nullptr || FrameCapture::Active() || XprCapture::Enabled()) return false;
 	std::shared_lock<std::shared_mutex> catalog_read;
-	if (Role() != 0) catalog_read = CatalogRead();
+	if (Role() != 0) CatalogGate(Catalog().m_catalog_writer_waiting, CatalogWriterFirst()), catalog_read = CatalogRead();
 	const CatalogReadScope catalog_read_scope(&catalog_read); // (spec_worker_sets)
 	DropStaleCatalog();
 	TableSweepPairs();

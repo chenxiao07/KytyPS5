@@ -10,6 +10,8 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include "live-switch.h"
+
 #include <array>
 #include <memory>
 #include <optional>
@@ -467,10 +469,24 @@ private:
 	// The catalog's owner changes its pairs and dispatches, image sets, draw states and compute clears under its lock
 	// exclusively (CatalogWrite); another executor reads them under it shared (CatalogRead, on its own thread).
 	mutable std::shared_mutex m_catalog_mutex;
+	// catalog_writer_first (under KYTY_SPECULATE=4, the only mode with readers): the owner raises this while it waits for
+	// the lock exclusively, and a worker waits for it to fall before its table try takes the lock shared. std::shared_mutex gives a waiting writer no priority: in an
+	// area transition the workers' table tries, taking it shared in turns, held the owner's writes 123-193 us each.
+	mutable std::atomic<int32_t> m_catalog_writer_waiting {0};
+	[[nodiscard]] static bool CatalogWriterFirst() {
+		return ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+	}
 	// (Outside KYTY_SPECULATE=4 no other executor reads the catalog: no lock. The mode changes only between submissions.)
 	[[nodiscard]] std::unique_lock<std::shared_mutex> CatalogWrite() const {
-		return ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? std::unique_lock(m_catalog_mutex)
-		                                                                       : std::unique_lock<std::shared_mutex>();
+		if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return std::unique_lock<std::shared_mutex>();
+		std::unique_lock lock(m_catalog_mutex, std::try_to_lock);
+		if (!lock.owns_lock()) {
+			const bool first = CatalogWriterFirst();
+			if (first) m_catalog_writer_waiting.fetch_add(1, std::memory_order_acq_rel);
+			lock.lock();
+			if (first) m_catalog_writer_waiting.fetch_sub(1, std::memory_order_acq_rel);
+		}
+		return lock;
 	}
 	[[nodiscard]] std::shared_lock<std::shared_mutex> CatalogRead() { return std::shared_lock(Catalog().m_catalog_mutex); }
 	[[nodiscard]] uint32_t        Role() const noexcept { return m_role; }
