@@ -411,7 +411,11 @@ inline void SpinPause() {
 		auto lock = TakeArmLock();
 		if (!HonourOverlaps(first, end)) return lock;
 		lock.unlock();
-		while (HonourOverlaps(first, end)) SpinPause();
+		// (A short spin, then yields: a preempted slot owner does not keep the GPU thread spinning.)
+		for (uint32_t spins = 0; HonourOverlaps(first, end); ++spins) {
+			if (spins < 2048) SpinPause();
+			else std::this_thread::yield();
+		}
 	}
 }
 
