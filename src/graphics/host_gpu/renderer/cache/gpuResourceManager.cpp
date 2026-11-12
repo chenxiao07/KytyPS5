@@ -202,16 +202,7 @@ bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept 
 }
 
 void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
-	const auto map = [this, vaddr, size] {
-		m_texture_cache.MapMemory(vaddr, size);
-		{
-			std::lock_guard lock(m_mapped_ranges_mutex);
-			m_mapped_ranges.Add(vaddr, size);
-			++m_mapping_epoch;
-			if (size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size)) NoteBdaSpan(vaddr, size);
-		}
-		FreshWatch(vaddr, size);
-	};
+	const auto map = [this, vaddr, size] { MapOnGpuThread(vaddr, size); };
 	if (m_gpu) {
 		// A pending readback writes its backing when it finishes, which a new mapping aliasing
 		// mapped memory would show; memory nothing else maps has no readback pending.
@@ -225,6 +216,46 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+void GpuResourceManager::MapOnGpuThread(uint64_t vaddr, uint64_t size) {
+	m_texture_cache.MapMemory(vaddr, size);
+	{
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.Add(vaddr, size);
+		++m_mapping_epoch;
+		if (size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size)) NoteBdaSpan(vaddr, size);
+	}
+	FreshWatch(vaddr, size);
+}
+
+// batch_map_syncs (kernel/memory.cpp KernelBatchMap2): a guest batch's ranges mapped on the GPU thread in
+// one command (each as MapMemory does, in order), not a command a range.
+void GpuResourceManager::MapMemoryBatch(const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+	if (ranges.empty()) return;
+	bool aliased = false;
+	for (const auto& [vaddr, size]: ranges) aliased |= !LibKernel::Memory::IsUniqueGuestBackingRange(vaddr, size);
+	const auto map = [this, &ranges, aliased] {
+		if (aliased) m_buffer_cache.DrainGuestReadback();
+		for (const auto& [vaddr, size]: ranges) MapOnGpuThread(vaddr, size);
+	};
+	if (m_gpu) m_gpu->SendCommandSync(map);
+	else map();
+}
+
+// batch_map_syncs: a guest batch's ranges unmapped on the GPU thread in one command (each as UnmapMemory does, not
+// releasing: the host protection is the trackers' until the guest's own unmap or map changes it).
+void GpuResourceManager::UnmapMemoryBatch(const std::vector<std::pair<uint64_t, uint64_t>>& ranges, bool releasing) {
+	if (ranges.empty()) return;
+	if (CommandScheduler::InDeferredOperation()) {
+		EXIT("unsupported memory unmap from an asynchronous GPU completion (batch of %zu)\n", ranges.size());
+	}
+	for (const auto& [vaddr, size]: ranges) TextureOffload::OnHostAccess(vaddr, size, true, false);
+	const auto unmap = [this, &ranges, releasing] {
+		for (const auto& [vaddr, size]: ranges) UnmapOnGpuThread(vaddr, size, releasing);
+	};
+	if (m_gpu == nullptr) unmap();
+	else m_gpu->SendCommandSync(unmap);
+}
+
 void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasing) {
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
@@ -232,69 +263,71 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
 		     vaddr, size);
 	}
 	TextureOffload::OnHostAccess(vaddr, size, true, false);
-	const auto unmap = [this, vaddr, size, releasing] {
-		// Released memory loses its host protection with the mapping: the watchers removed
-		// below need not restore it page run by page run first.
-		struct UnmappingRange {
-			explicit UnmappingRange(uint64_t begin, uint64_t end) { PageManager::SetUnmappingRange(begin, end); }
-			~UnmappingRange() { PageManager::SetUnmappingRange(0, 0); }
-		};
-		std::optional<UnmappingRange> unmapping;
-		if (releasing && kyty_local_unmap_protect_skip_mode.load(std::memory_order_relaxed) != 0) {
-			unmapping.emplace(vaddr, vaddr + size);
-		}
-		// Readbacks write guest memory when they finish: the ones into the range finish first
-		// (the others do not touch it).
-		m_buffer_cache.DrainGuestReadback(vaddr, size);
-		// Pending upload jobs on the range read its backing (or change its protection): they finish before
-		// it changes owner. Jobs elsewhere keep running.
-		AsyncUpload::DrainRange(vaddr, size);
-		// Guards of pending guest writes on the range (KYTY_WRITE_GUARD) dropped: a lift after the unmap would protect
-		// whatever is mapped there next (its lift job then finds none).
-		WriteGuard::Drop(vaddr, size);
-		// The GPU only works on the caches' own buffers and images, which are freed after the
-		// work in flight completes (deferred operations), so the unmap need not wait for the GPU
-		// (it used to finish all of it: up to a frame of GPU work, for every guest unmap). What
-		// writes guest memory after the GPU are the readbacks drained above and GPU-written
-		// images' downloads, which complete on the priority thread: wait for those over the range.
-		// (Deferred fault-buffer processing skips ranges no longer mapped.)
-		const auto download_tick = m_scheduler.Active() ? m_texture_cache.PendingDownloadTick(vaddr, size) : 0;
-		if (download_tick != 0) {
-			const auto start = std::chrono::steady_clock::now();
-			if (!m_scheduler.IsFree(download_tick)) m_scheduler.Wait(download_tick);
-			m_scheduler.WaitPriorityOperations(download_tick);
-			LiveCounters::Add(LiveCounters::UnmapFinishes);
-			LiveCounters::Add(LiveCounters::UnmapFinishUs,
-			                  static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-			                                            std::chrono::steady_clock::now() - start)
-			                                            .count()));
-		}
-		FreshUnwatch(vaddr, size, !releasing);
-		const bool registered = size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size);
-		m_buffer_cache.InvalidateMemory(vaddr, size);
-		if (registered) {
-			m_buffer_cache.DeleteUnmappedBuffers(vaddr, size);
-			m_buffer_cache.SplitUnmappedBuffers(vaddr, size);
-		}
-		m_texture_cache.UnmapMemory(vaddr, size);
-		std::lock_guard lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.Subtract(vaddr, size);
-		const auto epoch = ++m_mapping_epoch;
-		if (registered) NoteBdaSpan(vaddr, size);
-		if (size == 0) return;
-		m_unmap_latest = epoch;
-		constexpr uint64_t leaf_mask = (uint64_t {1} << UnmapLeafBits) - 1;
-		for (uint64_t g = vaddr >> UnmapGranuleBits, last = (vaddr + size - 1) >> UnmapGranuleBits; g <= last; ++g) {
-			auto& leaf = m_unmap_epochs[g >> UnmapLeafBits];
-			if (!leaf) leaf = std::make_unique<uint64_t[]>(leaf_mask + 1);
-			leaf[g & leaf_mask] = epoch;
-		}
-	};
+	const auto unmap = [this, vaddr, size, releasing] { UnmapOnGpuThread(vaddr, size, releasing); };
 	if (m_gpu == nullptr) {
 		unmap();
 		return;
 	}
 	m_gpu->SendCommandSync(unmap);
+}
+
+void GpuResourceManager::UnmapOnGpuThread(uint64_t vaddr, uint64_t size, bool releasing) {
+	// Released memory loses its host protection with the mapping: the watchers removed
+	// below need not restore it page run by page run first.
+	struct UnmappingRange {
+		explicit UnmappingRange(uint64_t begin, uint64_t end) { PageManager::SetUnmappingRange(begin, end); }
+		~UnmappingRange() { PageManager::SetUnmappingRange(0, 0); }
+	};
+	std::optional<UnmappingRange> unmapping;
+	if (releasing && kyty_local_unmap_protect_skip_mode.load(std::memory_order_relaxed) != 0) {
+		unmapping.emplace(vaddr, vaddr + size);
+	}
+	// Readbacks write guest memory when they finish: the ones into the range finish first
+	// (the others do not touch it).
+	m_buffer_cache.DrainGuestReadback(vaddr, size);
+	// Pending upload jobs on the range read its backing (or change its protection): they finish before
+	// it changes owner. Jobs elsewhere keep running.
+	AsyncUpload::DrainRange(vaddr, size);
+	// Guards of pending guest writes on the range (KYTY_WRITE_GUARD) dropped: a lift after the unmap would protect
+	// whatever is mapped there next (its lift job then finds none).
+	WriteGuard::Drop(vaddr, size);
+	// The GPU only works on the caches' own buffers and images, which are freed after the
+	// work in flight completes (deferred operations), so the unmap need not wait for the GPU
+	// (it used to finish all of it: up to a frame of GPU work, for every guest unmap). What
+	// writes guest memory after the GPU are the readbacks drained above and GPU-written
+	// images' downloads, which complete on the priority thread: wait for those over the range.
+	// (Deferred fault-buffer processing skips ranges no longer mapped.)
+	const auto download_tick = m_scheduler.Active() ? m_texture_cache.PendingDownloadTick(vaddr, size) : 0;
+	if (download_tick != 0) {
+		const auto start = std::chrono::steady_clock::now();
+		if (!m_scheduler.IsFree(download_tick)) m_scheduler.Wait(download_tick);
+		m_scheduler.WaitPriorityOperations(download_tick);
+		LiveCounters::Add(LiveCounters::UnmapFinishes);
+		LiveCounters::Add(LiveCounters::UnmapFinishUs,
+		                  static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                                            std::chrono::steady_clock::now() - start)
+		                                            .count()));
+	}
+	FreshUnwatch(vaddr, size, !releasing);
+	const bool registered = size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size);
+	m_buffer_cache.InvalidateMemory(vaddr, size);
+	if (registered) {
+		m_buffer_cache.DeleteUnmappedBuffers(vaddr, size);
+		m_buffer_cache.SplitUnmappedBuffers(vaddr, size);
+	}
+	m_texture_cache.UnmapMemory(vaddr, size);
+	std::lock_guard lock(m_mapped_ranges_mutex);
+	m_mapped_ranges.Subtract(vaddr, size);
+	const auto epoch = ++m_mapping_epoch;
+	if (registered) NoteBdaSpan(vaddr, size);
+	if (size == 0) return;
+	m_unmap_latest = epoch;
+	constexpr uint64_t leaf_mask = (uint64_t {1} << UnmapLeafBits) - 1;
+	for (uint64_t g = vaddr >> UnmapGranuleBits, last = (vaddr + size - 1) >> UnmapGranuleBits; g <= last; ++g) {
+		auto& leaf = m_unmap_epochs[g >> UnmapLeafBits];
+		if (!leaf) leaf = std::make_unique<uint64_t[]>(leaf_mask + 1);
+		leaf[g & leaf_mask] = epoch;
+	}
 }
 
 void GpuResourceManager::FreedByGame(uint64_t vaddr, uint64_t size) {

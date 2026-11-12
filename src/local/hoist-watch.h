@@ -2,7 +2,7 @@
 // batch_map_syncs hoists a KernelBatchMap2 call's GPU-side unmaps to
 // the call's start and skips each entry's own; a buffer or image the GPU thread registers over a hoisted range in that
 // window would outlive the range's OS unmap. While a hoist is active, every registration over a hoisted range marks it
-// touched (BufferCache::ChangeRegister, TextureCache::RegisterImage); the entry's own unmap then runs (batch_hoist_check).
+// touched (BufferCache::ChangeRegister, TextureCache::RegisterImage); the entry's own unmap then runs (UnmapGpuRange).
 
 #include <atomic>
 #include <cstdint>

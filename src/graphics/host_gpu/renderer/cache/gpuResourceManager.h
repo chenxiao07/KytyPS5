@@ -61,6 +61,9 @@ public:
 	// `releasing`: the caller unmaps or decommits the range right after (munmap, free,
 	// memory pool decommit), not a range about to receive a mapping.
 	void               UnmapMemory(uint64_t vaddr, uint64_t size, bool releasing = false);
+	// batch_map_syncs: a guest batch's ranges in one GPU-thread command each way (KernelBatchMap2).
+	void MapMemoryBatch(const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
+	void UnmapMemoryBatch(const std::vector<std::pair<uint64_t, uint64_t>>& ranges, bool releasing = false);
 	// The game freed the range and keeps it mapped (LibKernel::Memory::NoteGameFree): queued for the GPU thread, whose
 	// commands run before any later submission (and between the packets of the one under way), without waiting. The
 	// buffers it holds go as for an unmap (BufferCache::DropFreedRange). KYTY_ENGINE_FREE_BUFFERS=0: nothing; =2: their
@@ -91,6 +94,9 @@ public:
 	void               AdvanceFrame();
 
 private:
+	// The GPU thread's side of MapMemory / UnmapMemory (and of their batch forms).
+	void MapOnGpuThread(uint64_t vaddr, uint64_t size);
+	void UnmapOnGpuThread(uint64_t vaddr, uint64_t size, bool releasing);
 	void                      RunCollectors();
 	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault);
 	// One window of the fault's mapped range: [window_begin, window_begin + window_size) within it.

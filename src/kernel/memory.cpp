@@ -175,8 +175,38 @@ static bool IsGpuAddressRange(uint64_t vaddr, uint64_t size) {
 	return vaddr != 0 && size != 0 && vaddr < GPU_ADDRESS_LIMIT && size < GPU_ADDRESS_LIMIT - vaddr;
 }
 
+// KYTY_BATCH_MAP_SYNCS (live batch_map_syncs; -1, the default: 2 under KYTY_SPECULATE=4, 0 otherwise): a KernelBatchMap2
+// call's MAP_DIRECT entries into wholly reserved ranges have their GPU-side unmaps done in one GPU-thread command before
+// the entries run (hoisted: what an entry's own UnmapGpuRange would do, earlier, over memory nothing maps) and their
+// GPU-side maps in one after them (deferred), not two SendCommandSyncs an entry (one Demon's Souls level load's frame:
+// ~160 entries, ~320 round trips, ~20 ms of the render thread's frame). Entries that overlap another, or are not fixed
+// MAP_DIRECT into reserved memory, run as before; so does every call of fewer than two such entries. (2: the UNMAP entries
+// too; one the call never runs, because an entry before it failed, has its GPU side rolled back: RollBackHoistedUnmaps.)
+struct BatchGpuSyncs {
+	bool                                       active = false, unmaps = false; // (unmaps: batch_map_syncs 2)
+	std::vector<std::pair<uint64_t, uint64_t>> hoisted, maps;
+	// (batch_map_syncs 2: each UNMAP entry whose GPU side the call unmapped up front: its index, span and committed ranges,
+	// for the rollback of one the call never ran.)
+	struct HoistedUnmap {
+		int                                        index = 0;
+		uint64_t                                   start = 0, size = 0;
+		std::vector<std::pair<uint64_t, uint64_t>> committed;
+	};
+	std::vector<HoistedUnmap> unmap_entries;
+	[[nodiscard]] bool Hoisted(uint64_t vaddr, uint64_t size) const {
+		for (const auto& [begin, bytes]: hoisted)
+			if (vaddr >= begin && size <= bytes && vaddr - begin <= bytes - size) return true;
+		return false;
+	}
+};
+static thread_local BatchGpuSyncs t_batch_gpu;
+
 static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return;
+	}
+	if (t_batch_gpu.active && t_batch_gpu.Hoisted(vaddr, size)) {
+		t_batch_gpu.maps.emplace_back(vaddr, size); // (batch_map_syncs: with the call's others, after its entries)
 		return;
 	}
 	const auto start = __rdtsc();
@@ -188,6 +218,13 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 static void UnmapGpuRange(uint64_t vaddr, uint64_t size, bool releasing = false) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return;
+	}
+	if (t_batch_gpu.active && (!releasing || t_batch_gpu.unmaps) && t_batch_gpu.Hoisted(vaddr, size)) {
+		// (The hoist check: a buffer or image registered over the range since the hoist would outlive the OS unmap that
+		// follows: the entry's own GPU unmap then runs, as the per-entry path does.)
+		if (!HoistWatch::Touched(vaddr, size)) {
+			return;
+		}
 	}
 	const auto start = __rdtsc();
 	GetGpuResources().UnmapMemory(vaddr, size, releasing);
@@ -201,6 +238,17 @@ static void RestoreGpuRangeProtection(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	GetGpuResources().SyncProtection(vaddr, size);
+}
+
+// batch_map_syncs 2, at the call's end: the UNMAP entries after entry `ran` (where the call stopped) never ran, but their
+// GPU side was unmapped up front as a release (no protection restored): their trackers' protection is synced back, as
+// KernelMunmap's failure does, and their committed ranges are mapped on the GPU again (with the call's deferred maps).
+static void RollBackHoistedUnmaps(int ran) {
+	for (const auto& entry: t_batch_gpu.unmap_entries) {
+		if (entry.index <= ran) continue;
+		RestoreGpuRangeProtection(entry.start, entry.size);
+		for (const auto& [start, size]: entry.committed) MapGpuRange(start, size);
+	}
 }
 
 static bool DecodeMemoryProtection(int prot, VirtualMemory::Mode* mode, GpuAccessMode* gpu_mode) {
@@ -1386,6 +1434,12 @@ bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t si
 
 bool ReadFaults(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) && g_gpu_resources->HasReadWatchers(vaddr, size);
+}
+
+// batch_busy_once: a batch thread waiting for the GPU thread closes its busy section meanwhile (graphicsRun.cpp).
+bool BatchBusySuspend() { return g_guest_address_space != nullptr && g_guest_address_space->BatchSectionSuspend(); }
+void BatchBusyResume() {
+	if (g_guest_address_space != nullptr) g_guest_address_space->BatchSectionResume();
 }
 
 // A translating thread's read of guest memory no read watcher guards (its callers looked), none on
@@ -4854,6 +4908,96 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	// batch_map_syncs: the fixed MAP_DIRECT entries into wholly reserved, 16 KiB-aligned GPU ranges that overlap no other
+	// entry, their GPU-side unmaps now in one command; their GPU-side maps gathered (MapGpuRange) and made in one at
+	// the end, however the call ends.
+	static auto& batch_switch = LiveSwitch::Find("batch_map_syncs", -1); // (-1: 2 under KYTY_SPECULATE=4, 0 otherwise)
+	const int64_t batch_mode  = ModeFourDefault(batch_switch, 2);
+	struct BatchScope {
+		int ran = INT32_MAX; // (the entry the call stopped at: batch_map_syncs 2's UNMAP entries after it never ran)
+		~BatchScope() {
+			if (!t_batch_gpu.active) return;
+			RollBackHoistedUnmaps(ran); // (their maps deferred with the others, below)
+			t_batch_gpu.active = false;
+			if (!t_batch_gpu.maps.empty()) GetGpuResources().MapMemoryBatch(t_batch_gpu.maps);
+			HoistWatch::End();
+			t_batch_gpu.hoisted.clear();
+			t_batch_gpu.maps.clear();
+			t_batch_gpu.unmap_entries.clear();
+			t_batch_gpu.unmaps = false;
+		}
+	} batch_scope;
+	if (batch_mode != 0 && g_gpu_resources != nullptr && num_entries >= 2 &&
+	    (flags & 0x10) != 0 && !t_batch_gpu.active) {
+		std::vector<std::pair<uint64_t, uint64_t>> spans; // every entry's span, for the overlap test
+		spans.reserve(static_cast<size_t>(num_entries));
+		for (int i = 0; i < num_entries; i++)
+			if (entries[i].length != 0) spans.emplace_back(reinterpret_cast<uint64_t>(entries[i].start), entries[i].length);
+		std::ranges::sort(spans);
+		bool overlap = false;
+		for (size_t i = 1; i < spans.size() && !overlap; i++) overlap = spans[i].first < spans[i - 1].first + spans[i - 1].second;
+		if (!overlap) {
+			// (2: the UNMAP entries too, whose span the virtual ranges know, as KernelMunmap checks before its GPU
+			// unmap; theirs in a releasing command of their own, as KernelMunmap's is.)
+			std::vector<std::pair<uint64_t, uint64_t>> unmapped;
+			const bool with_unmaps = batch_mode >= 2;
+			for (int i = 0; i < num_entries; i++) {
+				const auto& entry = entries[i];
+				const auto  start = reinterpret_cast<uint64_t>(entry.start);
+				std::vector<VirtualRanges::Range> reserved;
+				if (entry.operation == MAP_OP_MAP_DIRECT && start != 0 && ((start | entry.length) & 0x3fffu) == 0 &&
+				    entry.length != 0 && IsGpuAddressRange(start, entry.length) &&
+				    g_virtual_ranges->QuerySpan(start, entry.length, &reserved) &&
+				    std::ranges::all_of(reserved, [](const auto& r) { return r.type == VirtualRangeType::Reserved; }))
+					t_batch_gpu.hoisted.emplace_back(start, entry.length);
+				else if (with_unmaps && entry.operation == MAP_OP_UNMAP && entry.length != 0 &&
+				         UINT64_MAX - start >= entry.length && IsGpuAddressRange(start, entry.length) &&
+				         g_virtual_ranges->QuerySpan(start, entry.length, &reserved)) {
+					unmapped.emplace_back(start, entry.length);
+					auto& hoisted_unmap = t_batch_gpu.unmap_entries.emplace_back();
+					hoisted_unmap.index = i;
+					hoisted_unmap.start = start;
+					hoisted_unmap.size  = entry.length;
+					for (const auto& r: reserved)
+						if (IsCommittedRangeType(r.type)) hoisted_unmap.committed.emplace_back(r.start, r.size);
+				}
+			}
+			if (t_batch_gpu.hoisted.size() + unmapped.size() >= 2) {
+				// (Watched before the GPU unmaps are sent: a buffer or image registered over a range while they run is seen.)
+				auto watched = t_batch_gpu.hoisted;
+				watched.insert(watched.end(), unmapped.begin(), unmapped.end());
+				HoistWatch::Begin(watched);
+				if (!t_batch_gpu.hoisted.empty()) GetGpuResources().UnmapMemoryBatch(t_batch_gpu.hoisted);
+				if (!unmapped.empty()) {
+					GetGpuResources().UnmapMemoryBatch(unmapped, true);
+					t_batch_gpu.unmaps = true;
+				}
+				t_batch_gpu.hoisted = std::move(watched);
+				t_batch_gpu.active  = true;
+			} else {
+				t_batch_gpu.hoisted.clear();
+				t_batch_gpu.unmap_entries.clear();
+			}
+		}
+	}
+
+	// KYTY_BATCH_BUSY_ONCE (live batch_busy_once, N entries per section; -1, the default: 8 under KYTY_SPECULATE=4, 0
+	// otherwise; 0 off; only with KYTY_PROTECT_SERIAL): the entries' maps and unmaps in busy sections
+	// (GuestAddressSpace::BatchEntry). Ends before batch_scope's GPU map command (declared after it).
+	struct BusySection {
+		bool on = false;
+		~BusySection() {
+			if (on) g_guest_address_space->BatchSectionEnd();
+		}
+	} busy_section;
+	if (static auto& per_switch = LiveSwitch::Find("batch_busy_once", -1);
+	    ModeFourDefault(per_switch, 8) > 0 && num_entries >= 2 && g_guest_address_space != nullptr &&
+	    GuestAddressSpace::BatchSectionsAllowed()) {
+		const auto per_section = std::min<int64_t>(ModeFourDefault(per_switch, 8), 1 << 30);
+		g_guest_address_space->BatchSectionBegin(static_cast<uint32_t>(per_section));
+		busy_section.on = true;
+	}
+
 	int processed = 0;
 
 	for (int i = 0; i < num_entries; i++, processed++) {
@@ -4895,12 +5039,14 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 		}
 
 		if (result != OK) {
+			batch_scope.ran = i;
 			if (num_entries_out != nullptr) {
 				*num_entries_out = processed;
 			}
 			return result;
 		}
 	}
+	batch_scope.ran = processed; // (an entry that stopped the loop: those after it never ran)
 
 	if (num_entries_out != nullptr) {
 		*num_entries_out = processed;

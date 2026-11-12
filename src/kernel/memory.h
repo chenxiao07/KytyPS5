@@ -149,9 +149,12 @@ bool                   TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, 
 // Avoid false-sharing read faults only when exact ownership proves clean.
 bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t size);
 bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean);
-// A speculation thread's raw read of guest memory without a fault: what the GPU thread would read, or false (the caller
-// refuses).
+// A speculation thread's raw read of guest memory without a fault (spec_worker_sets' program lookup): what the GPU
+// thread would read, or false (the caller refuses).
 bool TryReadGuestNoFault(uint64_t vaddr, void* data, uint64_t size);
+// batch_busy_once: the calling batch thread's busy section closed while it waits for the GPU thread (true: it had one).
+bool BatchBusySuspend();
+void BatchBusyResume();
 bool                   SyncGpuCleanBacking(uint64_t vaddr, uint64_t size);
 // A read of the range faults (a page the GPU wrote, its bytes read back when the GPU thread reads them): a thread
 // that is not the GPU thread must not read it.

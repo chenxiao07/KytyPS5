@@ -1,3 +1,4 @@
+#include "hoist-watch.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "slow-log.h"
 #include "live-switch.h"
@@ -814,6 +815,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	}
 	image.registered = true;
 	++image.registrations;
+	(void)HoistWatch::NoteRegistration(image.info.data.address, image.info.data.size); // (the batch's hoist check: marks it touched)
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
 }

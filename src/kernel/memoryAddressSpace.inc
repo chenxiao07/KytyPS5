@@ -2059,6 +2059,7 @@ public:
 	                VirtualMemory::Mode               mode,
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
 		LiveTrace::SlowOsCallScope slow(LiveTrace::OsMapBacking, vaddr, size);
+		BatchEntry(); // (batch_busy_once)
 		// (Offloaded ranges of the memory mapped given back first: the new view would not fault.)
 		TextureOffload::OnBackingMapped(GetBackingBase() + backing_offset, size);
 		MaterializeParked(vaddr, size);
@@ -2066,14 +2067,14 @@ public:
 		{
 			ExclusiveLock lock(m_mutex);
 			// (Guest maps and unmaps run one at a time: another one over the range is only waited for here.)
-			m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(vaddr, size); });
+			if (!t_batch_section) m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(vaddr, size); });
 			if (!ConsumeDeferredUnlocked(vaddr, size, &split)) {
 				if (failure_reason != nullptr) {
 					*failure_reason = GuestBackingStore::FailureReason::AddressRangeUnavailable;
 				}
 				return false;
 			}
-			m_busy.emplace_back(vaddr, vaddr + size);
+			if (!t_batch_section) m_busy.emplace_back(vaddr, vaddr + size); // (batch_busy_once: its section's)
 		}
 		// The system calls without the lock (BusyUnlocked): the trackers' protections of other ranges go on.
 		const auto called     = __rdtsc();
@@ -2091,9 +2092,9 @@ public:
 			} else {
 				RestoreSplitUnlocked(split, vaddr, size);
 			}
-			EraseBusyUnlocked(vaddr, vaddr + size);
+			if (!t_batch_section) EraseBusyUnlocked(vaddr, vaddr + size);
 		}
-		m_busy_done.notify_all();
+		if (!t_batch_section) m_busy_done.notify_all();
 		return mapped;
 	}
 
@@ -2119,6 +2120,7 @@ public:
 					busy_begin = vaddr;
 					busy_end   = vaddr + size;
 					m_backing->ViewSpan(vaddr, size, &busy_begin, &busy_end);
+					if (t_batch_section) break; // (batch_busy_once: its section's)
 					if (!BusyUnlocked(busy_begin, busy_end - busy_begin)) {
 						m_busy.emplace_back(busy_begin, busy_end);
 						break;
@@ -2141,9 +2143,9 @@ public:
 						spans    = AddFreedUnlocked(freed);
 						unmapped = true;
 					}
-					EraseBusyUnlocked(busy_begin, busy_end);
+					if (!t_batch_section) EraseBusyUnlocked(busy_begin, busy_end);
 				}
-				m_busy_done.notify_all();
+				if (!t_batch_section) m_busy_done.notify_all();
 				// (The free placeholders around them made one without the lock: guest maps and unmaps, the only users of
 				// the free list, run one at a time.)
 				CoalesceSpans(spans);
@@ -2392,7 +2394,7 @@ private:
 
 	// (With m_mutex held shared.) Returns once no map or unmap is changing [vaddr, vaddr + size).
 	void WaitNotBusy(std::shared_lock<std::shared_mutex>& lock, uint64_t vaddr, uint64_t size) {
-		if (!BusyUnlocked(vaddr, size)) return;
+		if (t_batch_section || !BusyUnlocked(vaddr, size)) return; // (batch_busy_once: its own section)
 		LiveCounters::Add(LiveCounters::AddressSpaceBusyWaits);
 		const auto start = __rdtsc();
 		m_busy_done.wait(lock, [&] { return !BusyUnlocked(vaddr, size); });
@@ -2404,6 +2406,62 @@ private:
 		EXIT_IF(it == m_busy.end());
 		m_busy.erase(it);
 	}
+
+public:
+	// batch_busy_once (KernelBatchMap2): the batch thread's busy section, N entries long.
+	static inline thread_local bool     t_batch_section = false;
+	static inline thread_local uint32_t t_batch_count = 0, t_batch_per = 0;
+	static constexpr uint64_t           BatchBegin = 0, BatchEnd = 1; // (a range nothing maps: any busy range stops all)
+	[[nodiscard]] static bool BatchSectionsAllowed() {
+		static const bool serial = [] {
+			const char* value = std::getenv("KYTY_PROTECT_SERIAL");
+			return value == nullptr || *value != '0';
+		}();
+		return serial;
+	}
+	void BatchSectionBegin(uint32_t per) {
+		t_batch_per = per;
+		OpenBatchSection();
+	}
+	void BatchSectionEnd() {
+		if (t_batch_section) CloseBatchSection();
+		t_batch_per = 0;
+	}
+	[[nodiscard]] bool BatchSectionSuspend() {
+		if (!t_batch_section) return false;
+		CloseBatchSection();
+		return true;
+	}
+	void BatchSectionResume() { OpenBatchSection(); }
+	// (An entry's map or unmap: past N in the section, the section is closed and opened again: its waiters run between.)
+	void BatchEntry() {
+		if (!t_batch_section) return;
+		if (++t_batch_count > t_batch_per) {
+			CloseBatchSection();
+			OpenBatchSection();
+			t_batch_count = 1;
+		}
+	}
+
+private:
+	void OpenBatchSection() {
+		{
+			ExclusiveLock lock(m_mutex);
+			m_busy_done.wait(lock.Lock(), [&] { return m_busy.empty(); });
+			m_busy.emplace_back(BatchBegin, BatchEnd);
+		}
+		t_batch_section = true;
+		t_batch_count   = 0;
+	}
+	void CloseBatchSection() {
+		{
+			ExclusiveLock lock(m_mutex);
+			EraseBusyUnlocked(BatchBegin, BatchEnd);
+		}
+		t_batch_section = false;
+		m_busy_done.notify_all();
+	}
+
 
 	// `trackers`: the GPU trackers' protection (VirtualMemory::ProtectWriteWatch), not the guest's.
 	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode, bool trackers = false) {
@@ -2633,17 +2691,19 @@ private:
 		if (!m_backing->ParkedViews(vaddr, size, &begin, &end)) return;
 		{
 			ExclusiveLock lock(m_mutex);
-			m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(begin, end - begin); });
-			m_busy.emplace_back(begin, end);
+			if (!t_batch_section) { // (batch_busy_once: its section's)
+				m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(begin, end - begin); });
+				m_busy.emplace_back(begin, end);
+			}
 		}
 		std::vector<std::pair<uint64_t, uint64_t>> freed, spans;
 		m_backing->Materialize(vaddr, size, &freed);
 		{
 			ExclusiveLock lock(m_mutex);
 			spans = AddFreedUnlocked(freed);
-			EraseBusyUnlocked(begin, end);
+			if (!t_batch_section) EraseBusyUnlocked(begin, end);
 		}
-		m_busy_done.notify_all();
+		if (!t_batch_section) m_busy_done.notify_all();
 		CoalesceSpans(spans);
 		if (g_remapped_count != 0) {
 			LiveCounters::Add(LiveCounters::RemappedViews, std::exchange(g_remapped_count, 0u));

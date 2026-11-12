@@ -5,6 +5,7 @@
 #include "live-census.h"
 #include "live-counters.h"
 #include "live-switch.h"
+#include "hoist-watch.h"
 #include "mode-toggle.h"
 #include "live-trace.h"
 #include "live-trace-gpu.h"
@@ -1217,6 +1218,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 	m_registration_epoch.store(epoch, std::memory_order_release);
 	LiveCounters::Add(LiveCounters::BufferRegistrations);
 	auto& buffer = m_slot_buffers[id];
+	// The batch's hoist check: a registration over a hoisted range of a KernelBatchMap2 call in progress marks it touched.
+	if constexpr (insert) (void)HoistWatch::NoteRegistration(buffer.CpuAddress(), buffer.Size());
 	if (static const bool log_registrations = std::getenv("KYTY_BUFREG_LOG") != nullptr; log_registrations)
 		std::printf("[tsc %llu] BUFREG %c addr=0x%llx size=0x%llx\n", static_cast<unsigned long long>(__rdtsc()),
 		            insert ? '+' : '-', static_cast<unsigned long long>(buffer.CpuAddress()),

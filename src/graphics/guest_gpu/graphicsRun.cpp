@@ -374,6 +374,13 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	// sleeps: waking a sleeping caller cost the GPU thread a system call each, ~200 a frame at 1-1 (same process: GPU
 	// thread 16.66 -> 16.38 ms a frame). 0 waiting, 1 done, 2 the caller sleeps.
 	constexpr uint32_t    Spins = 500;
+	// batch_busy_once: a batch thread's busy section closed while it waits here (the command's protections run).
+	struct BatchPause {
+		bool paused = Libs::LibKernel::Memory::BatchBusySuspend();
+		~BatchPause() {
+			if (paused) Libs::LibKernel::Memory::BatchBusyResume();
+		}
+	} batch_pause;
 	std::atomic<uint32_t> state {0};
 	// (Its time waiting for the GPU thread, running there and until this thread runs again: guest_sync_*_kt.)
 	const uint64_t        enqueued = __rdtsc();
