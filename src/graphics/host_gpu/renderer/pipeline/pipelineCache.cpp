@@ -411,6 +411,13 @@ static bool LoadPlanBytes(const SpilledPlan& in, ShaderRecompiler::IR::ResourceP
 	       ZstdUnpack(packed, bytes.data(), bytes.size()) && ResourcePlanSerial::Load(bytes, plan, &linear);
 }
 
+// KYTY_TABLE_FORMAT_INDEX (live table_format_index; -1, the default: on under KYTY_SPECULATE=4).
+static bool TableFormatIndexOn() {
+	static auto& index_on = LiveSwitch::Find("table_format_index", -1);
+	const auto   value    = index_on.load(std::memory_order_relaxed);
+	return value >= 0 ? value != 0 : ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+}
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -2229,6 +2236,8 @@ struct PipelineCache::ProgramCache {
 			}
 			const auto& stored = entry->second.permutations.emplace_back(std::move(permutation));
 			if (!stored.handle) return {};
+			if (TableFormatIndexOn()) // (TableFormatOnlyBuffers' index: KYTY_TABLE_FORMAT_INDEX only, mode 0 as before)
+				by_program.try_emplace(&stored.program, std::pair {&entry->second, &stored});
 			publish_stage(stored.program);
 			stored.program.bindings.AdvancePushData(push_data_cursor);
 			return stored.handle;
@@ -4482,15 +4491,33 @@ uint32_t PipelineCache::TableFormatOnlyBuffers(const void* want, const void* got
 	// (TranslateWarmup) inserts them from its own thread. The callers (TableResolveSet, TableStore) look the
 	// programs up with GetGraphicsPrograms first, which has released it by then (Common::Mutex is recursive anyway).
 	Common::LockGuard lock(m_mutex);
-	const ProgramCache::ProgramKey*  kw = nullptr;
-	const ProgramCache::ProgramKey*  kg = nullptr;
+	// KYTY_TABLE_FORMAT_INDEX (live table_format_index; -1, the default: on under KYTY_SPECULATE=4): the two programs'
+	// sources and permutations from the program index (by_program: a table job's permutation enters it when stored) instead
+	// of a pass over every permutation of every program (~0.8 ms under the cache's lock, on the GPU thread); a program the
+	// index lacks takes the pass.
+	const bool                       use = TableFormatIndexOn();
+	const void*                      kw = nullptr;
+	const void*                      kg = nullptr;
 	const ProgramCache::Permutation* mw = nullptr;
 	const ProgramCache::Permutation* mg = nullptr;
-	for (const auto& [key, entry]: m_program_cache->programs)
-		for (const auto& p: entry.permutations) {
-			if (&p.program == want) mw = &p, kw = &key;
-			if (&p.program == got) mg = &p, kg = &key;
+	bool                             indexed = false;
+	if (use) {
+		const auto& index = m_program_cache->by_program;
+		const auto  fw    = index.find(static_cast<const ShaderRecompiler::IR::CompiledShaderInfo*>(want));
+		const auto  fg    = index.find(static_cast<const ShaderRecompiler::IR::CompiledShaderInfo*>(got));
+		if (fw != index.end() && fg != index.end()) {
+			mw = fw->second.second, kw = fw->second.first;
+			mg = fg->second.second, kg = fg->second.first;
+			indexed = true;
 		}
+	}
+	if (!indexed) {
+		for (const auto& [key, entry]: m_program_cache->programs)
+			for (const auto& p: entry.permutations) {
+				if (&p.program == want) mw = &p, kw = &entry;
+				if (&p.program == got) mg = &p, kg = &entry;
+			}
+	}
 	if (mw == nullptr || mg == nullptr || kw != kg || !mw->table_mode || !mg->table_mode ||
 	    mw->program.bindings.push_data_start_dword != mg->program.bindings.push_data_start_dword)
 		return UINT32_MAX;
