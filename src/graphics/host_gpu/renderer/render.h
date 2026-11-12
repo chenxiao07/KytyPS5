@@ -503,6 +503,8 @@ private:
 	                      const NativeXprDrawState& draw_state, std::span<const uint64_t> commands,
 	                      uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
 	                      const NativeXprDirectDraw* direct);
+	// spec_worker_images: a worker's set's pending slots completed by the GPU thread at its commit (Speculation::Before).
+	[[nodiscard]] bool TableCompletePendingImages(TableImageSet& set);
 	[[nodiscard]] TableImageSet* TableResolveSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
 	                                             const NativeXprDrawState* draw_state, std::span<const uint32_t> words);
 	[[nodiscard]] bool           TableValidateSet(TableImageSet& set);

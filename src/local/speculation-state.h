@@ -453,6 +453,28 @@ struct State {
 	bool                                     bda_all = false; // the open segment's
 	std::vector<MemoryWrite>                 writes;
 	std::vector<std::pair<Image*, uint64_t>> touched_images; // and the serial
+	// spec_worker_sets: the image sets this speculation built itself (RenderExecutor::TableResolveSet,
+	// read only), by the catalog's pair and the words' hash; `segment`: the open segment then. Published into the
+	// catalog when a segment from it on is committed (Speculation::After: settle(true)); else kept aside, never freed (a
+	// draw that holds one may still be recorded): settle(false) when the record is cleared.
+	struct ProposedSet {
+		const void*               pair = nullptr;
+		uint64_t                  hash = 0;
+		void*                     set  = nullptr;
+		size_t                    segment = 0;
+		bool                      settled = false;
+		std::function<void(bool)> settle;
+		std::function<bool()>     complete; // (spec_worker_images: its pending slots, at its segment's commit; empty: none)
+	};
+	std::vector<ProposedSet> proposed_sets;
+	void SettleProposedSets(size_t committed_segment, bool all) {
+		for (auto& p: proposed_sets)
+			if (!p.settled && (all || p.segment <= committed_segment)) {
+				p.settled = true;
+				p.settle(!all);
+			}
+		if (all) proposed_sets.clear();
+	}
 	std::vector<Common::SlotId>              touched_buffers;
 	// All segments' current and written ranges and guest memory writes, for the caches' questions; the open
 	// segment's guest memory writes (made after its work: its work cannot read them) and the sources of its copies
@@ -910,6 +932,7 @@ struct State {
 		bda_all = false;
 		writes.clear();
 		touched_images.clear();
+		SettleProposedSets(0, true); // (spec_worker_sets: those never committed, aside)
 		touched_buffers.clear();
 		current_set.Clear();
 		written_set.Clear();

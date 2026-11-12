@@ -88,6 +88,22 @@ public:
 	// Moves whenever an image's slot is erased (EraseRetired, the only place): an id allocated when it was E is still
 	// allocated while it is E.
 	[[nodiscard]] uint64_t EraseEpoch() const { return m_erase_epoch.load(std::memory_order_acquire); }
+	// spec_worker_sets (mode 4): a speculation's image set built on its own thread resolves read only
+	// (ReadOnlyScope): FindImage finds an exact, registered image or fails; FindTexture an existing view of a current
+	// image the normal path already acquired for sampling, or fails. Nothing is made, merged, freed, refreshed or
+	// drained; the first failure's reason is kept (ReadOnlyFailed) and the caller refuses the set.
+	static inline thread_local bool        t_read_only        = false;
+	static inline thread_local const char* t_read_only_failed = nullptr;
+	// spec_worker_images: a sampled texture not made or not ready may be left to the commit (a hit, no refusal).
+	static inline thread_local bool t_pending_images_ok = false;
+	static inline thread_local bool t_pending_hit       = false;
+	struct ReadOnlyScope {
+		ReadOnlyScope() { t_read_only = true; t_read_only_failed = nullptr; }
+		~ReadOnlyScope() { t_read_only = false; }
+		KYTY_CLASS_NO_COPY(ReadOnlyScope);
+	};
+	static void ReadOnlyFail(const char* why) noexcept { if (t_read_only_failed == nullptr) t_read_only_failed = why; }
+	[[nodiscard]] static const char* ReadOnlyFailed() noexcept { return t_read_only_failed; }
 	// Only reuses discovery. FindTexture still refreshes contents and selects the current view.
 	[[nodiscard]] bool TryReuseSampledImage(ImageId id, const ImageDesc& desc, uint64_t& epoch);
 	// TryReuseSampledImage without the resolution-epoch proof, for caches that must
@@ -118,6 +134,7 @@ public:
 	[[nodiscard]] ImageId FindImageAt(uint64_t address, uint32_t width, uint32_t height,
 	                                  vk::Format format = vk::Format::eUndefined, uint32_t* count = nullptr);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
+	[[nodiscard]] vk::ImageView FindTextureReadOnly(ImageId id, const ImageDesc& desc); // (t_read_only)
 	// Whether FindTexture with `desc` uploads anything first: guest bytes the CPU wrote, a GPU buffer write over them or
 	// over the stencil plane. A sampled view of a texture whose levels below it stay dirty (RefreshTextureLevels) needs
 	// its own levels' bytes only. Caller holds no lock (the render thread's images).

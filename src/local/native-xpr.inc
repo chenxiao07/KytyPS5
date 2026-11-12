@@ -678,6 +678,9 @@ struct RenderExecutor::NativeXprCache {
 	std::unordered_map<VkDescriptorSet, VkDescriptorSetLayout>      set_layouts;
 	size_t                                                          free_count = 0;
 	std::vector<vk::DescriptorPool>                                pools;
+	// spec_worker_sets: a speculation's set build allocates from the catalog owner's pools (its sets are
+	// published into the owner's catalog, which retires them here): the pools, free lists and frees under this lock.
+	std::mutex                                                     alloc_mutex;
 	std::vector<uint32_t>                                          key;
 	// Store request: the reads of the normal draw's SRT evaluation.
 	std::vector<std::pair<uint64_t, uint64_t>> reads;
@@ -1005,6 +1008,9 @@ vk::DescriptorSet RenderExecutor::NativeXprAllocateSet(vk::DescriptorSetLayout l
                                                        vk::DescriptorPool& pool_out) {
 	auto&      cache  = NativeXprState();
 	const auto device = cache.device;
+	// (spec_worker_sets: a speculation's thread allocates here too: under mode 4 only, the only mode with worker sets.)
+	std::unique_lock<std::mutex> alloc_lock(cache.alloc_mutex, std::defer_lock);
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) alloc_lock.lock();
 	if (const auto found = cache.free_sets.find(static_cast<VkDescriptorSetLayout>(layout));
 	    found != cache.free_sets.end() && !found->second.empty()) {
 		const auto item = found->second.back();
@@ -1172,6 +1178,8 @@ void RenderExecutor::NativeXprCollect() {
 	if (cache.collected_frame == frame || cache.retired.empty()) return;
 	cache.collected_frame = frame;
 	auto& scheduler       = m_context.GetCommandScheduler();
+	std::unique_lock<std::mutex> alloc_lock(cache.alloc_mutex, std::defer_lock); // (spec_worker_sets: mode 4 only, as above)
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) alloc_lock.lock();
 	std::vector<NativeXprCache::RetiredSet> done;
 	std::erase_if(cache.retired, [&](const NativeXprCache::RetiredSet& item) {
 		if (!scheduler.IsFree(item.tick)) return false;

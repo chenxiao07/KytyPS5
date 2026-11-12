@@ -14,6 +14,7 @@
 #include "mode-toggle.h"
 #include "vulkan-recording.h"
 #include "write-guard.h"
+#include <xxhash.h>
 
 #include <algorithm>
 #include <array>
@@ -1299,6 +1300,26 @@ void Speculation::Before(Result& result, size_t index) {
 		const auto& range = state.invalidated[i];
 		textures.InvalidateMemoryFromGPU(range.begin, range.end - range.begin, "speculation");
 	}
+	// spec_worker_images: the sets its worker built with pending slots, completed by the owner now (the set is bound by
+	// the replay after this; their images are not among the segment's, which RestoreState below restores).
+	for (auto& proposed: state.proposed_sets)
+		if (proposed.segment == index && proposed.complete) {
+			if (!proposed.complete()) state.images_failed = true;
+			proposed.complete = nullptr;
+		}
+	// spec_commit_targets: the targets it left to its commit, acquired as the normal path does at the draw, before their
+	// states are restored to those its barriers start from (the acquisition's upload and clear stay: RestoreState
+	// transitions from them). A target found Undefined or per subresource, or not acquired, fails the segment (the
+	// caller stops it before the splice).
+	for (size_t i = from.pending_targets; i < to.pending_targets; ++i) {
+		const auto& pending = state.pending_targets[i];
+		const auto  use     = std::ranges::find(segment.images, pending.image, &Spec::ImageUse::image);
+		const bool  ok      = use != segment.images.end() && use->found.layout != vk::ImageLayout::eUndefined &&
+		                use->found_subresources.empty() &&
+		                textures.AcquireTargetAtCommit(pending.id, pending.serial, pending.base_level, pending.level_count,
+		                                               pending.base_layer, pending.layer_count, pending.clear);
+		if (!ok) state.target_failed = true;
+	}
 	for (const auto& use: segment.images) {
 		EXIT_IF(use.image->serial != use.serial); // (nothing released images since: Epochs)
 		use.image->RestoreState(use.found, use.found_subresources, scheduler.Current().Handle());
@@ -1313,6 +1334,8 @@ void Speculation::After(Result& result, size_t index) {
 	const auto& segment  = state.closed[index];
 	const auto  from     = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
 	const auto& to       = segment.end;
+	// spec_worker_sets: the image sets it built up to this segment, into the catalog (the owner's, under its write).
+	if (!state.proposed_sets.empty()) state.SettleProposedSets(index, false);
 	// What its thread could not note for the presenter (Spec::State::scenes): its indexed draws and its TAA dispatch,
 	// noted here, where the GPU thread would have run them, before the flip after them takes them (FrameGen::TakeScene).
 	// (A segment not committed is not here: its packets are translated again the normal way, which notes them.)
@@ -1457,6 +1480,10 @@ void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {
 	auto& scheduler = m_renderer.GetCommandScheduler();
 	auto& r         = *result;
 	r.state.ReleaseConsumePending(); // (its holes' clears are consumed now, or never: spec_predict_dcc=3)
+	// (spec_worker_sets: its proposed sets no commit settled, settled here on the GPU thread while it still counts as live,
+	// not at its Result's reuse on a worker: the catalog's pair sweeps wait for no speculation live, so the pairs those
+	// sets name are alive, and the aside release's queue and the owner's state are the GPU thread's.)
+	if (!r.state.proposed_sets.empty()) r.state.SettleProposedSets(0, true);
 	for (const auto& hole: r.holes) ++m_hole_reasons[hole.reason];
 	if (first < r.state.closed.size() || !r.recorder->recorded.empty() || r.recorder->open != SIZE_MAX)
 		scheduler.DiscardRecorded(*r.recorder);

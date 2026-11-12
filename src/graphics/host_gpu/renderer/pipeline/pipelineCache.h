@@ -272,6 +272,11 @@ public:
 	// the V#'s format / swizzle (bits by buffer); UINT32_MAX when anything else differs or either is not a table
 	// permutation here.
 	[[nodiscard]] uint32_t TableFormatOnlyBuffers(const void* want, const void* got) const;
+	// spec_worker_sets: a speculation's program lookup (TableResolveSet) sets t_no_fault_reads; its guest memory words
+	// are then read without a fault (ReadShaderRawGuestMemory), a word it cannot read so sets t_no_fault_failed (the
+	// caller refuses). A fault there waited for the GPU thread with the cache's lock held: a freeze.
+	static inline thread_local bool t_no_fault_reads  = false;
+	static inline thread_local bool t_no_fault_failed = false;
 	// When TablePending: the completion of that translation (set once it is done).
 	[[nodiscard]] std::shared_ptr<const std::atomic<bool>> TableWaiting() const;
 	// When TryCreateGraphicsPipeline or TryCreateComputePipeline returned null: the completion of that compile.

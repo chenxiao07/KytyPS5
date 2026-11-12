@@ -100,6 +100,14 @@ struct RenderExecutor::TableImageSet {
 		uint64_t                validity = 0;
 	};
 	TableWords            words; // without the LOD statistics fields (NativeXprLodStatsMask)
+	// spec_worker_images: its slots holding a null image until the commit completes them (Speculation::Before).
+	struct PendingImage {
+		uint32_t                binding = 0, element = 0;
+		vk::DescriptorType      type    = vk::DescriptorType::eSampledImage;
+		TextureCache::ImageDesc desc;
+		vk::ImageLayout         layout  = vk::ImageLayout::eShaderReadOnlyOptimal;
+	};
+	std::vector<PendingImage> pending_images;
 	vk::DescriptorSet     set  = nullptr;
 	vk::DescriptorPool    pool = nullptr;
 	std::vector<Image>    images;
@@ -261,6 +269,17 @@ struct RenderExecutor::TablePair {
 	TableImageSet*& LastSet(uint32_t role) { return role == 0 ? last_set : roles.Get().last_set[role - 1]; }
 	TableImageSet*& PreviousSet(uint32_t role) { return role == 0 ? previous_set : roles.Get().previous_set[role - 1]; }
 	uint64_t&       Generation(uint32_t role) { return role == 0 ? generation : roles.Get().generation[role - 1]; }
+	// Every role's last and previous pointer to `set` dropped (a worker set that goes unpublished: spec_worker_images).
+	void ForgetSet(const TableImageSet* set) noexcept {
+		if (last_set == set) last_set = nullptr;
+		if (previous_set == set) previous_set = nullptr;
+		if (auto* side = roles.Peek()) {
+			for (auto& at: side->last_set)
+				if (at == set) at = nullptr;
+			for (auto& at: side->previous_set)
+				if (at == set) at = nullptr;
+		}
+	}
 	// Every role's last and previous set dropped (a set replaced or retired).
 	void ClearSets() noexcept {
 		last_set = previous_set = nullptr;
@@ -637,6 +656,21 @@ static void TablePrefetchNext(Pair*& previous, Pair& pair) {
 	if (auto* const after = next->next; after != nullptr && after != &pair && after != next) TablePrefetchPair(*after);
 }
 
+// spec_worker_sets: the catalog read lock the speculation's table draw or dispatch holds (TableTry, TableDispatch,
+// TableContinue), so the set build can release it around the program lookup (a fault there waits for the GPU thread).
+static thread_local std::shared_lock<std::shared_mutex>* t_catalog_read = nullptr;
+struct CatalogReadScope {
+	std::shared_lock<std::shared_mutex>* old;
+	explicit CatalogReadScope(std::shared_lock<std::shared_mutex>* lock): old(t_catalog_read) {
+		t_catalog_read = lock;
+	}
+	~CatalogReadScope() {
+		t_catalog_read = old;
+	}
+	CatalogReadScope(const CatalogReadScope&)            = delete;
+	CatalogReadScope& operator=(const CatalogReadScope&) = delete;
+};
+
 RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands,
                                                      uint64_t index_base, uint64_t index_bytes,
                                                      vk::IndexType index_type, const NativeXprDirectDraw* direct) {
@@ -644,6 +678,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	// (Another executor's catalog is read under its lock.)
 	std::shared_lock<std::shared_mutex> catalog_read;
 	if (Role() != 0) catalog_read = CatalogRead();
+	const CatalogReadScope catalog_read_scope(&catalog_read); // (spec_worker_sets)
 	DropStaleCatalog();
 	TableSweepPairs();
 	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1e, 0); // census: the table path's phases (b)
@@ -834,6 +869,7 @@ bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64
 	if (kyty_local_table_xpr_mode.load(std::memory_order_relaxed) < 2 || !m_table_xpr || !m_native_xpr) return false;
 	std::shared_lock<std::shared_mutex> catalog_read;
 	if (Role() != 0) catalog_read = CatalogRead();
+	const CatalogReadScope catalog_read_scope(&catalog_read); // (spec_worker_sets)
 	DropStaleCatalog();
 	auto& table = OwnTable();
 	if (table.last_pair == nullptr || buffer.IsInvalid() || index_base == 0 || index_bytes == 0 ||
@@ -869,11 +905,101 @@ static int64_t TableLearnPortable() {
 	return Spec::On() ? value.load(std::memory_order_relaxed) : 0;
 }
 
+// spec_worker_sets and spec_worker_images (under KYTY_SPECULATE=4 only, the mode whose descriptor pools a worker may
+// share): a speculation's thread builds an image set
+// itself (TableResolveSet) when every image is resident, current and already acquired for sampling (the texture cache
+// read only: TextureCache::ReadOnlyScope); the set is its own (Spec::State::proposed_sets) until a segment from the one
+// that made it on is committed, when the owner publishes it into the catalog (or keeps it aside: never freed, a recorded
+// draw may hold it). Anything else is refused as before ('table image set').
+[[nodiscard]] static bool WorkerImagesOn() {
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+}
+
+static int64_t WorkerSets() {
+	if (!Spec::On()) return 0;
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 1 : 0;
+}
+static void TableKeepAside(std::shared_ptr<void> holder) {
+	static std::mutex                          mutex;
+	static std::vector<std::shared_ptr<void>> kept;
+	std::scoped_lock                           lock(mutex);
+	kept.push_back(std::move(holder));
+}
+
+// spec_worker_images: the GPU thread, at the commit of the segment that built `set` (Speculation::Before, before the replay
+// binds it): each pending slot's image as its own TableResolveSet would find it now (FindImage: made if needed;
+// FindTexture: uploaded, its view), transited to the sampled layout in the open buffer, its view written into the slot,
+// and the image added to the set's (its later draws validate and transit it as any). All of them, or false (the
+// segment stops; the set is never published).
+bool RenderExecutor::TableCompletePendingImages(TableImageSet& set) {
+	auto&                                textures = m_context.GetTextureCache();
+	const auto                           handle   = m_context.GetCommandScheduler().Current().Handle();
+	std::vector<vk::DescriptorImageInfo> infos(set.pending_images.size());
+	std::vector<vk::WriteDescriptorSet>  writes;
+	size_t                               done = 0;
+	for (size_t i = 0; i < set.pending_images.size(); ++i) {
+		auto&      pending = set.pending_images[i];
+		auto       desc    = pending.desc;
+		const auto id      = textures.FindImage(desc, false, true); // (may fail: no memory for it, a refusal)
+		if (!id) continue;
+		const auto view = textures.FindTexture(id, desc);
+		if (!view) continue;
+		auto& image = textures.GetImage(id);
+		image.usage.texture = true;
+		const ImageSubresourceRange range {desc.view_info.base_level, desc.view_info.level_count, desc.view_info.base_layer,
+		                                   desc.view_info.layer_count};
+		image.Transit(pending.layout, vk::AccessFlagBits2::eShaderRead, range, handle);
+		infos[i] = vk::DescriptorImageInfo {nullptr, view, pending.layout};
+		vk::WriteDescriptorSet write;
+		write.dstSet          = set.set;
+		write.dstBinding      = pending.binding;
+		write.dstArrayElement = pending.element;
+		write.descriptorCount = 1;
+		write.descriptorType  = pending.type;
+		write.pImageInfo      = &infos[i];
+		writes.push_back(write);
+		auto& dep  = set.images.emplace_back();
+		dep.id     = id;
+		dep.serial = image.serial;
+		dep.layout = pending.layout;
+		dep.range  = range;
+		dep.desc   = desc;
+		set.image_ids.push_back(id);
+		++done;
+	}
+	if (!writes.empty())
+		m_context.GetGraphics().device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		                                                    , LocalVulkanRecording::DirectDispatch()
+#endif
+		);
+	bool ok = done == set.pending_images.size();
+	set.span_begin = set.span_end = 0; // (its span grew: found again at its next proof)
+	if (ok) set.pending_images.clear();
+	return ok;
+}
+
 RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& buffer, TablePair& pair,
                                                                const TableVariant*       variant,
                                                                const NativeXprDrawState* draw_state,
                                                                std::span<const uint32_t> words) {
-	if (Spec::Current() != nullptr) return Spec::Refuse("table image set"), nullptr;
+	auto* const spec       = Spec::Current();
+	// (A speculation's set only: its proposals are found by the words' hash. Mode 0 hashes nothing here.)
+	const auto  words_hash = spec != nullptr ? XXH3_64bits(words.data(), words.size() * sizeof(uint32_t)) : uint64_t {0};
+	std::optional<TextureCache::ReadOnlyScope> read_only;
+	const auto worker_refuse = [](const char* why) -> TableImageSet* {
+		return Spec::Refuse(why), nullptr;
+	};
+	if (spec != nullptr) {
+		if (WorkerSets() == 0) return Spec::Refuse("table image set"), nullptr;
+		// (One it built already in this translation.)
+		for (const auto& proposed: spec->proposed_sets)
+			if (proposed.pair == &pair && proposed.hash == words_hash &&
+			    std::ranges::equal(static_cast<TableImageSet*>(proposed.set)->words, words))
+				return static_cast<TableImageSet*>(proposed.set);
+		if (Catalog().m_native_xpr == nullptr || CatalogTable() == nullptr) return worker_refuse("worker set: no catalog");
+		read_only.emplace();
+	}
 	auto       set      = std::make_unique<TableImageSet>();
 	auto&      textures = m_context.GetTextureCache();
 	// (Before the lookups: a registration they make over a depth image's pages is one IsSampledDepthCurrent sees.)
@@ -884,7 +1010,44 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 	const auto& ctx     = buffer.GetRegisters();
 	set->words.assign(words.begin(), words.end());
 	set->validated_frame = m_context.FrameNumber();
-	const auto publish = [&] {
+	const auto publish = [&]() -> TableImageSet* {
+		if (spec != nullptr) {
+			// A worker's: its own until committed (Speculation::After), then the catalog's, under the owner's write,
+			// when the catalog did not change since (its slot free, the pair's sets not cleared); else kept aside.
+			set->ValidatedFrame(Role())  = set->validated_frame;
+			set->ResolutionEpoch(Role()) = set->resolution_epoch;
+			set->validated_frame         = UINT64_MAX; // (the owner proves it in full at its first use)
+			auto* const raw    = set.get();
+			auto* const owner  = &Catalog();
+			auto* const target = &pair;
+			const auto  since  = CatalogTable()->epoch;
+			auto        holder = std::make_shared<std::unique_ptr<TableImageSet>>(std::move(set));
+			spec->proposed_sets.push_back({&pair, words_hash, raw, spec->closed.size(), false,
+			                               [owner, target, words_hash, since, holder](bool commit) {
+				                               // (spec_worker_images: never completed, never published or kept; the roles' pointers to it
+				                               // dropped first, under the write lock their reads exclude.)
+				                               if (*holder && !(*holder)->pending_images.empty()) {
+					                               const auto write = owner->CatalogWrite();
+					                               target->ForgetSet(holder->get());
+					                               return;
+				                               }
+				                               if (commit && *holder) {
+					                               const auto write = owner->CatalogWrite();
+					                               auto*      table = owner->m_table_xpr.get();
+					                               if (table != nullptr && table->epoch == since) {
+						                               auto& slot = target->sets[words_hash];
+						                               if (!slot) {
+							                               slot = std::move(*holder);
+							                               return;
+						                               }
+					                               }
+				                               }
+				                               TableKeepAside(holder);
+			                               }});
+			if (!raw->pending_images.empty())
+				spec->proposed_sets.back().complete = [owner, raw] { return owner->TableCompletePendingImages(*raw); };
+			return raw;
+		}
 		const auto write = CatalogWrite();
 		auto&      slot  = pair.sets[XXH3_64bits(words.data(), words.size() * sizeof(uint32_t))];
 		if (slot) {
@@ -895,7 +1058,8 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		slot = std::move(set);
 		return slot.get();
 	};
-	const auto refuse = [&](const char* reason) {
+	const auto refuse = [&](const char* reason) -> TableImageSet* {
+		if (spec != nullptr) return worker_refuse("worker set: refused set");
 		static std::atomic<uint32_t> reports[2] {}; // (dispatches, draws)
 		if (reports[pair.ps != 0 ? 1 : 0].fetch_add(1, std::memory_order_relaxed) < 32)
 			std::printf("Table: VS 0x%llx PS 0x%llx image set refused: %s\n", static_cast<unsigned long long>(pair.vs),
@@ -910,16 +1074,48 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 	if (variant != nullptr) {
 		ResetNativeVertexInput(vertex_info);
 		ResetNativeStageInput(pixel_info);
+		// RULE (from a freeze in a long run): a speculation thread never holds a lock the GPU thread can take (the
+		// catalog read, the pipeline cache m_mutex, the texture cache m_lock, the descriptor pools alloc_mutex) across anything
+		// that can fault into tracked guest memory or send a sync to the GPU thread: a fault there waits for the GPU thread,
+		// which waits for the lock. Under these locks a worker reads guest memory only non-faulting with a refusal (SRT words:
+		// t_no_fault_reads here; SRT spans: TryReadGpuShaderSpan guarded copy) or reads what is never GPU-written (shader code);
+		// anything else before the lock is taken. New worker paths (pair proposals) are audited against this list.
+		PipelineCache::t_no_fault_reads  = spec != nullptr;
+		PipelineCache::t_no_fault_failed = false;
+		// (A speculation's lookup without the catalog's read lock: PrepareProgramInto's reads of the vertex metadata and
+		// tables may fault and wait for the GPU thread, which may wait for the catalog's write: a freeze.
+		// The variant is found again by its state after it, and the set refused when the catalog changed meanwhile.)
+		// (Held by a speculation only: the lookup may run without the catalog's lock. Mode 0 reads them in place.)
+		struct Held {
+			std::remove_cvref_t<decltype(variant->mapping)> mapping;
+			std::remove_cvref_t<decltype(variant->state)>   state;
+			std::remove_cvref_t<decltype(pair.portable)>    portable;
+		};
+		std::optional<Held> held;
+		if (spec != nullptr) held.emplace(Held {variant->mapping, variant->state, pair.portable});
+		const auto* mapping  = held ? &held->mapping : &variant->mapping;
+		const auto* portable = held ? &held->portable : &pair.portable;
+		const auto  since    = spec != nullptr && CatalogTable() != nullptr ? CatalogTable()->epoch : 0;
+		const bool  unlocked = spec != nullptr && t_catalog_read != nullptr && t_catalog_read->owns_lock();
 		(void)m_context.GetPipelineCache().GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx,
-		                                                       buffer.GetUserConfig(), variant->mapping, stages == 2,
-		                                                       vertex_info, pixel_info, true, pair.portable);
-		if (m_context.GetPipelineCache().TablePending()) return nullptr;
+		                                                       buffer.GetUserConfig(), *mapping, stages == 2,
+		                                                       vertex_info, pixel_info, true, *portable);
+		PipelineCache::t_no_fault_reads = false;
+		if (spec != nullptr && PipelineCache::t_no_fault_failed) return worker_refuse("worker set: program read");
+		if (unlocked) {
+			if (CatalogTable() == nullptr || CatalogTable()->epoch != since) return worker_refuse("worker set: catalog changed");
+			const auto again = std::ranges::find(pair.variants, held->state, &TableVariant::state);
+			if (again == pair.variants.end()) return worker_refuse("worker set: catalog changed");
+			variant = &*again;
+		}
+		if (m_context.GetPipelineCache().TablePending())
+			return spec != nullptr ? worker_refuse("worker set: program pending") : nullptr;
 		if (vertex_info.stage.program != pair.programs[0] || (stages == 2 && pixel_info.stage.program != pair.programs[1])) {
 			// A format of a buffer's V# alone: the buffers learned as portable, as TableBlocks learns them when it sees a
 			// format change (it never runs for a draw whose set is refused), and the pair compiled again (respecialize,
 			// TableReset) instead of the set refused for RetryFrames, its draws native. (Demon's Souls at the view of
 			// 9 Nov: 11 pairs at spawn; ~38 refused draws a frame gone, s1-10 fps +2.4, settled +2.2.)
-			if (TableLearnPortable() != 0) {
+			if (TableLearnPortable() != 0 && spec == nullptr) {
 				bool                      other = false;
 				const ShaderStageRuntime* got[2] {&vertex_info.stage, &pixel_info.stage};
 				std::array<uint32_t, 2>   masks {};
@@ -951,10 +1147,23 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		ResetNativeStageInput(compute_info);
 		compute_info.dispatch_thread_dimensions = pair.compute->dispatch_thread_dimensions;
 		auto&      pipelines = m_context.GetPipelineCache();
+		PipelineCache::t_no_fault_reads  = spec != nullptr;
+		PipelineCache::t_no_fault_failed = false;
+		// (Held by a speculation only, as above.)
+		std::optional<std::remove_cvref_t<decltype(pair.portable[0])>> held_portable;
+		if (spec != nullptr) held_portable.emplace(pair.portable[0]);
+		const auto* portable0 = held_portable ? &*held_portable : &pair.portable[0];
+		const auto since     = spec != nullptr && CatalogTable() != nullptr ? CatalogTable()->epoch : 0;
+		const bool unlocked  = spec != nullptr && t_catalog_read != nullptr && t_catalog_read->owns_lock();
 		const auto handle    = pipelines.GetComputeProgram(sh.GetCs(), ctx.GetShaderRegisters(), compute_info, nullptr, true,
-		                                                   pair.portable[0]);
-		if (pipelines.TablePending()) return nullptr;
+		                                                   *portable0);
+		PipelineCache::t_no_fault_reads = false;
+		if (spec != nullptr && PipelineCache::t_no_fault_failed) return worker_refuse("worker set: program read");
+		if (unlocked && (CatalogTable() == nullptr || CatalogTable()->epoch != since))
+			return worker_refuse("worker set: catalog changed");
+		if (pipelines.TablePending()) return spec != nullptr ? worker_refuse("worker set: program pending") : nullptr;
 		if (compute_info.stage.program != pair.programs[0]) {
+			if (spec != nullptr) return worker_refuse("worker set: other specialization");
 			// Another specialization the table way alike (a particle simulation's texture 2D in one emitter and 3D in
 			// another, at Latria 90 programs): the set is made for it, with its pipeline.
 			const auto* other = compute_info.stage.program;
@@ -970,8 +1179,14 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		runtimes[0] = &compute_info.stage;
 	}
 	std::array<PreparedBindings, 2>                prepared;
+	TextureCache::t_pending_images_ok = spec != nullptr && WorkerImagesOn(); // (spec_worker_images)
 	for (uint32_t st = 0; st < stages; ++st) PrepareBindingsInto(*runtimes[st], prepared[st]);
 	for (uint32_t st = 0; st < stages; ++st) RebindImages(prepared[st]);
+	TextureCache::t_pending_images_ok = false;
+	if (spec != nullptr && TextureCache::ReadOnlyFailed() != nullptr) {
+		ResetBindings();
+		return worker_refuse(TextureCache::ReadOnlyFailed());
+	}
 	// An address probe's indirect image (a dispatch's): its root's elements in the order of the candidates the set's
 	// key holds (TableEvaluate's), each found among the dispatch's own (the normal path's materialization: the same
 	// enumeration, in the order the records name them); past them the null images it was padded with.
@@ -1004,6 +1219,10 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 	for (uint32_t st = 0; st < stages && ok; ++st)
 		for (auto& binding: prepared[st].images) {
 			auto&       image   = textures.GetImage(binding.image_id);
+			// (spec_worker_sets: the set's own bindings' state, which a speculation's read-only build does not mark (BindImage):
+			// all sampled textures there, neither written nor bound twice apart; the image's fields are the GPU thread's draw.)
+			const bool  bound_general = spec == nullptr && image.binding.force_general;
+			const bool  bound_written = spec == nullptr && image.binding.shader_write;
 			const bool  storage = binding.desc.type == TextureCache::BindingType::Storage;
 			const auto  found   = draw_state == nullptr ? decltype(draw_state->targets.end()) {}
 			                                                : std::ranges::find(draw_state->targets, binding.image_id,
@@ -1044,23 +1263,23 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			}();
 			if (image.info.data.Empty() ||
 			    (target != nullptr && !target_read && (storage || !(target->access & vk::AccessFlagBits2::eShaderRead))) ||
-			    ((storage || (image.binding.force_general && image.binding.shader_write)) && !image.info.IsTiled())) {
+			    ((storage || (bound_general && bound_written)) && !image.info.IsTiled())) {
 				ok = false;
 				break;
 			}
 			if (target != nullptr) {
 				binding.layout  = target->layout;
 				dep.target_read = target_read ? vk::AccessFlagBits2::eShaderRead |
-				                                    (storage || image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
+				                                    (storage || bound_written ? vk::AccessFlagBits2::eShaderWrite
 				                                                                           : vk::AccessFlags2 {})
 				                              : vk::AccessFlags2 {};
 				dep.access      = target->access | dep.target_read;
 				dep.target      = true;
-			} else if (image.binding.force_general && !image.info.IsDepth()) {
+			} else if (bound_general && !image.info.IsDepth()) {
 				binding.layout = vk::ImageLayout::eGeneral;
 				dep.access     = vk::AccessFlagBits2::eShaderRead |
-				                 (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlags2 {});
-				dep.storage    = image.binding.shader_write;
+				                 (bound_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlags2 {});
+				dep.storage    = bound_written;
 				dep.whole      = true;
 			} else if (storage) {
 				binding.layout = vk::ImageLayout::eGeneral;
@@ -1102,8 +1321,19 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				for (const auto resource: binding.resources)
 					image_infos.emplace_back(prepared[st].samplers.at(resource), nullptr, vk::ImageLayout::eUndefined);
 			} else if (item.image) {
-				for (const auto resource: binding.resources)
-					image_infos.push_back(MakeImageInfo(prepared[st].images.at(resource), occurrences.at(resource)++));
+				uint32_t element = 0;
+				for (const auto resource: binding.resources) {
+					const auto& bound = prepared[st].images.at(resource);
+					// (spec_worker_images: the slot the commit completes; the null image's view meanwhile.)
+					if (bound.pending && occurrences.at(resource) == 0) {
+						const auto& desc = *bound.pending_desc;
+						set->pending_images.push_back({item.write.dstBinding, element, item.write.descriptorType, desc,
+						                               desc.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+						                                                   : vk::ImageLayout::eShaderReadOnlyOptimal});
+					}
+					image_infos.push_back(MakeImageInfo(bound, occurrences.at(resource)++));
+					++element;
+				}
 			} else if (binding.kind == Kind::LodStats) {
 				buffer_infos.push_back(fixed(buffers.GetLodStatsBuffer()));
 			} else if (binding.kind == Kind::BdaPagetable) {
@@ -1123,11 +1353,13 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				set->holds_target |= dep.target;
 				set->read_after_write |= dep.whole && dep.storage;
 				// (Its view's metadata, which may not be the image's own: KYTY_TABLE_SERIALS.)
-				if (dep.desc.info.metadata.kind != ImageMetadataKind::None)
+				if (dep.desc.info.metadata.kind != ImageMetadataKind::None) {
+					if (spec != nullptr) return worker_refuse("worker set: metadata view");
 					m_context.GetTextureCache().NoteMetaUse(dep.desc.info.metadata.range.address, dep.id.index);
+				}
 			}
 	}
-	set->set = NativeXprAllocateSet((variant != nullptr      ? variant->pipeline
+	set->set = (spec != nullptr ? Catalog() : *this).NativeXprAllocateSet((variant != nullptr      ? variant->pipeline
 	                                 : set->pipeline != nullptr ? set->pipeline
 	                                                            : pair.pipeline)
 	                                    ->descriptor_set_layout,
@@ -3024,6 +3256,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	if (catalog == nullptr || FrameCapture::Active() || XprCapture::Enabled()) return false;
 	std::shared_lock<std::shared_mutex> catalog_read;
 	if (Role() != 0) catalog_read = CatalogRead();
+	const CatalogReadScope catalog_read_scope(&catalog_read); // (spec_worker_sets)
 	DropStaleCatalog();
 	TableSweepPairs();
 	const auto& sh    = buffer.GetShaders();

@@ -3348,7 +3348,82 @@ void TextureCache::HoldLayers(ImageInfo& info, uint32_t& first) {
 	first = static_cast<uint32_t>((view_address - grown.data.address) / slice);
 }
 
+// spec_worker_sets: FindImage on a speculation's thread building an image set (ReadOnlyScope). The exact
+// match FindImage's first lookups find (the last image of the same backing, by the page table or the region), registered,
+// current and holding the view's resources; anything FindImage would make, merge, free, alias or replace is a failure.
+// (DrainGuestReadback is a speculation's no-op anyway: its ranges are obtained again when it is committed.)
+ImageId TextureCache::FindImageReadOnly(const ImageDesc& desc, bool exact_format) {
+	if (desc.type != BindingType::Texture) return ReadOnlyFail("worker set: not a texture"), ImageId {};
+	std::scoped_lock lock {m_lock};
+	if (desc.info.data.Empty()) {
+		const auto type = desc.info.type == Prospero::ImageType::kColor1D || desc.info.type == Prospero::ImageType::kColor3D
+		                      ? desc.info.type
+		                      : Prospero::ImageType::kColor2D;
+		const auto found = m_null_images.find(std::pair {desc.info.pixel_format, type});
+		if (found == m_null_images.end()) return ReadOnlyFail("worker set: new null image"), ImageId {};
+		return found->second;
+	}
+	ImageId result {};
+	if (kyty_local_preparation_lookup_mode.load(std::memory_order_relaxed) != 0) {
+		ImagePageTable::PageRange pages {};
+		if (ImagePageTable::TryGetPageRange(desc.info.data.address, desc.info.data.size, pages)) {
+			if (const auto* owners = m_image_page_table.Find(pages.first)) {
+				owners->ForEach([&](ImageId id) {
+					const auto* image = m_slot_images.try_get(id);
+					if (image != nullptr && SameBacking(image->info, desc.info, exact_format)) result = id;
+				});
+			}
+		}
+	}
+	if (!result)
+		for (const auto id: FindImagesInRegion(desc.info.data.address, desc.info.data.size, false))
+			if (SameBacking(m_slot_images[id].info, desc.info, exact_format)) result = id;
+	if (!result) {
+		if (t_pending_images_ok && !desc.info.HasMetadata()) return t_pending_hit = true, ImageId {}; // (spec_worker_images)
+		return ReadOnlyFail("worker set: no image"), ImageId {};
+	}
+	auto& image = m_slot_images[result];
+	if (!image.registered || image.depth_id || image.binding.needs_rebind)
+		return ReadOnlyFail("worker set: image not current"), ImageId {};
+	if (exact_format && image.info.pixel_format != desc.info.pixel_format)
+		return ReadOnlyFail("worker set: image format"), ImageId {};
+	if (!image.info.resources.Contains(desc.info.resources)) return ReadOnlyFail("worker set: image resources"), ImageId {};
+	TouchImage(image); // (a speculation's: noted for its commit)
+	return result;
+}
+
+// spec_worker_sets: FindTexture on a set-building speculation's thread (ReadOnlyScope): the view of a current image that
+// needs no upload, no metadata clear and no new view, which the normal path already acquired for sampling.
+vk::ImageView TextureCache::FindTextureReadOnly(ImageId id, const ImageDesc& desc) {
+	std::scoped_lock lock {m_lock};
+	auto*            image = m_slot_images.try_get(id);
+	if (image == nullptr) return ReadOnlyFail("worker set: image gone"), vk::ImageView {};
+	if (desc.type != BindingType::Texture) return ReadOnlyFail("worker set: storage"), vk::ImageView {};
+	if (!image->info.data.Empty()) {
+		if (!image->registered || image->depth_id || image->binding.needs_rebind)
+			return ReadOnlyFail("worker set: image not current"), vk::ImageView {};
+		if (image->info.HasMetadata()) return ReadOnlyFail("worker set: metadata"), vk::ImageView {};
+		if (RefreshPending(*image, desc)) {
+			if (t_pending_images_ok && !image->depth_id) return t_pending_hit = true, vk::ImageView {}; // (spec_worker_images)
+			return ReadOnlyFail("worker set: upload"), vk::ImageView {};
+		}
+	}
+	if (!image->usage.texture) {
+		if (t_pending_images_ok && !image->info.HasMetadata() && !image->depth_id) return t_pending_hit = true, vk::ImageView {};
+		return ReadOnlyFail("worker set: first sampling"), vk::ImageView {};
+	}
+	const auto view = image->FindView(desc.view_info, true);
+	if (!view) {
+		if (t_pending_images_ok && !image->info.HasMetadata() && !image->depth_id) return t_pending_hit = true, vk::ImageView {};
+		return ReadOnlyFail("worker set: new view"), vk::ImageView {};
+	}
+	// (The sampled aspects AcquireImages notes are the draw's binding state, which the set build resets: none here.)
+	TouchImage(*image);
+	return view;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool may_fail) {
+	if (t_read_only) return FindImageReadOnly(desc, exact_format);
 	size_t         slow_candidates = 0;
 	SlowLog::Scope slow([&](double ms) {
 		std::printf("SLOW FindImage %.1f ms addr=0x%llx size=0x%llx type=%u fmt=%u %ux%ux%u levels=%u layers=%u "
@@ -3726,6 +3801,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	if (t_read_only) return FindTextureReadOnly(id, desc);
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	SlowLog::Scope   slow([&](double ms) {

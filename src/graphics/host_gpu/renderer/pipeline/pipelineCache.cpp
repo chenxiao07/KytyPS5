@@ -196,6 +196,12 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 	// unmapped and untracked addresses retain the original load/fault behavior.
 	if (NoGuestMemory(address, sizeof(*value))) {
 		*value = 0;
+	} else if (PipelineCache::t_no_fault_reads) [[unlikely]] {
+		// (A speculation's program lookup: never a fault, which would wait for the GPU thread under the cache's lock.)
+		if (!Libs::LibKernel::Memory::TryReadGuestNoFault(address, value, sizeof(*value))) {
+			PipelineCache::t_no_fault_failed = true;
+			*value                           = 0;
+		}
 	} else if (Libs::LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, value, sizeof(*value))) {
 		LiveCounters::Add(LiveCounters::SrtWatchedReads);
 	} else {
@@ -682,9 +688,10 @@ struct PipelineCache::ProgramCache {
 	// Runs a job on the pipeline cache's compile workers (set by PipelineCache).
 	std::function<void(std::function<void()>)> push_job;
 	// The last table mode Get found its permutation still translating (empty, not refused), and that translation's
-	// completion.
-	bool                                     table_pending = false;
-	std::shared_ptr<const std::atomic<bool>> table_waiting;
+	// completion. Per thread (spec_worker_sets: a speculation's set build looks programs up beside the GPU
+	// thread; each reads the answer of its own lookup).
+	static inline thread_local bool                                     table_pending = false;
+	static inline thread_local std::shared_ptr<const std::atomic<bool>> table_waiting;
 
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
