@@ -1,5 +1,25 @@
 ## New in this build
 
+Your precompiled shaders stay valid: the shader translation is the same as in v20261113.
+
+- **European 01.005.000: the freeze at King Allant's fog fixed for real** (#327, credit @Lukeyrich): the game's
+  resource loader keeps its pending loads in ten lists, and v20261113's repair of a broken list looked at five of them,
+  so the freeze at the fog could still happen. All ten are repaired now; a repair that fails says why in the log.
+- **Xbox controllers: View now really opens the Toolbelt** (#332, credit @kms810530-arch): v20261113 made View click the
+  touch pad with a finger at its exact middle, and Demon's Souls opens the menu of the half the finger is on (the
+  Toolbelt on the left by default), so the middle opened nothing. View now touches the left half, as the keyboard's
+  Backspace does. Tested with a virtual Xbox Series controller: View opens the Toolbelt, B closes it.
+- **Linux launcher: GameMode switch** (PR #331, credit @Bipboop-beep): on the Advanced page, "GameMode" starts the game
+  through `gamemoderun` when GameMode is installed (`GAMEMODE=1` for `run_ds.sh`), off by default. MangoHud is now off by
+  default too (`MANGO=1` or its switch turns it on); a settings file that already has it on keeps it.
+- **Linux with an AMD card (RADV): faster render thread** (PR #333, credit @Bios2000): RADV reads the GPU's progress
+  with a system call, which the emulator did ~2,200 times a frame on its render thread at 1-1. A thread now watches the
+  GPU's progress there by default (as on the Steam Deck already): 97.6 -> 110.8 fps at 1-1 on an RX 9070 XT.
+  `KYTY_TIMELINE_WATCHER=0` brings the old behaviour back. Windows and NVIDIA are unchanged.
+- **Thanks** to @Bipboop-beep and @Bios2000 for the pull requests and to @kms810530-arch and @Lukeyrich for the logs and the tests.
+
+## New in v20261113
+
 Your precompiled shaders stay valid: the shader translation is the same as in v20261110, except on AMD Radeon RX
 400/500 and Vega cards (the first item below). Precompile again after updating on such a card.
 
@@ -33,29 +53,25 @@ Your precompiled shaders stay valid: the shader translation is the same as in v2
 - **Thanks** to @CarpetHead, @Bipboop-beep and @DevList1454 for the pull requests, and to @FKF-GR, @brokeneggg,
   @Lukeyrich and @kms810530-arch for the logs, saves and tests.
 
-## New in v20261110
-
-Your precompiled shaders stay valid: the shader translation is the same as in v20261109, except on AMD's older driver
-for Radeon RX Vega and Polaris cards (the first item below).
-
-- **RX Vega / Polaris with AMD's older driver: the black title screen** (#305, credit @FKF-GR): that driver ("AMD
-  proprietary shader compiler" in the log's GPU line) refused every pipeline of 173 of the game's pixel shaders, the
-  ones that read the GPU's barycentric coordinates without per-vertex values, the picture's post-processing among them.
-  On that driver these shaders now get the same coordinates through AMD's own extension
-  (VK_AMD_shader_explicit_vertex_parameter), which it lists. Other graphics cards translate them as before. Precompile
-  again after updating on such a card. We could not run AMD's older driver here (the shaders pass validation and AMD's
-  own compiler for Vega takes them), so please tell us in #305 whether the title shows.
-- **New, experimental: parallel translation** (PR #293, credit @CarpetHead): with `-Set KYTY_SPECULATE=4` (run.cmd, or
-  the launcher's Advanced > Extra options, "Command-line options"), worker threads translate the game's GPU work ahead
-  of the render thread, which then only checks and commits it. Where the render thread limits the frame rate it is
-  faster: +6% to +16% over the worlds in the author's test at 120 fps (Core i9-12900K, RTX 5090). It needs 28 GB of RAM
-  or more (about 3.6 GB more than without it) and at least 9 logical CPUs on the performance cores; on other PCs it
-  stays off and the log says why. Off by default; without it the emulator runs as before. Tested on Windows only.
-- **A little faster**: the build's profile-guided optimization was trained again on this code. 1-1 at 120 fps on an
-  RTX 5090: 70.3 -> 72.5 fps (the render thread 13.9 -> 13.4 ms a frame); Latria and the arena unchanged.
-- **Thanks** to @CarpetHead for the pull request and the many rounds of measurements, and to @FKF-GR for the logs.
-
 ## 本版本的变化
+
+已有的预编译着色器继续有效：着色器翻译结果和 v20261113 相同。
+
+- **欧版 01.005.000：King Allant 雾门的卡死这次真正修好了**（#327，感谢 @Lukeyrich）：游戏的资源加载器把待加载的
+  资源放在 10 条链表里，而 v20261113 的修复只检查了其中 5 条，所以过雾门时仍可能卡死。现在 10 条都会修复；
+  万一修复失败，日志会写明原因。
+- **Xbox 手柄：View 键现在真的能打开工具栏（Toolbelt）了**（#332，感谢 @kms810530-arch）：v20261113 让 View 键在触摸板
+  正中间按下，而恶魔之魂按手指所在的半边打开对应菜单（默认左半边是工具栏），正中间不属于任何一边，所以什么都没打开。
+  现在 View 键按在左半边，和键盘的 Backspace 一样。用虚拟的 Xbox Series 手柄测试过：View 打开工具栏，B 关闭。
+- **Linux 启动器：GameMode 开关**（PR #331，感谢 @Bipboop-beep）：「高级」页新增「GameMode」，装了 GameMode 时通过
+  `gamemoderun` 启动游戏（`run_ds.sh` 用 `GAMEMODE=1`），默认关闭。MangoHud 现在也默认关闭（`MANGO=1` 或它的开关打开）；
+  设置文件里已经打开的保持打开。
+- **Linux + AMD 显卡（RADV）：渲染线程更快**（PR #333，感谢 @Bios2000）：RADV 读取 GPU 进度要走一次系统调用，而模拟器在
+  1-1 每帧要在渲染线程上读约 2,200 次。现在 RADV 下默认由一个专门线程监视 GPU 进度（Steam Deck 上早已如此）：RX 9070 XT
+  在 1-1 从 97.6 fps 提高到 110.8 fps。`KYTY_TIMELINE_WATCHER=0` 恢复旧行为。Windows 和 NVIDIA 不受影响。
+- **感谢** @Bipboop-beep 和 @Bios2000 的 PR，以及 @kms810530-arch 和 @Lukeyrich 提供的日志和测试。
+
+## v20261113 的变化
 
 已有的预编译着色器继续有效：着色器翻译结果和 v20261110 相同，只有 AMD Radeon RX 400/500 和 Vega 显卡例外（见第一条）。
 这类显卡更新后请重新预编译。
@@ -84,21 +100,3 @@ for Radeon RX Vega and Polaris cards (the first item below).
   发布包不含这项：在发布包里设 `KYTY_FSR4=1` 会在日志里说明原因并使用 FSR 3。
 - **Steam Deck 指南**：补充了如何更新已有安装（#240）。
 - **感谢** @CarpetHead、@Bipboop-beep 和 @DevList1454 的 PR，以及 @FKF-GR、@brokeneggg、@Lukeyrich、@kms810530-arch 提供的日志、存档和测试。
-
-## v20261110 的变化
-
-已有的预编译着色器继续有效：着色器的翻译与 v20261109 相同，只有 Radeon RX Vega、Polaris 显卡使用 AMD 旧驱动时例外
-（见第一条）。
-
-- **RX Vega / Polaris 配 AMD 旧驱动：标题画面黑屏**（#305，感谢 @FKF-GR）：这个驱动（日志 GPU 一行写着“AMD
-  proprietary shader compiler”）会拒绝游戏中 173 个像素着色器的全部管线，也就是读取 GPU 重心坐标、但不读逐顶点数据的
-  那些，画面的后处理也在其中。现在在这个驱动上，这些着色器改用 AMD 自己的扩展（VK_AMD_shader_explicit_vertex_parameter，
-  驱动有列出）取得同样的坐标，其他显卡的翻译不变。这类显卡更新后请重新预编译。我们这里没法运行 AMD 的旧驱动（这些着色器
-  通过了校验，AMD 自己的 Vega 编译器也能编译），所以请在 #305 告诉我们标题画面是否正常显示。
-- **新增实验功能：并行翻译**（PR #293，感谢 @CarpetHead）：加上 `-Set KYTY_SPECULATE=4`（run.cmd，或启动器的高级 >
-  附加参数“命令行参数”）后，工作线程会提前翻译游戏的 GPU 工作，渲染线程只需检查并提交。在渲染线程限制帧率的地方会更快：
-  作者在 120 fps 下逐个世界测试，提升 6% 到 16%（Core i9-12900K、RTX 5090）。需要 28 GB 以上内存（比不开多用约 3.6 GB），
-  以及性能核上至少 9 个逻辑处理器；不满足的电脑上它不会开启，日志会说明原因。默认关闭，不开时模拟器和以前一样。目前只在 Windows 上测试过。
-- **稍快一些**：重新训练了这个版本的 PGO（按运行情况优化）。RTX 5090 在 1-1、120 fps 下：70.3 -> 72.5 fps（渲染线程
-  每帧 13.9 -> 13.4 ms）；Latria 和竞技场不变。
-- **感谢** @CarpetHead 的 PR 和多轮测量，以及 @FKF-GR 提供的日志。
