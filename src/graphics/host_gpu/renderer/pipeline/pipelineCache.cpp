@@ -2189,7 +2189,9 @@ struct PipelineCache::ProgramCache {
 						job->module     = CreateModule(device, job->options, job->result->spirv);
 						job->info       = TakeOnWorker(*job->result);
 					} catch (const Common::RecoverableExit& refused) {
+						// (A line of its own in the log: most exit messages end without one.)
 						job->refused = refused.message;
+						if (job->refused.empty() || job->refused.back() != '\n') job->refused += '\n';
 					}
 					job->done.store(true, std::memory_order_release);
 				});
