@@ -1057,8 +1057,11 @@ const char* Speculation::Changed(const Result& result, size_t index) const {
 			if (resources.UnmappedSince(epochs.mapping, read.begin, read.end - read.begin)) return "commit: memory unmapped";
 		}
 		for (const auto& use: segment.images)
-			if (resources.UnmappedSince(epochs.mapping, use.image->info.data.address, use.image->info.data.size))
+			if (resources.UnmappedSince(epochs.mapping, use.image->info.data.address, use.image->info.data.size)) {
+				// redo_level_precise: not over the bytes of the levels the segment sampled, when it only sampled it.
+				if (Spec::RedoLevelPreciseOn() && SampledLevelsMapped(use, epochs.mapping)) continue;
 				return "commit: memory unmapped";
+			}
 	}
 	if (textures.ResolutionEpoch() == epochs.images) return nullptr;
 	// (Live spec_exact_image_stop: the registration log's exact ranges; -1, the default: on under KYTY_SPECULATE=4; 1 on,
@@ -1077,6 +1080,42 @@ const char* Speculation::Changed(const Result& result, size_t index) const {
 		if (!resolved(*state.touched_images[i].first, state.touched_images[i].second))
 			return "commit: images registered";
 	return nullptr;
+}
+
+// redo_level_precise: whether a used image's unmap since the speculation began left the levels the segment sampled mapped,
+// so that what its work read of the image is what the in-order path would read. Only when every access the segment made
+// to it was a sampled view with a base level above 0 (ImageUse::sample_other clear: Image::GetBarriers records every
+// transition with an entry, and a speculation transits every image it uses each time), on a single-layer, non-volume
+// colour image with no metadata, its object the one the segment used (serial). The bytes are ViewLevelBytes': the
+// sampled levels' spans, grown over every level that shares a byte with them (the mip tail).
+bool Speculation::SampledLevelsMapped(const Spec::ImageUse& use, uint64_t mapping) const {
+	const auto* image = use.image;
+	if (use.sample_other || use.sample_lo == 0 || use.sample_lo >= use.sample_hi || image->serial != use.serial) return false;
+	const auto& info   = image->info;
+	const auto  levels = info.resources.levels;
+	if (info.resources.layers != 1 || info.IsVolume() || info.IsDepth() || info.HasMetadata() ||
+	    levels > info.mip_layout.size() || use.sample_hi > levels)
+		return false;
+	uint64_t first = UINT64_MAX, last = 0;
+	for (uint32_t level = use.sample_lo; level < use.sample_hi; ++level) {
+		first = std::min(first, info.mip_layout[level].offset);
+		last  = std::max(last, info.mip_layout[level].offset + info.mip_layout[level].size);
+	}
+	for (bool grew = true; grew;) {
+		grew = false;
+		for (uint32_t level = 0; level < levels; ++level) {
+			const auto& mip = info.mip_layout[level];
+			if (mip.size == 0 || mip.offset >= last || mip.offset + mip.size <= first) continue;
+			if (mip.offset < first || mip.offset + mip.size > last) {
+				first = std::min(first, mip.offset);
+				last  = std::max(last, mip.offset + mip.size);
+				grew  = true;
+			}
+		}
+	}
+	last = std::min(last, info.data.size);
+	if (first >= last) return false;
+	return !m_renderer.GetGpuResources().UnmappedSince(mapping, info.data.address + first, last - first);
 }
 
 // KYTY_SPEC_COMMIT_VERIFY: whether this one is the Nth (the thread that commits).

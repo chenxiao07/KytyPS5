@@ -219,6 +219,8 @@ private:
 	// Why the work of the segment no longer holds (a buffer or image it used registered over, a mapping changed), or
 	// null.
 	[[nodiscard]] const char* Changed(const Result& result, size_t index) const;
+	// redo_level_precise: a used image's unmap left the levels its segment sampled mapped (speculation.cpp).
+	[[nodiscard]] bool SampledLevelsMapped(const Spec::ImageUse& use, uint64_t mapping) const;
 	// The segments committed, the holes after them run: all, or up to what the work after it no longer holds
 	// (Result::next: the segments committed).
 	[[nodiscard]] Progress CommitSegments(Result& result, CommandProcessor& cp);

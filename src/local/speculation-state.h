@@ -264,6 +264,12 @@ struct PendingTarget {
 		std::printf("Speculation: spec_reloc_refs=1 ignored outside KYTY_SPECULATE=4 (no granule epochs there)\n");
 	return v != 0 && mode4 && PendingBuffersOn();
 }
+// redo_level_precise (under KYTY_SPECULATE=4 only, the mode read at each use; exact): a used image's unmap stops a
+// commit only over the bytes of the levels the segment sampled (ImageUse::sample_lo / sample_hi), when every access the
+// segment made to it was a sampled view with a base level above 0 (Speculation::SampledLevelsMapped).
+[[nodiscard]] inline bool RedoLevelPreciseOn() {
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+}
 
 // A late read (State::late_reads): the range, and the effects log's end before it was read.
 struct LateRead {
@@ -329,6 +335,9 @@ struct ImageUse {
 	std::vector<VulkanImageState> found_subresources, left_subresources;
 	uint64_t                      found_group = 0, left_group = 0; // Image::transit_group
 	bool                          found_buffer_modified = false; // (Image::IsBufferModified when the segment found it)
+	// The levels its sampled views spanned, [sample_lo, sample_hi), and whether any access was not one (redo_level_precise).
+	uint32_t                      sample_lo = UINT32_MAX, sample_hi = 0;
+	bool                          sample_other = false;
 };
 
 // The 64 KiB granules ranges were added over, hashed into 4096 bits, and up to BigRanges ranges over 64 granules or
@@ -429,6 +438,12 @@ struct ImageEntry {
 	std::vector<VulkanImageState> found_subresources;
 	uint64_t                      found_group = 0;
 	bool                          found_buffer_modified = false;
+	// (redo_level_precise) The open segment's accesses to it, every transition (Image::GetBarriers): the levels of those
+	// that were a sampled view with a base level above 0 (shader-read-only layout, shader-read access, a level range),
+	// [sample_lo, sample_hi); sample_other: any other (a whole-image range, base level 0, a target, storage, General,
+	// a transfer, a clear, an upload, a download).
+	uint32_t                      sample_lo = UINT32_MAX, sample_hi = 0;
+	bool                          sample_other = false;
 };
 
 // (spec_predict_dcc=3.) The fast clears speculations' holes will consume, by surface and slice, until that speculation
@@ -1189,7 +1204,8 @@ struct State {
 			auto& entry = overlay[index];
 			segment.images.push_back({entry.image, entry.serial, entry.found, entry.state,
 			                          std::move(entry.found_subresources), entry.subresources, entry.found_group,
-			                          entry.group, entry.found_buffer_modified});
+			                          entry.group, entry.found_buffer_modified, entry.sample_lo, entry.sample_hi,
+			                          entry.sample_other});
 			entry.used = false;
 		}
 		used.clear();
