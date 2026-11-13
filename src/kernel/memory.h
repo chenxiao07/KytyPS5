@@ -216,6 +216,8 @@ bool TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size);
 // Whether a page of the range is one the GPU caches' trackers protect (PageManager::WatchedSpan: no system call).
 [[nodiscard]] bool GuestRangeWatched(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
+// upload_at_copy: the streamer's copy into [vaddr, vaddr + size) just done; its levels uploaded ahead (GPU thread).
+void                   PostLevelUploadAhead(uint64_t vaddr, uint64_t size);
 // Whether a guest mapping holds vaddr once a mapping change under way is done (it waits for one).
 [[nodiscard]] bool     IsGuestMappedAfterChanges(uint64_t vaddr);
 // Whether the address is in a view a partial unmap is mapping again (Windows; statistics: remap_window_writes).

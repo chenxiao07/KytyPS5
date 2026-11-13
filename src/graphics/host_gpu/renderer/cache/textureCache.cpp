@@ -3190,6 +3190,58 @@ bool TextureCache::RefreshTextureLevels(ImageId id, const ImageViewInfo& view) {
 	return true;
 }
 
+// (upload_at_copy; textureCache.h) EXACT: the same steps as RefreshTextureLevels' partial path (the range watched again
+// before its bytes are read, so a guest write after the read faults and dirties it; the dirty bytes uploaded; the range
+// marked complete), made ~one frame earlier: right after the guest's copy instead of at the first view. Only levels the
+// image holds (info.resources.levels), whole and on whole pages, as a view's range is grown.
+void TextureCache::UploadLevelAhead(uint64_t vaddr, uint64_t size) {
+	if (size == 0) return;
+	const uint64_t page = TRACKER_PAGE_SIZE;
+	const uint64_t from = vaddr & ~(page - 1), to = (vaddr + size + page - 1) & ~(page - 1);
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(from, to - from, false)) {
+		auto* found = m_slot_images.try_get(id);
+		if (found == nullptr) continue;
+		auto&       image = *found;
+		const auto& info  = image.info;
+		if (!LevelRefreshCandidate(image) || !image.IsPartiallyCpuDirty() || image.IsMaybeCpuDirty() ||
+		    image.track_addr != info.data.address || image.track_addr_end != info.data.End())
+			continue;
+		const uint64_t lo = std::max(vaddr, info.data.address) - info.data.address;
+		const uint64_t hi = std::min(vaddr + size, info.data.End()) - info.data.address;
+		if (lo >= hi) continue;
+		const auto levels = info.resources.levels;
+		uint64_t   first = UINT64_MAX, last = 0;
+		for (uint32_t level = 0; level < levels; ++level) {
+			const auto& mip = info.mip_layout[level];
+			if (mip.size == 0 || mip.offset >= hi || mip.offset + mip.size <= lo) continue;
+			first = std::min(first, mip.offset);
+			last  = std::max(last, mip.offset + mip.size);
+		}
+		if (first >= last) continue; // (bytes of no level the image holds)
+		for (bool grew = true; grew;) { // (the levels sharing those bytes, whole, as ViewLevelBytes)
+			grew = false;
+			for (uint32_t level = 0; level < levels; ++level) {
+				const auto& mip = info.mip_layout[level];
+				if (mip.size == 0 || mip.offset >= last || mip.offset + mip.size <= first) continue;
+				if (mip.offset < first || mip.offset + mip.size > last) {
+					first = std::min(first, mip.offset);
+					last  = std::max(last, mip.offset + mip.size);
+					grew  = true;
+				}
+			}
+		}
+		const uint64_t begin = info.data.address + first, end = info.data.address + std::min(last, info.data.size);
+		if (begin >= end || begin % page != 0 || end % page != 0) continue;
+		if (!IntersectsRanges(image.CpuDirtyRanges(), begin, end)) continue; // (already current)
+		RetrackHoles(image, begin, end);
+		g_partial_fail = "";
+		if (!UploadImagePartial(image, begin, end)) continue; // (left dirty: the view's own refresh uploads it)
+		image.staged_ring = nullptr;
+		image.RefreshRangeComplete(begin, end);
+	}
+}
+
 void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	if (!stencil.Valid()) {
 		EXIT("TextureCache: invalid stencil association range\n");

@@ -70,6 +70,9 @@ public:
 	// buffers it holds go as for an unmap (BufferCache::DropFreedRange). KYTY_ENGINE_FREE_BUFFERS=0: nothing; =2: their
 	// GPU-written bytes dropped instead of read back first.
 	void               FreedByGame(uint64_t vaddr, uint64_t size);
+	// upload_at_copy: from the streamer's thread, right after its copy into [vaddr, vaddr + size): the GPU thread uploads
+	// the streamed levels there ahead of their first view (TextureCache::UploadLevelAhead). Never waits.
+	void               PostLevelUploadAhead(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
 	void BeginAliasWrite() noexcept;
 	void EndAliasWrite() noexcept;

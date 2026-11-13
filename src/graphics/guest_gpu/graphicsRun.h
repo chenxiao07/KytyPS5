@@ -45,6 +45,8 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// (upload_at_copy: a queued command that takes the render lock as the draw path does.)
+	[[nodiscard]] RenderContext& Renderer() noexcept { return m_renderer; }
 	// KYTY_SERVE_IN_WAITS (live serve_in_waits, default 1): where the GPU thread runs the guest commands queued for it (a
 	// game thread's readback fault among them) besides before each packet: 1 while it waits for the upload worker (only
 	// from the drains told to serve, never inside a command), 2 after each segment a speculation commits, 4 while it

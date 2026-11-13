@@ -16,6 +16,7 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "kernel/memory.h"
 #include "loader/demonsSoulsPageFree.h"
@@ -339,6 +340,15 @@ void GpuResourceManager::UnmapOnGpuThread(uint64_t vaddr, uint64_t size, bool re
 		if (!leaf) leaf = std::make_unique<uint64_t[]>(leaf_mask + 1);
 		leaf[g & leaf_mask] = epoch;
 	}
+}
+
+void GpuResourceManager::PostLevelUploadAhead(uint64_t vaddr, uint64_t size) {
+	if (m_gpu == nullptr || !GuestRange {vaddr, size}.Valid()) return;
+	(void)m_gpu->TrySendCommand([this, vaddr, size] {
+		RenderLockGuard lock(m_gpu->Renderer().GetMutex()); // (as the draw path's)
+		if (!IsMapped(vaddr, size)) return; // (unmapped meanwhile)
+		m_texture_cache.UploadLevelAhead(vaddr, size);
+	});
 }
 
 void GpuResourceManager::FreedByGame(uint64_t vaddr, uint64_t size) {

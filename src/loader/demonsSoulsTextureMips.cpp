@@ -10,6 +10,7 @@
 // the game keeps whole (TextureManager::CacheHighMips, + 0x6c > 0) do not come here.
 #include "loader/demonsSoulsTextureMips.h"
 
+#include "common/abi.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
@@ -18,15 +19,22 @@
 #include "loader/guestCode.h"
 #include "loader/runtimeLinker.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
+#include "live-switch.h"
+
 #ifndef XBYAK_NO_EXCEPTION
 #define XBYAK_NO_EXCEPTION
 #endif
 #include <xbyak/xbyak.h>
+
+extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (graphics/guest_gpu/speculation.cpp)
+}
 
 namespace Loader::DemonsSoulsTextureMips {
 namespace {
@@ -40,6 +48,94 @@ constexpr const char* Pick = "45 85 ff 41 0f 9f c0 85 c9 41 89 4e 18 41 0f 95 c1
 constexpr uint64_t SiteOffset = 31; // sub r15d, esi (3 bytes) and mov rsi, [rip + d] (7) move to the stub
 constexpr uint32_t SiteSize   = 10;
 constexpr uint32_t Formats    = 512; // the T#'s format field: 9 bits
+
+// upload_at_copy (env KYTY_UPLOAD_AT_COPY; -1, the default: on when the run starts with KYTY_SPECULATE=4, else off). The
+// streamer's apply (0x901330) copies a part's decoded bytes into the texture's memory (memcpy at 0x901459) a median
+// 14.5 ms before it lowers the T#'s base level; our first view of that level comes ~12.5 ms after that. The apply is
+// hooked after the memcpy, where the resident part count is stored (mov [r14 + 0xb8], ebx): the memcpy has returned its
+// destination in rax ([record+0x98] + [part+8]) and its size is still in r15 ([part+4]; callee-saved). The bytes just
+// written are posted to the GPU thread, which uploads the streamed levels there ahead of their first view
+// (TextureCache::UploadLevelAhead).
+constexpr const char* ApplyStore = "4c 8b 25 ?? ?? ?? ?? 41 89 9e b8 00 00 00 80 7d c0 01"; // the store at + 7, 7 bytes
+constexpr uint64_t    ApplyCave  = 0x8000000 + 16 * PageSize;
+
+void KYTY_SYSV_ABI UploadAtCopy(uint64_t destination, uint64_t size) {
+	static auto& on = LiveSwitch::Find("upload_at_copy", -1);
+	// (Mode 4 asked at each call: a mode 4 that stands down for memory or CPUs, or a live switch to mode 0, posts nothing.)
+	if (on.load(std::memory_order_relaxed) == 0 || ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return;
+	size &= 0xffffffffu;
+	if (size != 0) Libs::LibKernel::Memory::PostLevelUploadAhead(destination, size);
+}
+
+// fn(a0, a1) with every register, the flags and the guest's red zone kept.
+void EmitHostCall(Xbyak::CodeGenerator& c, const void* fn, const Xbyak::Reg64& a0, const Xbyak::Reg64& a1) {
+	using namespace Xbyak::util;
+	c.lea(rsp, ptr[rsp - 128]);
+	c.pushfq();
+	for (const auto& reg: {rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11}) c.push(reg);
+	c.mov(r11, rsp);
+	c.and_(rsp, -16);
+	c.sub(rsp, 528);
+	c.mov(ptr[rsp + 512], r11);
+	constexpr uint8_t save_fp[] {0x48, 0x0f, 0xae, 0x04, 0x24}; // FXSAVE64 [rsp]
+	c.db(save_fp, sizeof(save_fp));
+	c.mov(rax, a0);
+	c.mov(rsi, a1);
+	c.mov(rdi, rax);
+	c.mov(rax, reinterpret_cast<uint64_t>(fn));
+	c.call(rax);
+	c.fxrstor64(ptr[rsp]);
+	c.mov(rsp, ptr[rsp + 512]);
+	for (const auto& reg: {r11, r10, r9, r8, rdi, rsi, rdx, rcx, rax}) c.pop(reg);
+	c.popfq();
+	c.lea(rsp, ptr[rsp + 128]);
+}
+
+void InstallUploadAtCopy(Program* program) {
+	// The performance switches are read on the GPU thread as it starts, which nothing orders before this: KYTY_SPECULATE
+	// is read here. A run started in mode 0 has no hook.
+	static auto&  upload    = LiveSwitch::Find("upload_at_copy", -1);
+	const int64_t value     = upload.load(std::memory_order_relaxed);
+	const char*   speculate = std::getenv("KYTY_SPECULATE");
+	const bool    on        = value < 0 ? speculate != nullptr && std::atoi(speculate) == 4 : value != 0;
+	if (!on) return;
+	const auto apply = GuestCode::FindUnique(*program, GuestCode::Pattern(ApplyStore));
+	if (!apply || program->base_vaddr > UINT64_MAX - ApplyCave - PageSize) {
+		std::printf("Demon's Souls texture streamer: its apply store was not found; upload_at_copy not installed\n");
+		return;
+	}
+	const auto requested = program->base_vaddr + ApplyCave;
+	const auto allocated = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    requested, PageSize, Common::VirtualMemory::Mode::ExecuteReadWrite, "demons_souls_upload_at_copy", true);
+	if (allocated != requested) {
+		if (allocated) Libs::LibKernel::Memory::FreeGuestMemory(allocated, PageSize);
+		return;
+	}
+	const uint64_t site = *apply + 7;
+	using namespace Xbyak::util;
+	Xbyak::ClearError();
+	Xbyak::CodeGenerator c(PageSize, reinterpret_cast<void*>(allocated));
+	EmitHostCall(c, reinterpret_cast<const void*>(&UploadAtCopy), rax, r15);
+	c.mov(dword[r14 + 0xb8], ebx); // (the replaced store)
+	c.jmp(reinterpret_cast<const void*>(site + 7));
+	c.ready();
+	if (Xbyak::GetError() || !Common::VirtualMemory::FlushInstructionCache(allocated, c.getSize()) ||
+	    !Libs::LibKernel::Memory::ProtectGuestMemory(allocated, PageSize, Common::VirtualMemory::Mode::ExecuteRead, nullptr)) {
+		Libs::LibKernel::Memory::FreeGuestMemory(allocated, PageSize);
+		return;
+	}
+	// (Before guest threads run, as Install's own patch; nothing jumps into the 7-byte store.)
+	uint8_t code[7];
+	std::memset(code, 0xcc, sizeof(code));
+	code[0]         = 0xe9;
+	const auto jump = static_cast<int32_t>(allocated - (site + 5));
+	std::memcpy(code + 1, &jump, sizeof(jump));
+	std::memcpy(reinterpret_cast<void*>(site), code, sizeof(code));
+	Common::VirtualMemory::FlushInstructionCache(site, sizeof(code));
+	std::printf("Demon's Souls texture streamer: upload_at_copy %lld (KYTY_UPLOAD_AT_COPY; -1: on in mode 4) at its apply "
+	            "(eboot+0x%llx)\n",
+	            static_cast<long long>(value), static_cast<unsigned long long>(site - program->base_vaddr));
+}
 } // namespace
 
 void Install(Program* program) {
@@ -55,6 +151,7 @@ void Install(Program* program) {
 	// an 8 GB GPU. A 6 GB GPU with 24 GiB of RAM (issue #85: an RTX 2060 slower and hitching since that release; 11-12,
 	// simulated, an hour of world changes each): streamed whole 163 slow frames, the worst 149 ms, 33.2 fps; left out 31,
 	// 60 ms, 35.6. KYTY_TEXTURE_REDUCE_GAME=0: streamed whole on any PC; =1: left out on any PC.
+	InstallUploadAtCopy(program); // (its own page, independent of the level stub below)
 	const char*    game   = std::getenv("KYTY_TEXTURE_REDUCE_GAME");
 	const uint32_t levels = Libs::Graphics::GameTextureReduceLevels();
 	if (levels == 0) return;

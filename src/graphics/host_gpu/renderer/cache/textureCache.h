@@ -217,6 +217,11 @@ public:
 
 	void MapMemory(uint64_t address, uint64_t size);
 	void UnmapMemory(uint64_t address, uint64_t size);
+	// upload_at_copy (GPU thread, takes m_lock): the guest has just copied a streamed level's bytes into
+	// [vaddr, vaddr + size) (the streamer's apply, eboot+0x901459): each streamed image there (a level-refresh candidate,
+	// partially dirty) has the held levels those bytes touch watched again and their dirty bytes uploaded now, as
+	// RefreshTextureLevels does at its first view of them, so that view finds them current.
+	void UploadLevelAhead(uint64_t vaddr, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
 	// KYTY_TEXTURE_OFFLOAD(_PROBE) (texture-offload.h): the guest bytes of clean sampled textures probed for touches, or
