@@ -50,7 +50,8 @@ const nlohmann::ordered_json& Defaults() {
 		d["output_auto"]         = true;
 		d["wide_bars"]           = false; // (Display page: 21:9 or 32:9, movies and menus at 16:9)
 		// (Linux.)
-		d["mangohud"]         = true; // run_ds.sh's MANGO=1 default
+		d["mangohud"]         = false; // run_ds.sh's MANGO=0 default (opt-in)
+		d["gamemode"]         = false; // run_ds.sh's GAMEMODE=0 default (opt-in)
 		d["terminal"]         = "";
 		d["precompile_quick"] = false;
 		d["ui_scale"]         = 0; // percent; 0: automatic

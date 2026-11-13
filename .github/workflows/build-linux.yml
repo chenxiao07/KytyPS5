@@ -116,8 +116,9 @@ jobs:
           ```
 
           The launcher prefers the `kyty_emulator` next to it (override with `KYTY_BIN`), opens a
-          1920x1080 window and shows MangoHud when it is installed (`MANGO=1`; `MANGO=0` hides it). The first
+          1920x1080 window and shows MangoHud when it is installed and `MANGO=1` is set (off by default). The first
           launch translates shaders in the background for a minute or two; later launches are faster.
+          `GAMEMODE=1` runs the game through `gamemoderun` when GameMode is installed (off by default).
 
           If the unpacker dropped the files' execute permission ("Permission denied"): `chmod +x kyty_emulator
           kyty_shader_precompile kyty_launcher run_ds.sh precompile-linux.sh get-dlss-linux.sh run-deck.sh`.

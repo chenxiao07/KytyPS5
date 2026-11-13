@@ -96,6 +96,7 @@ const Table& English() {
 	    {"summary.fps30", "30 fps lock"},
 	    {"summary.extra", "extra options"},
 	    {"summary.mangohud", "MangoHud"},
+	    {"summary.gamemode", "GameMode"},
 
 	    {"display.title", "Display"},
 	    {"display.window", "Window"},
@@ -339,6 +340,10 @@ const Table& English() {
 	                      "temperatures, power) over the "
 	                      "game."},
 	    {"mangohud.missing", "MangoHud is not installed (your distribution's mangohud package)."},
+	    {"gamemode", "GameMode"},
+	    {"gamemode.desc", "Runs the game through GameMode (gamemoderun): the system switches to its performance "
+	                      "settings (processor governor, priorities) while the game runs."},
+	    {"gamemode.missing", "GameMode is not installed (your distribution's gamemode package)."},
 	    {"safegpu", "Safe GPU mode"},
 	    {"safegpu.desc", "Prevents the crashes that come from the graphics card hanging ('device "
 	                     "lost', a black screen while "
@@ -516,6 +521,7 @@ const Table& Chinese() {
 	    {"summary.fps30", "锁定 30 帧"},
 	    {"summary.extra", "附加参数"},
 	    {"summary.mangohud", "MangoHud"},
+	    {"summary.gamemode", "GameMode"},
 
 	    {"display.title", "画面"},
 	    {"display.window", "窗口"},
@@ -717,6 +723,9 @@ const Table& Chinese() {
 	    {"mangohud", "MangoHud"},
 	    {"mangohud.desc", "在游戏画面上显示 MangoHud（帧率、处理器与显卡负载、温度、功耗）。"},
 	    {"mangohud.missing", "未安装 MangoHud（请安装发行版中的 mangohud 软件包）。"},
+	    {"gamemode", "GameMode"},
+	    {"gamemode.desc", "通过 GameMode（gamemoderun）运行游戏：游戏运行期间系统切换到性能模式（处理器调频策略、进程优先级等）。"},
+	    {"gamemode.missing", "未安装 GameMode（请安装发行版中的 gamemode 软件包）。"},
 	    {"safegpu", "安全 GPU 模式"},
 	    {"safegpu.desc", "防止显卡挂起导致的崩溃（device "
 	                     "lost、驱动恢复时黑屏）：游戏的计算任务逐个执行。帧率约降低 "
@@ -880,6 +889,7 @@ const Table& Portuguese() {
 	    {"summary.fps30", "trava em 30 fps"},
 	    {"summary.extra", "opções extras"},
 	    {"summary.mangohud", "MangoHud"},
+	    {"summary.gamemode", "GameMode"},
 
 	    {"display.title", "Tela"},
 	    {"display.window", "Janela"},
@@ -1120,6 +1130,11 @@ const Table& Portuguese() {
 	                      "consumo) sobre o jogo."},
 	    {"mangohud.missing",
 	     "O MangoHud não está instalado (pacote mangohud da sua distribuição)."},
+	    {"gamemode", "GameMode"},
+	    {"gamemode.desc", "Executa o jogo pelo GameMode (gamemoderun): o sistema usa suas configurações de "
+	                      "desempenho (governador do processador, prioridades) enquanto o jogo roda."},
+	    {"gamemode.missing",
+	     "O GameMode não está instalado (pacote gamemode da sua distribuição)."},
 	    {"safegpu", "Modo GPU seguro"},
 	    {"safegpu.desc", "Evita os travamentos que vêm da placa de vídeo parar ('device lost', "
 	                     "tela preta enquanto o driver se "

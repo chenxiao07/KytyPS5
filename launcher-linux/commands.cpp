@@ -28,6 +28,7 @@ const std::vector<std::string>& GameVariables() {
 	                                             "KYTY_VBLANK",
 	                                             "PRESENT_MODE",
 	                                             "MANGO",
+	                                             "GAMEMODE",
 	                                             "KYTY_PRESENT_ASPECT",
 	                                             "KYTY_LOW_LATENCY",
 	                                             "KYTY_RENDER_HEIGHT",
@@ -326,6 +327,7 @@ Launch Commands::Play(const GameInfo& game, bool direct) const {
 	if (const auto output = S().Str("audio_output"); output == "headphones" || output == "amplifier" || output == "soundbar")
 		Put(set, "KYTY_AUDIO_OUTPUT", output);
 	Put(set, "MANGO", S().Bool("mangohud") && context_.HasMangoHud() ? "1" : "0");
+	Put(set, "GAMEMODE", S().Bool("gamemode") && context_.HasGameMode() ? "1" : "0");
 	Put(set, "KYTY_GAME", S().Str("game"));
 	if (!context_.emulator.empty()) Put(set, "KYTY_BIN", context_.emulator.string());
 

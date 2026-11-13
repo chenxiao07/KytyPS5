@@ -1405,6 +1405,16 @@ void LauncherWindow::AdvancedPage() {
 		    }
 	    },
 	    T(context_.HasMangoHud() ? "mangohud.desc" : "mangohud.missing"));
+	Row(
+	    "gamemode",
+	    [&] {
+		    bool value = S().Bool("gamemode") && context_.HasGameMode();
+		    if (Switch("##gamemode", &value, context_.HasGameMode())) {
+			    S().Set("gamemode", value);
+			    Changed();
+		    }
+	    },
+	    T(context_.HasGameMode() ? "gamemode.desc" : "gamemode.missing"));
 	Row("safegpu", [&] { SettingSwitch("##safegpu", "safegpu"); }, T("safegpu.desc"));
 	if (context_.gpus.size() > 1) {
 		Section("advanced.gpu");
@@ -1592,6 +1602,7 @@ std::string LauncherWindow::Summary(std::vector<std::pair<std::string, std::stri
 	if (S().Bool("vrr_flips")) options.emplace_back(T("summary.vrrFlips"));
 	if (S().Bool("antilag")) options.emplace_back(T("summary.antilag"));
 	if (S().Bool("mangohud") && context_.HasMangoHud()) options.emplace_back(T("summary.mangohud"));
+	if (S().Bool("gamemode") && context_.HasGameMode()) options.emplace_back(T("summary.gamemode"));
 	if (!S().Str("extra_args").empty()) options.emplace_back(T("summary.extra"));
 	auto join = [](const std::vector<std::string>& parts, const char* separator) {
 		std::string out;
