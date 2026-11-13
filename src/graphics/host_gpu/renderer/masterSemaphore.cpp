@@ -37,11 +37,22 @@ MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics)
 		const auto begin = std::chrono::steady_clock::now();
 		for (int i = 0; i < 16; i++) read();
 		const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - begin).count() / 16;
-		m_watched       = us >= 1.0;
+		// Linux' RADV reads with a system call (DRM_IOCTL_SYNCOBJ_QUERY) that times short here:
+		// 0.22-0.35 us on a Ryzen 7 7800X3D with an RX 9070 XT, where its ~2,200 render-thread
+		// reads a frame at 1-1 standing took 9% of that thread's time (the watcher: 97.6 ->
+		// 110.8 fps). So RADV is watched whatever the timing says.
+		vk::PhysicalDeviceDriverProperties driver {};
+		vk::PhysicalDeviceProperties2      properties {};
+		properties.pNext = &driver;
+		m_graphics.physical_device.getProperties2(&properties);
+		const bool system_call = driver.driverID == vk::DriverId::eMesaRadv;
+		m_watched              = system_call || us >= 1.0;
 		static std::atomic<bool> told {false};
 		if (!told.exchange(true)) {
-			std::printf("Timeline reads: %.2f us each: %s\n", us,
-			            m_watched ? "a thread watches the GPU's progress (KYTY_TIMELINE_WATCHER=0: read where asked)"
+			std::printf("Timeline reads: %.2f us each%s: %s\n", us,
+			            system_call ? ", a system call (RADV)" : "",
+			            m_watched ? "a thread watches the GPU's progress (KYTY_TIMELINE_WATCHER=0: "
+			                        "read where asked)"
 			                      : "read where asked");
 			std::fflush(stdout);
 		}
