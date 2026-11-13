@@ -152,11 +152,11 @@ static void AddCopyMemoryIndirectExtension(const std::vector<vk::ExtensionProper
 }
 
 // AMD's Windows driver with its older shader compiler (driver info "AMD proprietary shader compiler": the GCN cards'
-// driver, Vega and Polaris; RDNA's says "LLPC") refused every pipeline whose pixel shader reads
-// VK_KHR_fragment_shader_barycentric's BaryCoordKHR without a per-vertex input (ErrorUnknown, with or without
-// optimization; an RX Vega 56 with 26.5.2, issue #305: the picture's post-processing among them, a black screen),
-// although it reports the feature. Its VK_AMD_shader_explicit_vertex_parameter gives the same I/J
-// (TranslatorFeatureAmdBarycentrics): enabled, and `graphics` told, where both are there. Returns whether.
+// (Vega, Polaris), and RDNA2's too, an RX 6800 with 26.10.1 in issue #80; an RX 9070 XT's says "LLPC") refused every
+// pipeline whose pixel shader reads VK_KHR_fragment_shader_barycentric's BaryCoordKHR without a per-vertex input
+// (ErrorUnknown, with or without optimization; an RX Vega 56 with 26.5.2, issue #305: the picture's post-processing
+// among them, a black screen), although it reports the feature. Its VK_AMD_shader_explicit_vertex_parameter gives the
+// same I/J (TranslatorFeatureAmdBarycentrics): enabled, and `graphics` told, where both are there. Returns whether.
 static bool AmdExplicitVertexBarycentrics(vk::PhysicalDevice physical_device, const std::vector<vk::ExtensionProperties>& available,
                                           std::vector<const char*>& extensions, GraphicContext& graphics) {
 	graphics.amd_explicit_vertex_barycentrics = false;
