@@ -1012,28 +1012,58 @@ void PrefetchKeptFile(const std::string& path) {
 	g_prefetch_ready.notify_one();
 }
 
+// (A TH32CS_SNAPTHREAD snapshot is system-wide and walking it maps and unmaps a snapshot view a step: ~4,000 host view
+// maps a call in an ETW memory trace, two calls a LiveControl::Measure window (Kyty.Record's CPU time), so every
+// quarter-second measure window put ~8,000 view map / unmaps on the address space. The named threads' handles are found
+// once and kept; the threads are looked for again (new ones of the name added) while none is found and whenever one of
+// them has exited since the last call. An exited thread's handle stays open and in the sum: its CPU time is final, so a
+// window that spans its exit never reads low.)
 double NamedThreadsCpuSeconds(const char* name) {
-	std::wstring wanted;
-	for (const char* p = name; *p != '\0'; ++p) wanted.push_back(static_cast<wchar_t>(*p));
-	double       total    = 0;
-	const DWORD  process  = GetCurrentProcessId();
-	HANDLE       snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-	if (snapshot == INVALID_HANDLE_VALUE) return 0;
-	THREADENTRY32 entry {};
-	entry.dwSize = sizeof(entry);
-	for (BOOL more = Thread32First(snapshot, &entry); more != 0; more = Thread32Next(snapshot, &entry)) {
-		if (entry.th32OwnerProcessID != process) continue;
-		HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
-		if (thread == nullptr) continue;
-		PWSTR description = nullptr;
-		if (SUCCEEDED(GetThreadDescription(thread, &description)) && description != nullptr) {
-			if (wanted == description) total += HandleCpuSeconds(thread);
-			LocalFree(description);
-		}
-		CloseHandle(thread);
+	struct Kept {
+		HANDLE handle = nullptr;
+		DWORD  id     = 0;
+		bool   exited = false;
+	};
+	static std::mutex                                         cache_mutex;
+	static std::unordered_map<std::string, std::vector<Kept>> cache;
+	const std::lock_guard                                     lock(cache_mutex);
+	auto&                                                     kept = cache[name];
+	bool                                                      look = false;
+	for (auto& thread: kept) {
+		if (thread.exited) continue;
+		DWORD code = 0;
+		if (GetExitCodeThread(thread.handle, &code) == 0 || code != STILL_ACTIVE) thread.exited = look = true;
 	}
-	CloseHandle(snapshot);
-	return total;
+	// (Looked for again on an exit, and while no live thread of the name is kept.)
+	if (look || std::ranges::none_of(kept, [](const Kept& k) { return !k.exited; })) {
+		std::wstring wanted;
+		for (const char* p = name; *p != '\0'; ++p) wanted.push_back(static_cast<wchar_t>(*p));
+		const DWORD process  = GetCurrentProcessId();
+		HANDLE      snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+		if (snapshot != INVALID_HANDLE_VALUE) {
+			THREADENTRY32 entry {};
+			entry.dwSize = sizeof(entry);
+			for (BOOL more = Thread32First(snapshot, &entry); more != 0; more = Thread32Next(snapshot, &entry)) {
+				if (entry.th32OwnerProcessID != process) continue;
+				// (A live kept thread is not opened twice; an id an exited one held is a new thread.)
+				if (std::ranges::any_of(kept, [&](const Kept& k) { return !k.exited && k.id == entry.th32ThreadID; })) continue;
+				HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+				if (thread == nullptr) continue;
+				PWSTR description = nullptr;
+				bool  keep        = false;
+				if (SUCCEEDED(GetThreadDescription(thread, &description)) && description != nullptr) {
+					keep = wanted == description;
+					LocalFree(description);
+				}
+				if (keep) kept.push_back({thread, entry.th32ThreadID, false});
+				else CloseHandle(thread);
+			}
+			CloseHandle(snapshot);
+		}
+	}
+	double sum = 0;
+	for (const auto& thread: kept) sum += HandleCpuSeconds(thread.handle);
+	return sum;
 }
 
 std::vector<std::pair<uint32_t, std::string>> ProcessThreads() {
