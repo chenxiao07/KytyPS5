@@ -49,10 +49,13 @@ constexpr uint64_t ScanDistance = 0x3a1;
 uint64_t              g_base = 0;
 std::atomic<uint32_t> g_waits {0}, g_repairs {0};
 
-// The loader's five priority lists: sentinel nodes at + 0xd0 + i * 0x28 (the owner, prev at + 0x8, next at + 0x10, the
-// list at + 0x18, the node count at + 0x20, an int). The loader holds their lock (its mutex at + 0x50) while it scans.
+// The loader's ten request lists, one per priority (the index the insertion at eboot+0x88e840 is given): sentinel nodes
+// at + 0xd0 + i * 0x28 (the owner, prev at + 0x8, next at + 0x10, the list at + 0x18, the node count at + 0x20, an int;
+// the release list follows at + 0x260). The scan takes the first node of lists 1-4, then of lists 5-9 in turn (list 0
+// instead while a weight allows), list 0 last. The loader holds their lock (its mutex at + 0x50) while it scans.
+// (Before issue #327's second log only lists 0-4 were repaired: its dead node was first in one of lists 5-9.)
 constexpr uint64_t ListSentinels = 0xd0, ListStride = 0x28;
-constexpr uint32_t Lists = 5, LongestWalk = 1u << 16;
+constexpr uint32_t Lists = 10, LongestWalk = 1u << 16;
 
 bool ReadPointer(uint64_t address, uint64_t& value) {
 	return address != 0 && (address & 7u) == 0 &&
@@ -64,7 +67,7 @@ bool ReadPointer(uint64_t address, uint64_t& value) {
 // list's sentinel knowing (issue #327: the sentinel's next named it forever after, the guard waited out nothing and the
 // loader scanned again without end). The list is rebuilt from the sentinel's prev back to that node (or to the
 // sentinel): the chain its tail insertions linked, every node's next set to the one after it, the count recounted.
-// Returns the list, or -1 (the node first in none, or a chain that does not end).
+// Returns the list, or -1 (the node first in none) or -2 (a chain back from the list's last node that does not end).
 int Repair(uint64_t loader, uint64_t node, uint32_t& kept) {
 	for (uint32_t i = 0; i < Lists; ++i) {
 		const uint64_t sentinel = loader + ListSentinels + ListStride * i;
@@ -75,7 +78,7 @@ int Repair(uint64_t loader, uint64_t node, uint32_t& kept) {
 		uint32_t count = 0;
 		while (at != sentinel && at != node) {
 			uint64_t before = 0;
-			if (count == LongestWalk || !ReadPointer(at + 0x8, before)) return -1;
+			if (count == LongestWalk || !ReadPointer(at + 0x8, before)) return -2;
 			if (before == at) break; // (another node out of the chain: the list starts after it)
 			*reinterpret_cast<uint64_t*>(at + 0x10) = after;
 			after = at;
@@ -114,9 +117,11 @@ void KYTY_SYSV_ABI Withdrawn(uint64_t node, uint64_t loader) {
 		if (round < 64) std::this_thread::yield();
 		else std::this_thread::sleep_for(std::chrono::microseconds(100));
 	}
+	const char* unrepaired = "";
 	if (unlinked || stuck) {
-		uint32_t kept = 0;
-		if (const int list = Repair(loader, node, kept); list >= 0) {
+		uint32_t  kept = 0;
+		const int list = Repair(loader, node, kept);
+		if (list >= 0) {
 			const auto repairs = g_repairs.fetch_add(1, std::memory_order_relaxed) + 1;
 			if (repairs <= 16 || (repairs & (repairs - 1)) == 0)
 				std::printf("Demon's Souls loader guard: list %d of the loader 0x%llx still began at the %s node 0x%llx; "
@@ -125,16 +130,18 @@ void KYTY_SYSV_ABI Withdrawn(uint64_t node, uint64_t loader) {
 				            static_cast<unsigned long long>(node), kept, repairs);
 			return;
 		}
+		unrepaired = list == -1 ? "; the node first in none of its lists, not repaired"
+		                        : "; its list's chain back from its last node does not end, not repaired";
 	}
 	const auto count = g_waits.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (count <= 8 || (count & (count - 1)) == 0)
 		std::printf("Demon's Souls loader guard: a request being withdrawn waited out (node 0x%llx of the loader 0x%llx, "
-		            "%lld us; %u so far), the lists scanned again\n",
+		            "%lld us; %u so far%s), the lists scanned again\n",
 		            static_cast<unsigned long long>(node), static_cast<unsigned long long>(loader),
 		            static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
 		                                       std::chrono::steady_clock::now() - begin)
 		                                       .count()),
-		            count);
+		            count, unrepaired);
 }
 
 // The scan's start before `site` as 01.005.000 has it; its first list's displacement from the loader (rbx), or 0.
