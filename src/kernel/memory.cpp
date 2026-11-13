@@ -4325,9 +4325,19 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 	// Existing pages remain logically owned throughout a successful replacement
 	// (or its rollback). Readers must not observe the temporary Remove/Add gap or
 	// a backing view halfway through replacement. GPU drains precede this lock.
-	UnmapGpuRange(start, size);
+	// (unmap_replace_releasing, -1, the default: on under KYTY_SPECULATE=4, off in every other mode; EXACT) the replaced
+	// pages leave the host mapping right after this (or a failed replacement maps them again with the guest's own
+	// protection): their watchers go either way, so restoring each watched page's protection first (a VirtualProtect a
+	// run, ~10 us each while the streamer works) is skipped, as for a release. A failed replacement leaves the chunks it
+	// never unmapped with the trackers' old protection and no watcher: the rollback syncs the range back first, as
+	// KernelMunmap's failure does (pageManager.h's contract).
+	static auto&  replace_releasing = LiveSwitch::Find("unmap_replace_releasing", -1);
+	const int64_t replace_value     = replace_releasing.load(std::memory_order_relaxed);
+	const bool    releasing =
+	    replace_value < 0 ? ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 : replace_value != 0;
+	UnmapGpuRange(start, size, releasing);
 	std::unique_lock residency_lock(g_prt_residency_mutex);
-	auto restore_chunks = [&chunks, &residency_lock]() -> bool {
+	auto restore_chunks = [&chunks, &residency_lock, releasing, start, size]() -> bool {
 		bool ok = true;
 		for (auto it = chunks.rbegin(); it != chunks.rend(); ++it) {
 			const auto& chunk            = *it;
@@ -4363,6 +4373,7 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 		}
 		if (ok) {
 			residency_lock.unlock();
+			if (releasing) RestoreGpuRangeProtection(start, size);
 			for (const auto& chunk: chunks) {
 				if (IsCommittedRangeType(chunk.range.type)) {
 					MapGpuRange(chunk.range.start, chunk.range.size);
