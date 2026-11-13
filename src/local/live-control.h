@@ -665,6 +665,56 @@ inline void Run(uint64_t id, const std::string& line) {
 		                                   &buttons, &seconds) == 6;
 		if (parsed) Libs::Controller::SetScriptedInput(axes[0], axes[1], axes[2], axes[3], buttons, seconds);
 		std::printf("LIVE_PAD id=%" PRIu64 " ok=%d\n", id, parsed ? 1 : 0);
+	} else if (cmd == "touch" && n >= 3) {
+		// touch X Y [SECONDS]: the touch pad clicked with a finger at X, Y (0..1 of its width and height) for SECONDS
+		// (0.2 by default), as the keyboard's Backspace and Tab click it (hostInput.cpp).
+		float      x = 0, y = 0;
+		double     seconds = 0.2;
+		const bool parsed  = std::sscanf(line.c_str(), "%*s %f %f %lf", &x, &y, &seconds) >= 2;
+		if (parsed) {
+			Libs::Controller::SetTouchPad(Libs::Controller::HOST_INPUT_CONTROLLER_ID, 0, true, x, y);
+			std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+			Libs::Controller::SetTouchPad(Libs::Controller::HOST_INPUT_CONTROLLER_ID, 0, false, x, y);
+		}
+		std::printf("LIVE_TOUCH id=%" PRIu64 " x=%.3f y=%.3f ok=%d\n", id, x, y, parsed ? 1 : 0);
+	} else if (cmd == "vpad" && n >= 2) {
+		// vpad attach | vpad button <SDL_GameControllerButton> [seconds] | vpad detach: a virtual game controller with
+		// an Xbox Series pad's ids (SDL calls it an Xbox One pad, type 2), to test a pad's path without one (#332:
+		// `vpad button 4` is View).
+		static int           s_index = -1;
+		static SDL_Joystick* s_joy   = nullptr;
+		const std::string_view what  = arg1;
+		bool                   ok    = false;
+		if (what == "attach" && s_joy == nullptr) {
+			SDL_VirtualJoystickDesc desc {};
+			desc.version     = SDL_VIRTUAL_JOYSTICK_DESC_VERSION;
+			desc.type        = SDL_JOYSTICK_TYPE_GAMECONTROLLER;
+			desc.naxes       = SDL_CONTROLLER_AXIS_MAX;
+			desc.nbuttons    = SDL_CONTROLLER_BUTTON_MAX;
+			desc.vendor_id   = 0x045e;
+			desc.product_id  = 0x0b12;
+			desc.button_mask = (1u << SDL_CONTROLLER_BUTTON_MAX) - 1;
+			desc.axis_mask   = (1u << SDL_CONTROLLER_AXIS_MAX) - 1;
+			desc.name        = "Kyty test pad";
+			s_index          = SDL_JoystickAttachVirtualEx(&desc);
+			if (s_index >= 0) s_joy = SDL_JoystickOpen(s_index);
+			ok = s_joy != nullptr;
+		} else if (what == "button" && s_joy != nullptr) {
+			int        button  = 0;
+			double     seconds = 0.2;
+			const bool parsed  = std::sscanf(line.c_str(), "%*s %*s %d %lf", &button, &seconds) >= 1;
+			if (parsed) {
+				SDL_JoystickSetVirtualButton(s_joy, button, 1);
+				std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+				SDL_JoystickSetVirtualButton(s_joy, button, 0);
+			}
+			ok = parsed;
+		} else if (what == "detach" && s_joy != nullptr) {
+			SDL_JoystickClose(s_joy);
+			s_joy = nullptr;
+			ok    = SDL_JoystickDetachVirtual(s_index) == 0;
+		}
+		std::printf("LIVE_VPAD id=%" PRIu64 " %s ok=%d\n", id, arg1, ok ? 1 : 0);
 	} else if (cmd == "fatal") {
 		// fatal: a fatal error on this thread, the path a crash takes (log, then the process ends).
 		EXIT("live fatal: a test of the fatal-error exit\n");
