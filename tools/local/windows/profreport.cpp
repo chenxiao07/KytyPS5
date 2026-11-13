@@ -89,13 +89,27 @@ static bool IsWait(const std::string& name) {
 	return false;
 }
 
+// KYTY_PROF_SHORT=1: names without their parameter lists, so a caller chain fits a line (a lambda shows as the function it
+// is in); KYTY_PROF_WIDTH=<n>: the characters of a line printed (default 150).
+static std::string Shown(const std::string& name) {
+	static const bool short_names = getenv("KYTY_PROF_SHORT") != nullptr;
+	if (!short_names) return name;
+	const auto open = name.find('(');
+	return open == std::string::npos ? name : name.substr(0, open);
+}
+
 static void Print(const char* title, const std::map<std::string, size_t>& counts, size_t total, size_t top) {
+	static const size_t width = [] {
+		const char*  value = getenv("KYTY_PROF_WIDTH");
+		const size_t n     = value != nullptr ? strtoul(value, nullptr, 10) : 150;
+		return n >= 40 ? n : 150;
+	}();
 	std::vector<std::pair<size_t, std::string>> sorted;
 	for (const auto& [name, count]: counts) sorted.emplace_back(count, name);
 	std::sort(sorted.rbegin(), sorted.rend());
 	printf("== %s (%zu samples)\n", title, total);
 	for (size_t i = 0; i < sorted.size() && i < top; ++i)
-		printf("%6.2f%% %7zu  %s\n", 100.0 * sorted[i].first / total, sorted[i].first, sorted[i].second.substr(0, 150).c_str());
+		printf("%6.2f%% %7zu  %s\n", 100.0 * sorted[i].first / total, sorted[i].first, sorted[i].second.substr(0, width).c_str());
 }
 
 int main(int argc, char** argv) {
@@ -160,7 +174,7 @@ int main(int argc, char** argv) {
 				if (sample[i] == 0) continue;
 				const std::string& caller = Name(sample[i]);
 				if (caller.rfind("kyty_emulator!", 0) == 0) {
-					who += (found ? "  <-  " : "") + caller.substr(14, 70);
+					who += (found ? "  <-  " : "") + Shown(caller).substr(14, 70);
 					++found;
 				}
 			}
@@ -203,7 +217,7 @@ int main(int argc, char** argv) {
 				const std::string& caller = Name(sample[i]);
 				if (caller == "?") continue;
 				if (emulator_only && caller.rfind("kyty_emulator!", 0) != 0) continue;
-				chain += (found ? "  <-  " : "") + caller;
+				chain += (found ? "  <-  " : "") + Shown(caller);
 				++found;
 			}
 			++callers[chain];
