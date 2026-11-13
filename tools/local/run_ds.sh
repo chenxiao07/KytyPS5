@@ -52,7 +52,9 @@ if [ -n "$KYTY_LIVE_FILE" ]; then
   ) &
 fi
 # Mailbox = vblank-aligned, no tearing, low latency (smooth). Override with PRESENT_MODE=Fifo|Immediate.
-# MANGO=1 (default): MangoHud FPS/CPU/GPU overlay; MANGO=0 disables it.
+# MANGO=1: MangoHud FPS/CPU/GPU overlay; off by default (MANGO=0).
+# GAMEMODE=1: runs the emulator through Feral's gamemoderun (https://github.com/FeralInteractive/gamemode), which asks
+# gamemoded for its optimisations (CPU governor, I/O and process priority...) while the game runs; off by default.
 # The game: KYTY_GAME (its folder, or a .zar archive).
 GAME="${KYTY_GAME:-}"
 [ -n "$GAME" ] || { echo "set KYTY_GAME to the game (its folder, or a .zar archive)" >&2; exit 1; }
@@ -69,9 +71,13 @@ if [ "$VBLANK" -gt 60 ] 2>/dev/null && [[ "$KYTY_GAME_CONVARS" != *gameMinDeltaT
   export KYTY_GAME_CONVARS="${KYTY_GAME_CONVARS:+$KYTY_GAME_CONVARS;}gameMinDeltaTime=0.004"
 fi
 RUN=("$BIN")
-if [ "${MANGO:-1}" = 1 ] && command -v mangohud >/dev/null 2>&1; then
+if [ "${MANGO:-0}" = 1 ] && command -v mangohud >/dev/null 2>&1; then
   RUN=(mangohud "$BIN")
   export MANGOHUD_CONFIG=${MANGOHUD_CONFIG:-fps,frame_timing,vram,ram,gpu_temp,cpu_temp,gpu_power,cpu_power}
+fi
+# (gamemoderun in front, as in `gamemoderun mangohud %command%`: it preloads libgamemodeauto and execs the rest.)
+if [ "${GAMEMODE:-0}" = 1 ] && command -v gamemoderun >/dev/null 2>&1; then
+  RUN=(gamemoderun "${RUN[@]}")
 fi
 exec "${RUN[@]}" --game "$GAME" \
   --screen-width 1920 --screen-height 1080 --console-language 1 \

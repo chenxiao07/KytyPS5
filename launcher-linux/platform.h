@@ -61,9 +61,11 @@ public:
 	[[nodiscard]] fs::path        LogsFolder() const;
 	[[nodiscard]] fs::path        Readme() const;
 	[[nodiscard]] bool            HasMangoHud() const { return mangohud_; }
+	[[nodiscard]] bool            HasGameMode() const { return gamemode_; }
 
 private:
 	bool mangohud_ = false;
+	bool gamemode_ = false;
 };
 
 namespace Platform {

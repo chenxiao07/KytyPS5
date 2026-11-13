@@ -478,6 +478,7 @@ LauncherContext::LauncherContext() {
 	efficiency_cpus = EfficiencyCpus();
 	terminals       = FindTerminals();
 	mangohud_       = Platform::HasProgram("mangohud");
+	gamemode_       = Platform::HasProgram("gamemoderun");
 }
 
 fs::path LauncherContext::Fsr4Folder() const {
