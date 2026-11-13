@@ -1719,6 +1719,17 @@ public:
 		ReserveGuestRegions();
 		m_backing = new GuestBackingStore(backing_size);
 		g_trim_space.store(this, std::memory_order_release);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (SerialPressureGateOn()) {
+			m_serial_sampler = std::thread([this] {
+				LocalPlatform::SetThreadName("Kyty.MemPressure");
+				while (!m_serial_stop.load(std::memory_order_acquire)) {
+					SampleSerialPressure();
+					std::this_thread::sleep_for(std::chrono::milliseconds(100));
+				}
+			});
+		}
+#endif
 		if (!m_backing->IsAvailable()) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			EXIT("could not reserve %" PRIu64 " MB for guest direct memory. Windows commits\n"
@@ -1732,6 +1743,10 @@ public:
 	}
 
 	~GuestAddressSpace() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		m_serial_stop.store(true, std::memory_order_release);
+		if (m_serial_sampler.joinable()) m_serial_sampler.join();
+#endif
 		g_trim_space.store(nullptr, std::memory_order_release);
 		delete m_backing;
 		m_backing = nullptr;
@@ -1996,6 +2011,33 @@ public:
 	// RAM. Each guard is a gap other threads read stale bytes in: at the Tower of Latria's start ~1 a frame with guards
 	// everywhere, none with these pages' no access (KYTY_READ_GUARD_RACES=1); and 16 GB PCs spend whole sessions around
 	// 2 GB left (issue #159: 2.0-2.5 GB the median), so from 2 GB, leaving at 3, they flickered as before the hot pages.
+	// protect_serial_pressure's sample (Kyty.MemPressure, every 100 ms; never a protect's): short of memory below 6 GiB of free
+	// RAM or 4 GiB of commit left, or while the hot pages' pressure holds; no longer short only at 8 GiB / 6 GiB (2 GiB of
+	// hysteresis). The 6 GiB entry is the park code's 4 GiB floor (the bug checks' low-memory precondition) plus 2 GiB: the
+	// broad wait is in force before that floor even if 2 GiB go in one sample. An unreadable figure counts as short.
+	void SampleSerialPressure() {
+		constexpr uint64_t GiB       = uint64_t {1} << 30u;
+		const uint64_t     available = LocalPlatform::AvailablePhysicalMemory();
+		const auto         commit    = LocalPlatform::SystemCommit();
+		// (was before hot: a HotReadsPressure that raises both between the two loads is then seen as hot, never cleared.)
+		const bool         was       = m_serial_pressure.load(std::memory_order_acquire);
+		const bool         hot       = m_hot_pressure.load(std::memory_order_acquire);
+		bool               next      = true;
+		if (available != 0 && commit.limit != 0)
+			next = was ? hot || available < 8 * GiB || commit.available < 6 * GiB
+			           : hot || available < 6 * GiB || commit.available < 4 * GiB;
+		if (next != was) m_serial_pressure.store(next, std::memory_order_release);
+		// (The staleness watchdog's stamp (SerialBroad) after the result: a fresh stamp never stands beside an older result.)
+		m_serial_stamp.store(GetTickCount64(), std::memory_order_release);
+		if (next == was) return;
+		static uint32_t reports = 0; // (this thread's only)
+		if (reports++ < 16)
+			std::printf("Memory: %llu MiB free, %llu MiB of commit left: protection changes wait for %s "
+			            "(KYTY_PROTECT_SERIAL_PRESSURE)\n",
+			            static_cast<unsigned long long>(available >> 20u),
+			            static_cast<unsigned long long>(commit.available >> 20u),
+			            next ? "any map or unmap" : "maps and unmaps in their page-table pages only");
+	}
 	bool HotReadsPressure() {
 		static const uint64_t minimum = [] {
 			const char* value = std::getenv("KYTY_HOT_READS_MIN_AVAIL_MB");
@@ -2008,6 +2050,8 @@ public:
 		const bool next = pressure ? available < minimum + (uint64_t {512} << 20u) : available < minimum;
 		if (next != pressure) {
 			m_hot_pressure.store(next, std::memory_order_relaxed);
+			// (protect_serial_pressure: hot-reads pressure brings the broad wait back at once, before CoolHotReads drains.)
+			if (next) m_serial_pressure.store(true, std::memory_order_release);
 			static std::atomic<uint32_t> reports {0};
 			if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
 				std::printf("Memory: %llu MiB left on the PC: the pages read back %s\n",
@@ -2374,11 +2418,51 @@ private:
 	// one section: their prototype PTEs are shared): two reporters of #5 still bug-checked with v20261018, whose waits
 	// were per page-table page; no measurable cost (an RTX 5090 desktop and an RTX 3080 laptop, 1-1 routes A-B-A).
 	// KYTY_PROTECT_SERIAL=0: the per page-table page waits only.
-	[[nodiscard]] bool BusyUnlocked(uint64_t vaddr, uint64_t size) const {
-		static const bool serial = [] {
-			const char* value = std::getenv("KYTY_PROTECT_SERIAL");
-			return value == nullptr || *value != '0';
+	// protect_serial_pressure (env KYTY_PROTECT_SERIAL_PRESSURE; unset: on under KYTY_SPECULATE=4, off otherwise; =0 / 1
+	// force it; KYTY_PROTECT_SERIAL set overrides it): the any-map-anywhere wait only while the PC is short of memory (the
+	// precondition of the #5 / #50 / #91 bug checks), the per page-table page wait always (KYTY_PROTECT_SERIAL=0 took render
+	// protect 11.5 -> 3.5 us a call, no bug check at ~49 GB free). KYTY_PROTECT_SERIAL=0 forces the narrow wait, any other
+	// value the broad one, as before; mode 0, or the gate off: broad. 'Short' is m_serial_pressure, sampled every 100 ms by
+	// Kyty.MemPressure (SampleSerialPressure), never by a protect; a sample older than 300 ms counts as short. The switch
+	// toward broad needs no barrier: a protect runs its system call under the shared lock (ProtectTransient), and a map or
+	// unmap registers its busy range under the exclusive lock, so a map / unmap that begins after the flag rose waits for
+	// every protect still running (narrow ones included) to leave, and every protect after it sees the flag and its busy
+	// range and waits; only pairs already overlapping when the flag rose (both begun under the narrow rule) finish as they
+	// began. (ArmReadGuard's first VirtualProtect runs without the lock under either rule, as before.)
+	[[nodiscard]] static int ProtectSerialEnv() { // (-1 unset, 0 narrow, 1 broad)
+		static const int value = [] {
+			const char* v = std::getenv("KYTY_PROTECT_SERIAL");
+			return v == nullptr || *v == '\0' ? -1 : *v == '0' ? 0 : 1;
 		}();
+		return value;
+	}
+	[[nodiscard]] static bool SerialPressureGateOn() {
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+		return false; // (no sampler outside Windows: the broad wait, and batch_busy_once stays allowed)
+#else
+		static const bool on = [] {
+			const char* v      = std::getenv("KYTY_PROTECT_SERIAL_PRESSURE");
+			const char* mode   = std::getenv("KYTY_SPECULATE");
+			const bool  wanted = v != nullptr && *v != '\0' ? *v != '0' : mode != nullptr && mode[0] == '4' && mode[1] == '\0';
+			// (Not with the texture offload: it gives backing pages real no-access and discards them at any free RAM.)
+			return ProtectSerialEnv() < 0 && wanted && TextureOffload::GetMode() != TextureOffload::Mode::Offload;
+		}();
+		return on;
+#endif
+	}
+	[[nodiscard]] bool SerialBroad() const {
+		if (const int forced = ProtectSerialEnv(); forced >= 0) return forced == 1;
+		if (!SerialPressureGateOn() || ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return true;
+		if (m_serial_pressure.load(std::memory_order_acquire)) return true;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// (Staleness watchdog: a sample older than 300 ms, e.g. Kyty.MemPressure starved among busy threads, counts as short:
+		// the broad wait until the sampler runs again. GetTickCount64 reads shared user data, no system call.)
+		if (GetTickCount64() - m_serial_stamp.load(std::memory_order_acquire) > 300) return true;
+#endif
+		return false;
+	}
+	[[nodiscard]] bool BusyUnlocked(uint64_t vaddr, uint64_t size) const {
+		const bool serial = SerialBroad();
 		if (serial && !m_busy.empty()) return true;
 		constexpr uint64_t PageTablePage = uint64_t {2} << 20u;
 		for (const auto& [begin, end]: m_busy) {
@@ -2461,12 +2545,11 @@ public:
 	static inline thread_local bool     t_batch_section = false;
 	static inline thread_local uint32_t t_batch_count = 0, t_batch_per = 0;
 	static constexpr uint64_t           BatchBegin = 0, BatchEnd = 1; // (a range nothing maps: any busy range stops all)
+	// (A section's busy range [0, 1) stops protection changes only under the broad wait; under the narrow one its maps, whose
+	// own ranges it doesn't register, would go unwaited even per page-table page: off with KYTY_PROTECT_SERIAL=0, and off
+	// whenever protect_serial_pressure is on, so a section never spans a switch from broad to narrow.)
 	[[nodiscard]] static bool BatchSectionsAllowed() {
-		static const bool serial = [] {
-			const char* value = std::getenv("KYTY_PROTECT_SERIAL");
-			return value == nullptr || *value != '0';
-		}();
-		return serial;
+		return ProtectSerialEnv() != 0 && !SerialPressureGateOn();
 	}
 	void BatchSectionBegin(uint32_t per) {
 		t_batch_per = per;
@@ -3188,6 +3271,8 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>> m_busy;
 	std::condition_variable_any                m_busy_done;
 	std::atomic<int32_t>                       m_busy_waiters {0}; // (trim_idle: the threads asleep in WaitNotBusy)
+	std::atomic<bool>     m_serial_pressure {true}; // (protect_serial_pressure: short of memory; broad until the first sample)
+	std::atomic<uint64_t> m_serial_stamp {0};       // (protect_serial_pressure: GetTickCount64 of the last sample; stale = broad)
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	// Moves with every change of m_mapped (under m_mutex exclusive): a region a thread found earlier is still m_mapped's
@@ -3226,6 +3311,8 @@ private:
 	uint64_t                     m_hot_cooled = 0; // (CoolHotReads: one thread)
 	bool                         m_hot_draining = false; // (CoolHotReads: short of memory, pages left to cool)
 	std::atomic<bool>            m_hot_pressure {false}; // HotReadsPressure
+	std::atomic<bool>            m_serial_stop {false}; // (Kyty.MemPressure's end)
+	std::thread                  m_serial_sampler;      // (protect_serial_pressure)
 #endif
 };
 
