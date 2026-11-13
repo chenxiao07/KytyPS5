@@ -68,6 +68,7 @@
 // compiler-rt profile runtime (instrumented builds only).
 extern "C" void __llvm_profile_set_filename(const char*);
 extern "C" int  __llvm_profile_write_file(void);
+extern "C" void __llvm_profile_reset_counters(void);
 #endif
 
 namespace Loader {
@@ -601,6 +602,10 @@ inline void Run(uint64_t id, const std::string& line) {
 		__llvm_profile_set_filename(arg1);
 		const int result = __llvm_profile_write_file();
 		std::printf("LIVE_PGO id=%" PRIu64 " path=%s result=%d\n", id, arg1, result);
+	} else if (cmd == "pgoreset") {
+		// pgoreset: zero the instrumentation counters, so a profile written later counts only what ran after this.
+		__llvm_profile_reset_counters();
+		std::printf("LIVE_PGORESET id=%" PRIu64 "\n", id);
 #endif
 	} else if (cmd == "vma" && n >= 2) {
 		// vma <path>: the GPU allocator's detailed statistics (JSON: every allocation's type and size).

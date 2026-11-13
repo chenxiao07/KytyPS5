@@ -22,6 +22,10 @@ if ($LASTEXITCODE -ne 0) { 'prepare failed'; exit 1 }
 $date = Get-Date -Format yyyyMMdd
 $name = if ($Kind -eq 'ir') { "kyty-ir-$date" } else { "kyty-$date" }
 try {
+	# One unrecorded launch first (the first scene, -Warm): the instrumented executable's shader caches are made there,
+	# so no recorded scene profiles the prefetch's translation (pgo-train.ps1 also waits for the prefetch to finish).
+	"== warm-up $(Get-Date -Format HH:mm:ss)"
+	& "$root\tools\local\windows\pgo-train.ps1" -Out "$root\_Build\pgo\windows\warmup-$date" -NoPrecompile -Warm -Kind $Kind
 	foreach ($scene in $SceneList) {
 		$save, $switch = $scene.Split('+', 2)
 		$tag = $scene -replace '[^\w.-]', '_'

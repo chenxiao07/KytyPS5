@@ -1,4 +1,4 @@
-param([string]$Out = '', [string[]]$Set = @(), [switch]$NoPrecompile, [ValidateSet('fe', 'ir')][string]$Kind = 'fe')
+param([string]$Out = '', [string[]]$Set = @(), [switch]$NoPrecompile, [switch]$Warm, [ValidateSet('fe', 'ir')][string]$Kind = 'fe')
 # Windows PGO refresh (tools/local/PGO.md): build an instrumented emulator in _Build\windows-pgogen,
 # play the training scene with it (the benchmark walk and standing, camera turns, on into the ruins,
 # strafing), write the profile with the live `pgo` command and merge it. Installing it as the release
@@ -34,6 +34,7 @@ if ($Set.Count) { $params['Set'] = $Set }
 if ($NoPrecompile) { $params['NoPrecompile'] = $true }
 # (The instrumented runtime's own file, default.profraw where it runs, made empty at start-up: under _Build instead.)
 $env:LLVM_PROFILE_FILE = "$root\_Build\pgo\windows\default-%p.profraw"
+$t0 = Get-Date
 $started = & "$S\bench-run.ps1" @params | Select-Object -Last 1
 $started
 # A start-up that never reached the HUD would train the title screen: no profile then.
@@ -42,6 +43,21 @@ if ("$started" -match 'no HUD') {
 	'no profile: the game did not reach the HUD'
 	exit 1
 }
+# The scene is played only once the shader prefetch is done ('Shader prefetch: all' in this launch's run log): a
+# profile taken while the prefetch still translates on every core counts translation and its waits as the hot path.
+$logFile = Get-ChildItem "$root\_Build\run-logs\*.out.log" -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $t0 } | Sort-Object LastWriteTime | Select-Object -Last 1
+for ($w = 0; $w -lt 600 -and !($logFile -and (Select-String -Path $logFile.FullName -Pattern 'Shader prefetch: all' -SimpleMatch -Quiet)); $w += 2) { Start-Sleep 2 }
+if ($w -ge 600) {
+	Ours | Stop-Process -Force
+	'no profile: no "Shader prefetch: all" within 600 s of the HUD'
+	exit 1
+}
+"shader prefetch done $w s after the HUD"
+# -Warm: a launch that only makes the instrumented executable's shader caches, so the recorded scenes start warm.
+if ($Warm) { Ours | Stop-Process -Force; 'warm-up launch: caches made, no profile'; exit 0 }
+# The counters start from here: start-up and the prefetch (a world whose prefetch index does not match translates
+# every program again, warm-up or not) are left out of the profile.
+python tools\local\bench-windows.py live 'pgoreset' | Select-String 'LIVE_PGORESET|LIVE_ERROR'
 function Plan([string]$plan) {
 	$walk = Start-Process powershell -ArgumentList '-NoProfile', '-File', "$S\keys.ps1", '-Plan', $plan -PassThru -WindowStyle Hidden
 	$walk.WaitForExit()
