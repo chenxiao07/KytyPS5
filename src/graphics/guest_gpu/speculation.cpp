@@ -1361,8 +1361,14 @@ bool Speculation::SegmentAsHole(Result& result, CommandProcessor& cp, size_t ind
 	const bool reached = cp.TakeStopReached();
 	DrawStateObserver::Invalidate();
 	executor.NativeXprForgetState();
-	if (!reached)
+	if (!reached) {
+		// (DIAG: the hole's reason and packet, and whether a run of indirect draws passed it.)
+		const auto& hole = result.holes[index];
+		std::printf("Speculation: hole %zu of %zu not reached: %s, %u dwords, header 0x%08x\n", index, result.holes.size(),
+		            hole.reason != nullptr ? hole.reason : "(no reason)", hole.dwords, hole.packet != nullptr ? *hole.packet : 0u);
+		CommandProcessor::PrintPacketAt(stop, "Speculation: the hole's position");
 		EXIT("Speculation: a segment run as a hole did not reach its hole (processed %d)\n", static_cast<int>(processed));
+	}
 	return true;
 }
 
