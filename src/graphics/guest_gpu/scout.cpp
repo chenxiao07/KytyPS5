@@ -11,6 +11,7 @@
 #include "kernel/memory.h"
 
 #include "live-counters.h"
+#include "local-platform.h"
 #include "spin-gate.h"
 
 #include <algorithm>
@@ -723,6 +724,8 @@ bool Walk(State& state, const FeedEntry& entry) {
 
 void Main() {
 	KYTY_PROFILER_THREAD("Thread_Scout");
+	// (Named like the other threads of the emulator: per-thread CPU lists showed it as an unnamed ~85-93% thread.)
+	LocalPlatform::SetThreadName("Kyty.Scout");
 	auto     state = std::make_unique<State>();
 	uint64_t last  = 0; // the last submission fed (a gap: Feed dropped one on a full ring)
 	for (uint32_t spin = 0;;) {
