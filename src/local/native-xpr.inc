@@ -935,6 +935,15 @@ void RenderExecutor::NativeXprKey(CommandBuffer& buffer, std::vector<uint32_t>& 
 	key.push_back(static_cast<uint32_t>(sh.GetVs().start_instance_user_sgpr));
 }
 
+// (Every byte of the context and the configuration is hashed: neither may have tail padding, which
+// a copy assignment leaves as it was on Linux, hardwareContext.h.)
+#if defined(__clang__)
+#if !__is_identifier(__datasizeof)
+static_assert(__datasizeof(HW::Context) == sizeof(HW::Context) &&
+              __datasizeof(HW::UserConfig) == sizeof(HW::UserConfig));
+#endif
+#endif
+
 // Draw-state identity: the whole graphics context, the user configuration and
 // the graphics shader stage registers with the user-data layout (types and
 // counts) but not the user-data values, which identify the object instead.
