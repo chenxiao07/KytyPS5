@@ -876,7 +876,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			LiveTrace::Event(LiveTrace::FaultCaller, *reinterpret_cast<const uint64_t*>(info->rsp),
 			                 info->exception_address);
 		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr, info->exception_address, info->rsp)) {
 			LiveTrace::Event(LiveTrace::FaultDone, access == GpuAccess::Write ? 1 : 0, info->access_violation_vaddr);
 			return true;
 		}

@@ -1718,8 +1718,13 @@ bool InRemapWindow(uint64_t vaddr) noexcept {
 	return begin != 0 && vaddr >= begin && vaddr < g_remap_window_end.load(std::memory_order_relaxed);
 }
 
-bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	if (g_gpu_resources == nullptr || !g_gpu_resources->HandleFault(access, fault_vaddr)) return false;
+bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr, uint64_t rip, uint64_t rsp) noexcept {
+	if (g_gpu_resources == nullptr) return false;
+	const Graphics::GuestGpu::FaultSite site {fault_vaddr, rip, rsp};
+	const auto*                         outer   = Graphics::GuestGpu::NoteFault(&site);
+	const bool                          handled = g_gpu_resources->HandleFault(access, fault_vaddr);
+	Graphics::GuestGpu::NoteFault(outer);
+	if (!handled) return false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	// (A page read back: it keeps no access a while, GuestAddressSpace::NoteRead.)
 	if (access == Graphics::PageFaultAccess::Read && kyty_local_read_guard.load(std::memory_order_relaxed) != 0 &&

@@ -217,7 +217,9 @@ void                   InstallGpuResources(Graphics::GpuResourceManager* resourc
 [[nodiscard]] bool     IsGuestMappedAfterChanges(uint64_t vaddr);
 // Whether the address is in a view a partial unmap is mapping again (Windows; statistics: remap_window_writes).
 [[nodiscard]] bool     InRemapWindow(uint64_t vaddr) noexcept;
-[[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// (`rip`, `rsp`: the faulting instruction and stack, for the spec_thread_gpu_faults tripwire: GuestGpu::NoteFault.)
+[[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr, uint64_t rip = 0,
+                                  uint64_t rsp = 0) noexcept;
 // Windows with guard pages: the pages read back lately that were not for a while get guards again (the render thread's,
 // once a frame; GuestAddressSpace::CoolHotReads).
 void CoolHotReads();

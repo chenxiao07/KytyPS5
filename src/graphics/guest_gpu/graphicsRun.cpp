@@ -22,6 +22,7 @@
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
+#include "kernel/pthread.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
 
@@ -338,6 +339,27 @@ void GuestGpu::ProcessCommands() {
 	}
 }
 
+// spec_thread_gpu_faults: the fault this thread's exception handler serves (GuestGpu::NoteFault).
+static thread_local const GuestGpu::FaultSite* t_fault_site = nullptr;
+
+const GuestGpu::FaultSite* GuestGpu::NoteFault(const FaultSite* site) noexcept {
+	return std::exchange(t_fault_site, site);
+}
+
+// A host thread other than the GPU thread (not a guest thread) whose fault waits for the GPU thread: the deadlock shape
+// of the mode 4 freezes (the GPU thread may wait for a lock this thread holds, or for this thread's translation).
+[[gnu::noinline]] static void NoteSpecThreadGpuFault(const GuestGpu::FaultSite& site) {
+	if (Libs::LibKernel::PthreadSelfOrNull() != nullptr) return; // (a guest thread: its readback is the normal path)
+	LiveCounters::Add(LiveCounters::SpecThreadGpuFaults);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) >= 8) return;
+	// (The return address at the stack top names the caller of a leaf routine such as memcpy; the stack is this thread's.)
+	const uint64_t caller = site.rsp != 0 ? *reinterpret_cast<const uint64_t*>(site.rsp) : 0;
+	std::printf("SPEC_THREAD_GPU_FAULT addr=0x%016" PRIx64 " rip=0x%016" PRIx64 " ret=0x%016" PRIx64 " thread=%s\n",
+	            site.vaddr, site.rip, caller, GuestGpu::IsTranslatingThread() ? "speculation" : "host");
+	std::fflush(stdout);
+}
+
 void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
 	if (IsGpuThread()) {
@@ -345,6 +367,7 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
+	if (t_fault_site != nullptr) [[unlikely]] NoteSpecThreadGpuFault(*t_fault_site);
 	// The caller spins a while (~20 us, about the time a guest readback command waits for its turn and runs) before it
 	// sleeps: waking a sleeping caller cost the GPU thread a system call each, ~200 a frame at 1-1 (same process: GPU
 	// thread 16.66 -> 16.38 ms a frame). 0 waiting, 1 done, 2 the caller sleeps.
