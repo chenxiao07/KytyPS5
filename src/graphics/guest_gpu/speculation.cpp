@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "async-upload.h"
 #include "draw-state-observer.h"
+#include "frame-gen.h"
 #include "local-platform.h"
 #include "mode-toggle.h"
 #include "vulkan-recording.h"
@@ -1178,6 +1179,11 @@ void Speculation::After(Result& result, size_t index) {
 	const auto& segment  = state.closed[index];
 	const auto  from     = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
 	const auto& to       = segment.end;
+	// What its thread could not note for the presenter (Spec::State::scenes): its indexed draws and its TAA dispatch,
+	// noted here, where the GPU thread would have run them, before the flip after them takes them (FrameGen::TakeScene).
+	// (A segment not committed is not here: its packets are translated again the normal way, which notes them.)
+	if (to.indexed_draws != from.indexed_draws) FrameGen::NoteIndexedDraws(to.indexed_draws - from.indexed_draws);
+	if (to.scenes != from.scenes) FrameGen::NoteScene();
 	// Its writes are the latest GPU work over those ranges; the images as it left them; the caches' LRU; the command
 	// processor's guest memory writes.
 	for (size_t i = from.written; i < to.written; ++i) {

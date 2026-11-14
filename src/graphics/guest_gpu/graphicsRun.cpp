@@ -33,6 +33,7 @@
 #include "write-guard.h"
 #include "draw-state-observer.h"
 #include "frame-capture.h"
+#include "frame-gen.h"
 #include "hud-anchor.h"
 #include "live-control.h"
 #include "mode-toggle.h"
@@ -2387,6 +2388,9 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		if (!KeepsDeferredProtection(opcode)) PageManager::FlushDeferredProtection();
 		auto handler = g_cp_op_func[opcode];
 		LiveCounters::AddPm4(opcode);
+		// (A speculation off the GPU thread, which AddPm4 does not count: its indexed draws, which its commit counts for
+		// the presenter's 3D view, FrameGen::TakeScene. A refused packet's go with it: Rollback.)
+		if (note_words && FrameGen::IsIndexedDrawPacket(opcode)) ++spec->indexed_draws;
 		if (DrawsOrDispatches(opcode)) PrefetchNextDraw(packet, remaining_dw);
 		if (XprCapture::Enabled()) {
 			if (opcode == Pm4::IT_DRAW_INDEX_INDIRECT) {

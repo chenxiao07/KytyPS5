@@ -82,7 +82,7 @@ struct WaitCheck {
 struct Counts {
 	size_t current = 0, written = 0, bda = 0, invalidated = 0, writes = 0, touched_images = 0, touched_buffers = 0,
 	       clean_reads = 0, feedbacks = 0, buffer_ranges = 0, sets = 0, chain_reads = 0, waits = 0, cpu_copies = 0,
-	       late_reads = 0, texel_syncs = 0;
+	       late_reads = 0, texel_syncs = 0, indexed_draws = 0, scenes = 0;
 };
 
 // A late read (State::late_reads): the range, and the effects log's end before it was read.
@@ -350,12 +350,18 @@ struct State {
 	uint64_t checkpoint_work    = 0; // LocalVulkanRecording::RecordedWrites()
 	// (NoteCommandWords: the run of command words not noted yet.)
 	uint64_t command_begin = 0, command_end = 0;
+	// What the GPU thread notes for the presenter as it runs the packets (FrameGen), noted here off it and noted by the
+	// commit of the segment they are in (Speculation::After), in order before the flip that takes them: its indexed draw
+	// packets (FrameGen::NoteIndexedDraws: LiveCounters::AddPm4 counts only the render thread's), its TAA dispatches
+	// (FrameGen::NoteScene: the game's 3D view). Noted at the commit only: a speculation's thread translates ahead,
+	// past flips; a segment not committed is translated again the normal way, which notes them itself.
+	size_t indexed_draws = 0, scenes = 0;
 
 	[[nodiscard]] Counts Sizes() const noexcept {
 		return {current.size(),        written.size(),         bda.size(),         invalidated.size(), writes.size(),
 		        touched_images.size(), touched_buffers.size(), clean_reads.size(), feedbacks.size(), buffer_ranges.size(),
 		        sets.size(),           chain_reads.size(),     waits.size(),       cpu_copies.size(),
-		        late_reads.size(),     texel_syncs.size()};
+		        late_reads.size(),     texel_syncs.size(),     indexed_draws,      scenes};
 	}
 	// Its pending guest memory writes or a previous speculation's over the range; the ranges its work or a previous
 	// one's writes.
@@ -704,6 +710,8 @@ struct State {
 		cpu_copies.resize(std::min(cpu_copies.size(), checkpoint.cpu_copies));
 		late_reads.resize(std::min(late_reads.size(), checkpoint.late_reads));
 		texel_syncs.resize(std::min(texel_syncs.size(), checkpoint.texel_syncs));
+		indexed_draws = std::min(indexed_draws, checkpoint.indexed_draws);
+		scenes        = std::min(scenes, checkpoint.scenes);
 		bda_all = checkpoint_bda_all;
 	}
 
@@ -722,6 +730,8 @@ struct State {
 		late_reads.clear();
 		texel_syncs.clear();
 		draw_verifies.clear();
+		indexed_draws = 0;
+		scenes        = 0;
 		late = false;
 		bda.clear();
 		bda_all = false;

@@ -2232,12 +2232,19 @@ void NoteCut() {
 	g_cut = true;
 }
 
-// The guest's indexed draw packets so far (LiveCounters::AddPm4 counts every PM4 packet the render thread runs).
+// Kyty.Gpu: the indexed draw packets of the speculations' segments committed so far (NoteIndexedDraws).
+static std::atomic<uint64_t> g_committed_draws {0};
+
+void NoteIndexedDraws(uint64_t count) {
+	g_committed_draws.fetch_add(count, std::memory_order_relaxed);
+}
+
+// The guest's indexed draw packets so far (LiveCounters::AddPm4 counts every PM4 packet the render thread runs; the
+// committed segments of a speculation's thread, KYTY_SPECULATE, add theirs: NoteIndexedDraws. Without them a frame whose
+// draws a speculation's threads all translated was not the 3D view: capped at 60 above 60 Hz, as a menu).
 static uint64_t IndexedDrawPackets() {
-	using namespace Libs::Graphics::Pm4;
-	uint64_t draws = 0;
-	for (const uint32_t opcode: {IT_DRAW_INDEX_2, IT_DRAW_INDEX_OFFSET_2, IT_DRAW_INDEX_INDIRECT, IT_DRAW_INDEX_INDIRECT_MULTI})
-		draws += LiveCounters::g_pm4[opcode].load(std::memory_order_relaxed);
+	uint64_t draws = g_committed_draws.load(std::memory_order_relaxed);
+	for (const uint32_t opcode: IndexedDrawOpcodes) draws += LiveCounters::g_pm4[opcode].load(std::memory_order_relaxed);
 	return draws;
 }
 
