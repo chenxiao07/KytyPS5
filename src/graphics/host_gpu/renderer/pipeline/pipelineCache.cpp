@@ -1546,8 +1546,11 @@ struct PipelineCache::ProgramCache {
 			                 p.groups.size(), p.inputs.records.size(), added, ranked, threads, p.gentle_threads,
 			                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
 			p.ready.store(true, std::memory_order_release);
-			// (No program at all: no worker reaches the "all" line.)
-			if (p.groups.empty()) prefetch_end.store(1, std::memory_order_release);
+			// (No program at all, every input the warmup's: no worker reaches the "all" line, so it is written here.)
+			if (p.groups.empty()) {
+				PipelineCacheLog("Shader prefetch: all 0 programs translated (every input the warmup's)");
+				prefetch_end.store(1, std::memory_order_release);
+			}
 			for (uint32_t t = 0; t < threads; ++t) p.threads.emplace_back([this, t] { PrefetchWork(t); });
 			// (KYTY_SHADER_FOLLOW_THREADS: that many helpers, 0 none.)
 			uint32_t helpers = p.by_record.empty() ? 0 : 2;
@@ -3724,9 +3727,15 @@ bool PipelineCache::PrefetchWaitEnabled() {
 // PC short of memory, WaitForMemory, makes no programs play has not met: the hold times out there and the game starts).
 void PipelineCache::HoldForShaderPrefetch(const std::function<void(const PrefetchProgress&)>& show) {
 	if (!PrefetchWaitEnabled()) return;
+	// (KYTY_PREFETCH_WAIT_S: whole seconds, clamped to 1-7200; unset, empty or not a number: 600.)
 	static const int64_t limit = [] {
-		const char* value = std::getenv("KYTY_PREFETCH_WAIT_S");
-		return value != nullptr && *value != '\0' ? std::max<int64_t>(0, std::strtoll(value, nullptr, 10)) : int64_t {600};
+		constexpr int64_t Default = 600, Least = 1, Most = 7200;
+		const char*       value   = std::getenv("KYTY_PREFETCH_WAIT_S");
+		if (value == nullptr || *value == '\0') return Default;
+		char*           rest   = nullptr;
+		const long long parsed = std::strtoll(value, &rest, 10);
+		if (rest == value || *rest != '\0') return Default;
+		return std::clamp<int64_t>(parsed, Least, Most);
 	}();
 	auto&      programs = *m_program_cache;
 	const auto begin    = std::chrono::steady_clock::now();
@@ -3753,7 +3762,8 @@ void PipelineCache::HoldForShaderPrefetch(const std::function<void(const Prefetc
 		PipelineCacheLog("Shader prefetch wait: timed out after {:.1f} s, {} of {} programs translated; the game starts",
 		                 waited, progress.done, progress.total);
 #if defined(KYTY_PGO_GENERATE)
-	// The counters start from here: start-up and the prefetch are left out of the profile.
+	// The counters start from here: the emulator's start-up and the shader prefetch are left out of the profile; the
+	// game's own boot, menus and level load are counted (they are play).
 	__llvm_profile_reset_counters();
 	PipelineCacheLog("Shader prefetch wait: profile counters zeroed");
 #endif

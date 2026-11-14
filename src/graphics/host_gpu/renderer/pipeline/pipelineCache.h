@@ -319,10 +319,12 @@ public:
 	void StopWarmup();
 	[[nodiscard]] PrefetchProgress GetPrefetchProgress() const;
 	// KYTY_PREFETCH_WAIT=1 (default off): the game's first instruction waits until the shader prefetch has translated
-	// every program (a warmup beside the game first, which starts it), at most KYTY_PREFETCH_WAIT_S seconds (default 600),
-	// so a PGO training counts no start-up translation; an instrumented build (KYTY_PGO_GENERATE) zeroes its counters as
-	// the wait ends. Called on the guest's main thread before any guest code (RuntimeLinker::Execute, through
-	// WindowHoldForShaderPrefetch); `show` gets the progress about 4 times a second. Off: returns at once.
+	// every program (a warmup beside the game first, which starts it), at most KYTY_PREFETCH_WAIT_S seconds (default 600,
+	// clamped to 1-7200), so a PGO training counts no start-up translation; an instrumented build (KYTY_PGO_GENERATE)
+	// zeroes its counters as the wait ends: the emulator's start-up and the shader prefetch are left out of the profile,
+	// the game's own boot, menus and level load are counted (they are play). Called on the guest's main thread before
+	// any guest code (RuntimeLinker::Execute, through WindowHoldForShaderPrefetch); `show` gets the progress about 4
+	// times a second. Off: returns at once.
 	[[nodiscard]] static bool PrefetchWaitEnabled();
 	void                      HoldForShaderPrefetch(const std::function<void(const PrefetchProgress&)>& show);
 	// Pipelines compiled where first needed, not made of the static store's binaries: how many and how long, since the

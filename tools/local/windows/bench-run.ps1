@@ -175,6 +175,10 @@ if ($attempt -gt 1) {
 }
 $env:KYTY_LIVE_FILE = "$root\_Build\windows-bench\live-commands.txt"
 foreach ($pair in $Extra) { $k, $v = $pair -split '=', 2; Set-Item "env:$k" $v }
+# A launch with KYTY_PREFETCH_WAIT=1 (pgo-train.ps1) holds the game until the shader prefetch is done: its run log is read
+# below for the hold's lines.
+$holdWatch = @(@($Set) + @($Extra) | ForEach-Object { $_ -split ',(?=[A-Za-z_][A-Za-z0-9_]*=)' } | Where-Object { $_ -eq 'KYTY_PREFETCH_WAIT=1' }).Count -gt 0
+$launchAt = Get-Date
 & "$root\run-windows.ps1" @params 6>&1 | Select-Object -Last 1
 Restore-GamePath
 # (The emulator has its environment: the switches, -Extra's and KYTY_LIVE_FILE leave this session's.)
@@ -196,6 +200,19 @@ $log = New-Object System.Collections.Generic.List[string]
 $last = ''
 while (((Get-Date) - $start).TotalSeconds -lt $StartupSeconds) {
 	if (!(Get-Process kyty_emulator -ErrorAction SilentlyContinue)) { $state = 'exited'; break }
+	# While the run log's last hold line is its start, the game is held: its progress screen is no skip prompt, so nothing
+	# is captured (each capture took the focus) or pressed (the presses queued pad input for the game's first read).
+	if ($holdWatch) {
+		$runLog = Get-ChildItem "$root\_Build\run-logs\*.out.log" -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $launchAt } | Sort-Object LastWriteTime | Select-Object -Last 1
+		$holdLine = if ($runLog) { Select-String -Path $runLog.FullName -Pattern 'Shader prefetch wait: ' -SimpleMatch | Select-Object -Last 1 }
+		if ($holdLine -and $holdLine.Line -match 'Shader prefetch wait: the game starts once') {
+			$state = 'hold'
+			if ($state -ne $last) { $log.Add(("{0,6:N1} s {1}" -f ((Get-Date) - $start).TotalSeconds, $state)); $last = $state }
+			Start-Sleep -Milliseconds 500
+			continue
+		}
+		if ($holdLine) { $holdWatch = $false } # (the hold is over: the log is not read again)
+	}
 	$w = Window
 	# The capture reads the screen where the window is: it must be in front (as screen.ps1 did).
 	$bmp = if ($w -and [BenchWin]::Focus($w.MainWindowHandle)) { [BenchWin]::Client($w.MainWindowHandle) } else { $null }
