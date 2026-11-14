@@ -32,7 +32,8 @@ Copy-Item "$gen\kyty_emulator.exe", "$gen\libwinpthread-1.dll" $exe -Force
 # KYTY_PREFETCH_WAIT=1: the game starts only once the shader prefetch has translated every program (at most $hold s), and
 # the instrumented build zeroes its counters there: start-up and the prefetch are left out of the profile, and the
 # scene is played with no translation beside it. The HUD comes that much later.
-$hold = 600
+# (1200 s: a cold instrumented executable translates every program inside the hold; a slower PC than ours needs room.)
+$hold = 1200
 $params = @{ Label = 'pgotrain'; Exe = "$exe\kyty_emulator.exe"; KeepRunning = $true; NoWalk = $true; ShotOnly = $true; StartupSeconds = 180 + $hold }
 $params['Set'] = @($Set) + @('KYTY_PREFETCH_WAIT=1', "KYTY_PREFETCH_WAIT_S=$hold")
 if ($NoPrecompile) { $params['NoPrecompile'] = $true }
@@ -51,6 +52,12 @@ if ("$started" -match 'no HUD') {
 # hold's end by it. Without them (a hold that timed out, an executable without the switch) the scene would profile
 # translation as the hot path: no profile then.
 $logFile = Get-ChildItem "$root\_Build\run-logs\*.out.log" -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $t0 } | Sort-Object LastWriteTime | Select-Object -Last 1
+# (A hold that ended by its time-out is the old flaw again: the scene would be profiled beside translation.)
+if ($logFile -and (Select-String -Path $logFile.FullName -Pattern 'Shader prefetch wait: timed out' -SimpleMatch -Quiet)) {
+	Ours | Stop-Process -Force
+	'NO PROFILE: THE SHADER PREFETCH HOLD TIMED OUT (the scene would have trained beside translation); raise $hold or check the prefetch'
+	exit 1
+}
 foreach ($line in 'Shader prefetch: all', 'Shader prefetch wait: done') {
 	if (!($logFile -and (Select-String -Path $logFile.FullName -Pattern $line -SimpleMatch -Quiet))) {
 		Ours | Stop-Process -Force
