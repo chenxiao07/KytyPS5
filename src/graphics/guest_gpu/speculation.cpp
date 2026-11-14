@@ -1167,6 +1167,10 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		for (const auto& use: state.closed[index].images)
 			if (!use.found_buffer_modified && use.image->IsBufferModified())
 				return ++m_stop_reasons["commit: GPU work wrote an image it uses"], Progress::Stopped;
+		for (const auto& left: state.left_clears)
+			if (left.segment == index && (left.image->serial != left.serial ||
+			                              left.image->validity.load(std::memory_order_relaxed) != left.validity))
+				return ++m_stop_reasons["commit: a left clear's image moved"], Progress::Stopped;
 		for (const auto& fact: state.meta_facts)
 			if (!fact.cleared && fact.first <= index && index <= fact.last &&
 			    m_renderer.GetTextureCache().IsMetaCleared(fact.address, fact.slice))

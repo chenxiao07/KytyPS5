@@ -87,7 +87,7 @@ struct Counts {
 	size_t current = 0, written = 0, bda = 0, invalidated = 0, writes = 0, touched_images = 0, touched_buffers = 0,
 	       clean_reads = 0, feedbacks = 0, buffer_ranges = 0, sets = 0, chain_reads = 0, waits = 0, cpu_copies = 0,
 	       late_reads = 0, texel_syncs = 0, pending_buffers = 0, table_ranges = 0, pending_targets = 0, indexed_draws = 0,
-	       scenes = 0, used_pairs = 0;
+	       scenes = 0, used_pairs = 0, left_clears = 0;
 };
 
 // spec_pending_buffers (under KYTY_SPECULATE=4 only): a table V#'s range with no
@@ -629,7 +629,7 @@ struct State {
 		        touched_images.size(), touched_buffers.size(), clean_reads.size(), feedbacks.size(), buffer_ranges.size(),
 		        sets.size(),           chain_reads.size(),     waits.size(),       cpu_copies.size(),
 		        late_reads.size(),     texel_syncs.size(),     pending_buffers.size(), table_ranges.size(), pending_targets.size(),
-		        indexed_draws,         scenes,                 used_pairs.size()};
+		        indexed_draws,         scenes,                 used_pairs.size(),      left_clears.size()};
 	}
 	// Its pending guest memory writes or a previous speculation's over the range; the ranges its work or a previous
 	// one's writes.
@@ -837,6 +837,16 @@ struct State {
 		bool     dcc   = false; // a predicted DCC fill's clear (spec_predict_dcc): not a fact about other metadata
 	};
 	std::vector<MetaFact> meta_facts;
+	// Sampled DCC images a segment bound with their clears pending, as the normal path's FindTexture leaves them
+	// (TextureCache::DccClearLeftPending): the commit checks the image's serial and validity unmoved (a metadata change
+	// PrepareDccClear would make, or any other the image's proof rests on, stops the segment).
+	struct LeftClear {
+		const Image* image    = nullptr;
+		uint64_t     serial   = 0;
+		uint64_t     validity = 0;
+		size_t       segment  = 0;
+	};
+	std::vector<LeftClear> left_clears;
 	std::vector<uint64_t> consume_pending; // (its holes' clears, registered: ConsumePendingAdd)
 	void ReleaseConsumePending() {
 		for (const auto key: consume_pending) ConsumePendingAdd(key, false);
@@ -1124,6 +1134,7 @@ struct State {
 		indexed_draws = std::min(indexed_draws, checkpoint.indexed_draws);
 		scenes        = std::min(scenes, checkpoint.scenes);
 		used_pairs.resize(std::min(used_pairs.size(), checkpoint.used_pairs));
+		left_clears.resize(std::min(left_clears.size(), checkpoint.left_clears));
 		bda_all = checkpoint_bda_all;
 	}
 
@@ -1174,6 +1185,7 @@ struct State {
 		closed.clear();
 		ReleaseConsumePending();
 		meta_facts.clear();
+		left_clears.clear();
 		overlay.clear();
 		overlay_index.clear();
 		used.clear();

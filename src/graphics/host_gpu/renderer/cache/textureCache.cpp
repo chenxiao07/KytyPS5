@@ -5392,6 +5392,24 @@ bool TextureCache::DccClearSticks(uint64_t address) {
 	return m_dcc_sticky.contains(address);
 }
 
+// PrepareDccClear's no-op, read only: its record update changes nothing (the image's metadata the view's, the record
+// there a DCC one: nothing inserted, retyped or moved), and its clear is never applied (levels != 1, range.size == 0:
+// the image's own, the same at the commit while its serial is). FindTexture's checks before it as the caller's
+// (registered, no depth_id, no rebind).
+bool TextureCache::DccClearLeftPending(ImageId id, const ImageDesc& desc, uint64_t& serial, uint64_t& validity) {
+	if (desc.info.metadata.kind != ImageMetadataKind::Dcc) return false;
+	std::scoped_lock lock {m_lock};
+	const auto*      image = m_slot_images.try_get(id);
+	if (image == nullptr || image->info.data.Empty() || !image->registered || image->depth_id ||
+	    image->binding.needs_rebind || !(image->info.metadata == desc.info.metadata))
+		return false;
+	const auto found = m_surface_metas.find(desc.info.metadata.range.address);
+	if (found == m_surface_metas.end() || found->second.type != MetaDataInfo::Type::Dcc) return false;
+	serial   = image->serial; // (under the lock: the slot not reused before the serial is read)
+	validity = image->validity.load(std::memory_order_relaxed);
+	return image->info.resources.levels != 1 || desc.info.metadata.range.size == 0;
+}
+
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	if (!MetaFilterMayHold(address)) return false;
 	std::scoped_lock lock {m_lock};

@@ -2495,6 +2495,14 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 				// The normal path's FindTexture clears its layers first. A speculation's packet is a hole that does:
 				// the work after it finds them cleared (speculation-state.h).
 				if (auto* spec = Spec::Current()) {
+					// Not where the normal path's FindTexture leaves every clear of the image pending, whatever its metadata
+					// holds (TextureCache::DccClearLeftPending: 94% of these holes at 5-1, an image of more than one level):
+					// it binds the image uncleared, as here, and so does the commit while the image's validity has not moved
+					// (Spec::State::left_clears). As the normal path's, no other layer of it is asked.
+					if (uint64_t serial = 0, validity = 0; textures.DccClearLeftPending(dep.id, dep.desc, serial, validity)) {
+						spec->left_clears.push_back({image, serial, validity, spec->closed.size()});
+						break;
+					}
 					// (KYTY_SPEC_PREDICT_DCC: not where the normal path's FindTexture was seen to leave the clear pending,
 					// TextureCache::DccClearSticks: the work after the hole finds it cleared still, and a "not cleared" fact
 					// would fail at its commit. Its later uses read the cache, and are holes too.)

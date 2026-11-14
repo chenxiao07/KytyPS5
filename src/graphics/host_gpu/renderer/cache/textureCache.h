@@ -496,6 +496,11 @@ public:
 	// such a use consumes the clear).
 	void               NoteDccClear(uint64_t address, bool sticks);
 	[[nodiscard]] bool DccClearSticks(uint64_t address);
+	// Whether FindTexture's PrepareDccClear with `desc` would change nothing and clear nothing of image `id` whatever its
+	// metadata record holds (more than one level, or an empty metadata range: its pending clears stay pending, and the
+	// normal path binds it uncleared). Read only, under m_lock. `validity`: the image's then (a record change
+	// PrepareDccClear would make moves it).
+	[[nodiscard]] bool DccClearLeftPending(ImageId id, const ImageDesc& desc, uint64_t& serial, uint64_t& validity);
 
 private:
 	std::atomic<uint64_t>                             m_meta_epoch {1};
