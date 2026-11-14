@@ -13,6 +13,8 @@ profile 里改过的函数会因哈希不符而失去 PGO，需要重新训练�
    它在 `_Build\windows-pgogen` 构建插桩版本（`-DKYTY_PGO_GENERATE=ON`），用它跑训练场景
    （基准路线走过去站立、转镜头、走进遗迹、横移），用 live 命令 `pgo <file>` 写出 profile，
    再用 `llvm-profdata merge` 得到 `_Build\pgo\windows\kyty-<日期>.profdata`。
+   插桩版本带 `KYTY_PREFETCH_WAIT=1` 启动：游戏的第一条指令等着色器预取把所有程序翻译完（最多 `KYTY_PREFETCH_WAIT_S` 秒，默认 600），
+   等待结束时插桩计数清零（日志 `Shader prefetch wait: done`），启动和预取不进 profile；到 HUD 时日志里缺 `Shader prefetch: all` 或这一行的场景不出 profile。
 2. 把旧的 `kyty.profdata` 另存一份，新文件复制成 `kyty.profdata`；路径不变时 Ninja 不会重编，
    所以先 `cmake --build _Build\windows --target clean` 再 `build-windows.cmd`。
 3. 用 `ab-exe.ps1` 对比旧 profile 的可执行文件（先复制到自己的目录）和新构建。

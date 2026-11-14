@@ -894,6 +894,9 @@ struct PipelineCache::ProgramCache {
 	// `prefetch` for threads without the pipeline cache's lock (GetPrefetchProgress, the live report): a warmup beside
 	// the game starts the prefetch once done.
 	std::atomic<Prefetch*> prefetch_live {nullptr};
+	// Whether the prefetch is over, for a game held until it is (PipelineCache::HoldForShaderPrefetch): 0 not yet (or not
+	// started yet), 1 every program translated, 2 none runs (KYTY_SHADER_PREFETCH=0, no inputs, no scratch file).
+	std::atomic<uint32_t> prefetch_end {0};
 
 	// Heap bytes of a prefetched group by part (container capacities, list and string nodes; allocator headers left
 	// out): what keeping every program's plan and infos costs.
@@ -1431,6 +1434,7 @@ struct PipelineCache::ProgramCache {
 				                 "writes them){}", Common::PathToString(path), recorded.empty() ? "" : ": the recording's only");
 				if (recorded.empty()) {
 					ReleaseDiskIndex();
+					prefetch_end.store(2, std::memory_order_release);
 					return;
 				}
 				p.inputs.records.clear();
@@ -1519,6 +1523,7 @@ struct PipelineCache::ProgramCache {
 			if (p.spill == 0) p.spill = LocalPlatform::OpenScratchFile();
 			if (p.spill == 0) {
 				PipelineCacheLog("Shader prefetch: no temporary file for the SPIR-V");
+				prefetch_end.store(2, std::memory_order_release);
 				return;
 			}
 			uint32_t threads = SpareThreads();
@@ -1541,6 +1546,8 @@ struct PipelineCache::ProgramCache {
 			                 p.groups.size(), p.inputs.records.size(), added, ranked, threads, p.gentle_threads,
 			                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
 			p.ready.store(true, std::memory_order_release);
+			// (No program at all: no worker reaches the "all" line.)
+			if (p.groups.empty()) prefetch_end.store(1, std::memory_order_release);
 			for (uint32_t t = 0; t < threads; ++t) p.threads.emplace_back([this, t] { PrefetchWork(t); });
 			// (KYTY_SHADER_FOLLOW_THREADS: that many helpers, 0 none.)
 			uint32_t helpers = p.by_record.empty() ? 0 : 2;
@@ -1603,6 +1610,7 @@ struct PipelineCache::ProgramCache {
 				                 p.spilled_plans.load(std::memory_order_relaxed),
 				                 p.spilled_plan_bytes.load(std::memory_order_relaxed) >> 20u,
 				                 p.dropped_linear.load(std::memory_order_relaxed));
+				prefetch_end.store(1, std::memory_order_release);
 			}
 		}
 	}
@@ -3495,8 +3503,13 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 			// (No scene in SceneWaitSeconds: every recorded pipeline, as without scenes.)
 			constexpr int64_t SceneWaitSeconds = 300;
 			programs.warm_phase.store(0, std::memory_order_release);
+			// (A game held for the shader prefetch, KYTY_PREFETCH_WAIT: the scene wait starts once it is let go, or a long
+			// hold would make every recorded pipeline before its first scene.)
+			while (m_game_held.load(std::memory_order_acquire) && !m_warmup_stop.load(std::memory_order_relaxed))
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			const auto scene_wait_begin = std::chrono::steady_clock::now();
 			while (SceneTags::Current() == SceneTags::None && !m_warmup_stop.load(std::memory_order_relaxed) &&
-			       std::chrono::steady_clock::now() - pipelines_begin < std::chrono::seconds(SceneWaitSeconds))
+			       std::chrono::steady_clock::now() - scene_wait_begin < std::chrono::seconds(SceneWaitSeconds))
 				std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			if (!m_warmup_stop.load(std::memory_order_relaxed))
 				WarmScene(SceneTags::Current(), settings.compute_video, true);
@@ -3650,6 +3663,7 @@ void PipelineCache::StartShaderPrefetch(std::vector<std::vector<uint32_t>> recor
 	if ((prefetch != nullptr && std::string_view(prefetch) == "0") || KYTY_BUILD != KYTY_BUILD_RELEASE ||
 	    PipelineCacheTitleId().empty()) {
 		m_program_cache->ReleaseDiskIndex(); // (the warmup's)
+		m_program_cache->prefetch_end.store(2, std::memory_order_release);
 		return;
 	}
 	auto identity = PipelineCacheTitleId() + ShaderInputDeviceSignature(m_graphics.GetPhysicalDeviceProperties());
@@ -3684,6 +3698,65 @@ PipelineCache::PrefetchProgress PipelineCache::GetPrefetchProgress() const {
 	if (prefetch == nullptr || !prefetch->ready.load(std::memory_order_acquire)) return {};
 	const auto total = prefetch->groups.size();
 	return {std::min(prefetch->finished.load(std::memory_order_relaxed), total), total};
+}
+
+#if defined(KYTY_PGO_GENERATE)
+// compiler-rt profile runtime (instrumented builds only).
+extern "C" void __llvm_profile_reset_counters(void);
+#endif
+
+bool PipelineCache::PrefetchWaitEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PREFETCH_WAIT");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return on;
+}
+
+// No deadlock: the game is held before its first instruction (no guest thread exists yet, no guest submission, the GPU
+// thread idle), and what the hold waits for needs none of it. The warmup beside the game (TranslateWarmup, and
+// WarmPipelines when not by scene: m_mutex, which the idle GPU thread does not hold, and the driver) and the prefetch (its
+// loader: the input files and the shader cache; its workers and helpers: the recompiler on recorded inputs, the scratch
+// file) read no guest memory and wait for no guest work; the pipelines by scene (the one part that waits for the game,
+// its first scene) come after the prefetch has started and are not waited for here. The window's message loop
+// stays on the main thread (WindowRun), and the progress is painted there by posted tasks, never waited for. Ends
+// early: the prefetch done (1) or not running (2: off, no inputs, no scratch file); else after KYTY_PREFETCH_WAIT_S (a
+// PC short of memory, WaitForMemory, makes no programs play has not met: the hold times out there and the game starts).
+void PipelineCache::HoldForShaderPrefetch(const std::function<void(const PrefetchProgress&)>& show) {
+	if (!PrefetchWaitEnabled()) return;
+	static const int64_t limit = [] {
+		const char* value = std::getenv("KYTY_PREFETCH_WAIT_S");
+		return value != nullptr && *value != '\0' ? std::max<int64_t>(0, std::strtoll(value, nullptr, 10)) : int64_t {600};
+	}();
+	auto&      programs = *m_program_cache;
+	const auto begin    = std::chrono::steady_clock::now();
+	PipelineCacheLog("Shader prefetch wait: the game starts once every program is translated (KYTY_PREFETCH_WAIT=1, at "
+	                 "most {} s)",
+	                 limit);
+	uint32_t end = 0;
+	while ((end = programs.prefetch_end.load(std::memory_order_acquire)) == 0 &&
+	       std::chrono::steady_clock::now() - begin < std::chrono::seconds(limit)) {
+		if (show) show(GetPrefetchProgress());
+		std::this_thread::sleep_for(std::chrono::milliseconds(250));
+	}
+	m_game_held.store(false, std::memory_order_release);
+	const double waited   = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+	const auto   progress = GetPrefetchProgress();
+	const auto*  prefetch = programs.prefetch_live.load(std::memory_order_acquire);
+	const size_t cached   = prefetch != nullptr && prefetch->ready.load(std::memory_order_acquire) ? prefetch->cache_loaded : 0;
+	if (end == 1)
+		PipelineCacheLog("Shader prefetch wait: done in {:.1f} s, {} programs translated ({} of them from the prefetch cache)",
+		                 waited, progress.total, cached);
+	else if (end == 2)
+		PipelineCacheLog("Shader prefetch wait: no shader prefetch runs; the game starts after {:.1f} s", waited);
+	else
+		PipelineCacheLog("Shader prefetch wait: timed out after {:.1f} s, {} of {} programs translated; the game starts",
+		                 waited, progress.done, progress.total);
+#if defined(KYTY_PGO_GENERATE)
+	// The counters start from here: start-up and the prefetch are left out of the profile.
+	__llvm_profile_reset_counters();
+	PipelineCacheLog("Shader prefetch wait: profile counters zeroed");
+#endif
 }
 
 void PipelineCache::WarmPipelines(uint64_t compute_video, bool background, const std::unordered_set<uint64_t>* only) {

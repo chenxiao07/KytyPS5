@@ -318,6 +318,13 @@ public:
 	// Stops a warmup still running beside the game, and waits for it (the window's close; not under m_mutex).
 	void StopWarmup();
 	[[nodiscard]] PrefetchProgress GetPrefetchProgress() const;
+	// KYTY_PREFETCH_WAIT=1 (default off): the game's first instruction waits until the shader prefetch has translated
+	// every program (a warmup beside the game first, which starts it), at most KYTY_PREFETCH_WAIT_S seconds (default 600),
+	// so a PGO training counts no start-up translation; an instrumented build (KYTY_PGO_GENERATE) zeroes its counters as
+	// the wait ends. Called on the guest's main thread before any guest code (RuntimeLinker::Execute, through
+	// WindowHoldForShaderPrefetch); `show` gets the progress about 4 times a second. Off: returns at once.
+	[[nodiscard]] static bool PrefetchWaitEnabled();
+	void                      HoldForShaderPrefetch(const std::function<void(const PrefetchProgress&)>& show);
 	// Pipelines compiled where first needed, not made of the static store's binaries: how many and how long, since the
 	// start (the panel's note while it happens, issue #129). Any thread.
 	struct PlayCompiles {
@@ -478,6 +485,9 @@ private:
 	void              StartShaderPrefetch(std::vector<std::vector<uint32_t>> recorded_inputs);
 	std::thread       m_warmup_thread;
 	std::atomic<bool> m_warmup_stop {false};
+	// The game held until the shader prefetch is done (HoldForShaderPrefetch): from the start with KYTY_PREFETCH_WAIT=1,
+	// before any warmup thread reads it.
+	std::atomic<bool> m_game_held {PrefetchWaitEnabled()};
 	// The warmup by scene (local/scene-tags.h, KYTY_SCENE_WARMUP): the recording's file (its .scenes beside it), whether
 	// it is on, and what it made. WarmScene: the pipelines of `scene` (every recorded one for a scene not known yet), from
 	// the warmup's own records (`in_memory`, the first scene) or the recording read again; SceneLoop: those of each scene

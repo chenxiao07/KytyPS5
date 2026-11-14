@@ -1,4 +1,4 @@
-param([string]$Out = '', [string[]]$Set = @(), [switch]$NoPrecompile, [switch]$Warm, [ValidateSet('fe', 'ir')][string]$Kind = 'fe')
+param([string]$Out = '', [string[]]$Set = @(), [switch]$NoPrecompile, [ValidateSet('fe', 'ir')][string]$Kind = 'fe')
 # Windows PGO refresh (tools/local/PGO.md): build an instrumented emulator in _Build\windows-pgogen,
 # play the training scene with it (the benchmark walk and standing, camera turns, on into the ruins,
 # strafing), write the profile with the live `pgo` command and merge it. Installing it as the release
@@ -29,8 +29,12 @@ if ($built -ne $Kind) { "no profile: $gen holds $built counters, not $Kind"; exi
 $exe = "$root\_Build\ab\pgogen$suffix"
 New-Item -ItemType Directory -Force $exe | Out-Null
 Copy-Item "$gen\kyty_emulator.exe", "$gen\libwinpthread-1.dll" $exe -Force
-$params = @{ Label = 'pgotrain'; Exe = "$exe\kyty_emulator.exe"; KeepRunning = $true; NoWalk = $true; ShotOnly = $true; StartupSeconds = 180 }
-if ($Set.Count) { $params['Set'] = $Set }
+# KYTY_PREFETCH_WAIT=1: the game starts only once the shader prefetch has translated every program (at most $hold s), and
+# the instrumented build zeroes its counters there: start-up and the prefetch are left out of the profile, and the
+# scene is played with no translation beside it. The HUD comes that much later.
+$hold = 600
+$params = @{ Label = 'pgotrain'; Exe = "$exe\kyty_emulator.exe"; KeepRunning = $true; NoWalk = $true; ShotOnly = $true; StartupSeconds = 180 + $hold }
+$params['Set'] = @($Set) + @('KYTY_PREFETCH_WAIT=1', "KYTY_PREFETCH_WAIT_S=$hold")
 if ($NoPrecompile) { $params['NoPrecompile'] = $true }
 # (The instrumented runtime's own file, default.profraw where it runs, made empty at start-up: under _Build instead.)
 $env:LLVM_PROFILE_FILE = "$root\_Build\pgo\windows\default-%p.profraw"
@@ -43,21 +47,18 @@ if ("$started" -match 'no HUD') {
 	'no profile: the game did not reach the HUD'
 	exit 1
 }
-# The scene is played only once the shader prefetch is done ('Shader prefetch: all' in this launch's run log): a
-# profile taken while the prefetch still translates on every core counts translation and its waits as the hot path.
+# With the hold the prefetch was done before the game started: this launch's run log has 'Shader prefetch: all' and the
+# hold's end by it. Without them (a hold that timed out, an executable without the switch) the scene would profile
+# translation as the hot path: no profile then.
 $logFile = Get-ChildItem "$root\_Build\run-logs\*.out.log" -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $t0 } | Sort-Object LastWriteTime | Select-Object -Last 1
-for ($w = 0; $w -lt 600 -and !($logFile -and (Select-String -Path $logFile.FullName -Pattern 'Shader prefetch: all' -SimpleMatch -Quiet)); $w += 2) { Start-Sleep 2 }
-if ($w -ge 600) {
-	Ours | Stop-Process -Force
-	'no profile: no "Shader prefetch: all" within 600 s of the HUD'
-	exit 1
+foreach ($line in 'Shader prefetch: all', 'Shader prefetch wait: done') {
+	if (!($logFile -and (Select-String -Path $logFile.FullName -Pattern $line -SimpleMatch -Quiet))) {
+		Ours | Stop-Process -Force
+		"no profile: no ""$line"" in the run log at the HUD"
+		exit 1
+	}
 }
-"shader prefetch done $w s after the HUD"
-# -Warm: a launch that only makes the instrumented executable's shader caches, so the recorded scenes start warm.
-if ($Warm) { Ours | Stop-Process -Force; 'warm-up launch: caches made, no profile'; exit 0 }
-# The counters start from here: start-up and the prefetch (a world whose prefetch index does not match translates
-# every program again, warm-up or not) are left out of the profile.
-python tools\local\bench-windows.py live 'pgoreset' | Select-String 'LIVE_PGORESET|LIVE_ERROR'
+(Select-String -Path $logFile.FullName -Pattern 'Shader prefetch wait: done' -SimpleMatch | Select-Object -First 1).Line
 function Plan([string]$plan) {
 	$walk = Start-Process powershell -ArgumentList '-NoProfile', '-File', "$S\keys.ps1", '-Plan', $plan -PassThru -WindowStyle Hidden
 	$walk.WaitForExit()

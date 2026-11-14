@@ -15,6 +15,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/presentation/window.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/demonsSoulsIdle.h"
@@ -1640,6 +1641,10 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	DemonsSoulsTextureMips::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsEnginePools::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsLanguages::Install(m_programs.empty() ? nullptr : m_programs.front());
+	// KYTY_PREFETCH_WAIT=1: no guest code before the shader prefetch is done (a PGO training's counters start there). The
+	// graphics and the pipeline cache are up (Libs::Graphics::Initialize, before the program was loaded), the window's
+	// loop runs on the host main thread, and no guest thread exists yet.
+	Libs::Graphics::WindowHoldForShaderPrefetch();
 	// The main thread runs guest code from here (module initializers, then main): the console's floating-point
 	// environment, as its other threads get it (RunThread) and fibers that ask for it.
 	Common::EnterGuestFpEnv();

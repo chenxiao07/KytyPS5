@@ -39,6 +39,7 @@
 #include "frame-gen.h"
 #include "local-platform.h"
 #include "perf-overlay.h"
+#include "startup-progress.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/startupProgress.h"
@@ -1147,6 +1148,21 @@ void WindowRun() {
 	g_window->render_context->GetPipelineCache().StopWarmup();
 	g_window->render_context->GetPipelineCache().ReportSession();
 	g_window->render_context->GetPipelineCache().Save();
+}
+
+void WindowHoldForShaderPrefetch() {
+	if (!PipelineCache::PrefetchWaitEnabled() || g_window == nullptr || g_window->render_context == nullptr) return;
+	auto* context = g_window.get();
+	// The start-up screen again (startupProgress.cpp paints on the main thread only): posted to the main loop, never
+	// waited for, so the window keeps handling its messages and the hold needs nothing from it.
+	context->PostToMainThread([context] { StartupProgressShow(context->window); });
+	context->render_context->GetPipelineCache().HoldForShaderPrefetch([context](const PipelineCache::PrefetchProgress& progress) {
+		const char* text  = progress.label != nullptr ? progress.label : "Preparing shaders";
+		const auto  done  = static_cast<uint64_t>(progress.done);
+		const auto  total = static_cast<uint64_t>(progress.total);
+		context->PostToMainThread([text, done, total] { StartupProgress::Report(text, done, total); });
+	});
+	context->PostToMainThread([] { StartupProgressHide(); });
 }
 
 void WindowShutdown() {
