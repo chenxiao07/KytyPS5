@@ -134,21 +134,27 @@ def restore():
 IMAGE_BASE = 0x140000000  # kyty_emulator.exe links with /DYNAMICBASE:NO
 
 
-def symbol_address(name):
-    """Runtime address of a global from the lld map (RVA + fixed image base)."""
+def symbol_address(name, required=True):
+    """Runtime address of a global from the lld map (RVA + fixed image base); None when it has none and not required."""
     map_file = next((ROOT / '_Build/windows').glob('kyty_emulator_*.map'))
     for line in map_file.open(errors='replace'):
         fields = line.split()
         if len(fields) >= 4 and fields[-1] == name:
             return IMAGE_BASE + int(fields[0], 16)
+    if not required:
+        return None
     sys.exit(f'{name} not found in {map_file}')
 
 
 def expand(line):
-    # "set NAME VALUE" -> "poke32 <address> <hex value>" (a 32-bit switch such as kyty_local_*).
+    # "set NAME VALUE" -> "poke32 <address> <hex value>" for a 32-bit global such as kyty_local_*; a name the map does
+    # not have goes to the emulator as it is: its own `set`, a live switch (src/local/live-switch.h). (Before 11-14 such
+    # a line ended this script before anything was sent: an A/B toggling a live switch through it never toggled it.)
     parts = line.split()
     if len(parts) == 3 and parts[0] == 'set':
-        return f'poke32 {symbol_address(parts[1]):x} {int(parts[2], 0):x}'
+        address = symbol_address(parts[1], required=False)
+        if address is not None:
+            return f'poke32 {address:x} {int(parts[2], 0):x}'
     return line
 
 
