@@ -258,6 +258,18 @@ ShaderProgram UnreadCode() {
 	return {};
 }
 
+// The invariant: a speculation (non-GPU) thread never takes a fault that needs the GPU thread. Its lookup holds the
+// catalog read (TableResolveSet), which the GPU thread's CatalogWrite waits for, so PrepareProgramInto's guest reads too
+// are made without a fault there (PrepareNoFault: the code's hash on a miss of the thread's hash cache, the AGC metadata,
+// the vertex tables; ShaderReadGuest); one it could not make refuses the lookup before m_mutex ("worker set: code unread").
+bool PrepareNoFault() {
+	return GuestGpu::IsTranslatingThread() && !GuestGpu::IsGpuThread();
+}
+void PrepareUnread() {
+	Spec::Refuse("worker set: code unread");
+	if (PipelineCache::t_no_fault_reads) PipelineCache::t_no_fault_failed = true;
+}
+
 } // namespace
 
 void MaterializationReaders(ShaderRecompiler::IR::SrtRuntime& runtime) {
@@ -4475,6 +4487,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	m_program_cache->table_waiting.reset();
 	// Reused per thread: every normal-path draw prepares both (their user data were new vectors).
 	thread_local ShaderParams vertex_params, pixel_params;
+	std::optional<ShaderHashNoFaultScope> no_fault; // (PrepareNoFault)
+	if (PrepareNoFault()) no_fault.emplace(true), t_shader_read_failed = false;
 	PrepareProgramInto(vertex_regs, context, user_config, vertex_info, vertex_params);
 	const bool mesh_active   = vertex_info.mesh.threads_num[0] != 0;
 	if (mesh_active) {
@@ -4497,6 +4511,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	if (pixel_active) {
 		PrepareProgramInto(pixel_regs, sh, target_export_mapping, pixel_info, pixel_params);
+	}
+	if (no_fault) {
+		no_fault.reset();
+		if (t_shader_read_failed) return PrepareUnread(), GraphicsPrograms {};
 	}
 	if (context.GetClipControl().clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];
@@ -4590,7 +4608,14 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	// Reused per thread: every dispatch prepares one (its user data was a new vector each time).
 	thread_local ShaderParams params;
-	PrepareProgramInto(regs, sh, input_info, params);
+	if (PrepareNoFault()) {
+		const ShaderHashNoFaultScope no_fault {true};
+		t_shader_read_failed = false;
+		PrepareProgramInto(regs, sh, input_info, params);
+		if (t_shader_read_failed) return PrepareUnread(), ShaderProgram {};
+	} else {
+		PrepareProgramInto(regs, sh, input_info, params);
+	}
 	if (!GuestGpu::IsGpuThread()) { // (the code before the lock: CopyShaderCode)
 		thread_local std::vector<uint32_t> code, back_code;
 		CopyShaderCode(params, code, back_code);

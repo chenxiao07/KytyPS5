@@ -664,7 +664,8 @@ static void TablePrefetchNext(Pair*& previous, Pair& pair) {
 }
 
 // spec_worker_sets: the catalog read lock the speculation's table draw or dispatch holds (TableTry, TableDispatch,
-// TableContinue), so the set build can release it around the program lookup (a fault there waits for the GPU thread).
+// TableContinue). The set build keeps it across the program lookup (`unlocked` there only tests it), so the lookup's guest
+// reads are made without a fault: a fault there would wait for the GPU thread while it waits for the catalog's write.
 static thread_local std::shared_lock<std::shared_mutex>* t_catalog_read = nullptr;
 // catalog_writer_first: before a worker's table try takes the catalog shared, it waits while the owner waits to write
 // (pause, then yield), unless this thread holds the catalog shared already.
@@ -1180,10 +1181,12 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		// DMA: a freeze in Get's table job copy), copied before m_mutex (CopyShaderCode); anything else before the lock is taken. New worker paths (pair proposals) are audited against this list.
 		PipelineCache::t_no_fault_reads  = spec != nullptr;
 		PipelineCache::t_no_fault_failed = false;
-		// (A speculation's lookup without the catalog's read lock: PrepareProgramInto's reads of the vertex metadata and
-		// tables may fault and wait for the GPU thread, which may wait for the catalog's write: a freeze.
-		// The variant is found again by its state after it, and the set refused when the catalog changed meanwhile.)
-		// (Held by a speculation only: the lookup may run without the catalog's lock. Mode 0 reads them in place.)
+		// (A speculation's lookup runs under the catalog's read lock (TableTry / TableContinue / TableDispatch hold it across
+		// it: nothing releases it here), which the GPU thread's CatalogWrite waits for: its guest reads (PrepareProgramInto's
+		// hash, AGC metadata and vertex tables, Get's code and SRT words) are made without a fault, the set refused when
+		// one cannot be (PipelineCache: "worker set: code unread", "GPU-written shader code"; t_no_fault_failed). The
+		// epoch and variant checks after it hold for the lock; they stay for a lookup made without it.)
+		// (Copies held by a speculation only. Mode 0 reads them in place.)
 		struct Held {
 			std::remove_cvref_t<decltype(variant->mapping)> mapping;
 			std::remove_cvref_t<decltype(variant->state)>   state;
@@ -1889,10 +1892,10 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 			if (set == nullptr || (set->refused && retry_due(*set))) {
 				auto* const retried = set;
 				set                 = TableResolveSet(buffer, pair, variant, draw_state, words);
-				// (A retry that came back pending: the refused set is still the slot's.) (The GPU thread's only. A
-				// speculation's TableResolveSet drops the catalog's read for its program lookup, and the
-				// owner may destroy `retried` meanwhile (TableReset, the set collection, a publish): the write would land in
-				// freed memory; workers also wrote the shared_ptr under the shared lock while others read it.)
+				// (A retry that came back pending: the refused set is still the slot's.) (The GPU thread's only: workers
+				// would write the shared_ptr under the shared lock while others read it. A speculation's TableResolveSet keeps
+				// the catalog's read across its program lookup, its guest reads made without a fault; were it ever released
+				// there, the owner could destroy `retried` meanwhile (TableReset, the set collection, a publish).)
 				if (Spec::Current() == nullptr && retried != nullptr && set == nullptr && TableLearnPortable() == 2 &&
 				    m_context.GetPipelineCache().TablePending()) {
 					// (Under the catalog's write lock: workers read retry_wait under the shared one, and this assignment can drop

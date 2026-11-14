@@ -291,6 +291,10 @@ struct ShaderHashNoFaultScope {
 	explicit ShaderHashNoFaultScope(bool on) noexcept: old(t_shader_hash_no_fault) { t_shader_hash_no_fault = on || old; }
 	~ShaderHashNoFaultScope() { t_shader_hash_no_fault = old; }
 };
+// Under t_shader_hash_no_fault a program's guest reads (the hash, the AGC metadata, the vertex tables) are guarded copies:
+// one that would fault reads zeros and sets t_shader_read_failed (sticky: its reader clears it). Otherwise a plain load.
+extern thread_local bool t_shader_read_failed;
+bool ShaderReadGuest(void* out, const void* guest, size_t bytes);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
