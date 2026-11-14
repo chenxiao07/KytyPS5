@@ -63,7 +63,10 @@
 - Memory-level parallelism: misses overlap; removing sampled lookups often leaves per-call cost unchanged. Expect it
   whenever per-item cost is latency (cold tables, guest pages, TLB).
 - In-process samplers distort what they measure (thread suspension made 0.5-1.8 s walk frames, let game threads take
-  the render CPUs); judge hitches unprofiled, sample with a bounded external unwinder.
+  the render CPUs); judge hitches unprofiled, sample with a bounded external unwinder. Worst case: a thread that holds
+  locks across system calls (the upload worker: the address space's lock shared, a region's spin lock) suspended at
+  4 kHz stalls every writer and then every reader - 0-3 slow frames per world change unprofiled became 12-39, with
+  frames of 1.5-35 s. Compare the hitch counts of profiled and unprofiled rounds before reading a hitch profile.
 - Diagnostics leak cost: TEMP counters slowed a day of A/Bs; stdout writes blocked ~6 ms (async stdout pipe);
   census scopes inflate small phases ~10x. Off = one relaxed load; keep them in an uncommitted diag set.
 - Worker "busy" is mostly spin; a worker is a wall only if the critical thread waits on it.
