@@ -84,6 +84,8 @@ static bool IsHole(uint32_t header) {
 
 // A chunk's translation stopped where the next chunk begins (Result::stop).
 static constexpr char ChunkEnd[] = "chunk end";
+// A result that ends before a packet whose command words lie on a page a read watcher guards (ProcessPm4Spec).
+static constexpr char CommandWordsWatched[] = "command words watched";
 
 // "Work wrote what it read", by the write's kind and what logged it (null: not found).
 static const char* WroteWhatItRead(const Spec::EffectsLog::Entry* entry) {
@@ -239,6 +241,7 @@ bool Speculation::StatePass(const Job& job, uint64_t which) {
 		Spec::t_record       = chunk.record.get();
 		const auto processed = m_state->Process(execution, job.commands);
 		Spec::t_record       = nullptr;
+		(void)m_state->TakeWatchedStop(); // (a stop before a packet on a page without access: the pass ends, not followed)
 		const bool boundary  = processed != Pm4ProcessResult::Complete && m_state->TakeBoundary();
 		chunk.end            = execution;
 		chunk.last           = !boundary;
@@ -747,7 +750,9 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 			const auto processed = processor.Process(spec, commands);
 			if (r.state.refused == nullptr) {
 				// (Its chunk's end, or a constant engine wait.)
-				if (processed != Pm4ProcessResult::Complete) r.stop = processor.TakeStopReached() ? ChunkEnd : "suspended";
+				// (CommandWordsWatched: its next packet's words on a page a read watcher guards, ProcessPm4Spec.)
+				if (processed != Pm4ProcessResult::Complete)
+					r.stop = processor.TakeStopReached() ? ChunkEnd : processor.TakeWatchedStop() ? CommandWordsWatched : "suspended";
 				break;
 			}
 			// (A packet that does not fit its buffer, refused "malformed packet" before its Mark: a command buffer the game
@@ -809,6 +814,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	Spec::t_state = nullptr;
 	processor.SetStopAt(nullptr);
 	(void)processor.TakeStopReached();
+	(void)processor.TakeWatchedStop();
 	// (The draw state the translation goes on from is not this thread's shadow any more.)
 	DrawStateObserver::Invalidate();
 	translator.draw->NativeXprForgetState();

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/guardedCopy.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -526,6 +527,29 @@ bool CommandProcessor::SamePosition(const Pm4Execution& a, const Pm4Execution& b
 		    a.m_buffer_stack[i].offset_dw != b.m_buffer_stack[i].offset_dw)
 			return false;
 	return true;
+}
+
+void CommandProcessor::PrintPacketAt(const Pm4Execution& at, const char* what) {
+	if (at.m_buffer_stack.empty()) {
+		std::printf("%s: no position\n", what);
+		return;
+	}
+	const auto&    cursor  = at.m_buffer_stack.back();
+	const auto*    words   = cursor.commands.data();
+	const auto     size    = cursor.commands.size();
+	const uint32_t offset  = cursor.offset_dw;
+	const uint32_t header  = offset < size ? words[offset] : 0u;
+	const uint32_t before  = offset >= 5u ? words[offset - 5u] : 0u;
+	const bool     same    = offset >= 5u && offset + 5u <= size && before == 0xc0032500u &&
+	                         words[offset - 3u] == words[offset + 2u] && words[offset - 2u] == words[offset + 3u] &&
+	                         words[offset - 1u] == words[offset + 4u];
+	const auto     address = reinterpret_cast<uint64_t>(words + offset);
+	std::printf("%s: header 0x%08x at dword %u of %zu (depth %zu), %u bytes past a 4 KiB boundary%s; 5 dwords before: 0x%08x, "
+	            "%s\n",
+	            what, header, offset, size, at.m_buffer_stack.size(), static_cast<uint32_t>(address & 4095u),
+	            (address & 4095u) < 20u ? " (within 20)" : "", before,
+	            same ? "an indexed indirect draw of the same words 2-4 (inside a run)" : "not a run's packet before it");
+	std::fflush(stdout);
 }
 
 // A draw or dispatch: what chunks of a command buffer are counted in.
@@ -2204,6 +2228,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 	}
 }
 
+// The most DRAW_INDEX_INDIRECT packets (0xc0032500, 5 dwords each) a run of indirect draws takes in one step
+// (TryNativeXprDraws, TryDrawIndirectRun): what they read from a run's first word is within DrawIndirectRunMax * 5 dwords.
+static constexpr uint32_t DrawIndirectRunMax = 64;
+
 // KYTY_SPECULATE=4's PM4 loop (ProcessPm4 chooses it): the state pass's and a speculation's checks, refusals and
 // recoverable exits, and the GPU thread's chunk stops.
 void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth) {
@@ -2216,6 +2244,34 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 	const auto refuse = [&](const char* why) {
 		Spec::Refuse(why);
 		execution.m_suspended = true;
+	};
+	// A speculation's or the state pass's thread (not the GPU thread) reads no command word on a page a read watcher
+	// guards: GNM allocates labels in its command buffers, a page holding a label the GPU wrote is no-access until it is
+	// downloaded, and that fault waits for the GPU thread (spec_thread_gpu_faults), which may be waiting for this thread.
+	// The execution suspends before the packet, as at a chunk's end: a speculation's result ends there ("command words
+	// watched", nothing refused or rolled back) and the GPU thread translates on from it in order; a state pass ends there.
+	// Each packet is probed anew, from its first word to the end of the page of its last (clean_end); PrefetchNextDraw, which
+	// reads past the packet, is held to that range, and a run of indirect draws is read from a guarded copy of its words
+	// (below, at the stop check). (A protection added after the probe is the race the tripwire still counts.)
+	// The pages are probed, not asked: a guarded one-byte copy of each page's first byte read (Common::GuardedCopy, which the
+	// exception filter resumes before any fault handler, so a probe never waits for the GPU thread). Asking the read watchers
+	// (Memory::ReadFaults) missed the other protections (KYTY_READ_GUARD's guard pages among them): the tripwire still read 0.1
+	// a frame (fxv6r, 14 Nov). The probe reads the pointer the packet is read through (a backing view's when rebased).
+	const bool off_gpu_thread = (spec != nullptr || m_state_only) && !GuestGpu::IsGpuThread();
+	uint64_t   clean_end      = 0;
+	const auto watched        = [&](uint64_t host, uint64_t bytes) {
+		if (!off_gpu_thread) return false;
+		const uint64_t end = ((host + bytes - 1) | uint64_t {4095}) + 1;
+		for (uint64_t at = std::max(host, clean_end); at < end; at = (at | uint64_t {4095}) + 1) {
+			uint8_t probe = 0;
+			if (Common::GuardedCopy(&probe, reinterpret_cast<const void*>(at), 1) != 0) {
+				m_watched_stop        = true;
+				execution.m_suspended = true;
+				return true;
+			}
+		}
+		clean_end = std::max(clean_end, end);
+		return false;
 	};
 	while (execution.m_buffer_stack.size() > stop_depth) {
 		if (spec != nullptr && spec->refused != nullptr) return refuse(spec->refused);
@@ -2259,6 +2315,10 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			continue;
 		}
 
+		// (Its header's page first, to the page's end; then its words' pages once its length is read.)
+		const auto packet_at = reinterpret_cast<uint64_t>(cursor.commands.data() + cursor.offset_dw); // (the pointer read)
+		clean_end               = 0;
+		if (watched(packet_at, 4u)) return;
 		const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
 		const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
@@ -2275,6 +2335,10 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			execution.m_suspended = true;
 			return;
 		}
+		if (packet_header != 0x80000000u && watched(packet_at, uint64_t {KYTY_PM4_LEN(packet_header)} * 4u)) return;
+		// (The words a prefetch, a hint, may read from here: off the GPU thread, the checked range only.)
+		const auto run_dw = off_gpu_thread ? static_cast<uint32_t>(std::min<uint64_t>(remaining_dw, (clean_end - packet_at) / 4u))
+		                                   : remaining_dw;
 
 		if (packet_header == 0x80000000u) {
 			if (note_words) spec->NoteCommandWords(reinterpret_cast<uint64_t>(cursor.Position() + cursor.offset_dw), 4u);
@@ -2333,6 +2397,71 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			m_stop_reached        = true;
 			execution.m_suspended = true;
 			return;
+		}
+		// A run of indirect draws (TryNativeXprDraws, TryDrawIndirectRun: up to DrawIndirectRunMax packets in one step). Off
+		// the GPU thread its readers parse a guarded copy of its words (Common::GuardedCopy into a thread-local buffer), never
+		// the command memory: a copy stops at the first page without access, so the readers' span ends before that page and
+		// the worker takes the run's head part; the packet on that page is the next one, whose probe suspends the execution
+		// before it. Only a copy that cannot take the head packet's own words suspends before the head. No word of the run is
+		// read outside the copy (no window between a probe and the read). The threads' runs may then differ (a worker's ends
+		// before a page without access; a worker tries only the table draw, a refusal is a hole, while the GPU thread in
+		// SegmentAsHole, its draw state shadow not clean, falls through to TryDrawIndirectRun; m_draw_run_skip differs after
+		// a hole), so a run on the GPU thread may begin before and reach past a point where a worker's ended. (5606d838 held
+		// the readers to the packet's own pages: the GPU thread's whole run passed the hole after the worker's first half, "a
+		// segment run as a hole did not reach its hole", 14 Nov.) What guarantees that SegmentAsHole reaches its hole is the
+		// stop cap below, on every thread. The state pass reads no run (draws are passed over).
+		uint32_t        draw_run_dw = remaining_dw;
+		const uint32_t* run_words   = packet;
+		if (packet_header == 0xc0032500u && !m_state_only) {
+			// A stop (SetStopAt) ahead in this buffer caps the run there, on every thread and always, so a stop inside a run is
+			// honoured. A stop at or past the run's end leaves the run as it was (it ends at its last matching packet either
+			// way); with no stop set nothing changes.
+			const uint32_t reach_dw = std::min(remaining_dw, DrawIndirectRunMax * 5u);
+			uint32_t       to_stop  = 0;
+			if (m_stop_at != nullptr && m_stop_at->m_buffer_stack.size() == execution.m_buffer_stack.size()) {
+				const auto& stop_stack = m_stop_at->m_buffer_stack;
+				bool        same       = true;
+				for (size_t i = 0; same && i <= buffer_index; ++i)
+					same = stop_stack[i].Position() == execution.m_buffer_stack[i].Position() &&
+					       (i == buffer_index || stop_stack[i].offset_dw == execution.m_buffer_stack[i].offset_dw);
+				const uint32_t stop_dw = stop_stack[buffer_index].offset_dw;
+				to_stop                = same && stop_dw > cursor.offset_dw ? stop_dw - cursor.offset_dw : 0u;
+			}
+			const bool capped = to_stop >= 5u && to_stop < reach_dw;
+			if (capped) draw_run_dw = to_stop;
+			// (Off the GPU thread, the copy: the head and the next packet first (a lone head copies 40 bytes), the rest of the
+			// reach only when the next packet continues the run as the readers match it. The span is the words copied: a
+			// packet the copy did not take whole is outside it ((count + 1) * 5 <= the span), so no reader reads it.)
+			if (off_gpu_thread) {
+				static thread_local std::array<uint32_t, DrawIndirectRunMax * 5u> run_copy;
+				const uint32_t reach = std::min(draw_run_dw, DrawIndirectRunMax * 5u);
+				// (Words [from, to) copied; returns the end of what was, up to a page without access.)
+				const auto copy = [&](uint32_t from, uint32_t to) {
+					const uint64_t bytes = uint64_t {to - from} * 4u;
+					return from + static_cast<uint32_t>((bytes - Common::GuardedCopy(run_copy.data() + from, packet + from, bytes)) / 4u);
+				};
+				uint32_t copied = copy(0, std::min(reach, 10u));
+				if (copied < 5u) { // (the head's own words: before the packet, as the probe stops)
+					m_watched_stop        = true;
+					execution.m_suspended = true;
+					return;
+				}
+				if (copied == 10u && reach > 10u && run_copy[5] == 0xc0032500u && run_copy[7] == run_copy[2] &&
+				    run_copy[8] == run_copy[3] && run_copy[9] == run_copy[4])
+					copied = copy(10u, reach);
+				draw_run_dw = copied;
+				run_words   = run_copy.data();
+			} else if (capped) {
+				// (DIAG, on a thread that reads command words freely: the packets up to and at the stop continue this run, so
+				// the cap cut it. It can fire legitimately, when the threads took a run differently; rate-limited.)
+				bool inside = to_stop % 5u == 0;
+				for (uint32_t at = 5; inside && at <= to_stop; at += 5u)
+					inside = at + 5u <= remaining_dw && packet[at] == 0xc0032500u && packet[at + 2] == packet[2] &&
+					         packet[at + 3] == packet[3] && packet[at + 4] == packet[4];
+				static std::atomic<uint32_t> inside_reports {0};
+				if (inside && inside_reports.fetch_add(1, std::memory_order_relaxed) < 16)
+					std::printf("Speculation: a stop inside a run of indirect draws (%u dwords on): the run cut there\n", to_stop);
+			}
 		}
 		// A state pass's chunk boundary (SetChunking): not within a run of indirect draws, which a translation takes
 		// together (the packet runs when the pass resumes, counted again).
@@ -2414,7 +2543,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		// (A speculation off the GPU thread, which AddPm4 does not count: its indexed draws, which its commit counts for
 		// the presenter's 3D view, FrameGen::TakeScene. A refused packet's go with it: Rollback.)
 		if (note_words && FrameGen::IsIndexedDrawPacket(opcode)) ++spec->indexed_draws;
-		if (DrawsOrDispatches(opcode)) PrefetchNextDraw(packet, remaining_dw);
+		if (DrawsOrDispatches(opcode)) PrefetchNextDraw(packet, run_dw);
 		if (XprCapture::Enabled()) {
 			if (opcode == Pm4::IT_DRAW_INDEX_INDIRECT) {
 				XprCapture::ObserveDraw(m_draw_indirect_args_base_addr + packet[1]);
@@ -2441,7 +2570,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 				m_renderer.GetRenderExecutor().NativeXprForgetState();
 			if (packet_header == 0xc0032500u && !GraphicsRunDebugDumpEnabled()) {
 				const auto consumed =
-				    TryNativeXprDraws({packet, remaining_dw}, DrawStateObserver::g_shadow.last_clean);
+				    TryNativeXprDraws({run_words, draw_run_dw}, DrawStateObserver::g_shadow.last_clean);
 				if (consumed) {
 					// (The run's other packets: their words noted too, after the first's.)
 					if (note_words && consumed > KYTY_PM4_LEN(packet_header))
@@ -2533,7 +2662,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 #endif
 		if (opcode != Pm4::IT_DRAW_INDEX_INDIRECT) m_draw_run_skip = 0;
 		if (packet_header == 0xc0032500u && !GraphicsRunDebugDumpEnabled()) {
-			const auto consumed = TryDrawIndirectRun({packet, remaining_dw});
+			const auto consumed = TryDrawIndirectRun({run_words, draw_run_dw});
 			if (consumed) {
 				// (The run's other packets: their words noted too, after the first's.)
 				if (note_words && consumed > KYTY_PM4_LEN(packet_header))
@@ -2776,7 +2905,7 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 	}
 	// A run: consecutive packets that differ only in the argument offset draw
 	// the same object (no register write between them).
-	constexpr uint32_t max_draws = 64;
+	constexpr uint32_t max_draws = DrawIndirectRunMax;
 	uint32_t           count     = 1;
 	while (count < max_draws && (count + 1u) * 5u <= packets.size()) {
 		const auto* next = packets.data() + count * 5u;
@@ -3017,7 +3146,7 @@ uint32_t CommandProcessor::TryNativeIndirectAutoDraw(std::span<const uint32_t> p
 }
 
 uint32_t CommandProcessor::TryDrawIndirectRun(std::span<const uint32_t> packets) {
-	constexpr uint32_t max_draws = 64;
+	constexpr uint32_t max_draws = DrawIndirectRunMax;
 	if (FrameCapture::Active()) return 0; // one record per draw while a frame is recorded
 	if (m_draw_run_skip) {
 		--m_draw_run_skip;
