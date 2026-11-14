@@ -2302,8 +2302,11 @@ void AvoidCpuList(const char* avoid_cpus) {
 	    avoid != 0 && sched_getaffinity(0, sizeof(set), &set) == 0) {
 		for (int cpu = 0; cpu < 64; ++cpu)
 			if ((avoid >> cpu) & 1u) CPU_CLR(cpu, &set);
-		// (A thread the render thread made inherits its one CPU: the process's other CPUs instead.)
-		if (CPU_COUNT(&set) == 0 && core != 0 && sched_getaffinity(getpid(), sizeof(set), &set) == 0)
+		// (A thread the render thread made inherits its CPUs, its one CPU or all of
+		// KYTY_RENDER_CPUS: the process's other CPUs instead. Without this a speculation worker the
+		// GPU thread started stayed on the render threads' CPUs, and mode 4 ran at one of two
+		// levels for as long as its workers lived.)
+		if (CPU_COUNT(&set) == 0 && sched_getaffinity(getpid(), sizeof(set), &set) == 0)
 			for (int cpu = 0; cpu < 64; ++cpu)
 				if ((avoid >> cpu) & 1u) CPU_CLR(cpu, &set);
 		if (CPU_COUNT(&set) != 0) (void)sched_setaffinity(0, sizeof(set), &set);
