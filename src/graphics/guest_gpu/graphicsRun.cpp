@@ -307,9 +307,11 @@ void GuestGpu::ServePendingCommands() {
 	g_gpu_state->ProcessCommands();
 }
 
+// (Sequentially consistent: a flip wait stores its flag and then asks this, SendCommand adds to the count and then reads
+// the flag (FlipQueue::Wait / InterruptWait); one of the two must see the other. An x86 load either way.)
 bool GuestGpu::CommandsPending() noexcept {
 	return t_command_depth == 0 && g_gpu_state != nullptr &&
-	       g_gpu_state->m_pending_commands.load(std::memory_order_acquire) != 0;
+	       g_gpu_state->m_pending_commands.load(std::memory_order_seq_cst) != 0;
 }
 
 void GuestGpu::ProcessCommands() {
