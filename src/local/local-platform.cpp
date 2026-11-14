@@ -2088,7 +2088,12 @@ static uint32_t TrimHeap() {
 #else
 
 void SetThreadName(const char* name) {
-	(void)pthread_setname_np(pthread_self(), name);
+	// (Linux takes 15 characters at most and refuses a longer name whole: the thread kept the name
+	// of the thread that started it. The speculation workers showed up as Kyty.Gpu or as one of the
+	// game's job threads (BPE_JobWorkerTh).)
+	char text[16] {};
+	std::strncpy(text, name, sizeof(text) - 1);
+	(void)pthread_setname_np(pthread_self(), text);
 }
 
 uint32_t ThreadId() {
