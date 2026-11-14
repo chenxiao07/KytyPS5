@@ -17,6 +17,7 @@
 #include "libs/errno.h"
 #include "live-census.h"
 #include "write-guard.h"
+#include "draw-state-observer.h"
 #include "live-counters.h"
 #include "speculation-state.h"
 
@@ -143,9 +144,10 @@ void ReportOtherData(uint32_t cmd_id, uint32_t offset) {
 	uint32_t*                          words = nullptr;
 	// (A state pass's: ProcessPm4Spec's copy of this packet's table, the words the observer read, taken, not copied again;
 	// nothing between writes the table, its SyncCommandMemory returns at once. A speculation's copies here, after its
-	// check, as before: ProcessPm4Spec keys none for it.)
-	if (auto& early = t_indirect_table_copy;
-	    early.packet == packet && early.table == reinterpret_cast<uint64_t>(table) && early.pairs == pairs) {
+	// check, as before (its early copy is not shared).)
+	auto&      early = t_indirect_table_copy;
+	const bool keyed = early.packet == packet && early.table == reinterpret_cast<uint64_t>(table) && early.pairs == pairs;
+	if (keyed && early.shared) {
 		early.packet = nullptr;
 		words        = early.words.data();
 	} else {
@@ -174,6 +176,16 @@ void ReportOtherData(uint32_t cmd_id, uint32_t offset) {
 			if (!read && Common::GuardedCopy(words, table, uint64_t {pairs} * 8u) != 0) {
 				if (Spec::Current() != nullptr) Spec::Refuse("GPU-written guest memory");
 				return false;
+			}
+		}
+		// (A speculation's: the observer read the early copy, before the check. A table downloaded between, other bytes
+		// now: the shadow may have missed a change (a draw after taken as clean, its previous state key reused), so nothing
+		// it holds is known any more. Invalidate, not the pairs applied again: the early copy's writes stay in it.)
+		if (keyed) {
+			early.packet = nullptr;
+			if (std::memcmp(words, early.words.data(), uint64_t {pairs} * 8u) != 0) {
+				DrawStateObserver::Invalidate();
+				LiveCounters::Add(LiveCounters::SpecIndirectTableChanged);
 			}
 		}
 	}

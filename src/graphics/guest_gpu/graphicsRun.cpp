@@ -2471,7 +2471,8 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		// table: the observer reads the copy, and a state pass's GuardTable takes it too (t_indirect_table_copy), one copy,
 		// not two. A speculation's GuardTable copies again after its SyncCommandMemory check, as before: a copy taken before
 		// that check could hold the bytes of a table GPU work wrote and the check then found downloaded (the check refuses
-		// and notes the clean read, so it cannot run here, before the packet is entered). A state pass checks nothing
+		// and notes the clean read, so it cannot run here, before the packet is entered); bytes other than the observer's
+		// invalidate the observer's shadow (GuardTable). A state pass checks nothing
 		// (SyncCommandMemory returns at once). (WRITE_DATA packets are few a frame.) The GPU thread and mode 0 read as before.
 		const uint32_t*           handler_words = packet;
 		std::span<const uint32_t> table_words;
@@ -2502,7 +2503,8 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 						std::memcpy(copy.words.data(), backing, bytes);
 					else if (Common::GuardedCopy(copy.words.data(), reinterpret_cast<const void*>(table), bytes) != 0)
 						return stop_before();
-					if (spec == nullptr) copy.packet = packet, copy.table = table, copy.pairs = pairs; // (a state pass's)
+					// (Shared with a state pass's GuardTable; a speculation's compares its own copy with it.)
+					copy.packet = packet, copy.table = table, copy.pairs = pairs, copy.shared = spec == nullptr;
 					table_words = {copy.words.data(), copy.words.size()};
 				}
 			}
