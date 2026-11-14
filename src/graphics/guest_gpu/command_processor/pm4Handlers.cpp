@@ -143,9 +143,28 @@ void ReportOtherData(uint32_t cmd_id, uint32_t offset) {
 	// (KYTY_WRITE_GUARD_SPEC: a table on a guarded page, through the backing view: the bytes the GPU thread wrote.)
 	if (const auto* backing = WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(table), uint64_t {pairs} * 8u)) {
 		std::memcpy(copy.data(), backing, uint64_t {pairs} * 8u);
-	} else if (Common::GuardedCopy(copy.data(), table, uint64_t {pairs} * 8u) != 0) {
-		if (Spec::Current() != nullptr) Spec::Refuse("GPU-written guest memory");
-		return false;
+	} else {
+		bool read = false;
+#if !defined(_WIN32)
+		// (Linux, KYTY_SPEC_BACKING_READS / live spec_backing_reads 1: GuardedCopy is a pread of
+		// /proc/self/mem there, a system call per table under the mmap lock (~6000 a frame at the
+		// 1-1 stand). A table a read watcher guards is refused, as the fault refuses it on Windows;
+		// any other is read through the backing view.)
+		static auto& backing_reads = LiveSwitch::Find("spec_backing_reads", 1);
+		if (backing_reads.load(std::memory_order_relaxed) != 0) {
+			const auto address = reinterpret_cast<uint64_t>(table);
+			if (Libs::LibKernel::Memory::ReadFaults(address, uint64_t {pairs} * 8u)) {
+				if (Spec::Current() != nullptr) Spec::Refuse("GPU-written guest memory");
+				return false;
+			}
+			read = Libs::LibKernel::Memory::TryReadBackingToHost(address, copy.data(),
+			                                                     uint64_t {pairs} * 8u);
+		}
+#endif
+		if (!read && Common::GuardedCopy(copy.data(), table, uint64_t {pairs} * 8u) != 0) {
+			if (Spec::Current() != nullptr) Spec::Refuse("GPU-written guest memory");
+			return false;
+		}
 	}
 	for (uint32_t i = 0; i < pairs; ++i) {
 		const uint32_t raw = copy[size_t {i} * 2u];
