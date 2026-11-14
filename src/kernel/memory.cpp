@@ -1296,6 +1296,83 @@ static bool TryReleaseParkedView(uint64_t vaddr, uint64_t size) {
 // heap below it), so hint-less searches must not fall back to the low system-managed range.
 static constexpr uint64_t GUEST_DEFAULT_MAP_BASE = 0x200000000ull;
 
+// The guest's own placements: the ranges it asked the kernel for as one unit (a hint-less mapping or reservation where
+// FindGuestFreeRange put it; a fixed one outside every placement), whatever the virtual ranges merge or split since
+// (adjacent flexible mappings or reservations of one kind merge there, a reservation mapped piece by piece is split).
+// Which allocations end up adjacent is first-fit in lock-arrival order and differs from boot to boot; a placement does
+// not (leap_guest_edge, BufferCache::ResolveOverlaps; the live `buffers` report). A new placement replaces the parts of
+// older ones it overlaps (memory unmapped and placed again); an unmap that covers a placement whole removes it; a fixed
+// mapping inside one placement is a part of it (a pool or reservation the game maps piece by piece). Its own lock, a
+// leaf: taken under the memory operations' lock by the guest's calls, and by the GPU thread's lookups.
+// Kept only with KYTY_LEAP_GUEST_EDGE set non-zero at start-up (read once, before any guest memory call): otherwise,
+// the default, nothing here runs on any guest call (no lock, no insert or erase) and GuestPlacement knows no placement.
+static const bool g_guest_placements_kept = [] {
+	const char* value = std::getenv("KYTY_LEAP_GUEST_EDGE");
+	return value != nullptr && *value != '\0' && std::strtoll(value, nullptr, 10) != 0;
+}();
+class GuestPlacements {
+public:
+	void Place(uint64_t start, uint64_t size) {
+		if (!g_guest_placements_kept || size == 0 || UINT64_MAX - start < size) return;
+		const auto      end = start + size;
+		std::lock_guard lock(m_mutex);
+		auto            it = m_by_start.upper_bound(start);
+		if (it != m_by_start.begin()) --it;
+		while (it != m_by_start.end() && it->first < end) {
+			const auto [from, to] = *it;
+			if (to <= start) {
+				++it;
+				continue;
+			}
+			it = m_by_start.erase(it);
+			if (from < start) m_by_start.emplace(from, start);
+			if (to > end) m_by_start.emplace(end, to);
+		}
+		m_by_start.emplace(start, end);
+	}
+	void PlaceFixed(uint64_t start, uint64_t size) {
+		if (!g_guest_placements_kept || size == 0 || UINT64_MAX - start < size) return;
+		{
+			std::lock_guard lock(m_mutex);
+			if (const auto it = m_by_start.upper_bound(start); it != m_by_start.begin() && std::prev(it)->second >= start + size)
+				return;
+		}
+		Place(start, size);
+	}
+	void RemoveWithin(uint64_t start, uint64_t size) {
+		if (!g_guest_placements_kept || size == 0 || UINT64_MAX - start < size) return;
+		const auto      end = start + size;
+		std::lock_guard lock(m_mutex);
+		for (auto it = m_by_start.lower_bound(start); it != m_by_start.end() && it->first < end;)
+			it = it->second <= end ? m_by_start.erase(it) : std::next(it);
+	}
+	bool Find(uint64_t address, uint64_t* base, uint64_t* size) {
+		if (!g_guest_placements_kept) return false;
+		std::lock_guard lock(m_mutex);
+		auto            it = m_by_start.upper_bound(address);
+		if (it == m_by_start.begin()) return false;
+		--it;
+		if (address >= it->second) return false;
+		*base = it->first;
+		*size = it->second - it->first;
+		return true;
+	}
+
+private:
+	std::mutex                   m_mutex;
+	std::map<uint64_t, uint64_t> m_by_start; // start -> end, disjoint
+};
+// (Never freed: the GPU thread may look one up while statics are destroyed at exit.)
+static GuestPlacements& g_guest_placements = *new GuestPlacements;
+
+bool GuestPlacement(uint64_t vaddr, uint64_t* base, uint64_t* size) {
+	return base != nullptr && size != nullptr && g_guest_placements.Find(vaddr, base, size);
+}
+
+bool GuestPlacementsKept() {
+	return g_guest_placements_kept;
+}
+
 static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t alignment) {
 	EXIT_IF(g_guest_address_space == nullptr || g_virtual_ranges == nullptr);
 
@@ -3373,6 +3450,12 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 	     in_addr, out_addr, len, Common::EnumName(mode).c_str(), static_cast<uint32_t>(flags), name,
 	     Common::EnumName(gpu_mode).c_str());
 
+	if ((flags & GUEST_MAP_FIXED) != 0) {
+		g_guest_placements.PlaceFixed(out_addr, len);
+	} else {
+		g_guest_placements.Place(out_addr, len);
+	}
+
 	residency_lock.unlock();
 	MapGpuRange(out_addr, len);
 
@@ -3625,6 +3708,8 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	const int result = UnmapMemoryRange(vaddr, len);
 	if (result != OK) {
 		RestoreGpuRangeProtection(vaddr, len);
+	} else {
+		g_guest_placements.RemoveWithin(vaddr, len);
 	}
 	return result;
 }
@@ -3941,6 +4026,7 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
 
 	for (const auto& alias: mapped_aliases) {
 		EXIT_IF(!g_virtual_ranges->Remove(alias.map_vaddr, alias.map_size));
+		g_guest_placements.RemoveWithin(alias.map_vaddr, alias.map_size);
 	}
 
 	for (const auto& block: allocated_span) {
@@ -4176,6 +4262,12 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 			                               consumed_range.name));
 		}
 		return KERNEL_ERROR_EBUSY;
+	}
+
+	if (fixed || consumed_reservation) {
+		g_guest_placements.PlaceFixed(out_addr, len);
+	} else {
+		g_guest_placements.Place(out_addr, len);
 	}
 
 	residency_lock.unlock();
@@ -4536,6 +4628,11 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 	    !g_virtual_ranges->Add(out_addr, len, 0, 0, 0, VirtualRangeType::Reserved, "anon")) {
 		return KERNEL_ERROR_EBUSY;
 	}
+	if ((flags & GUEST_MAP_FIXED) != 0) {
+		g_guest_placements.PlaceFixed(out_addr, len);
+	} else {
+		g_guest_placements.Place(out_addr, len);
+	}
 
 	*addr = reinterpret_cast<void*>(out_addr);
 
@@ -4750,6 +4847,11 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 		EXIT_IF(!g_guest_address_space->ReleaseCommitted(vaddr, mapped_size));
 		return 0;
 	}
+	if (fixed) {
+		g_guest_placements.PlaceFixed(vaddr, mapped_size);
+	} else {
+		g_guest_placements.Place(vaddr, mapped_size);
+	}
 	MapGpuRange(vaddr, mapped_size);
 	return vaddr;
 }
@@ -4832,6 +4934,8 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	const bool freed = FreeGuestMemoryOwner(vaddr, mapped_size);
 	if (!freed) {
 		RestoreGpuRangeProtection(vaddr, mapped_size);
+	} else {
+		g_guest_placements.RemoveWithin(vaddr, mapped_size);
 	}
 	return freed;
 }

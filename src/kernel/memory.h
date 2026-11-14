@@ -179,6 +179,11 @@ bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t si
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // The end of the guest mapping (one committed virtual range) `vaddr` lies in; 0 when none.
 [[nodiscard]] uint64_t MappingEnd(uint64_t vaddr);
+// The guest's own placement `vaddr` lies in (the range one hint-less mapping or reservation got, or a fixed one outside
+// any: memory.cpp GuestPlacements), mapped or not; false when none. Takes a leaf lock of its own only (any thread).
+bool                   GuestPlacement(uint64_t vaddr, uint64_t* base, uint64_t* size);
+// Whether placements are kept this boot (KYTY_LEAP_GUEST_EDGE non-zero at start-up); else GuestPlacement knows none.
+bool                   GuestPlacementsKept();
 // Whether guest mappings cover all of [vaddr, vaddr + size), and the parts they cover (as
 // (address, size), in order): what can be read of a range that reaches into unmapped memory.
 [[nodiscard]] bool     IsFullyMapped(uint64_t vaddr, uint64_t size);

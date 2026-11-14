@@ -2238,10 +2238,44 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 		}
 		return first;
 	};
+	// KYTY_LEAP_GUEST_EDGE (live leap_guest_edge; 0, the default in every mode: as before): the padding below - the
+	// stream leap and the room - stays inside the guest's own placement the request lies in (LibKernel::Memory::
+	// GuestPlacement: the range one hint-less mapping or reservation got): to the right up to the end of the placement
+	// of the request's first byte, to the left down to the start of the placement of its last byte. Without it the
+	// padding runs to the end of the mapped run, over whatever allocation sits next to the request's, and which one does
+	// is first-fit in lock-arrival order (memory.cpp FindGuestFreeRange): one boot's 120 MiB pool became a 136 MiB buffer
+	// by joining a separate 16 MiB allocation that sat at its end that boot, another boot's only a 2.5 MiB one. Only
+	// padding is bounded: the request and the buffers it overlaps are joined as before, across an edge too (a request
+	// over two placements stays one buffer), and memory with no placement known pads as before.
+	// The placements are kept only when KYTY_LEAP_GUEST_EDGE is on at start-up (memory.cpp): set on live in a boot that
+	// started without it, the switch does nothing (said once); set off live, padding is unbounded again.
+	static auto& guest_edge   = LiveSwitch::Find("leap_guest_edge", 0);
+	bool         edges_known  = false;
+	bool         edge_clamped = false; // (a leap the edge shortened: one left with no bytes is no stream leap, below)
+	uint64_t     edge_left = 0, edge_right = UINT64_MAX;
+	const auto   guest_edges = [&] {
+		if (std::exchange(edges_known, true) || guest_edge.load(std::memory_order_relaxed) == 0) return;
+		if (!LibKernel::Memory::GuestPlacementsKept()) {
+			static std::atomic_bool said {false};
+			if (!said.exchange(true))
+				std::printf("leap_guest_edge: on, but KYTY_LEAP_GUEST_EDGE was off at start-up: no guest placements kept, "
+				            "padding unbounded\n");
+			return;
+		}
+		uint64_t base = 0, bytes = 0;
+		if (LibKernel::Memory::GuestPlacement(vaddr, &base, &bytes)) edge_right = base + bytes;
+		if (LibKernel::Memory::GuestPlacement(vaddr + size - 1, &base, &bytes)) edge_left = base;
+	};
 	// A leap covers memory the game maps only (its run from the edge): over an unmapped gap it joined the buffers of
 	// pieces mapped apart into one that held the gaps in video memory too (1-1 after two world trips: a pool mapping 256
 	// KiB of each MiB in one buffer of 369 MiB, 236 MiB of it unmapped; 349 MiB in 29 buffers).
 	const auto leap_right = [&](uint64_t from, uint64_t to) {
+		guest_edges();
+		if (edge_right < to) {
+			edge_clamped = true;
+			to           = std::max(from, edge_right);
+		}
+		if (to <= from) return from;
 		if (m_resources == nullptr) return to;
 		RangeSet mapped;
 		m_resources->MappedRanges(from, to - from, mapped);
@@ -2252,6 +2286,12 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 		return reach & ~(CACHING_PAGESIZE - 1);
 	};
 	const auto leap_left = [&](uint64_t from, uint64_t to) {
+		guest_edges();
+		if (edge_left > from) {
+			edge_clamped = true;
+			from         = std::min(to, edge_left);
+		}
+		if (from >= to) return to;
 		if (m_resources == nullptr) return from;
 		RangeSet mapped;
 		m_resources->MappedRanges(from, to - from, mapped);
@@ -2282,6 +2322,8 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 		end                       = std::max(end, buffer_end);
 		if (!has_stream_leap && (stream_score += buffer.StreamScore()) > StreamLeapThreshold) {
 			has_stream_leap = true;
+			edge_clamped    = false;
+			const auto leap_begin = begin, leap_end = end;
 			// Fix the shadPS4 bug that reserves space opposite to the incoming stream's growth.
 			// The old buffer extending left of the request predicts growth to the right, and vice versa.
 			if (expands_left) {
@@ -2295,6 +2337,9 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 				first = find_first(begin);
 				begin = std::min(begin, first->first);
 			}
+			// (leap_guest_edge: a leap the placement's edge left with no bytes is none: the stream scores still carry
+			// and the room below still applies, as for a buffer that never leapt.)
+			if (edge_clamped && begin == leap_begin && end == leap_end) has_stream_leap = false;
 		}
 	}
 	// A big buffer growing (a pool the game fills over minutes: one of 638 MB made whole again six times up to 910 MB, on
