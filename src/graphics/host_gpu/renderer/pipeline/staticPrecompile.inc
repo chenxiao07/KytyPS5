@@ -447,6 +447,7 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 		std::vector<uint32_t> user_data(seed.user_data_count);
 		auto                  options = LocalShaderWarmup::Options(seed, user_data);
 		options.table_mode            = table;
+		options.table_dead_user_data  = table && TableDeadUserDataOn(); // (as ProgramCache::Get's table jobs)
 		try {
 			Common::RecoverableExitScope recoverable;
 			auto translated = ShaderRecompiler::TranslateProgram(seed.code, options);

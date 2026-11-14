@@ -6,6 +6,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <utility>
 
@@ -41,6 +45,88 @@ std::vector<uint32_t> CollectUserData(const Program& program) {
 		}
 	}
 	return result;
+}
+
+// A use of a table mode program's user data register that reads nothing on the GPU: a descriptor word of a handle the
+// table module emits nothing for and never reads a word of (the SPIR-V emitter, spirvEmitterFlow.cpp: the handle
+// opcodes define no value; the renderer evaluates the descriptors' words from the draw's user data, TablePlan, and
+// writes them to the block):
+// - a buffer's (GetBufferResource): table mode's buffer accesses take base, length, stride and buffer word from the
+//   block (EmitTableMode; PrepareMemoryResourceAccess, PrepareStorageBufferResourceAccess), not from the handle;
+// - a sampler's (GetSamplerResource): sampled through its binding;
+// - an image's (GetImageResource), but in a program with an indirect image, whose search keys on a word of its handle
+//   (spirvEmitterImage.cpp's EmitImageSample: handle->Arg(key_arg));
+// - an address's (GetAddressResource) only planning-only loads use (PlanningOnlyHandle): an address load that is not
+//   one reads the handle's base words (GuestAddress, and LoadBda's walk key).
+// Any other use (arithmetic, a phi, an address load's offset, a store's value...) reads the register.
+bool TableDeadUserDataUse(const Program& program, const Use& use, bool indirect_images) {
+	switch (use.user->GetOpcode()) {
+		case ValueOpcode::GetBufferResource:
+		case ValueOpcode::GetSamplerResource: return true;
+		case ValueOpcode::GetImageResource: return !indirect_images;
+		case ValueOpcode::GetAddressResource: return PlanningOnlyHandle(program, *use.user);
+		default: return false;
+	}
+}
+
+// CollectUserData without the registers whose every use is a TableDeadUserDataUse (table mode only): the module reads
+// the others alone; a register left out defines its GetUserData as 0 (spirvEmitterFlow.cpp), which only those handles'
+// words take.
+std::vector<uint32_t> TableLiveUserData(const Program& program) {
+	const bool indirect_images = std::ranges::any_of(program.info.images, [](const ImageResource& image) {
+		return image.indirect_root != ImageResource::NoIndirectImage || image.indirect_search_iterations != 0u;
+	});
+	std::array<bool, NumScalarRegs> registers {};
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() != ValueOpcode::GetUserData || !inst.HasUses()) {
+				continue;
+			}
+			if (inst.Arg(0).GetType() != Type::ScalarReg) {
+				BindingFail("typed shader contains an invalid user-data register");
+			}
+			const auto index = RegIndex(inst.Arg(0).ScalarRegister());
+			if (index >= NumScalarRegs) {
+				BindingFail("typed shader contains an invalid user-data register");
+			}
+			if (!std::ranges::all_of(inst.Uses(), [&](const Use& use) {
+				    return TableDeadUserDataUse(program, use, indirect_images);
+			    }))
+				registers[index] = true;
+		}
+	}
+	std::vector<uint32_t> result;
+	for (uint32_t index = 0; index < registers.size(); index++) {
+		if (registers[index]) {
+			result.push_back(index);
+		}
+	}
+	return result;
+}
+
+// KYTY_TABLE_DEAD_USER_DATA: a table mode layout whose shader data do not fit the push constants from `start` laid out
+// with TableLiveUserData's registers alone (the offsets after them follow: memory_offset_dword, and the push data start
+// for the new size). Fits or exits as the plain rule does, with the counts.
+void RetryTableUserData(const Program& program, BindingLayout& next, uint32_t start) {
+	const auto plain           = static_cast<uint32_t>(next.user_data_registers.size());
+	next.user_data_registers   = TableLiveUserData(program);
+	next.memory_offset_dword   = static_cast<uint32_t>(next.user_data_registers.size());
+	next.push_data_start_dword = PushData::StartFor(start, next.ShaderDataDwords());
+	const auto reduced         = static_cast<uint32_t>(next.user_data_registers.size());
+	if (!next.UsesPushData()) {
+		EXIT("shader binding layout failed: %s (reduced %u -> %u, cursor %u, needs %u of %u)",
+		     "table mode user data do not fit the push constants", plain, reduced, start, next.ShaderDataDwords(),
+		     PushData::DwordCount);
+		std::abort();
+	}
+	const char* stage = program.stage == ShaderType::Vertex  ? "VS"
+	                    : program.stage == ShaderType::Pixel ? "PS"
+	                    : program.stage == ShaderType::Mesh  ? "MS"
+	                                                         : "CS";
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 200)
+		std::printf("Table: dead user data left out: %s 0x%016" PRIx64 " registers %u -> %u, cursor %u, needs %u of %u\n",
+		            stage, program.shader_hash, plain, reduced, start, next.ShaderDataDwords(), PushData::DwordCount);
 }
 
 void AddBinding(BindingLayout& layout, DescriptorBindingKind kind,
@@ -178,6 +264,20 @@ std::optional<uint32_t> ShaderBaseOffset(Value low, Value high) {
 }
 
 } // namespace
+
+bool PlanningOnlyHandle(const Program& program, const Inst& handle) {
+	return !handle.Uses().empty() &&
+	       std::ranges::all_of(handle.Uses(), [&](const Use& use) {
+		       const auto op = use.user->GetOpcode();
+		       if (op != ValueOpcode::LoadAddressU32 &&
+		           op != ValueOpcode::ReadConstBuffer) {
+			       return false;
+		       }
+		       const auto index = use.user->Flags<MemoryFlags>().index;
+		       return index < program.memory_info.size() &&
+		              program.memory_info[index].planning_only;
+	       });
+}
 
 void EnterTableMode(Program& program) {
 	const auto refuse = [&](const char* reason) {
@@ -369,7 +469,8 @@ void EnterTableMode(Program& program) {
 	program.info.uses_dma = true;
 }
 
-void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool enable_lod_stats) {
+void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool enable_lod_stats,
+                      bool table_dead_user_data) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
 		                                             ? "shader info is not ready"
@@ -450,6 +551,9 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool ena
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}
 
+	// (Only a table mode layout the plain rule above left without push data: one that fits is not changed.)
+	if (program.table_mode && table_dead_user_data && next.ShaderDataDwords() != 0 && !next.UsesPushData())
+		RetryTableUserData(program, next, push_data_start_dword);
 	if (next.ShaderDataDwords() != 0 && !next.UsesPushData()) {
 		if (program.table_mode) BindingFail("table mode user data do not fit the push constants");
 		AddBinding(next, DescriptorBindingKind::ShaderData);

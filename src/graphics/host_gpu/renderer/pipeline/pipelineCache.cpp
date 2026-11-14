@@ -467,6 +467,15 @@ static bool TableFormatIndexOn() {
 	return value >= 0 ? value != 0 : ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 }
 
+// KYTY_TABLE_DEAD_USER_DATA (live table_dead_user_data; mode-toggle.h: on under KYTY_SPECULATE=4, off otherwise): a
+// table mode translation whose user data do not fit the push constants laid out again without the registers only
+// handles the table module emits nothing for read (IR::AllocateBindings). Read where a table translation is asked for
+// (the job's options, the static precompile's): a module made keeps its layout.
+static bool TableDeadUserDataOn() {
+	static auto& on = LiveSwitch::Find("table_dead_user_data", ModeToggle::Default("table_dead_user_data"));
+	return on.load(std::memory_order_relaxed) != 0;
+}
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -2244,6 +2253,7 @@ struct PipelineCache::ProgramCache {
 				job->user_data         = params.user_data;
 				job->options           = options;
 				job->options.table_mode = true;
+				job->options.table_dead_user_data = TableDeadUserDataOn();
 				job->options.user_data = job->user_data;
 				job->options.back_code = job->back_code;
 				job->options.input_info = {};

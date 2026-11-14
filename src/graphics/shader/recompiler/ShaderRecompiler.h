@@ -21,6 +21,9 @@ struct CompileOptions {
 	bool                        early_dump                 = false;
 	bool                        enable_lod_stats           = false;
 	bool                        table_mode                 = false; // IR::EnterTableMode
+	// Table mode: user data that do not fit the push constants laid out again without the registers only handles the
+	// table module emits nothing for read (IR::AllocateBindings; KYTY_TABLE_DEAD_USER_DATA, the renderer sets it).
+	bool                        table_dead_user_data       = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
