@@ -59,7 +59,15 @@ def emulator_running():
     return 'kyty_emulator.exe' in out
 
 
+def baseline_present():
+    # (A missing baseline installed nothing and still said so: the game then booted with no save and waited at a dark
+    # screen until the bench gave up, 11-14.)
+    if not (BASELINE / 'PPSA01341').is_dir():
+        sys.exit(f'no baseline save at {BASELINE} (its PPSA01341 folder is missing); nothing changed')
+
+
 def prepare():
+    baseline_present()
     if emulator_running():
         sys.exit('an emulator process is running; close it first')
     active = STATE / 'active.json'
@@ -93,6 +101,7 @@ def prepare():
 
 def reset():
     """Fresh baseline save for the next run (the game autosaves over it while playing)."""
+    baseline_present()
     if emulator_running():
         sys.exit('an emulator process is running; close it first')
     if not (STATE / 'active.json').exists():
