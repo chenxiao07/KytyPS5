@@ -21,6 +21,10 @@
 
 - **Same process, live switch, alternating** (A B A B, 4-6 rounds of 5-8 s at a fixed spot); accept when every B
   window beats every A window. Within-run noise +-0.1-0.3 fps; render ms of one 10 s window +-1 ms.
+- **Prove the switch moved** before reading the numbers: the log's `LIVE_SET <name>=<v> ok=1` for a live switch, a
+  counter only one side touches, or a screenshot. Until 11-14 the bench tool's `set` silently dropped every live-switch
+  name (it only poked map globals), and two "flat" A/Bs (barrier scopes, an unsafe drain ceiling) had measured the same
+  setting twice. A ceiling that moves nothing, an unsafe skip included, is a reason to check the toggle first.
 - **Cross-boot is noisy**: one view 55.7 vs 60 fps across boots; whole sweeps differ ~7% per world. Needed for things
   that cannot be poked (layouts, build changes): >=2 boots per side, alternate exes (`-Exe` from a copied dir).
 - **Effects under 3%**: compare census per call (us per draw/dispatch/phase), not fps. Under ~0.5%: profile share.
