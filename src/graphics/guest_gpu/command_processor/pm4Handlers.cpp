@@ -221,13 +221,12 @@ void ReportOtherData(uint32_t cmd_id, uint32_t offset) {
 // On such a thread, a word GPU work writes (a COND_EXEC's predicate, a branch's compare value) read in a guarded copy, as
 // GuardTable reads a table (through the backing view on a page a guest write of the GPU thread guards), never by a fault
 // that waits for the GPU thread (spec_thread_gpu_faults). A page without access exits: the state pass, the one such thread
-// these packets run on (a speculation takes neither, SpeculationTakes), ends before the packet.
+// these packets run on (a speculation takes neither, SpeculationTakes), ends before the packet. (Spec::WorkerCopy: on
+// Linux a page a read watcher guards counts as one without access, where a plain load would fault and fetch the label.)
 template <typename T>
 [[nodiscard]] T SpecWorkerRead(uint64_t address) {
 	T value {};
-	if (const auto* backing = WriteGuard::GuardedBacking(address, sizeof(T))) {
-		std::memcpy(&value, backing, sizeof(T));
-	} else if (Common::GuardedCopy(&value, reinterpret_cast<const void*>(address), sizeof(T)) != 0) {
+	if (Spec::WorkerCopy(&value, reinterpret_cast<const void*>(address), sizeof(T), true) != 0) {
 		Spec::Refuse("GPU-written guest memory");
 		EXIT("a GPU-written word at 0x%016" PRIx64 " on a page without access, off the GPU thread\n", address);
 	}
@@ -431,11 +430,12 @@ KYTY_HW_CTX_PARSER(HwCtxSetAaSampleControl) {
 	// (Off the GPU thread the look-ahead, the next packet's 4 words past this packet's probed pages, read in a guarded
 	// copy: a page without access is no match, refused "GPU-written guest memory", and no match exits, which there refuses
 	// the packet (not a hole: the speculation stops before it and the GPU thread merges it in order) or ends the state pass.
-	// Not merging and running the next packet alone is not the same: no match is an exit on every thread.)
+	// Not merging and running the next packet alone is not the same: no match is an exit on every thread. Spec::WorkerCopy:
+	// on Linux a page a read watcher guards counts as one without access.)
 	const uint32_t* next = buffer + 16;
 	uint32_t        next_copy[4] {};
 	if (dw >= 20 && OnSpecWorker()) {
-		next = Common::GuardedCopy(next_copy, buffer + 16, sizeof(next_copy)) == 0 ? next_copy : nullptr;
+		next = Spec::WorkerCopy(next_copy, buffer + 16, sizeof(next_copy), false) == 0 ? next_copy : nullptr;
 		if (next == nullptr) Spec::Refuse("GPU-written guest memory");
 	}
 	if (dw >= 20 && next != nullptr && next[0] == 0xc0026900 && next[1] == Pm4::PA_SC_CENTROID_PRIORITY_0) {

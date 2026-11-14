@@ -45,6 +45,7 @@ extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULAT
 namespace Libs::LibKernel::Memory {
 bool ReadFaults(uint64_t vaddr, uint64_t size);                       // (kernel/memory.h)
 bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size); // (kernel/memory.h)
+bool BackingView(uint64_t* base, uint64_t* size);                     // (kernel/memory.h)
 } // namespace Libs::LibKernel::Memory
 
 namespace Libs::Graphics {
@@ -84,6 +85,82 @@ struct Counts {
 	       clean_reads = 0, feedbacks = 0, buffer_ranges = 0, sets = 0, chain_reads = 0, waits = 0, cpu_copies = 0,
 	       late_reads = 0, texel_syncs = 0, indexed_draws = 0, scenes = 0, used_pairs = 0;
 };
+
+#if !defined(_WIN32)
+// (Linux, WorkerCopy.) Whether [address, address + bytes) is in the backing view (a command buffer rebased through it,
+// RebaseGuardedCommands): its protections never change, and its bytes are the guest's.
+[[nodiscard]] inline bool InBackingView(uint64_t address, uint64_t bytes) {
+	uint64_t base = 0, size = 0;
+	return Libs::LibKernel::Memory::BackingView(&base, &size) && address >= base && address - base < size &&
+	       bytes <= size - (address - base);
+}
+
+// (Linux.) How many bytes of [from, from + bytes), from its start, a speculation's or the state pass's thread reads:
+// up to the first page a read watcher guards (Memory::ReadFaults), whose bytes a plain load would fault on and fetch
+// from the GPU thread; all of a range in the backing view. Asked, never probed: no system call.
+[[nodiscard]] inline uint64_t WorkerReadable(const void* from, uint64_t bytes) {
+	const auto address = reinterpret_cast<uint64_t>(from);
+	if (bytes == 0 || InBackingView(address, bytes) || !Libs::LibKernel::Memory::ReadFaults(address, bytes)) return bytes;
+	const uint64_t end = address + bytes;
+	uint64_t       at  = address;
+	while (at < end) {
+		const uint64_t next = std::min(end, (at | uint64_t {4095}) + 1);
+		if (Libs::LibKernel::Memory::ReadFaults(at, next - at)) break;
+		at = next;
+	}
+	return at - address;
+}
+
+// (Linux, ProcessPm4Spec's head probe.) Whether a page of [from, from + bytes) is one a guest write of the GPU thread
+// guards (KYTY_WRITE_GUARD: no access until its lift, WriteGuard::Arm), exactly: the count and the counting filter first,
+// without the lock (never a false "no"), g_lock shared only on a maybe. A plain load there faults into WriteGuard::OnFault
+// and waits for the lift; Windows' probe, a GuardedCopy, stops on such a page. (A backing view's range is never guarded.)
+[[nodiscard]] inline bool WriteGuarded(const void* from, uint64_t bytes) {
+	const auto address = reinterpret_cast<uint64_t>(from);
+	if (bytes == 0 || WriteGuard::g_count.load(std::memory_order_acquire) == 0 || !WriteGuard::MayBeGuarded(address, bytes))
+		return false;
+	std::shared_lock lock(WriteGuard::g_lock);
+	return WriteGuard::AnyIn(address, bytes);
+}
+#endif
+
+// Guest words a speculation's or the state pass's thread copies before it reads them (ProcessPm4Spec's command-word
+// copies, the early register-table copy, SpecWorkerRead's labels), never by a fault, which would wait for the GPU thread
+// (spec_thread_gpu_faults). As Common::GuardedCopy: the bytes not copied returned (0: all), a copy stopping at the first
+// page it cannot read. `from` is the pointer the caller reads through (a guest address, or a rebased command buffer's
+// backing view). `guarded` (the sites that read a guarded page through the backing view before): a range a guest write
+// of the GPU thread guards, through the backing view first (WriteGuard::GuardedBacking, KYTY_WRITE_GUARD_SPEC).
+// Windows: then Common::GuardedCopy, as before (rep movsb; the exception filter resumes a copy that faults on a page
+// without access, a read watcher's or a read guard's). Linux: Common::GuardedCopy is a pread of /proc/self/mem there, a
+// system call each, and it reads a page mprotect read-protected: GPU-written bytes not downloaded yet, stale, where a
+// plain load would fault and fetch them. So there, as CopyGuest and GuardTable read (8f3a878f, be9b2f04): no page a
+// read watcher guards is read (the copy stops before the first, WorkerReadable), whatever spec_backing_reads says; the
+// rest through the backing view (live spec_backing_reads 1, the default; 0: a GuardedCopy of it, as his 0 does); a
+// range in the backing view copied as it is.
+[[nodiscard]] inline uint64_t WorkerCopy(void* out, const void* from, uint64_t bytes, bool guarded) {
+	if (bytes == 0) return 0;
+	const auto address = reinterpret_cast<uint64_t>(from);
+	if (guarded)
+		if (const auto* backing = WriteGuard::GuardedBacking(address, bytes)) {
+			std::memcpy(out, backing, bytes);
+			return 0;
+		}
+#if !defined(_WIN32)
+	if (InBackingView(address, bytes)) {
+		std::memcpy(out, from, bytes);
+		return 0;
+	}
+	const uint64_t readable = WorkerReadable(from, bytes);
+	if (readable == 0) return bytes;
+	static auto& backing_reads = LiveSwitch::Find("spec_backing_reads", 1);
+	if (backing_reads.load(std::memory_order_relaxed) != 0 &&
+	    Libs::LibKernel::Memory::TryReadBackingToHost(address, out, readable))
+		return bytes - readable;
+	return bytes - readable + Common::GuardedCopy(out, from, readable);
+#else
+	return Common::GuardedCopy(out, from, bytes);
+#endif
+}
 
 // A late read (State::late_reads): the range, and the effects log's end before it was read.
 struct LateRead {

@@ -2257,11 +2257,17 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 	// exception filter resumes before any fault handler, so a probe never waits for the GPU thread). Asking the read watchers
 	// (Memory::ReadFaults) missed the other protections (KYTY_READ_GUARD's guard pages among them): the tripwire still read 0.1
 	// a frame (fxv6r, 14 Nov). The probe reads the pointer the packet is read through (a backing view's when rebased).
+	// Linux: asked, not probed. A GuardedCopy is a pread of /proc/self/mem there, a system call a page and so at least one
+	// a packet, and it reads a page mprotect left without access, so it never stops. Asked instead are the protections a
+	// plain load faults on there: the read watchers (Spec::WorkerReadable; a backing view's range readable) and the write
+	// guard's no-access pages (KYTY_WRITE_GUARD, Spec::WriteGuarded: a load there waits in WriteGuard::OnFault for the
+	// lift), so it stops where Windows' probe stops. The read guards are Windows' only (PAGE_GUARD).
 	const bool off_gpu_thread = (spec != nullptr || m_state_only) && !GuestGpu::IsGpuThread();
 	uint64_t   clean_end      = 0;
 	const auto watched        = [&](uint64_t host, uint64_t bytes) {
 		if (!off_gpu_thread) return false;
 		const uint64_t end = ((host + bytes - 1) | uint64_t {4095}) + 1;
+#if defined(_WIN32)
 		for (uint64_t at = std::max(host, clean_end); at < end; at = (at | uint64_t {4095}) + 1) {
 			uint8_t probe = 0;
 			if (Common::GuardedCopy(&probe, reinterpret_cast<const void*>(at), 1) != 0) {
@@ -2270,6 +2276,15 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 				return true;
 			}
 		}
+#else
+		if (const uint64_t from = std::max(host, clean_end);
+		    from < end && (Spec::WorkerReadable(reinterpret_cast<const void*>(from), end - from) != end - from ||
+		                   Spec::WriteGuarded(reinterpret_cast<const void*>(from), end - from))) {
+			m_watched_stop        = true;
+			execution.m_suspended = true;
+			return true;
+		}
+#endif
 		clean_end = std::max(clean_end, end);
 		return false;
 	};
@@ -2435,10 +2450,11 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			if (off_gpu_thread) {
 				static thread_local std::array<uint32_t, DrawIndirectRunMax * 5u> run_copy;
 				const uint32_t reach = std::min(draw_run_dw, DrawIndirectRunMax * 5u);
-				// (Words [from, to) copied; returns the end of what was, up to a page without access.)
+				// (Words [from, to) copied; returns the end of what was, up to a page without access: Spec::WorkerCopy, on
+				// Linux a page a read watcher guards.)
 				const auto copy = [&](uint32_t from, uint32_t to) {
 					const uint64_t bytes = uint64_t {to - from} * 4u;
-					return from + static_cast<uint32_t>((bytes - Common::GuardedCopy(run_copy.data() + from, packet + from, bytes)) / 4u);
+					return from + static_cast<uint32_t>((bytes - Spec::WorkerCopy(run_copy.data() + from, packet + from, bytes, false)) / 4u);
 				};
 				uint32_t copied = copy(0, std::min(reach, 10u));
 				if (copied < 5u) { // (the head's own words: before the packet, as the probe stops)
@@ -2474,6 +2490,8 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		// and notes the clean read, so it cannot run here, before the packet is entered); bytes other than the observer's
 		// invalidate the observer's shadow (GuardTable). A state pass checks nothing
 		// (SyncCommandMemory returns at once). (WRITE_DATA packets are few a frame.) The GPU thread and mode 0 read as before.
+		// (Spec::WorkerCopy: on Linux a page a read watcher guards counts as one without access, the rest is read through the
+		// backing view, no system call.)
 		const uint32_t*           handler_words = packet;
 		std::span<const uint32_t> table_words;
 		if (off_gpu_thread) {
@@ -2486,7 +2504,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 				static thread_local std::vector<uint32_t> write_copy;
 				const uint32_t                           dwords = KYTY_PM4_LEN(packet_header);
 				write_copy.resize(dwords);
-				if (dwords < 4u || Common::GuardedCopy(write_copy.data(), packet, uint64_t {dwords} * 4u) != 0)
+				if (dwords < 4u || Spec::WorkerCopy(write_copy.data(), packet, uint64_t {dwords} * 4u, false) != 0)
 					return stop_before();
 				handler_words = write_copy.data();
 			} else if ((opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT || opcode == Pm4::IT_SET_SH_REG_INDIRECT ||
@@ -2499,9 +2517,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 					const uint64_t bytes = uint64_t {pairs} * 8u;
 					copy.words.resize(size_t {pairs} * 2u);
 					// (KYTY_WRITE_GUARD_SPEC: a table on a guarded page through the backing view, as GuardTable reads it.)
-					if (const auto* backing = WriteGuard::GuardedBacking(table, bytes))
-						std::memcpy(copy.words.data(), backing, bytes);
-					else if (Common::GuardedCopy(copy.words.data(), reinterpret_cast<const void*>(table), bytes) != 0)
+					if (Spec::WorkerCopy(copy.words.data(), reinterpret_cast<const void*>(table), bytes, true) != 0)
 						return stop_before();
 					// (Shared with a state pass's GuardTable; a speculation's compares its own copy with it.)
 					copy.packet = packet, copy.table = table, copy.pairs = pairs, copy.shared = spec == nullptr;
