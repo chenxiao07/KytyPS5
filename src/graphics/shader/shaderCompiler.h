@@ -18,9 +18,11 @@ struct ShaderParams {
 	std::vector<uint32_t>     user_data;
 	uint64_t                  hash = 0;
 	std::span<const uint32_t> back_code;
+	uint64_t                  code_address = 0;     // (code a host copy: the guest address it was read from)
+	bool                      code_unread  = false; // (a copy that would fault, not made: PipelineCache's CopyShaderCode)
 
 	[[nodiscard]] uint64_t Base() const {
-		return reinterpret_cast<uint64_t>(code.data());
+		return code_address != 0 ? code_address : reinterpret_cast<uint64_t>(code.data());
 	}
 };
 

@@ -1176,8 +1176,8 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		// catalog read, the pipeline cache m_mutex, the texture cache m_lock, the descriptor pools alloc_mutex) across anything
 		// that can fault into tracked guest memory or send a sync to the GPU thread: a fault there waits for the GPU thread,
 		// which waits for the lock. Under these locks a worker reads guest memory only non-faulting with a refusal (SRT words:
-		// t_no_fault_reads here; SRT spans: TryReadGpuShaderSpan guarded copy) or reads what is never GPU-written (shader code);
-		// anything else before the lock is taken. New worker paths (pair proposals) are audited against this list.
+		// t_no_fault_reads here; SRT spans: TryReadGpuShaderSpan guarded copy); shader code is GPU-written too (a level load's
+		// DMA: a freeze in Get's table job copy), copied before m_mutex (CopyShaderCode); anything else before the lock is taken. New worker paths (pair proposals) are audited against this list.
 		PipelineCache::t_no_fault_reads  = spec != nullptr;
 		PipelineCache::t_no_fault_failed = false;
 		// (A speculation's lookup without the catalog's read lock: PrepareProgramInto's reads of the vertex metadata and

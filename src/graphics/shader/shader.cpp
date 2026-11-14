@@ -224,6 +224,8 @@ static void FillShaderParams(uint64_t shader_addr, const char* label, std::span<
 	params.user_data.assign(user_data.begin(), user_data.end());
 	params.hash      = ShaderCodeHash(shader_addr, code);
 	params.back_code = {};
+	params.code_address = 0;
+	params.code_unread  = false;
 }
 
 uint64_t ShaderHashAt(uint64_t addr) {

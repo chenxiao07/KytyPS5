@@ -5,6 +5,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -34,6 +35,7 @@
 #include "device-fault.h"
 #include "local-platform.h"
 #include "slow-log.h"
+#include "speculation-state.h"
 #include "startup-progress.h"
 
 #include <algorithm>
@@ -219,6 +221,41 @@ bool ReadShaderMemorySpan(void*, uint64_t address, uint32_t* values, uint32_t co
 	// null page goes word by word (the readers above).
 	return count >= 2 && count <= (clean ? 1024u : 16u) && !NoGuestMemory(address, uint64_t {count} * 4u) &&
 	       Libs::LibKernel::Memory::TryReadGpuShaderSpan(address, values, count * 4u, clean);
+}
+
+// A guest read can fault into a GPU-thread readback (BufferCache::ReadMemory -> SendCommandSync); never under
+// PipelineCache::m_mutex, which the GPU thread takes for its own lookups: a speculation's thread that faulted in
+// ProgramCache::Get copying a table job's code (pages a level load's DMA had just written) waited for the GPU thread
+// holding it, the GPU thread for it (a mode 4 freeze). Off the GPU thread the program's code is copied here, before the
+// lock, and Get reads the copy. A speculation's thread copies without a fault: code it cannot copy (GPU-written bytes)
+// stays unread, and Get refuses the lookup only where it would read it (UnreadCode); a lookup that finds its
+// permutation reads no code. (The GPU thread reads the code in place: its own fault reads back on it.)
+void CopyShaderCode(ShaderParams& params, std::vector<uint32_t>& code, std::vector<uint32_t>& back_code) {
+	const auto copy = [](std::span<const uint32_t> from, std::vector<uint32_t>& to) {
+		to.resize(from.size());
+		if (from.empty()) return true;
+		if (!GuestGpu::IsTranslatingThread()) {
+			std::memcpy(to.data(), from.data(), from.size_bytes());
+			return true;
+		}
+		return Libs::LibKernel::Memory::TryReadGuestNoFault(reinterpret_cast<uint64_t>(from.data()), to.data(),
+		                                                    from.size_bytes());
+	};
+	if (!copy(params.code, code) || !copy(params.back_code, back_code)) {
+		params.code_unread = true;
+		return;
+	}
+	params.code_address = reinterpret_cast<uint64_t>(params.code.data()); // (Base(): the SRT's shader base stays the guest's)
+	params.code         = code;
+	params.back_code    = back_code;
+}
+
+// A lookup that would read code CopyShaderCode could not copy: refused (the GPU thread looks it up itself). (A worker
+// set's lookup, t_no_fault_reads: t_no_fault_failed, as for an SRT word it cannot read.)
+ShaderProgram UnreadCode() {
+	Spec::Refuse("GPU-written shader code");
+	if (PipelineCache::t_no_fault_reads) PipelineCache::t_no_fault_failed = true;
+	return {};
 }
 
 } // namespace
@@ -2024,6 +2061,7 @@ struct PipelineCache::ProgramCache {
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
 		if (entry != programs.end() && !entry->second.warm_code.empty()) {
+			if (params.code_unread) return UnreadCode();
 			if (!std::ranges::equal(params.code, entry->second.warm_code) ||
 			    !std::ranges::equal(params.back_code, entry->second.warm_back_code)) {
 				std::erase_if(by_program, [&](const auto& item) { return item.second.first == &entry->second; });
@@ -2174,6 +2212,7 @@ struct PipelineCache::ProgramCache {
 				return job->push_data_cursor == push_data_cursor && job->specialization == table_specialization;
 			});
 			if (found == jobs.end()) {
+				if (params.code_unread) return UnreadCode();
 				auto job              = std::make_shared<TableJob>();
 				job->specialization   = table_specialization;
 				job->push_data_cursor = push_data_cursor;
@@ -2244,6 +2283,7 @@ struct PipelineCache::ProgramCache {
 			stored.program.bindings.AdvancePushData(push_data_cursor);
 			return stored.handle;
 		}
+		if (params.code_unread) return UnreadCode(); // (the prefetch's digest, the translation, the warmup record)
 		// A program met for the first time that the prefetch translated: its plan, materialized for
 		// this draw, and its modules are taken over.
 		if (entry == programs.end()) {
@@ -4472,6 +4512,11 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
 	}
+	if (!GuestGpu::IsGpuThread()) { // (the code before the lock: CopyShaderCode)
+		thread_local std::vector<uint32_t> vertex_code, vertex_back_code, pixel_code, pixel_back_code;
+		CopyShaderCode(vertex_params, vertex_code, vertex_back_code);
+		if (pixel_active) CopyShaderCode(pixel_params, pixel_code, pixel_back_code);
+	}
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
@@ -4546,6 +4591,10 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	// Reused per thread: every dispatch prepares one (its user data was a new vector each time).
 	thread_local ShaderParams params;
 	PrepareProgramInto(regs, sh, input_info, params);
+	if (!GuestGpu::IsGpuThread()) { // (the code before the lock: CopyShaderCode)
+		thread_local std::vector<uint32_t> code, back_code;
+		CopyShaderCode(params, code, back_code);
+	}
 	Common::LockGuard lock(m_mutex);
 	m_program_cache->table_pending = false;
 	m_program_cache->table_waiting.reset();
