@@ -340,17 +340,26 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	// thread 16.66 -> 16.38 ms a frame). 0 waiting, 1 done, 2 the caller sleeps.
 	constexpr uint32_t    Spins = 500;
 	std::atomic<uint32_t> state {0};
-	SendCommand([operation = std::move(command), &state]() mutable {
+	// (Its time waiting for the GPU thread, running there and until this thread runs again: guest_sync_*_kt.)
+	const uint64_t        enqueued = __rdtsc();
+	uint64_t              ended    = 0;
+	SendCommand([operation = std::move(command), &state, enqueued, &ended]() mutable {
+		const uint64_t started = __rdtsc();
+		LiveCounters::Add(LiveCounters::GuestSyncQueueKt, (started - enqueued) >> 10u);
 		operation();
+		ended = __rdtsc();
+		LiveCounters::Add(LiveCounters::GuestSyncRunKt, (ended - started) >> 10u);
 		if (state.exchange(1, std::memory_order_acq_rel) == 2) state.notify_one();
 	});
+	const auto woken = [&] { LiveCounters::Add(LiveCounters::GuestSyncWakeKt, (__rdtsc() - ended) >> 10u); };
 	for (uint32_t spin = 0; spin < Spins; ++spin) {
-		if (state.load(std::memory_order_acquire) == 1) return;
+		if (state.load(std::memory_order_acquire) == 1) return woken();
 		_mm_pause();
 	}
 	uint32_t expected = 0;
-	if (!state.compare_exchange_strong(expected, 2, std::memory_order_acq_rel)) return; // (done meanwhile)
+	if (!state.compare_exchange_strong(expected, 2, std::memory_order_acq_rel)) return woken(); // (done meanwhile)
 	while (state.load(std::memory_order_acquire) != 1) state.wait(2, std::memory_order_acquire);
+	woken();
 }
 
 void GuestGpu::Submit(std::span<const uint32_t> draw_commands,

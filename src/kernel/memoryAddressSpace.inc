@@ -1990,12 +1990,14 @@ public:
 			m_busy.emplace_back(vaddr, vaddr + size);
 		}
 		// The system calls without the lock (BusyUnlocked): the trackers' protections of other ranges go on.
+		const auto called     = __rdtsc();
 		const bool split_done = SplitPlaceholders(split, vaddr, size);
 		const auto host_mode  = VirtualMemory::IsExecute(mode)
 		                            ? VirtualMemory::Mode::ExecuteReadWrite
 		                            : VirtualMemory::Mode::ReadWrite;
 		const bool mapped =
 		    split_done && m_backing->MapExistingPlaceholderFixed(vaddr, size, backing_offset, host_mode, failure_reason);
+		LiveCounters::Add(LiveCounters::AddressSpaceMapCallKt, (__rdtsc() - called) >> 10u);
 		{
 			ExclusiveLock lock(m_mutex);
 			if (mapped) {
@@ -2035,13 +2037,17 @@ public:
 						m_busy.emplace_back(busy_begin, busy_end);
 						break;
 					}
+					const auto waited = __rdtsc();
 					m_busy_done.wait(lock.Lock());
+					LiveCounters::Add(LiveCounters::AddressSpaceUnmapWaitKt, (__rdtsc() - waited) >> 10u);
 				}
 			}
 			if (contained) {
 				bool                                       placeholder_preserved = false;
 				std::vector<std::pair<uint64_t, uint64_t>> freed, spans;
+				const auto                                 called = __rdtsc();
 				const bool done = m_backing->Unmap(vaddr, size, &placeholder_preserved, &freed) && placeholder_preserved;
+				LiveCounters::Add(LiveCounters::AddressSpaceUnmapCallKt, (__rdtsc() - called) >> 10u);
 				{
 					ExclusiveLock lock(m_mutex);
 					if (done) {
@@ -2279,7 +2285,9 @@ public:
 				m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(at, next - at); });
 				m_busy.emplace_back(at, next);
 			}
+			const auto trimmed = __rdtsc();
 			VirtualUnlock(reinterpret_cast<void*>(at), next - at);
+			LiveCounters::Add(LiveCounters::AddressSpaceTrimKt, (__rdtsc() - trimmed) >> 10u);
 			{
 				ExclusiveLock lock(m_mutex);
 				EraseBusyUnlocked(at, next);
@@ -2296,7 +2304,9 @@ private:
 	void WaitNotBusy(std::shared_lock<std::shared_mutex>& lock, uint64_t vaddr, uint64_t size) {
 		if (!BusyUnlocked(vaddr, size)) return;
 		LiveCounters::Add(LiveCounters::AddressSpaceBusyWaits);
+		const auto start = __rdtsc();
 		m_busy_done.wait(lock, [&] { return !BusyUnlocked(vaddr, size); });
+		LiveCounters::Add(LiveCounters::AddressSpaceBusyWaitKt, (__rdtsc() - start) >> 10u);
 	}
 
 	void EraseBusyUnlocked(uint64_t begin, uint64_t end) {
