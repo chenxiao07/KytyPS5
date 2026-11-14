@@ -182,11 +182,15 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	// Finish recording the caller's commands before publishing that handoff.
 	LocalVulkanRecording::Drain();
 #endif
-	Common::LockGuard lock(m_queue_mutex);
-	EXIT_IF(!m_accepting);
-	m_commands.push_back(std::move(command));
-	m_pending_commands.fetch_add(1, std::memory_order_release);
-	m_work_available.Signal();
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		EXIT_IF(!m_accepting);
+		m_commands.push_back(std::move(command));
+		m_pending_commands.fetch_add(1, std::memory_order_seq_cst);
+		m_work_available.Signal();
+	}
+	// (The GPU thread may be waiting for a flip, where it runs the commands queued: CommandProcessor::WaitFlipDone.)
+	if (auto* video_out = m_renderer.VideoOutIfAny(); video_out != nullptr) video_out->InterruptFlipWait();
 }
 
 bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
@@ -199,11 +203,14 @@ bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	LocalVulkanRecording::Drain(); // (as SendCommand)
 #endif
-	Common::LockGuard lock(m_queue_mutex);
-	if (!m_accepting) return false;
-	m_commands.push_back(std::move(command));
-	m_pending_commands.fetch_add(1, std::memory_order_release);
-	m_work_available.Signal();
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		if (!m_accepting) return false;
+		m_commands.push_back(std::move(command));
+		m_pending_commands.fetch_add(1, std::memory_order_seq_cst);
+		m_work_available.Signal();
+	}
+	if (auto* video_out = m_renderer.VideoOutIfAny(); video_out != nullptr) video_out->InterruptFlipWait(); // (as SendCommand)
 	return true;
 }
 
@@ -3326,8 +3333,13 @@ bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	BufferFlush();
 
-	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
-	                                      static_cast<int>(display_buffer_index));
+	// The guest commands queued meanwhile run while the GPU thread waits for the flip (live serve_in_flip_waits, 0: they
+	// wait for it to end; a speculation's thread never waits here).
+	static auto& serve_in_flip_waits = LiveSwitch::Find("serve_in_flip_waits", 1);
+	const bool   serve               = GuestGpu::IsGpuThread() && serve_in_flip_waits.load(std::memory_order_relaxed) != 0;
+	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle), static_cast<int>(display_buffer_index),
+	                                      serve ? &GuestGpu::CommandsPending : nullptr,
+	                                      serve ? &GuestGpu::ServePendingCommands : nullptr);
 }
 
 template <typename T>

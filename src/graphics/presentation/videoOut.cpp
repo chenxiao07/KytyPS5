@@ -219,7 +219,8 @@ public:
 	bool Flip(uint32_t micros, bool between_vblanks = false);
 	[[nodiscard]] uint64_t ReadyDue();
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
-	void Wait(VideoOutConfig& cfg, int index);
+	void Wait(VideoOutConfig& cfg, int index, bool (*pending)() = nullptr, void (*serve)() = nullptr);
+	void InterruptWait();
 
 private:
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
@@ -250,6 +251,8 @@ private:
 	Common::CondVar      m_submit_cond_var;
 	Common::CondVar      m_submit_slot_cond_var;
 	Common::CondVar      m_done_cond_var;
+	// A Wait that runs guest commands is blocked or about to (InterruptWait wakes it).
+	std::atomic<bool>    m_serving_wait {false};
 	std::list<Request>   m_requests;
 	std::list<Request>   m_cpu_requests;
 	std::list<Request>   m_cancelled_requests;
@@ -1309,7 +1312,13 @@ void FlipQueue::WaitForSubmitSlot() {
 // GPU thread runs behind the game), so waiting for one never ended: the GPU thread waited for itself and the game froze
 // (at the Sony intro of Demon's Souls, about 1 boot in 3 on some builds). On the console a CPU flip is no work of the
 // GPU queue that waits.
-void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
+//
+// `pending` / `serve`: the guest commands queued for the GPU thread meanwhile run here, the lock released. A game thread's
+// unmap, map or readback fault waits for that thread, which sat here for the rest of the frame: at a loading screen ~0.5
+// ms an unmap on average, 5-7 ms of the loading job thread's time a frame. (The flag is set before the queue is looked at,
+// and InterruptWait reads it after its command was queued: one of the two sees the other; the queue is looked at again
+// under the lock, which InterruptWait takes to signal.)
+void FlipQueue::Wait(VideoOutConfig& cfg, int index, bool (*pending)(), void (*serve)()) {
 	Common::LockGuard lock(m_mutex);
 
 	auto has_request = [this, &cfg, index] {
@@ -1317,8 +1326,24 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 		return std::any_of(m_requests.begin(), m_requests.end(), matches);
 	};
 	while (has_request()) {
+		if (serve != nullptr) {
+			m_serving_wait.store(true, std::memory_order_seq_cst);
+			if (pending()) {
+				m_mutex.Unlock();
+				serve();
+				m_mutex.Lock();
+				continue;
+			}
+		}
 		m_done_cond_var.Wait(&m_mutex);
 	}
+	if (serve != nullptr) m_serving_wait.store(false, std::memory_order_relaxed);
+}
+
+void FlipQueue::InterruptWait() {
+	if (!m_serving_wait.load(std::memory_order_seq_cst)) return;
+	Common::LockGuard lock(m_mutex);
+	m_done_cond_var.SignalAll();
 }
 
 // VrrFlips: when the frame at the front, done, may flip (a performance counter; 0: none is done).
@@ -1817,12 +1842,16 @@ void VideoOutDriver::WaitForSubmitSlot() {
 	m_impl->GetFlipQueue().WaitForSubmitSlot();
 }
 
-void VideoOutDriver::WaitFlipDone(int handle, int index) {
+void VideoOutDriver::WaitFlipDone(int handle, int index, bool (*pending)(), void (*serve)()) {
 	auto* ctx = m_impl->Get(handle);
 	EXIT_IF(ctx == nullptr);
 
 	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
-	m_impl->GetFlipQueue().Wait(*ctx, index);
+	m_impl->GetFlipQueue().Wait(*ctx, index, pending, serve);
+}
+
+void VideoOutDriver::InterruptFlipWait() {
+	m_impl->GetFlipQueue().InterruptWait();
 }
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {

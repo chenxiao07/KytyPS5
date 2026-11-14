@@ -103,6 +103,8 @@ public:
 	// The guest frame number, 0 without a guest GPU (offline tools).
 	[[nodiscard]] uint64_t                  FrameNumber() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
+	// (Null before InitializeGpu and after ShutdownGpu.)
+	[[nodiscard]] VideoOut::VideoOutDriver* VideoOutIfAny() const { return m_video_out; }
 
 	RenderMutex&        GetMutex() { return m_mutex; }
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }

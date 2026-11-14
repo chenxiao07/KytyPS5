@@ -38,7 +38,11 @@ public:
 	void CompleteFlip(uint64_t request_id);
 	void SubmitFlipPreparation(uint64_t request_id);
 	void WaitForSubmitSlot();
-	void WaitFlipDone(int handle, int index);
+	// `pending` / `serve` (the GPU thread's WAIT_FLIP_DONE): whether guest commands are queued for that thread, and running
+	// them; the wait runs them while it would block (its lock released). InterruptFlipWait wakes such a wait, from the
+	// thread that queued a command.
+	void WaitFlipDone(int handle, int index, bool (*pending)() = nullptr, void (*serve)() = nullptr);
+	void InterruptFlipWait();
 
 	[[nodiscard]] Impl& State() noexcept;
 
