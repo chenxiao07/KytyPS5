@@ -994,6 +994,13 @@ private:
 	EqaaControl m_eqaa_control;
 
 	ShaderRegisters m_sh_regs;
+
+	// The 4 bytes after the registers, a member instead of tail padding. On Linux (Itanium C++ ABI)
+	// a copy assignment copies the data size only and leaves tail padding as the memory held it;
+	// the native draw state key hashes all of the context (RenderExecutor::NativeXprStateKey), so a
+	// speculation's command processor made in reused heap memory had other keys than the GPU
+	// thread's, and mode 4 refused nearly every draw for the whole process.
+	uint32_t m_tail = 0;
 };
 
 class UserConfig {
