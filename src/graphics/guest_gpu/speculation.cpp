@@ -1195,6 +1195,12 @@ void Speculation::After(Result& result, size_t index) {
 	// (A segment not committed is not here: its packets are translated again the normal way, which notes them.)
 	if (to.indexed_draws != from.indexed_draws) FrameGen::NoteIndexedDraws(to.indexed_draws - from.indexed_draws);
 	if (to.scenes != from.scenes) FrameGen::NoteScene();
+	// The table pairs its draws and dispatches used (Spec::State::used_pairs), stamped as the GPU thread's lookup of them
+	// would have: the sweep keeps a pair used within PairKeepFrames. (Alive: the sweep waits for no speculation live.)
+	if (to.used_pairs != from.used_pairs) {
+		const auto frame = m_renderer.FrameNumber();
+		for (size_t i = from.used_pairs; i < to.used_pairs; ++i) *state.used_pairs[i] = frame;
+	}
 	// Its writes are the latest GPU work over those ranges; the images as it left them; the caches' LRU; the command
 	// processor's guest memory writes.
 	for (size_t i = from.written; i < to.written; ++i) {

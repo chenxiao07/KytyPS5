@@ -688,7 +688,10 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	}
 	auto& pair = *known;
 	TablePrefetchPair(pair);
+	// (A speculation's thread notes the pair in its segment, whose commit stamps it (Speculation::After): only the GPU
+	// thread writes it, and a pair only speculations use is not swept as unused. A refused draw's note goes with it.)
 	if (Role() == 0) pair.used_frame = frame;
+	else if (auto* spec = Spec::Current(); spec != nullptr) spec->NoteUsedPair(&pair.used_frame);
 	if (pair.vs != vs_address || pair.ps != ps_address || pair.start_instance != vs.start_instance_user_sgpr)
 		return Spec::Refuse("table: pair key"), TableResult::Native;
 	if (const auto generation = ShaderMapGeneration(); generation != pair.Generation(Role())) {
@@ -2975,6 +2978,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 		return m_dispatch_declined = "dispatch: frame generation inputs", false;
 	TablePrefetchPair(pair);
 	if (Role() == 0) pair.used_frame = m_context.FrameNumber();
+	else if (auto* spec = Spec::Current(); spec != nullptr) spec->NoteUsedPair(&pair.used_frame); // (as TableTry's)
 	if (Role() == 0) TablePrefetchNext(OwnTable().previous_dispatch, pair);
 	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1f, 0); // census: the dispatches' phases (b)
 	// The dispatch executor's sets retire here too (NativeXprTry collects only the draw executor's): without it they

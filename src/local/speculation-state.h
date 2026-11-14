@@ -82,7 +82,7 @@ struct WaitCheck {
 struct Counts {
 	size_t current = 0, written = 0, bda = 0, invalidated = 0, writes = 0, touched_images = 0, touched_buffers = 0,
 	       clean_reads = 0, feedbacks = 0, buffer_ranges = 0, sets = 0, chain_reads = 0, waits = 0, cpu_copies = 0,
-	       late_reads = 0, texel_syncs = 0, indexed_draws = 0, scenes = 0;
+	       late_reads = 0, texel_syncs = 0, indexed_draws = 0, scenes = 0, used_pairs = 0;
 };
 
 // A late read (State::late_reads): the range, and the effects log's end before it was read.
@@ -356,12 +356,26 @@ struct State {
 	// (FrameGen::NoteScene: the game's 3D view). Noted at the commit only: a speculation's thread translates ahead,
 	// past flips; a segment not committed is translated again the normal way, which notes them itself.
 	size_t indexed_draws = 0, scenes = 0;
+	// The catalog's table pairs its table draws and dispatches looked up (TableTry, TableDispatch): their used_frame,
+	// which only the GPU thread writes, stamped by the commit of the segment they are in (Speculation::After) as the GPU
+	// thread's own lookup stamps it. Unstamped, a pair only speculations' threads used was swept as unused past
+	// PairKeepFrames (TableSweepPairs), then refused ('table store', 'dispatch: not seen', 'table program') until learned
+	// again. A pair once a run in its segment (consecutive draws and dispatches mostly keep theirs). The pairs live until
+	// the commit: the sweep waits for no speculation live (kyty_local_speculations_live: from before the translation to
+	// its Finish, after its commits).
+	std::vector<uint64_t*> used_pairs;
+	void NoteUsedPair(uint64_t* used_frame) {
+		const size_t open = closed.empty() ? 0 : closed.back().end.used_pairs;
+		if (used_pairs.size() > open && used_pairs.back() == used_frame) return;
+		used_pairs.push_back(used_frame);
+	}
 
 	[[nodiscard]] Counts Sizes() const noexcept {
 		return {current.size(),        written.size(),         bda.size(),         invalidated.size(), writes.size(),
 		        touched_images.size(), touched_buffers.size(), clean_reads.size(), feedbacks.size(), buffer_ranges.size(),
 		        sets.size(),           chain_reads.size(),     waits.size(),       cpu_copies.size(),
-		        late_reads.size(),     texel_syncs.size(),     indexed_draws,      scenes};
+		        late_reads.size(),     texel_syncs.size(),     indexed_draws,      scenes,
+		        used_pairs.size()};
 	}
 	// Its pending guest memory writes or a previous speculation's over the range; the ranges its work or a previous
 	// one's writes.
@@ -712,6 +726,7 @@ struct State {
 		texel_syncs.resize(std::min(texel_syncs.size(), checkpoint.texel_syncs));
 		indexed_draws = std::min(indexed_draws, checkpoint.indexed_draws);
 		scenes        = std::min(scenes, checkpoint.scenes);
+		used_pairs.resize(std::min(used_pairs.size(), checkpoint.used_pairs));
 		bda_all = checkpoint_bda_all;
 	}
 
@@ -732,6 +747,7 @@ struct State {
 		draw_verifies.clear();
 		indexed_draws = 0;
 		scenes        = 0;
+		used_pairs.clear();
 		late = false;
 		bda.clear();
 		bda_all = false;
