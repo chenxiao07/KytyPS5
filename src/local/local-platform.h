@@ -92,6 +92,9 @@ int KeepRenderCoreAlone();
 // The calling thread above the normal priority of the game's threads (Windows: THREAD_PRIORITY_HIGHEST; Linux:
 // nice -10 where the nice limit allows, unless KYTY_LINUX_FAST_LOCKS=0): the render thread, which every frame waits for, is not time-sliced against them on its CPUs.
 void MakeCriticalThread();
+// The calling thread above the game's threads but below the render thread (Windows: THREAD_PRIORITY_ABOVE_NORMAL; Linux:
+// unchanged, not measured there): the upload worker, which holds the guest address space's lock while it protects pages.
+void MakeAboveGameThread();
 // While it lives, the calling thread at the normal priority if it was above it (MakeCriticalThread), then back: the render
 // thread doing the upload worker's jobs (AsyncUpload's Help) as the worker does them, not ahead of the game's threads.
 class NormalPriority {

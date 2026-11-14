@@ -1089,6 +1089,10 @@ void MakeCriticalThread() {
 	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 }
 
+void MakeAboveGameThread() {
+	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+}
+
 NormalPriority::NormalPriority() {
 	m_saved   = GetThreadPriority(GetCurrentThread());
 	m_changed = m_saved != THREAD_PRIORITY_ERROR_RETURN && m_saved > THREAD_PRIORITY_NORMAL &&
@@ -2390,6 +2394,8 @@ void MakeCriticalThread() {
 	if (enabled) (void)setpriority(PRIO_PROCESS, static_cast<id_t>(ThreadId()), -10);
 #endif
 }
+
+void MakeAboveGameThread() {}
 
 // (Linux: back to a nice value below 0 is allowed again, RLIMIT_NICE having allowed it the first time.)
 NormalPriority::NormalPriority() {

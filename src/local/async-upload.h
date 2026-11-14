@@ -213,12 +213,28 @@ private:
 		return head + 1;
 	}
 
+	// The worker's threads above the game's (KYTY_UPLOAD_PRIORITY=0: at their normal priority, as before 11-14). Held to the
+	// performance cores (KYTY_RECORDING_CPUS) at the same priority as the game's threads, which fill those cores while a
+	// world loads, the worker lost its CPU for whole time slices while it held the guest address space's lock to protect
+	// pages: the game's next map waited for it, and every thread for that map, the render thread in its label drains (one
+	// boot, the soak's world changes, the priority switched live: 22 stalls of 3-30 ms in 6 loads at normal priority, none
+	// above it; 1-1 standing at 120 Hz 72.5 fps either way, 1% low 65.1 -> 65.9). Not pinned instead: no stalls either, but
+	// 1% low -3 fps (it ran on efficiency cores). (Called unconditionally: Run keeps its trained profile.)
+	static void RaisePriority() {
+		static const bool raise = [] {
+			const char* value = std::getenv("KYTY_UPLOAD_PRIORITY");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (raise) LocalPlatform::MakeAboveGameThread();
+	}
+
 	void Run() {
 		LocalPlatform::SetThreadName("Kyty.Upload");
 		t_worker = true;
 		WriteGuard::t_no_wait = true; // (KYTY_WRITE_GUARD: the lifts are this thread's jobs)
 		// Created by the render thread: do not inherit its dedicated CPU.
 		LocalPlatform::PinThreadToCpuList(std::getenv("KYTY_RECORDING_CPUS"));
+		RaisePriority();
 		// Pause iterations the worker polls for new copies before it sleeps (while its CPUs idle: spin-gate.h).
 		constexpr uint32_t UploadSpins = 20000;
 		for (;;) {
@@ -362,6 +378,7 @@ private:
 		LocalPlatform::SetThreadName("Kyty.Upload2");
 		t_worker = true;
 		LocalPlatform::PinThreadToCpuList(std::getenv("KYTY_RECORDING_CPUS"));
+		RaisePriority();
 		uint32_t seen = 0;
 		for (;;) {
 			uint32_t posted = 0;
