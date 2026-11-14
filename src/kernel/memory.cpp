@@ -1375,6 +1375,20 @@ bool ReadFaults(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) && g_gpu_resources->HasReadWatchers(vaddr, size);
 }
 
+// A translating thread's read of guest memory no read watcher guards (its callers looked), none on
+// a fault. Linux (KYTY_SPEC_BACKING_READS, live spec_backing_reads 1): through the backing view
+// first, as the scout reads; a GuardedCopy there is a pread of /proc/self/mem, a system call per
+// read under the mmap lock (half the speculation threads' time in mode 4, 11-14). 0: GuardedCopy
+// only, as before.
+static bool CopyUnwatched(uint64_t vaddr, void* data, uint64_t size) {
+#if !defined(_WIN32)
+	static auto& backing = LiveSwitch::Find("spec_backing_reads", 1);
+	if (backing.load(std::memory_order_relaxed) != 0 && TryReadBackingToHost(vaddr, data, size))
+		return true;
+#endif
+	return Common::GuardedCopy(data, reinterpret_cast<const void*>(vaddr), size) == 0;
+}
+
 bool TryReadGuestNoFault(uint64_t vaddr, void* data, uint64_t size) {
 	if (data == nullptr || size == 0 || !Graphics::GuestGpu::IsTranslatingThread() || Graphics::GuestGpu::IsGpuThread())
 		return false;
@@ -1382,7 +1396,7 @@ bool TryReadGuestNoFault(uint64_t vaddr, void* data, uint64_t size) {
 	// copy, a fault refused. A read-watched one only through its clean backing.)
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
 	    (!g_gpu_resources->HasReadWatchers(vaddr, size) && SpeculationReadsClean(vaddr, size)))
-		return Common::GuardedCopy(data, reinterpret_cast<const void*>(vaddr), size) == 0;
+		return CopyUnwatched(vaddr, data, size);
 	return TryReadGpuCleanBackingToHost(vaddr, data, size);
 }
 
@@ -1394,7 +1408,7 @@ bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean)
 		// A speculation's thread: the GPU thread may read-protect the page after the look above (work it commits
 		// writes it), and a fault there waits for the GPU thread, which may wait for this thread (a mode 4 hang at the
 		// stone arch, 11-01): a guarded read, none on a fault (the caller's word reads refuse the speculation).
-		if (!Graphics::GuestGpu::IsGpuThread()) return Common::GuardedCopy(data, reinterpret_cast<const void*>(vaddr), size) == 0;
+		if (!Graphics::GuestGpu::IsGpuThread()) return CopyUnwatched(vaddr, data, size);
 		// 8..64 bytes of whole words: fixed-size moves inline, a variable-size memcpy is a CRT call
 		// (thousands of SRT span reads per frame).
 		auto*       out = static_cast<uint8_t*>(data);

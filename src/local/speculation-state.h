@@ -42,6 +42,11 @@ extern "C" {
 extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (performance-switches.h)
 }
 
+namespace Libs::LibKernel::Memory {
+bool ReadFaults(uint64_t vaddr, uint64_t size);                       // (kernel/memory.h)
+bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size); // (kernel/memory.h)
+} // namespace Libs::LibKernel::Memory
+
 namespace Libs::Graphics {
 class Image;
 class StreamBuffer;
@@ -546,6 +551,20 @@ struct State {
 			std::memcpy(out, backing, bytes);
 			return true;
 		}
+#if !defined(_WIN32)
+		// (Linux, KYTY_SPEC_BACKING_READS / live spec_backing_reads 1: GuardedCopy is a pread of
+		// /proc/self/mem there, a system call per read under the mmap lock, and it reads a page
+		// mprotect read-protected. A page a read watcher guards is refused, as the fault refuses it
+		// on Windows; any other through the backing view.)
+		static auto& backing_reads = LiveSwitch::Find("spec_backing_reads", 1);
+		if (backing_reads.load(std::memory_order_relaxed) != 0) {
+			if (Libs::LibKernel::Memory::ReadFaults(address, bytes)) {
+				if (refused == nullptr) refused = "GPU-written guest memory (read watched)";
+				return false;
+			}
+			if (Libs::LibKernel::Memory::TryReadBackingToHost(address, out, bytes)) return true;
+		}
+#endif
 		if (Common::GuardedCopy(out, reinterpret_cast<const void*>(address), bytes) == 0) return true;
 		if (refused == nullptr) refused = "GPU-written guest memory (read fault)";
 		return false;
