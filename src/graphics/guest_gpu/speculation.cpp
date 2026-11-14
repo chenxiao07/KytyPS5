@@ -732,6 +732,12 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	// (What it kept of the catalogs from its last translation, dropped when a sweep or reset happened since.)
 	translator.draw->ForgetStaleCatalog();
 	translator.compute->ForgetStaleCatalog();
+	// (This thread's draw state shadow and state key as nothing known: a state pass on the same thread (no pass thread,
+	// KYTY_SPEC_PASS_THREAD=0 or no slot for it; the async queue always) writes this chunk's own register values into
+	// the shadow, and a write of the same value in the translation would then look unchanged: its next draw taken as
+	// clean, with the previous draw's key.)
+	DrawStateObserver::Invalidate();
+	translator.draw->NativeXprForgetState();
 	{
 	Spec::t_state = &r.state;
 	CommandScheduler::SetThreadRecorder(r.recorder.get());
@@ -868,6 +874,11 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 		EXIT_IF(committed != r.state.closed.size());
 		// Committed whole: the processor state at its end (or at the packet it stopped at).
 		cp.CopyStateFrom(*r.end_state, false);
+		// (The registers are the worker's end state now, not what this thread's draw state shadow and state key saw
+		// before the chunk: without this, its next draw could be taken as clean, or keep the old context hash, and bind
+		// the draw state of the last draw it translated itself. As after a hole or spliced worker packets.)
+		DrawStateObserver::Invalidate();
+		m_renderer.GetRenderExecutor().NativeXprForgetState();
 		outcome = r.stop == nullptr ? Outcome::Whole : r.stop == ChunkEnd ? Outcome::Chunk : Outcome::Partly;
 		if (r.stop != nullptr) execution = std::move(r.stop_execution);
 	} else if (committed != 0) {
