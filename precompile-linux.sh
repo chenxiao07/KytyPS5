@@ -119,6 +119,7 @@ if [ ! -f "$SEEDS" ] || [ "$REMAKE" = 1 ]; then
 	mkdir -p "$SEED_DIR"
 	made="$SEEDS"
 	[ "$REMAKE" = 1 ] && made="$SEEDS.new"
+	echo "seeds:      listing the game's shaders from its files (once for each emulator version)"
 	"$EXE" --game "$GAME" --make-seeds "$made" --states "$STATES" ||
 		die "making the seed file failed (kyty_shader_precompile --make-seeds)"
 	if [ "$REMAKE" = 1 ]; then
@@ -258,6 +259,9 @@ run_precompile() { # name what arguments...: in the foreground, the run ends whe
 	[ "$rc" = 0 ] || die "$what failed; logs: $LOGS"
 }
 elapsed() { local s=$(( $(date +%s) - BEGIN )); printf '%02d:%02d:%02d' $((s / 3600)) $((s % 3600 / 60)) $((s % 60)); }
+# What the run does next, with the time since it began: the plans and merges print nothing of their own for minutes
+# (issue #334: no output, so no telling whether it was doing anything).
+step() { echo "  $(elapsed) $1"; }
 # A background process is done once it is gone or a zombie.
 finished() { [ ! -d "/proc/$1" ] || [ "$(cut -d' ' -f3 "/proc/$1/stat" 2>/dev/null)" = Z ]; }
 
@@ -291,11 +295,13 @@ HAS_RECORDED=0
 	die "--quick needs the specializations of recorded play (a recording or the release's hints)"
 # Two tiers: the specializations of recorded play first, then every shader the game ships (--quick: not those).
 if [ "$HAS_RECORDED" = 1 ]; then
+	step 'planning: the shaders recorded play needs (a dry run on all CPUs, a minute or more)'
 	run_precompile plan-recorded plan --seeds "$RECORDED" --dry-run --plan "$PLAN" --threads "$CPUS"
 fi
 if [ "$MODE" != quick ]; then
 	seed_plan=(--seeds "$SEEDS" --dry-run --plan "$PLAN" --threads "$CPUS" --static-inputs)
 	[ "$HAS_RECORDED" = 1 ] && [ "$MODE" != full ] && seed_plan+=(--covered-by "$RECORDED")
+	step 'planning: every other shader the game ships (a dry run on all CPUs, a minute or more)'
 	run_precompile plan-seeds plan "${seed_plan[@]}"
 fi
 FIRST=()
@@ -315,6 +321,7 @@ if [ "$MODE" != quick ]; then
 	[ "$count" -ge "$SHARDS" ] || count=$SHARDS
 	for ((i = 0; i < count; i++)); do SECOND+=("$SEEDS$TAB$i/$count"); done
 fi
+step "compiling: $(( ${#FIRST[@]} + ${#SECOND[@]} )) shards of about 100 pipelines, $JOBS at a time (a progress line every minute)"
 # The shards share the pipelines they hold (PipelineBinaryWriter::Claimed): one that several shards make is compiled once.
 export KYTY_PRECOMPILE_CLAIMS="$CACHES/claims"
 mkdir -p "$KYTY_PRECOMPILE_CLAIMS"
@@ -401,7 +408,10 @@ while [ ${#FIRST[@]} -gt 0 ] || [ ${#SECOND[@]} -gt 0 ] || [ ${#RUN_PID[@]} -gt 
 	done
 	if [ $(( $(date +%s) - SHOWN )) -ge 60 ]; then
 		SHOWN=$(date +%s)
-		echo "  $(elapsed) shards: $DONE_COUNT done, ${#RUN_PID[@]} running, $(( ${#FIRST[@]} + ${#SECOND[@]} )) waiting ($SPLIT split)"
+		# (Of all the run's shards: a split one counts as its two halves.)
+		waiting=$(( ${#FIRST[@]} + ${#SECOND[@]} ))
+		total=$(( DONE_COUNT + ${#RUN_PID[@]} + waiting ))
+		echo "  $(elapsed) shards: $DONE_COUNT of $total done ($(( 100 * DONE_COUNT / (total > 0 ? total : 1) ))%), ${#RUN_PID[@]} running, $waiting waiting ($SPLIT split)"
 	fi
 done
 unset KYTY_PRECOMPILE_CLAIMS KYTY_PRECOMPILE_STUCK
@@ -409,6 +419,7 @@ unset KYTY_PRECOMPILE_CLAIMS KYTY_PRECOMPILE_STUCK
 # earlier run made for it stay too.) (--stamp: the store's translation features, those this run used.)
 merge_arguments=(--merge --stamp)
 [ "$MODE" != quick ] && [ "$RECORDED_LOST" = 0 ] && merge_arguments+=(--prune)
+step 'merging the shards into the static cache'
 run_precompile merge merge "${merge_arguments[@]}"
 [ "$MODE" = quick ] && run_precompile inputs inputs "${INPUTS[@]}"
 cache="$(ls -t "$ROOT/_PipelineCache/static/$ID".{bin,binaries,blobs} 2>/dev/null | head -1)"

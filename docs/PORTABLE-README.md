@@ -355,6 +355,8 @@ There are two levels of preparation, both specific to the graphics card and driv
      laptop (Ryzen 9 5900HX), longer with fewer threads. The CPU is fully loaded meanwhile: running it
      overnight is a good idea. Once "ready to play" shows (about halfway), what play needs is in place
      and the game can be started; the rest follows.
+   - The window says what it is doing (first planning, a few minutes with fewer threads), then shows the progress
+     every minute while it compiles: `shards: 120 of 1096 done (10%), 8 running, 968 waiting`.
    - Closing the window stops it; running it again continues where it stopped.
    - If the graphics driver never finishes compiling a pipeline (reported on an AMD card), the precompile leaves
      that pipeline out after 5 minutes and carries on; at the end it lists them in the logs folder

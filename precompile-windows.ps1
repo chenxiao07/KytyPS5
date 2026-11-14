@@ -160,6 +160,7 @@ if (!(Test-Path $Seeds) -or $remake) {
 	# precompile.py seeds without Python).
 	New-Item -ItemType Directory -Force (Split-Path $Seeds) | Out-Null
 	$made = if ($remake) { "$Seeds.new" } else { $Seeds }
+	Write-Host 'seeds:      listing the game''s shaders from its files (once for each emulator version)'
 	& $Exe --game $Game --make-seeds $made --states "$PSScriptRoot\tools\local\static-precompile\pass-states.json"
 	if ($LASTEXITCODE) { throw 'making the seed file failed (kyty_shader_precompile --make-seeds)' }
 	if ($remake -and (Get-FileHash $made).Hash -eq (Get-FileHash $Seeds).Hash) { Remove-Item $made } elseif ($remake) { Move-Item -Force $made $Seeds }
@@ -307,6 +308,9 @@ function Wait-Precompile($process, [string]$what) {
 		throw "$what failed; logs: $logName"
 	}
 }
+# What the run does next, with the time since it began: the plans and merges print nothing of their own for minutes
+# (issue #334: no output, so no telling whether it was doing anything).
+function Write-Step([string]$text) { Write-Host ("  {0:hh\:mm\:ss} {1}" -f ((Get-Date) - $begin), $text) }
 
 Write-Host "precompile: $Seeds, $Shards shards, $Jobs at a time, affinity 0x$('{0:X}' -f $mask); logs $logName"
 Write-Host "recorded:   $(if ($Recorded) { "$Recorded (the release's hints and this PC's recorded play)" } else { 'none: the seeds alone' })"
@@ -349,6 +353,7 @@ $plan = "$logs\plan.bin"
 $hasRecorded = $Recorded -and (Test-Path $Recorded)
 if ($Quick -and !$hasRecorded) { throw "-Quick needs the specializations of recorded play (a recording or the release's hints)" }
 if ($hasRecorded) {
+	Write-Step 'planning: the shaders recorded play needs (a dry run on all CPUs, a minute or more)'
 	Wait-Precompile (Start-Precompile 'plan-recorded' @('--seeds', "`"$Recorded`"", '--dry-run', '--plan', "`"$plan`"",
 		'--threads', "$cpus")) 'plan'
 }
@@ -357,6 +362,7 @@ if (!$Quick) {
 	# of shaders recorded play has are left out (-Full: not).
 	$seedPlan = @('--seeds', "`"$Seeds`"", '--dry-run', '--plan', "`"$plan`"", '--threads', "$cpus", '--static-inputs')
 	if ($hasRecorded -and !$Full) { $seedPlan += @('--covered-by', "`"$Recorded`"") }
+	Write-Step 'planning: every other shader the game ships (a dry run on all CPUs, a minute or more)'
 	Wait-Precompile (Start-Precompile 'plan-seeds' $seedPlan) 'plan'
 }
 $first  = [System.Collections.Generic.Queue[object]]::new()
@@ -373,6 +379,8 @@ if (!$Quick) {
 	$count = [math]::Max($Shards, [math]::Ceiling((Get-PlannedPipelines 'plan-seeds') / 100))
 	for ($i = 0; $i -lt $count; $i++) { $second.Enqueue(@($Seeds, "$i/$count")) }
 }
+Write-Step ("compiling: {0} shards of about 100 pipelines, {1} at a time (a progress line every minute)" -f
+	($first.Count + $second.Count), $Jobs)
 # The shards share the pipelines they hold (PipelineBinaryWriter::Claimed): one that the seeds of several
 # shards make (a third of them) is compiled once.
 $env:KYTY_PRECOMPILE_CLAIMS = Join-Path $nvidiaCaches 'claims'
@@ -495,8 +503,11 @@ while ($first.Count -or $second.Count -or $running.Count) {
 	}
 	if (((Get-Date) - $shown).TotalSeconds -ge 60) {
 		$shown = Get-Date
-		Write-Host ("  {0:hh\:mm\:ss} shards: {1} done, {2} running, {3} waiting ({4} split)" -f ((Get-Date) - $begin), $finished,
-			$running.Count, ($first.Count + $second.Count), $split)
+		# (Of all the run's shards: a split one counts as its two halves.)
+		$waiting = $first.Count + $second.Count
+		$total = $finished + $running.Count + $waiting
+		Write-Host ("  {0:hh\:mm\:ss} shards: {1} of {2} done ({3}%), {4} running, {5} waiting ({6} split)" -f ((Get-Date) - $begin),
+			$finished, $total, [math]::Floor(100 * $finished / [math]::Max(1, $total)), $running.Count, $waiting, $split)
 	}
 }
 $env:KYTY_PRECOMPILE_CLAIMS = $null
@@ -506,6 +517,7 @@ $env:KYTY_PRECOMPILE_STUCK = $null
 # (--stamp: the store's translation features, those this run used: ShaderRecompiler TranslatorFeatures.)
 $mergeArguments = @('--merge', '--stamp')
 if (!$Quick -and !$recordedLost) { $mergeArguments += '--prune' }
+Write-Step 'merging the shards into the static cache'
 Wait-Precompile (Start-Precompile 'merge' $mergeArguments) 'merge'
 if ($Quick) { Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs' }
 $cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\$gameId.bin", "$PSScriptRoot\_PipelineCache\static\$gameId.binaries",
