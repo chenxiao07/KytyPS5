@@ -2463,6 +2463,50 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 					std::printf("Speculation: a stop inside a run of indirect draws (%u dwords on): the run cut there\n", to_stop);
 			}
 		}
+		// Off the GPU thread, the words two packets read after the probe, read once in a guarded copy before the packet is
+		// entered; a page without access suspends the execution before it as the probe does (nothing refused or rolled
+		// back). A WRITE_DATA's own words (its handler journals or records its payload: the GPU thread flushes the deferred
+		// read protections before a label, so a probed page may lose access before the read): the handler reads the copy; one
+		// too short to hold its address (its handler's count would wrap) stops there too. A SET_*_REG_INDIRECT's register
+		// table: the observer reads the copy, and a state pass's GuardTable takes it too (t_indirect_table_copy), one copy,
+		// not two. A speculation's GuardTable copies again after its SyncCommandMemory check, as before: a copy taken before
+		// that check could hold the bytes of a table GPU work wrote and the check then found downloaded (the check refuses
+		// and notes the clean read, so it cannot run here, before the packet is entered). A state pass checks nothing
+		// (SyncCommandMemory returns at once). (WRITE_DATA packets are few a frame.) The GPU thread and mode 0 read as before.
+		const uint32_t*           handler_words = packet;
+		std::span<const uint32_t> table_words;
+		if (off_gpu_thread) {
+			t_indirect_table_copy.packet = nullptr; // (no earlier packet's copy is taken)
+			const auto stop_before = [&] {
+				m_watched_stop        = true;
+				execution.m_suspended = true;
+			};
+			if (opcode == Pm4::IT_WRITE_DATA) {
+				static thread_local std::vector<uint32_t> write_copy;
+				const uint32_t                           dwords = KYTY_PM4_LEN(packet_header);
+				write_copy.resize(dwords);
+				if (dwords < 4u || Common::GuardedCopy(write_copy.data(), packet, uint64_t {dwords} * 4u) != 0)
+					return stop_before();
+				handler_words = write_copy.data();
+			} else if ((opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT || opcode == Pm4::IT_SET_SH_REG_INDIRECT ||
+			            opcode == Pm4::IT_SET_UCONFIG_REG_INDIRECT) &&
+			           KYTY_PM4_LEN(packet_header) >= 5u) { // (as the observer reads one; its handler takes 5 only)
+				const uint64_t table = (uint64_t {packet[1]} & 0xfffffffcu) | (uint64_t {packet[2]} << 32u);
+				const uint32_t pairs = packet[4] & 0x3fffu;
+				if (table != 0 && pairs != 0) {
+					auto&          copy  = t_indirect_table_copy;
+					const uint64_t bytes = uint64_t {pairs} * 8u;
+					copy.words.resize(size_t {pairs} * 2u);
+					// (KYTY_WRITE_GUARD_SPEC: a table on a guarded page through the backing view, as GuardTable reads it.)
+					if (const auto* backing = WriteGuard::GuardedBacking(table, bytes))
+						std::memcpy(copy.words.data(), backing, bytes);
+					else if (Common::GuardedCopy(copy.words.data(), reinterpret_cast<const void*>(table), bytes) != 0)
+						return stop_before();
+					if (spec == nullptr) copy.packet = packet, copy.table = table, copy.pairs = pairs; // (a state pass's)
+					table_words = {copy.words.data(), copy.words.size()};
+				}
+			}
+		}
 		// A state pass's chunk boundary (SetChunking): not within a run of indirect draws, which a translation takes
 		// together (the packet runs when the pass resumes, counted again).
 		if (m_chunk_every != 0 && IsChunkWork(opcode)) {
@@ -2507,6 +2551,12 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			case Pm4::IT_DRAW_INDEX_INDIRECT:
 			case Pm4::IT_DRAW_INDIRECT_MULTI:
 			case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+				// (Off the GPU thread, one too short to hold it is other data, its word 3 past its probed words: the execution
+				// suspends before reading it. Only a state pass meets one: a speculation takes these by their headers.)
+				if (KYTY_PM4_LEN(packet_header) < 4u && off_gpu_thread) {
+					execution.m_suspended = true;
+					return;
+				}
 				m_sh_ctx.SetStartInstanceUserSgpr(GsUserSgprAt(packet[3] & 0xffffu));
 				break;
 			case Pm4::IT_DRAW_INDEX_2:
@@ -2563,8 +2613,9 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			}
 		} native_store_end;
 		if (const auto native = kyty_local_native_xpr_mode.load(std::memory_order_relaxed); native != 0) {
+			// (Off the GPU thread, an indirect register table from its copy above.)
 			DrawStateObserver::ObservePacket(opcode, packet, std::min(KYTY_PM4_LEN(packet_header), remaining_dw),
-			                                 false);
+			                                 false, off_gpu_thread ? &table_words : nullptr);
 			if (opcode == Pm4::IT_DRAW_INDEX_INDIRECT &&
 			    (packet_header != 0xc0032500u || GraphicsRunDebugDumpEnabled()))
 				m_renderer.GetRenderExecutor().NativeXprForgetState();
@@ -2704,11 +2755,12 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		// (Off the GPU thread a handler's exit, a packet that cannot be, is a worker reading command memory the game
 		// reused or GPU work wrote: the speculation refuses it ("malformed packet", the spec report's stops) and a state
 		// pass ends there, as 4c1e5d95's length check does; the render thread keeps the exits. A COPY_DATA of another
-		// header ended a mode 4 run after a death, 5 Nov.)
+		// header ended a mode 4 run after a death, 5 Nov.) (Off the GPU thread a WRITE_DATA's handler reads its copy,
+		// handler_words.)
 		if (spec == nullptr && m_state_only && !GuestGpu::IsGpuThread()) {
 			try {
 				const Common::RecoverableExitScope recoverable;
-				packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+				packet_dw = handler(*this, packet_header & ~1u, handler_words + 1, remaining_dw, total_dw) + 1;
 			} catch (const Common::RecoverableExit& malformed) {
 				static std::atomic<uint32_t> reports {0};
 				if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
@@ -2723,7 +2775,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			// What would submit or wait for the GPU refuses the packet.
 			try {
 				const Common::RecoverableExitScope recoverable;
-				packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+				packet_dw = handler(*this, packet_header & ~1u, handler_words + 1, remaining_dw, total_dw) + 1;
 			} catch (const CommandScheduler::RecorderRefusal& refusal) {
 				Spec::Refuse(refusal.what);
 			} catch (const Common::RecoverableExit&) {

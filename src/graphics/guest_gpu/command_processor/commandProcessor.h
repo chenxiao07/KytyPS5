@@ -14,6 +14,18 @@ namespace Libs::Graphics {
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
 
+// Off the GPU thread (ProcessPm4Spec: a speculation's or a state pass's thread), a SET_*_REG_INDIRECT packet's register
+// table read once, in a guarded copy before the packet is entered: the observer (DrawStateObserver::ObservePacket) reads
+// this copy, never the table, and so does a state pass's handler (GuardTable; a speculation's copies after its check).
+// Keyed by the packet and the table it names (`packet` null: none; GuardTable takes it).
+struct IndirectTableCopy {
+	const uint32_t*       packet = nullptr;
+	uint64_t              table  = 0;
+	uint32_t              pairs  = 0;
+	std::vector<uint32_t> words;
+};
+inline thread_local IndirectTableCopy t_indirect_table_copy;
+
 enum class Pm4ProcessResult { Complete, Blocked };
 
 enum class ContextStateOperation : uint32_t {

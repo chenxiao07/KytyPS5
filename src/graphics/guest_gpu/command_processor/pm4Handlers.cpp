@@ -130,7 +130,8 @@ void ReportOtherData(uint32_t cmd_id, uint32_t offset) {
 		            cmd_id, offset);
 }
 
-[[nodiscard]] bool GuardTable(uint32_t*& table, uint32_t pairs, uint32_t bank) {
+// (`packet`: the packet the table is of, for ProcessPm4Spec's copy, t_indirect_table_copy.)
+[[nodiscard]] bool GuardTable(uint32_t*& table, uint32_t pairs, uint32_t bank, const uint32_t* packet) {
 	if (GuestGpu::IsGpuThread()) {
 		// (KYTY_WRITE_GUARD: a table on a page a pending guest write guards, through the backing view: the bytes this
 		// thread wrote, local/write-guard.h.)
@@ -139,35 +140,45 @@ void ReportOtherData(uint32_t cmd_id, uint32_t offset) {
 		return true;
 	}
 	thread_local std::vector<uint32_t> copy;
-	copy.resize(size_t {pairs} * 2u);
-	// (KYTY_WRITE_GUARD_SPEC: a table on a guarded page, through the backing view: the bytes the GPU thread wrote.)
-	if (const auto* backing = WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(table), uint64_t {pairs} * 8u)) {
-		std::memcpy(copy.data(), backing, uint64_t {pairs} * 8u);
+	uint32_t*                          words = nullptr;
+	// (A state pass's: ProcessPm4Spec's copy of this packet's table, the words the observer read, taken, not copied again;
+	// nothing between writes the table, its SyncCommandMemory returns at once. A speculation's copies here, after its
+	// check, as before: ProcessPm4Spec keys none for it.)
+	if (auto& early = t_indirect_table_copy;
+	    early.packet == packet && early.table == reinterpret_cast<uint64_t>(table) && early.pairs == pairs) {
+		early.packet = nullptr;
+		words        = early.words.data();
 	} else {
-		bool read = false;
+		copy.resize(size_t {pairs} * 2u);
+		words = copy.data();
+		// (KYTY_WRITE_GUARD_SPEC: a table on a guarded page, through the backing view: the bytes the GPU thread wrote.)
+		if (const auto* backing = WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(table), uint64_t {pairs} * 8u)) {
+			std::memcpy(words, backing, uint64_t {pairs} * 8u);
+		} else {
+			bool read = false;
 #if !defined(_WIN32)
-		// (Linux, KYTY_SPEC_BACKING_READS / live spec_backing_reads 1: GuardedCopy is a pread of
-		// /proc/self/mem there, a system call per table under the mmap lock (~6000 a frame at the
-		// 1-1 stand). A table a read watcher guards is refused, as the fault refuses it on Windows;
-		// any other is read through the backing view.)
-		static auto& backing_reads = LiveSwitch::Find("spec_backing_reads", 1);
-		if (backing_reads.load(std::memory_order_relaxed) != 0) {
-			const auto address = reinterpret_cast<uint64_t>(table);
-			if (Libs::LibKernel::Memory::ReadFaults(address, uint64_t {pairs} * 8u)) {
+			// (Linux, KYTY_SPEC_BACKING_READS / live spec_backing_reads 1: GuardedCopy is a pread of
+			// /proc/self/mem there, a system call per table under the mmap lock (~6000 a frame at the
+			// 1-1 stand). A table a read watcher guards is refused, as the fault refuses it on Windows;
+			// any other is read through the backing view.)
+			static auto& backing_reads = LiveSwitch::Find("spec_backing_reads", 1);
+			if (backing_reads.load(std::memory_order_relaxed) != 0) {
+				const auto address = reinterpret_cast<uint64_t>(table);
+				if (Libs::LibKernel::Memory::ReadFaults(address, uint64_t {pairs} * 8u)) {
+					if (Spec::Current() != nullptr) Spec::Refuse("GPU-written guest memory");
+					return false;
+				}
+				read = Libs::LibKernel::Memory::TryReadBackingToHost(address, words, uint64_t {pairs} * 8u);
+			}
+#endif
+			if (!read && Common::GuardedCopy(words, table, uint64_t {pairs} * 8u) != 0) {
 				if (Spec::Current() != nullptr) Spec::Refuse("GPU-written guest memory");
 				return false;
 			}
-			read = Libs::LibKernel::Memory::TryReadBackingToHost(address, copy.data(),
-			                                                     uint64_t {pairs} * 8u);
-		}
-#endif
-		if (!read && Common::GuardedCopy(copy.data(), table, uint64_t {pairs} * 8u) != 0) {
-			if (Spec::Current() != nullptr) Spec::Refuse("GPU-written guest memory");
-			return false;
 		}
 	}
 	for (uint32_t i = 0; i < pairs; ++i) {
-		const uint32_t raw = copy[size_t {i} * 2u];
+		const uint32_t raw = words[size_t {i} * 2u];
 		if (raw == 0xffffffffu) continue;
 		const uint32_t offset = NormalizeRegisterOffset(raw);
 		const bool     known  = bank == 0   ? offset < Pm4::CX_NUM || HwCtxIsFakeRegister(offset)
@@ -184,8 +195,31 @@ void ReportOtherData(uint32_t cmd_id, uint32_t offset) {
 			return false;
 		}
 	}
-	table = copy.data();
+	table = words;
 	return true;
+}
+
+// A speculation's or a state pass's thread (KYTY_SPECULATE set, a plain global first; off the GPU thread): ProcessPm4Spec
+// runs its handlers in a RecoverableExitScope there, so an exit refuses the packet ("malformed packet") or ends the pass.
+[[nodiscard]] bool OnSpecWorker() {
+	return ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && !GuestGpu::IsGpuThread() &&
+	       (Spec::Current() != nullptr || Spec::Record() != nullptr);
+}
+
+// On such a thread, a word GPU work writes (a COND_EXEC's predicate, a branch's compare value) read in a guarded copy, as
+// GuardTable reads a table (through the backing view on a page a guest write of the GPU thread guards), never by a fault
+// that waits for the GPU thread (spec_thread_gpu_faults). A page without access exits: the state pass, the one such thread
+// these packets run on (a speculation takes neither, SpeculationTakes), ends before the packet.
+template <typename T>
+[[nodiscard]] T SpecWorkerRead(uint64_t address) {
+	T value {};
+	if (const auto* backing = WriteGuard::GuardedBacking(address, sizeof(T))) {
+		std::memcpy(&value, backing, sizeof(T));
+	} else if (Common::GuardedCopy(&value, reinterpret_cast<const void*>(address), sizeof(T)) != 0) {
+		Spec::Refuse("GPU-written guest memory");
+		EXIT("a GPU-written word at 0x%016" PRIx64 " on a page without access, off the GPU thread\n", address);
+	}
+	return value;
 }
 
 // An entry of an indirect register table the emulator cannot apply: report the table once in a
@@ -382,7 +416,17 @@ KYTY_HW_CTX_PARSER(HwCtxSetAaSampleControl) {
 
 	uint32_t count = 1;
 
-	if (dw >= 20 && buffer[16] == 0xc0026900 && buffer[17] == Pm4::PA_SC_CENTROID_PRIORITY_0) {
+	// (Off the GPU thread the look-ahead, the next packet's 4 words past this packet's probed pages, read in a guarded
+	// copy: a page without access is no match, refused "GPU-written guest memory", and no match exits, which there refuses
+	// the packet (not a hole: the speculation stops before it and the GPU thread merges it in order) or ends the state pass.
+	// Not merging and running the next packet alone is not the same: no match is an exit on every thread.)
+	const uint32_t* next = buffer + 16;
+	uint32_t        next_copy[4] {};
+	if (dw >= 20 && OnSpecWorker()) {
+		next = Common::GuardedCopy(next_copy, buffer + 16, sizeof(next_copy)) == 0 ? next_copy : nullptr;
+		if (next == nullptr) Spec::Refuse("GPU-written guest memory");
+	}
+	if (dw >= 20 && next != nullptr && next[0] == 0xc0026900 && next[1] == Pm4::PA_SC_CENTROID_PRIORITY_0) {
 		count = 20;
 
 		HW::AaSampleControl r;
@@ -390,7 +434,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetAaSampleControl) {
 		memcpy(r.locations, buffer, static_cast<size_t>(16) * 4);
 
 		r.centroid_priority =
-		    static_cast<uint64_t>(buffer[18]) | (static_cast<uint64_t>(buffer[19]) << 32u);
+		    static_cast<uint64_t>(next[2]) | (static_cast<uint64_t>(next[3]) << 32u);
 
 		cp.GetCtx().SetAaSampleControl(r);
 	} else {
@@ -1596,7 +1640,10 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 			     addr);
 		}
 	}
-	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
+	// (A state pass's, in a guarded copy: SpecWorkerRead.)
+	const uint32_t predicate =
+	    OnSpecWorker() ? SpecWorkerRead<uint32_t>(addr) : *reinterpret_cast<const volatile uint32_t*>(addr);
+	if (predicate == 0) {
 		return payload_dw + exec_count;
 	}
 
@@ -1630,7 +1677,10 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
+	// (A state pass's, in a guarded copy: SpecWorkerRead.)
+	const uint64_t compare =
+	    OnSpecWorker() ? SpecWorkerRead<uint64_t>(reinterpret_cast<uint64_t>(compare_addr)) : *compare_addr;
+	const bool take_then = TestWaitRegMemValue(compare, reference, mask, function);
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
@@ -2366,7 +2416,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectCxRegs"))
 		return KYTY_PM4_LEN(cmd_id) - 1u;
-	if (!GuardTable(indirect_buffer, indirect_num_dw, 0)) return KYTY_PM4_LEN(cmd_id) - 1u;
+	if (!GuardTable(indirect_buffer, indirect_num_dw, 0, buffer - 1)) return KYTY_PM4_LEN(cmd_id) - 1u;
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
 	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
@@ -2446,7 +2496,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectShRegs"))
 		return KYTY_PM4_LEN(cmd_id) - 1u;
-	if (!GuardTable(indirect_buffer, indirect_num_dw, 1)) return KYTY_PM4_LEN(cmd_id) - 1u;
+	if (!GuardTable(indirect_buffer, indirect_num_dw, 1, buffer - 1)) return KYTY_PM4_LEN(cmd_id) - 1u;
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
 	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
@@ -2503,7 +2553,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectUcRegs"))
 		return KYTY_PM4_LEN(cmd_id) - 1u;
-	if (!GuardTable(indirect_buffer, indirect_num_dw, 2)) return KYTY_PM4_LEN(cmd_id) - 1u;
+	if (!GuardTable(indirect_buffer, indirect_num_dw, 2, buffer - 1)) return KYTY_PM4_LEN(cmd_id) - 1u;
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
 	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
