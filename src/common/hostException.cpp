@@ -487,7 +487,79 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 
 #endif
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// The filter is entered through KytyExceptionFilterEntry, which keeps the upper halves of ymm0-15 as they came in and puts
+// them back before an exception is resumed (KYTY_VEH_STUB=0: the filter registered itself, as before). The context of an
+// exception the emulator serves often carries no AVX state (its XSTATE mask only x87 and SSE), and in this process Windows
+// now and then resumed the thread with the upper halves the filter's own code left (compiled with AVX: zero after its
+// vzeroupper): a copy that held data in ymm registers across the fault got zeros there (the register tables of the
+// copy fix, ThreadExceptions; the game's own AVX code has no such fix). 11-15, the game's moves of up to a few KiB that
+// took an exception, not made again: 21 wrong in 700,000 without the stub, 3 in 1,120,000 and 2 in 1,720,000 with it.
+extern "C" LONG WINAPI KytyExceptionFilterBody(PEXCEPTION_POINTERS exception) noexcept {
+	return ExceptionFilter(exception);
+}
+extern "C" LONG WINAPI KytyExceptionFilterEntry(PEXCEPTION_POINTERS exception);
+// (A frame of 336 bytes aligned to 32: the shadow space, then 16 upper halves of 16 bytes. EXCEPTION_CONTINUE_EXECUTION is
+// -1: only then are they put back; the low halves come from the context.)
+__asm__(".text\n"
+        ".globl KytyExceptionFilterEntry\n"
+        ".def KytyExceptionFilterEntry; .scl 2; .type 32; .endef\n"
+        ".p2align 4\n"
+        "KytyExceptionFilterEntry:\n"
+        ".seh_proc KytyExceptionFilterEntry\n"
+        "  pushq %rbp\n"
+        "  .seh_pushreg %rbp\n"
+        "  movq %rsp, %rbp\n"
+        "  .seh_setframe %rbp, 0\n"
+        "  subq $336, %rsp\n"
+        "  .seh_stackalloc 336\n"
+        "  .seh_endprologue\n"
+        "  andq $-32, %rsp\n"
+        "  vextractf128 $1, %ymm0, 32(%rsp)\n"
+        "  vextractf128 $1, %ymm1, 48(%rsp)\n"
+        "  vextractf128 $1, %ymm2, 64(%rsp)\n"
+        "  vextractf128 $1, %ymm3, 80(%rsp)\n"
+        "  vextractf128 $1, %ymm4, 96(%rsp)\n"
+        "  vextractf128 $1, %ymm5, 112(%rsp)\n"
+        "  vextractf128 $1, %ymm6, 128(%rsp)\n"
+        "  vextractf128 $1, %ymm7, 144(%rsp)\n"
+        "  vextractf128 $1, %ymm8, 160(%rsp)\n"
+        "  vextractf128 $1, %ymm9, 176(%rsp)\n"
+        "  vextractf128 $1, %ymm10, 192(%rsp)\n"
+        "  vextractf128 $1, %ymm11, 208(%rsp)\n"
+        "  vextractf128 $1, %ymm12, 224(%rsp)\n"
+        "  vextractf128 $1, %ymm13, 240(%rsp)\n"
+        "  vextractf128 $1, %ymm14, 256(%rsp)\n"
+        "  vextractf128 $1, %ymm15, 272(%rsp)\n"
+        "  callq KytyExceptionFilterBody\n"
+        "  cmpl $-1, %eax\n"
+        "  jne 1f\n"
+        "  vinsertf128 $1, 32(%rsp), %ymm0, %ymm0\n"
+        "  vinsertf128 $1, 48(%rsp), %ymm1, %ymm1\n"
+        "  vinsertf128 $1, 64(%rsp), %ymm2, %ymm2\n"
+        "  vinsertf128 $1, 80(%rsp), %ymm3, %ymm3\n"
+        "  vinsertf128 $1, 96(%rsp), %ymm4, %ymm4\n"
+        "  vinsertf128 $1, 112(%rsp), %ymm5, %ymm5\n"
+        "  vinsertf128 $1, 128(%rsp), %ymm6, %ymm6\n"
+        "  vinsertf128 $1, 144(%rsp), %ymm7, %ymm7\n"
+        "  vinsertf128 $1, 160(%rsp), %ymm8, %ymm8\n"
+        "  vinsertf128 $1, 176(%rsp), %ymm9, %ymm9\n"
+        "  vinsertf128 $1, 192(%rsp), %ymm10, %ymm10\n"
+        "  vinsertf128 $1, 208(%rsp), %ymm11, %ymm11\n"
+        "  vinsertf128 $1, 224(%rsp), %ymm12, %ymm12\n"
+        "  vinsertf128 $1, 240(%rsp), %ymm13, %ymm13\n"
+        "  vinsertf128 $1, 256(%rsp), %ymm14, %ymm14\n"
+        "  vinsertf128 $1, 272(%rsp), %ymm15, %ymm15\n"
+        "1:\n"
+        "  movq %rbp, %rsp\n"
+        "  popq %rbp\n"
+        "  retq\n"
+        ".seh_endproc\n");
+static PVECTORED_EXCEPTION_HANDLER RegisteredFilter() {
+	const char* value = std::getenv("KYTY_VEH_STUB");
+	return value != nullptr && value[0] == '0' ? &ExceptionFilter : &KytyExceptionFilterEntry;
+}
+#else
 // (The signal frame keeps the whole extended state: nothing to count.)
 uint64_t ThreadExceptions() noexcept {
 	return 0;
@@ -507,7 +579,7 @@ bool InstallHandler(Handler handler) {
 	g_handler.store(handler, std::memory_order_release);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (AddVectoredExceptionHandler(0, ExceptionFilter) == nullptr) {
+	if (AddVectoredExceptionHandler(0, RegisteredFilter()) == nullptr) {
 		g_handler.store(nullptr, std::memory_order_release);
 		g_install_state.store(0, std::memory_order_release);
 		printf("AddVectoredExceptionHandler() failed\n");
