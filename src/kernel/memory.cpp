@@ -1904,10 +1904,12 @@ bool InRemapWindow(uint64_t vaddr) noexcept {
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr, uint64_t rip, uint64_t rsp) noexcept {
 	if (g_gpu_resources == nullptr) return false;
+	// (spec_thread_gpu_faults, a mode-4 tripwire: noted only under KYTY_SPECULATE != 0; mode 0 runs the base's fault path.)
+	const bool                          note    = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0;
 	const Graphics::GuestGpu::FaultSite site {fault_vaddr, rip, rsp};
-	const auto*                         outer   = Graphics::GuestGpu::NoteFault(&site);
+	const auto*                         outer   = note ? Graphics::GuestGpu::NoteFault(&site) : nullptr;
 	const bool                          handled = g_gpu_resources->HandleFault(access, fault_vaddr);
-	Graphics::GuestGpu::NoteFault(outer);
+	if (note) Graphics::GuestGpu::NoteFault(outer);
 	if (!handled) return false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	// (A page read back: it keeps no access a while, GuestAddressSpace::NoteRead.)

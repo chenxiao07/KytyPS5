@@ -2877,7 +2877,8 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		LiveCensus::Scope miss(LiveCensus::DrawPhase, 0x7ab1e, &held == &table.args ? 10 : 11);
 		prepare();
 		const auto registration_before = buffer_cache.RegistrationEpoch(); // (a speculation's: before its lookup)
-		const BufferCache::AheadSite ahead_site(&held == &table.args ? 4 : 3); // (the lookup's site)
+		std::optional<BufferCache::AheadSite> ahead_site; // (the lookup's site: read by a speculation's lookup only)
+		if (spec_state != nullptr) ahead_site.emplace(&held == &table.args ? 4 : 3);
 		const auto result = buffer_cache.ObtainBuffer(address, size, false);
 		region_epochs.fill({UINT64_MAX, 0}); // (its uploads may have moved them)
 		const auto owner  = spec_state != nullptr ? buffer_cache.RegisteredBuffer(address, size)
@@ -3565,7 +3566,6 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	if (indirect_args != 0) {
 		// As DispatchDirect's: the arguments' owner, made current.
 		cache.EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
-		const BufferCache::AheadSite ahead_site(5); // (the lookup's site)
 		const auto id = cache.FindBuffer(indirect_args, 3u * sizeof(uint32_t));
 		if (Spec::Current() != nullptr && Spec::Current()->refused != nullptr) return false;
 		auto& owner     = cache.GetBuffer(id);
