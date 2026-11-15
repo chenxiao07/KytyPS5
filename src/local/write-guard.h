@@ -24,6 +24,7 @@
 // * An unmap drops the guards of its range (Drop), and so the GPU thread's own table's entries of them (g_gone).
 
 #include "common/virtualMemory.h"
+#include "hoist-watch.h"
 #include "live-switch.h"
 #include "mode-toggle.h"
 
@@ -286,6 +287,9 @@ template <typename InRange>
 	}
 	g_pages.emplace(page, entry);
 	g_count.fetch_add(1, std::memory_order_release);
+	// (batch_map_syncs: a guard armed over a hoisted range marks it touched, so the entry's own GPU unmap runs and drops
+	// it; the hoist's unmap dropped only the guards armed before it.)
+	(void)HoistWatch::NoteRegistration(page, Page);
 	const uint64_t arm = g_arms.load(std::memory_order_relaxed);
 	g_armed[arm % ArmRing].store(page, std::memory_order_release); // (before g_arms counts it)
 	g_arms.fetch_add(1, std::memory_order_release);
