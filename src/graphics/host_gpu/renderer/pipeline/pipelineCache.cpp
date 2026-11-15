@@ -3713,11 +3713,6 @@ PipelineCache::PrefetchProgress PipelineCache::GetPrefetchProgress() const {
 	return {std::min(prefetch->finished.load(std::memory_order_relaxed), total), total};
 }
 
-#if defined(KYTY_PGO_GENERATE)
-// compiler-rt profile runtime (instrumented builds only).
-extern "C" void __llvm_profile_reset_counters(void);
-#endif
-
 bool PipelineCache::PrefetchWaitEnabled() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_PREFETCH_WAIT");
@@ -3771,12 +3766,6 @@ void PipelineCache::HoldForShaderPrefetch(const std::function<void(const Prefetc
 	else
 		PipelineCacheLog("Shader prefetch wait: timed out after {:.1f} s, {} of {} programs translated; the game starts",
 		                 waited, progress.done, progress.total);
-#if defined(KYTY_PGO_GENERATE)
-	// The counters start from here: the emulator's start-up and the shader prefetch are left out of the profile; the
-	// game's own boot, menus and level load are counted (they are play).
-	__llvm_profile_reset_counters();
-	PipelineCacheLog("Shader prefetch wait: profile counters zeroed");
-#endif
 }
 
 void PipelineCache::WarmPipelines(uint64_t compute_video, bool background, const std::unordered_set<uint64_t>* only) {

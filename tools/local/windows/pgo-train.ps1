@@ -29,10 +29,10 @@ if ($built -ne $Kind) { "no profile: $gen holds $built counters, not $Kind"; exi
 $exe = "$root\_Build\ab\pgogen$suffix"
 New-Item -ItemType Directory -Force $exe | Out-Null
 Copy-Item "$gen\kyty_emulator.exe", "$gen\libwinpthread-1.dll" $exe -Force
-# KYTY_PREFETCH_WAIT=1: the game starts only once the shader prefetch has translated every program (at most $hold s), and
-# the instrumented build zeroes its counters there: the emulator's start-up and the shader prefetch are left out of the
-# profile, the game's own boot, menus and level load are counted (they are play), and the scene is played with no
-# translation beside it. The HUD comes that much later.
+# KYTY_PREFETCH_WAIT=1: the game starts only once the shader prefetch has translated every program (at most $hold s), so
+# the scene is played with no translation beside it. The counters are kept: the emulator's start-up and the prefetch
+# count as an unheld training counts them (zeroed there, the arena read ~1.7 fps slower in mode 0, 15 Nov). The HUD
+# comes that much later.
 # (1200 s: a cold instrumented executable translates every program inside the hold; a slower PC than ours needs room.)
 $hold = 1200
 $params = @{ Label = 'pgotrain'; Exe = "$exe\kyty_emulator.exe"; KeepRunning = $true; NoWalk = $true; ShotOnly = $true; StartupSeconds = 180 + $hold }

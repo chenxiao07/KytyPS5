@@ -1641,7 +1641,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	DemonsSoulsTextureMips::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsEnginePools::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsLanguages::Install(m_programs.empty() ? nullptr : m_programs.front());
-	// KYTY_PREFETCH_WAIT=1: no guest code before the shader prefetch is done (a PGO training's counters start there). The
+	// KYTY_PREFETCH_WAIT=1: no guest code before the shader prefetch is done (a PGO training plays nothing beside it). The
 	// graphics and the pipeline cache are up (Libs::Graphics::Initialize, before the program was loaded), the window's
 	// loop runs on the host main thread, and no guest thread exists yet.
 	Libs::Graphics::WindowHoldForShaderPrefetch();
