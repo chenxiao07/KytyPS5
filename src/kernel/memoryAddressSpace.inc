@@ -2440,7 +2440,7 @@ private:
 	}
 	[[nodiscard]] static bool SerialPressureGateOn() {
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-		return false; // (no sampler outside Windows: the broad wait, and batch_busy_once stays allowed)
+		return false; // (no sampler outside Windows: the broad wait, and batch_busy_once, off by default, stays allowed)
 #else
 		static const bool on = [] {
 			const char* v      = std::getenv("KYTY_PROTECT_SERIAL_PRESSURE");

@@ -5123,19 +5123,21 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 		}
 	}
 
-	// KYTY_BATCH_BUSY_ONCE (live batch_busy_once, N entries per section; -1, the default: 8 under KYTY_SPECULATE=4, 0
-	// otherwise; 0 off; only with KYTY_PROTECT_SERIAL): the entries' maps and unmaps in busy sections
-	// (GuestAddressSpace::BatchEntry). Ends before batch_scope's GPU map command (declared after it).
+	// KYTY_BATCH_BUSY_ONCE (live batch_busy_once, N entries per section; 0, the default in every mode: off; only with
+	// KYTY_PROTECT_SERIAL): the entries' maps and unmaps in busy sections (GuestAddressSpace::BatchEntry). Ends before
+	// batch_scope's GPU map command (declared after it). (Off by default: a section's busy range stays registered while
+	// the loop body writes guest memory and runs PROTECT entries, so a write fault there can wait in HandleFault on a
+	// region lock whose holder waits in ProtectTransient for the section to end.)
 	struct BusySection {
 		bool on = false;
 		~BusySection() {
 			if (on) g_guest_address_space->BatchSectionEnd();
 		}
 	} busy_section;
-	if (static auto& per_switch = LiveSwitch::Find("batch_busy_once", -1);
-	    ModeFourDefault(per_switch, 8) > 0 && num_entries >= 2 && g_guest_address_space != nullptr &&
-	    GuestAddressSpace::BatchSectionsAllowed()) {
-		const auto per_section = std::min<int64_t>(ModeFourDefault(per_switch, 8), 1 << 30);
+	static auto& per_switch = LiveSwitch::Find("batch_busy_once", 0);
+	if (const auto per = per_switch.load(std::memory_order_relaxed);
+	    per > 0 && num_entries >= 2 && g_guest_address_space != nullptr && GuestAddressSpace::BatchSectionsAllowed()) {
+		const auto per_section = std::min<int64_t>(per, 1 << 30);
 		g_guest_address_space->BatchSectionBegin(static_cast<uint32_t>(per_section));
 		busy_section.on = true;
 	}
