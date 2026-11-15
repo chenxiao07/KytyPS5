@@ -2118,7 +2118,10 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 		uint64_t since   = 0;
 	};
 	std::vector<PendingHere> pending_here;
-	const bool               pending_ok = Spec::Current() != nullptr && Spec::PendingBuffersOn();
+	// (Outside a speculation, mode 0 always, none of the bookkeeping below is read: the flags and the lookup site are
+	// read only by ObtainBufferSpec, a speculation's lookup. It is skipped there.)
+	const bool               spec_here  = Spec::Current() != nullptr;
+	const bool               pending_ok = spec_here && Spec::PendingBuffersOn();
 	const bool               reloc      = pending_ok && Spec::RelocRefsOn();
 	// (spec_reloc_refs: the V#'s own lookups note no buffer range, the entry stands for it; restored on every return.)
 	struct NoRange {
@@ -2170,15 +2173,20 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						if (image_starts(address)) return false;
 						proof.image_checked = true;
 					}
-					const BufferCache::AheadSite ahead_site(2); // (the lookup's site: spec_ring_index)
-					const auto    written_since = buffer_cache.RegistrationEpoch(); // (spec_reloc_refs: before its lookup)
-					const NoRange no_range(reloc);
-					Spec::t_pending_ok         = pending_ok;
-					Spec::t_pending_hit        = false;
+					std::optional<BufferCache::AheadSite> ahead_site; // (the lookup's site: spec_ring_index)
+					std::optional<NoRange>                no_range;
+					uint64_t                              written_since = 0; // (spec_reloc_refs: before its lookup)
+					if (spec_here) {
+						ahead_site.emplace(2);
+						written_since = buffer_cache.RegistrationEpoch();
+						no_range.emplace(reloc);
+						Spec::t_pending_ok  = pending_ok;
+						Spec::t_pending_hit = false;
+					}
 					const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, true, formatted);
-					Spec::t_pending_ok         = false;
+					if (spec_here) Spec::t_pending_ok = false;
 					region_epochs.fill({UINT64_MAX, 0}); // (its uploads may have moved them)
-					if (owner == nullptr && Spec::t_pending_hit) {
+					if (spec_here && owner == nullptr && Spec::t_pending_hit) {
 						// (spec_pending_buffers: the null buffer, size 0, until the commit writes the range's.)
 						if (formatted) textures.InvalidateMemoryFromGPU(address, size, "storage-buffer");
 						pending_here.push_back({plan.BufferDword(i), address, size, true, formatted});
@@ -2321,14 +2329,18 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 					}
 					if (cpu_written) buffer_cache.EnsureBufferContents(address, size);
 					const auto registration_before = buffer_cache.RegistrationEpoch(); // (a speculation's: before its lookup)
-					const BufferCache::AheadSite ahead_site(1); // (the lookup's site)
-					const NoRange no_range(reloc);
-					Spec::t_pending_ok         = pending_ok;
-					Spec::t_pending_hit        = false;
+					std::optional<BufferCache::AheadSite> ahead_site; // (the lookup's site)
+					std::optional<NoRange>                no_range;
+					if (spec_here) {
+						ahead_site.emplace(1);
+						no_range.emplace(reloc);
+						Spec::t_pending_ok  = pending_ok;
+						Spec::t_pending_hit = false;
+					}
 					const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, false, formatted);
-					Spec::t_pending_ok         = false;
+					if (spec_here) Spec::t_pending_ok = false;
 					region_epochs.fill({UINT64_MAX, 0});
-					if (owner == nullptr && Spec::t_pending_hit) {
+					if (spec_here && owner == nullptr && Spec::t_pending_hit) {
 						// (spec_pending_buffers: the null buffer, size 0, until the commit writes the range's; nothing
 						// held, nothing noted: the commit obtains the range itself.)
 						pending_here.push_back({plan.BufferDword(i), address, size, false, formatted});
