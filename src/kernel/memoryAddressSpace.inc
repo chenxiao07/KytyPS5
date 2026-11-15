@@ -22,6 +22,14 @@ static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t 
 	return candidate <= range_end && size <= range_end - candidate;
 }
 
+// A live switch's value, -1 (its default) meaning `on4` under KYTY_SPECULATE=4 and 0 otherwise. (Every platform's:
+// KernelBatchMap2 reads it.)
+static int64_t ModeFourDefault(const std::atomic<int64_t>& value, int64_t on4) {
+	const auto v = value.load(std::memory_order_relaxed);
+	if (v >= 0) return v;
+	return ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? on4 : 0;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 // (A placeholder split or coalesce, counted with its time: placeholder_calls, placeholder_kt.)
 static bool PlaceholderFree(void* vaddr, uint64_t size, DWORD type) {
@@ -45,12 +53,6 @@ static std::atomic<uint64_t> g_trim_backlog_bytes {0};
 // GuestAddressSpace::ReleaseParkedView).
 static void ReleaseParkedView(uint64_t vaddr, uint64_t size);
 static bool TryReleaseParkedView(uint64_t vaddr, uint64_t size); // (release_gate)
-// A live switch's value, -1 (its default) meaning `on4` under KYTY_SPECULATE=4 and 0 otherwise.
-static int64_t ModeFourDefault(const std::atomic<int64_t>& value, int64_t on4) {
-	const auto v = value.load(std::memory_order_relaxed);
-	if (v >= 0) return v;
-	return ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? on4 : 0;
-}
 // KYTY_PARK_WHOLE_VIEWS (live park_whole_views; -1, the default: 50 under KYTY_SPECULATE=4, 0 otherwise; 0 off): N > 0:
 // a guest unmap of a whole view (UnmapOne How::Whole, and a view emptied of its last mapping, How::Release) parks the view
 // and queues its release, which Kyty.Release makes N ms later or after.
