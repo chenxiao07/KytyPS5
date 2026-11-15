@@ -964,11 +964,18 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 		m_renderer.GetRenderExecutor().NativeXprForgetState();
 		outcome = r.stop == nullptr ? Outcome::Whole : r.stop == ChunkEnd ? Outcome::Chunk : Outcome::Partly;
 		if (r.stop != nullptr) execution = std::move(r.stop_execution);
+	} else if (r.resume_at) {
+		// Stopped where `cp` ran a segment as a hole to (SegmentAsHole). A run that missed its hole and ended the
+		// submission (its stack empty) made it whole: an empty execution handed back would process it again from its start.
+		const bool ended = !r.resume_at->Started();
+		execution        = std::move(*r.resume_at);
+		outcome          = ended ? Outcome::Whole : Outcome::Partly;
 	} else if (committed != 0) {
 		// Stopped after the hole that followed the last segment committed (`cp` translated it).
 		execution = std::move(r.holes[committed - 1].after);
 		outcome   = Outcome::Partly;
 	}
+	r.resume_at.reset();
 	++(outcome == Outcome::Whole || outcome == Outcome::Chunk ? m_whole : outcome == Outcome::Partly ? m_partly : m_none);
 	Finish(std::move(result), committed);
 	uint64_t trim_from = 0; // (KYTY_SPEC_STAMP_TRIM: the bound, taken under the lock; the leaves freed after it)
@@ -1147,15 +1154,24 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		if (const char* why = Changed(result, index)) {
 			// (spec_stop_as_hole: the segment run the normal way as a hole, its recorded work dropped; the hole after it as
 			// after any segment.)
-			if (!SegmentAsHole(result, cp, index)) return ++m_stop_reasons[why], Progress::Stopped;
-			result.next    = index + 1;
+			const auto as_hole = SegmentAsHole(result, cp, index);
+			if (as_hole == AsHole::NotTaken) return ++m_stop_reasons[why], Progress::Stopped;
+			result.next = index + 1;
+			// (The GPU thread ran it: on the normal way from where it stopped, on its own state, when its run did not reach
+			// the hole (the packets changed under the walk), or reached it in another state than the work after it assumed
+			// (the worker's at the hole, which nothing checked: what Changed found moved may have moved a register).)
+			if (as_hole == AsHole::NotReached)
+				return ++m_stop_reasons["commit: a segment run as a hole did not reach its hole"], Progress::Stopped;
+			if (!cp.SameState(*result.hole_states[index]))
+				return ++m_stop_reasons["commit: a segment run as a hole ended in another state"], Progress::Stopped;
+			result.resume_at.reset();
 			// (Its Before did not run: the worker sets it proposed are the next segment's to check and complete before that
 			// one's replay, as they would have been this one's. A later segment may bind any of them, through the reuse of
 			// its own or the role's last / previous / memo set, so all move; one only the dropped replay bound may then
 			// stop that segment's commit for nothing: the price of the rule.)
 			for (auto& proposed: result.state.proposed_sets)
 				if (proposed.segment == index) proposed.segment = index + 1;
-			const auto run = RunHole(result, cp, index);
+			const auto run = RunHole(result, cp, index, false);
 			if (run == HoleRun::Blocked) return result.blocked = index, Progress::Blocked;
 			if (run == HoleRun::Changed) return Progress::Stopped;
 			continue;
@@ -1668,11 +1684,11 @@ void Speculation::After(Result& result, size_t index) {
 	}
 }
 
-Speculation::HoleRun Speculation::RunHole(Result& result, CommandProcessor& cp, size_t index) {
+Speculation::HoleRun Speculation::RunHole(Result& result, CommandProcessor& cp, size_t index, bool copy_state) {
 	const Spec::EffectSourceScope source(Spec::EffectSource::Hole);
 	const auto& hole  = result.holes[index];
 	const auto& state = *result.hole_states[index];
-	cp.CopyStateFrom(state, false);
+	if (copy_state) cp.CopyStateFrom(state, false);
 	// (The draw state it starts from is not the shadow's.)
 	auto& executor = m_renderer.GetRenderExecutor();
 	DrawStateObserver::Invalidate();
@@ -1696,18 +1712,19 @@ Speculation::HoleRun Speculation::RunHole(Result& result, CommandProcessor& cp, 
 	return HoleRun::Done;
 }
 
-bool Speculation::SegmentAsHole(Result& result, CommandProcessor& cp, size_t index) {
+Speculation::AsHole Speculation::SegmentAsHole(Result& result, CommandProcessor& cp, size_t index) {
 	// (Under KYTY_SPECULATE=4 only; otherwise the stop stands.)
-	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4 || index >= result.holes.size()) return false;
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4 || index >= result.holes.size())
+		return AsHole::NotTaken;
 	const auto& state = result.state;
 	const auto  from  = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
 	const auto& to    = state.closed[index].end;
 	// (A wait inside it: the GPU thread could block there, before the hole it must stop at.)
-	if (to.waits != from.waits) return false;
+	if (to.waits != from.waits) return AsHole::NotTaken;
 	// From the segment's start (the chunk's, or past the hole before it: `cp` is in that state, the commit checked the
 	// chunk's start state and ran the hole) up to its hole's packet.
 	Pm4Execution execution = index == 0 ? result.start_at : result.holes[index - 1].after;
-	if (!execution.Started() || !result.holes[index].at.Started()) return false;
+	if (!execution.Started() || !result.holes[index].at.Started()) return AsHole::NotTaken;
 	// Its recorded work dropped, never submitted: the GPU thread records it again.
 	m_renderer.GetCommandScheduler().DiscardFirst(*result.recorder, state.closed[index].recorded - result.submitted);
 	result.submitted = state.closed[index].recorded;
@@ -1724,15 +1741,16 @@ bool Speculation::SegmentAsHole(Result& result, CommandProcessor& cp, size_t ind
 	const bool reached = cp.TakeStopReached();
 	DrawStateObserver::Invalidate();
 	executor.NativeXprForgetState();
+	result.resume_at = std::move(execution); // (at the hole's packet, or where the run ended)
 	if (!reached) {
-		// (DIAG: the hole's reason and packet, and whether a run of indirect draws passed it.)
+		// (The packets changed under the walk: the commit stops, the GPU thread goes on from where its run ended.)
 		const auto& hole = result.holes[index];
-		std::printf("Speculation: hole %zu of %zu not reached: %s, %u dwords, header 0x%08x\n", index, result.holes.size(),
-		            hole.reason != nullptr ? hole.reason : "(no reason)", hole.dwords, hole.packet != nullptr ? *hole.packet : 0u);
-		CommandProcessor::PrintPacketAt(stop, "Speculation: the hole's position");
-		EXIT("Speculation: a segment run as a hole did not reach its hole (processed %d)\n", static_cast<int>(processed));
+		std::printf("Speculation: hole %zu of %zu not reached (processed %d): %s, %u dwords, header 0x%08x\n", index,
+		            result.holes.size(), static_cast<int>(processed), hole.reason != nullptr ? hole.reason : "(no reason)",
+		            hole.dwords, hole.packet != nullptr ? *hole.packet : 0u);
+		return AsHole::NotReached;
 	}
-	return true;
+	return AsHole::Reached;
 }
 
 void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {

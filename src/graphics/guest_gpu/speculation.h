@@ -127,6 +127,8 @@ private:
 	};
 	enum class Progress { Complete, Stopped, Blocked };
 	enum class HoleRun { Done, Changed, Blocked };
+	// SegmentAsHole: not taken (nothing run), or run by the GPU thread up to its hole's packet, or past it without reaching it.
+	enum class AsHole { NotTaken, Reached, NotReached };
 	// What the speculation's work assumed of the caches: no buffer or image registered or released, no mapping changed
 	// since (and the surface metadata it found not cleared still not: Spec::State::meta_facts).
 	struct Epochs {
@@ -153,6 +155,9 @@ private:
 		// recorded can be committed, whether it translated anything.
 		const char*  stop = nullptr;
 		Pm4Execution stop_execution;
+		// A commit stopped after the GPU thread ran a segment itself (SegmentAsHole): where it goes on the normal way (that
+		// segment's hole's packet, or where the run ended), on its own state.
+		std::optional<Pm4Execution> resume_at;
 		Pm4Execution start_at; // where its translation began
 		bool         failed = false, progressed = false;
 		bool         blind  = false; // translated without the one before it while that was not done (mode 4)
@@ -228,10 +233,12 @@ private:
 	void Before(Result& result, size_t index);
 	void After(Result& result, size_t index);
 	// The hole translated the normal way: changed what the work after it assumed, or a wait not satisfied yet.
-	[[nodiscard]] HoleRun RunHole(Result& result, CommandProcessor& cp, size_t index);
+	// `copy_state` false: `cp` is already at the hole in the state it runs from (a segment run as a hole, its state checked).
+	[[nodiscard]] HoleRun RunHole(Result& result, CommandProcessor& cp, size_t index, bool copy_state = true);
 	// Under KYTY_SPECULATE=4: segment `index`, which Changed stopped, run by `cp` the normal way
-	// as a hole (its recorded work dropped), so the commit can go on; false: not taken (the stop stands).
-	bool SegmentAsHole(Result& result, CommandProcessor& cp, size_t index);
+	// as a hole (its recorded work dropped), so the commit can go on; NotTaken: the stop stands, nothing run. Reached or
+	// NotReached: result.resume_at is where `cp` stopped.
+	[[nodiscard]] AsHole SegmentAsHole(Result& result, CommandProcessor& cp, size_t index);
 	// KYTY_SPECULATE=4: a speculation thread; the state pass of a submission (the state it starts from, null: none to
 	// translate, or the pass could not follow it); the state pass on from the GPU thread's last submission when it
 	// cannot follow or is behind (under m_mutex).
