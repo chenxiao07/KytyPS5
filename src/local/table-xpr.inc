@@ -677,13 +677,16 @@ static void CatalogGate(const std::atomic<int32_t>& writer_waiting, bool on) {
 		else std::this_thread::yield();
 	}
 }
+// (t_catalog_read is read only by a speculation's executor (CatalogGate behind Role() != 0, the set build's `unlocked`
+// behind a speculation), which runs only while the mode is not 0: mode 0 tests the global and touches no thread-local.)
 struct CatalogReadScope {
-	std::shared_lock<std::shared_mutex>* old;
-	explicit CatalogReadScope(std::shared_lock<std::shared_mutex>* lock): old(t_catalog_read) {
-		t_catalog_read = lock;
+	std::shared_lock<std::shared_mutex>* old = nullptr;
+	const bool                           on;
+	explicit CatalogReadScope(std::shared_lock<std::shared_mutex>* lock): on(Spec::On()) {
+		if (on) old = t_catalog_read, t_catalog_read = lock;
 	}
 	~CatalogReadScope() {
-		t_catalog_read = old;
+		if (on) t_catalog_read = old;
 	}
 	CatalogReadScope(const CatalogReadScope&)            = delete;
 	CatalogReadScope& operator=(const CatalogReadScope&) = delete;

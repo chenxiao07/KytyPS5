@@ -104,6 +104,13 @@ public:
 	};
 	static void ReadOnlyFail(const char* why) noexcept { if (t_read_only_failed == nullptr) t_read_only_failed = why; }
 	[[nodiscard]] static const char* ReadOnlyFailed() noexcept { return t_read_only_failed; }
+	// The normal path's tests: the global first. Both flags are set only on a speculation's thread, which runs only
+	// while the mode is not 0 (started after it is set, joined before it is cleared), so mode 0 reads no thread-local
+	// here, as the base.
+	[[nodiscard]] static bool ReadOnly() noexcept { return Spec::On() && t_read_only; }
+	static void               ClearPendingHit() noexcept {
+		if (Spec::On()) t_pending_hit = false;
+	}
 	// Only reuses discovery. FindTexture still refreshes contents and selects the current view.
 	[[nodiscard]] bool TryReuseSampledImage(ImageId id, const ImageDesc& desc, uint64_t& epoch);
 	// TryReuseSampledImage without the resolution-epoch proof, for caches that must

@@ -410,7 +410,7 @@ bool GpuResourceManager::UnmappedSince(uint64_t epoch, uint64_t vaddr, uint64_t 
 		}
 		return false;
 	};
-	if (t_unmap_list_site && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && t_unmap_list_site) { // (the global first: mode 0 reads no thread-local)
 		if (const int answer = UnmappedSinceByList(epoch, vaddr, size); answer >= 0) return answer != 0;
 	}
 	return by_granule();

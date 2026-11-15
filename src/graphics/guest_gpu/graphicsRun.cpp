@@ -370,7 +370,9 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
-	if (t_fault_site != nullptr) [[unlikely]] NoteSpecThreadGpuFault(*t_fault_site);
+	// (NoteFault is called only under a non-zero mode (HandleGpuFault): mode 0 tests the global, no thread-local.)
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && t_fault_site != nullptr) [[unlikely]]
+		NoteSpecThreadGpuFault(*t_fault_site);
 	// The caller spins a while (~20 us, about the time a guest readback command waits for its turn and runs) before it
 	// sleeps: waking a sleeping caller cost the GPU thread a system call each, ~200 a frame at 1-1 (same process: GPU
 	// thread 16.66 -> 16.38 ms a frame). 0 waiting, 1 done, 2 the caller sleeps.

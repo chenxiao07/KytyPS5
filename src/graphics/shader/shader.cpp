@@ -161,6 +161,16 @@ bool ShaderReadGuest(void* out, const void* guest, size_t bytes) {
 	std::memset(out, 0, bytes);
 	return false;
 }
+// This file's per-attribute and per-input readers. t_shader_hash_no_fault is set only on a speculation's thread
+// (PrepareNoFault, the table workers' scopes), which runs only while the mode is not 0: mode 0 tests the global and
+// reads in place, as the base (no call, no thread-local).
+static inline bool ReadGuestHere(void* out, const void* guest, size_t bytes) {
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 0) {
+		std::memcpy(out, guest, bytes);
+		return true;
+	}
+	return ShaderReadGuest(out, guest, bytes);
+}
 
 static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
 	EXIT_IF(shader_addr == 0);
@@ -327,7 +337,7 @@ static bool ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		uint32_t size = in.size_in_elements;
 
 		uint32_t word = 0; // (attrib[in.semantic], guest memory)
-		if (!ShaderReadGuest(&word, &attrib[in.semantic], sizeof(word))) return false;
+		if (!ReadGuestHere(&word, &attrib[in.semantic], sizeof(word))) return false;
 		if (Config::GraphicsDebugDumpEnabled()) {
 			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i, word);
 		}
@@ -351,7 +361,7 @@ static bool ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
 
 		std::array<uint32_t, 4> sharp {}; // (buffer[index * 4], guest memory)
-		if (!ShaderReadGuest(sharp.data(), &buffer[index * 4], sizeof(sharp))) return false;
+		if (!ReadGuestHere(sharp.data(), &buffer[index * 4], sizeof(sharp))) return false;
 
 		EXIT_NOT_IMPLEMENTED(info.resources_num >= ShaderVertexInputInfo::RES_MAX);
 
@@ -474,7 +484,8 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 	}
 	ShaderVertexMetadata metadata;
 	std::string          metadata_error;
-	if (!ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, metadata, &metadata_error, ShaderReadGuest)) {
+	if (!ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, metadata, &metadata_error,
+	                              kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? ShaderReadGuest : nullptr)) {
 		if (!t_shader_read_failed)
 			LOGF("ShaderGetInputInfoVS(): invalid AGC metadata shader=0x%016" PRIx64 ": %s\n",
 			     shader_addr, metadata_error.c_str());
@@ -527,7 +538,7 @@ static void ShaderGetStaticInputInfoPS(
 	}
 	for (uint32_t i = 0; i < data.num_input_semantics && i < ps_info.input_num && i < 32u; i++) {
 		ShaderSemantic semantic {}; // (data.input_semantics[i], guest memory)
-		if (!ShaderReadGuest(&semantic, &data.input_semantics[i], sizeof(semantic))) break; // (t_shader_read_failed)
+		if (!ReadGuestHere(&semantic, &data.input_semantics[i], sizeof(semantic))) break; // (t_shader_read_failed)
 		if (semantic.is_custom != 0 && semantic.is_f16 == 0) {
 			ps_info.custom_interpolation_mask |= 1u << i;
 		}

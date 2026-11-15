@@ -198,8 +198,9 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 	// unmapped and untracked addresses retain the original load/fault behavior.
 	if (NoGuestMemory(address, sizeof(*value))) {
 		*value = 0;
-	} else if (PipelineCache::t_no_fault_reads) [[unlikely]] {
-		// (A speculation's program lookup: never a fault, which would wait for the GPU thread under the cache's lock.)
+	} else if (Spec::On() && PipelineCache::t_no_fault_reads) [[unlikely]] {
+		// (A speculation's program lookup: never a fault, which would wait for the GPU thread under the cache's lock. Set
+		// only under a speculation: mode 0 tests the global, as the base reads no thread-local here.)
 		if (!Libs::LibKernel::Memory::TryReadGuestNoFault(address, value, sizeof(*value))) {
 			PipelineCache::t_no_fault_failed = true;
 			*value                           = 0;
@@ -262,8 +263,14 @@ ShaderProgram UnreadCode() {
 // catalog read (TableResolveSet), which the GPU thread's CatalogWrite waits for, so PrepareProgramInto's guest reads too
 // are made without a fault there (PrepareNoFault: the code's hash on a miss of the thread's hash cache, the AGC metadata,
 // the vertex tables; ShaderReadGuest); one it could not make refuses the lookup before m_mutex ("worker set: code unread").
+// (Speculation threads run only while the mode is not 0: started after it is set, joined before it is cleared. Mode 0
+// tests the global and calls neither: only the GPU thread looks programs up there.)
 bool PrepareNoFault() {
-	return GuestGpu::IsTranslatingThread() && !GuestGpu::IsGpuThread();
+	return Spec::On() && GuestGpu::IsTranslatingThread() && !GuestGpu::IsGpuThread();
+}
+// Off the GPU thread (a speculation's): the code copied before the lock (CopyShaderCode). Mode 0: never, as the base.
+bool CopiesCodeFirst() {
+	return Spec::On() && !GuestGpu::IsGpuThread();
 }
 void PrepareUnread() {
 	Spec::Refuse("worker set: code unread");
@@ -753,12 +760,27 @@ struct PipelineCache::ProgramCache {
 	// Runs a job on the pipeline cache's compile workers (set by PipelineCache).
 	std::function<void(std::function<void()>)> push_job;
 	// The last table mode Get found its permutation still translating (empty, not refused), and that translation's
-	// completion. Per thread (spec_worker_sets: a speculation's set build looks programs up beside the GPU
-	// thread; each reads the answer of its own lookup).
-	static inline thread_local bool                                     table_pending = false;
+	// completion. Mode 0: the members, as the base (only the GPU thread looks programs up). Under a speculation, per
+	// thread (spec_worker_sets: a speculation's set build looks programs up beside the GPU thread; each reads the
+	// answer of its own lookup). (The mode changes only on the GPU thread between submissions, with no speculation
+	// thread running, so a lookup and its answer read the same pair.)
+	bool                                                                table_pending = false;
+	std::shared_ptr<const std::atomic<bool>>                            table_waiting;
+	static inline thread_local bool                                     t_table_pending = false;
 	// (Defined out of the class, below: an inline thread_local shared_ptr member made lld-link fail an instrumented
 	// ThinLTO build with "Associative COMDAT symbol ... table_waiting".)
-	static thread_local std::shared_ptr<const std::atomic<bool>> table_waiting;
+	static thread_local std::shared_ptr<const std::atomic<bool>> t_table_waiting;
+	bool&                                     Pending() noexcept { return Spec::On() ? t_table_pending : table_pending; }
+	std::shared_ptr<const std::atomic<bool>>& Waiting() noexcept { return Spec::On() ? t_table_waiting : table_waiting; }
+	void                                      ClearTable() noexcept {
+		if (Spec::On()) {
+			t_table_pending = false;
+			t_table_waiting.reset();
+		} else {
+			table_pending = false;
+			table_waiting.reset();
+		}
+	}
 
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
@@ -2283,14 +2305,14 @@ struct PipelineCache::ProgramCache {
 					}
 					job->done.store(true, std::memory_order_release);
 				});
-				table_pending = true;
-				table_waiting = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
+				Pending() = true;
+				Waiting() = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 				return {};
 			}
 			const auto job = *found;
 			if (!job->done.load(std::memory_order_acquire)) {
-				table_pending = true;
-				table_waiting = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
+				Pending() = true;
+				Waiting() = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 				return {};
 			}
 			jobs.erase(found);
@@ -2837,7 +2859,7 @@ struct PipelineCache::ProgramCache {
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 };
-thread_local std::shared_ptr<const std::atomic<bool>> PipelineCache::ProgramCache::table_waiting;
+thread_local std::shared_ptr<const std::atomic<bool>> PipelineCache::ProgramCache::t_table_waiting;
 
 // A pipeline a CompileWorkers thread creates; `done` publishes the finished object.
 struct PipelineCache::PendingComputePipeline {
@@ -4565,8 +4587,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info, bool table_mode,
     std::array<uint32_t, 2> table_portable) {
 	LiveCensus::Scope census(LiveCensus::GraphicsPrograms, 0);
-	m_program_cache->table_pending = false;
-	m_program_cache->table_waiting.reset();
+	m_program_cache->ClearTable();
 	// Reused per thread: every normal-path draw prepares both (their user data were new vectors).
 	thread_local ShaderParams vertex_params, pixel_params;
 	std::optional<ShaderHashNoFaultScope> no_fault; // (PrepareNoFault)
@@ -4612,7 +4633,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
 	}
-	if (!GuestGpu::IsGpuThread()) { // (the code before the lock: CopyShaderCode)
+	if (CopiesCodeFirst()) { // (the code before the lock: CopyShaderCode)
 		thread_local std::vector<uint32_t> vertex_code, vertex_back_code, pixel_code, pixel_back_code;
 		CopyShaderCode(vertex_params, vertex_code, vertex_back_code);
 		if (pixel_active) CopyShaderCode(pixel_params, pixel_code, pixel_back_code);
@@ -4698,13 +4719,12 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	} else {
 		PrepareProgramInto(regs, sh, input_info, params);
 	}
-	if (!GuestGpu::IsGpuThread()) { // (the code before the lock: CopyShaderCode)
+	if (CopiesCodeFirst()) { // (the code before the lock: CopyShaderCode)
 		thread_local std::vector<uint32_t> code, back_code;
 		CopyShaderCode(params, code, back_code);
 	}
 	Common::LockGuard lock(m_mutex);
-	m_program_cache->table_pending = false;
-	m_program_cache->table_waiting.reset();
+	m_program_cache->ClearTable();
 	uint32_t          push_data_cursor = 0;
 	g_unevaluated     = unevaluated;
 	const auto program = m_program_cache->Get(params, input_info, push_data_cursor, table_mode, table_portable);
@@ -5111,11 +5131,11 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	return *iter->second;
 }
 bool PipelineCache::TablePending() const {
-	return m_program_cache->table_pending;
+	return m_program_cache->Pending();
 }
 
 std::shared_ptr<const std::atomic<bool>> PipelineCache::TableWaiting() const {
-	return m_program_cache->table_waiting;
+	return m_program_cache->Waiting();
 }
 
 PipelineCache::Pipeline* PipelineCache::TryCreateComputePipeline(const ShaderComputeInputInfo& input_info,

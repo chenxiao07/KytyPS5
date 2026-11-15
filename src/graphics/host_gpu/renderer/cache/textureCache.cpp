@@ -3370,7 +3370,7 @@ void TextureCache::HoldLayers(ImageInfo& info, uint32_t& first) {
 	// (A speculation's thread building an image set (spec_worker_sets) only reads: growing the image inserts, tracks,
 	// copies and uploads through the buffer cache's staging, all the GPU thread's. The set is refused; the GPU thread
 	// builds it and grows the image there.)
-	if (t_read_only) return ReadOnlyFail("worker set: hold layers");
+	if (ReadOnly()) return ReadOnlyFail("worker set: hold layers");
 	// (Guest memory current before its bytes are uploaded, as FindImage does.)
 	m_buffer_cache.DrainGuestReadback(grown.data.address, grown.data.size);
 	std::scoped_lock lock {m_lock};
@@ -3487,7 +3487,7 @@ vk::ImageView TextureCache::FindTextureReadOnly(ImageId id, const ImageDesc& des
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool may_fail) {
-	if (t_read_only) return FindImageReadOnly(desc, exact_format);
+	if (ReadOnly()) return FindImageReadOnly(desc, exact_format);
 	size_t         slow_candidates = 0;
 	SlowLog::Scope slow([&](double ms) {
 		std::printf("SLOW FindImage %.1f ms addr=0x%llx size=0x%llx type=%u fmt=%u %ux%ux%u levels=%u layers=%u "
@@ -3865,7 +3865,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
-	if (t_read_only) return FindTextureReadOnly(id, desc);
+	if (ReadOnly()) return FindTextureReadOnly(id, desc);
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	SlowLog::Scope   slow([&](double ms) {
