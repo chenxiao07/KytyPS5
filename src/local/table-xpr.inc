@@ -1090,10 +1090,13 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			                               [owner, target, words_hash, since, holder, replaces](bool commit) {
 				                               if (commit && TableAsideReleaseOn()) TableAsideDrain(owner->m_context.FrameNumber());
 				                               // (spec_worker_images: never completed, never published or kept; the roles' pointers to it
-				                               // dropped first, under the write lock their reads exclude.)
+				                               // dropped first, under the write lock their reads exclude; its descriptor set retired as the
+				                               // owner retires one. No other translation binds it (an unpublished proposal is foreign to
+				                               // them, TableSet), and its own segment's commit stopped before any replay that binds it ran.)
 				                               if (*holder && !(*holder)->pending_images.empty()) {
 					                               const auto write = owner->CatalogWrite();
 					                               target->ForgetSet(holder->get());
+					                               owner->NativeXprRetireSet((*holder)->pool, (*holder)->set);
 					                               return;
 				                               }
 				                               if (commit && *holder) {
