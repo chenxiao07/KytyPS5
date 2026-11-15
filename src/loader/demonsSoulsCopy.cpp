@@ -37,7 +37,8 @@ void* CompareMove(uint64_t to, uint64_t from, size_t size) {
 	const auto         write = [&] {
         if (run_end == run) return;
         (void)Libs::LibKernel::Memory::TryPrepareHostOverwrite(to + run, run_end - run);
-        std::memmove(reinterpret_cast<void*>(to + run), reinterpret_cast<const void*>(from + run), run_end - run);
+        // (Made again after an exception taken in it, MoveBytes: the source is not overlapped here.)
+        (void)MoveBytes(reinterpret_cast<void*>(to + run), reinterpret_cast<const void*>(from + run), run_end - run);
 	};
 	for (uint64_t at = 0; at < size;) {
 		const auto next  = std::min<uint64_t>(size, ((to + at) / Page + 1) * Page - to);

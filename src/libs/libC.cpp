@@ -1,6 +1,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
@@ -641,18 +642,32 @@ int KYTY_SYSV_ABI fflush(FILE* stream) {
 	return ::fflush(stream);
 }
 
+// More than 32 bytes made again after an exception taken in them (HostException::RepeatAfterException, as the game's moves
+// in loader/demonsSoulsCopy.h): the CRT's AVX routines hold data in ymm registers across their stores, whose upper halves
+// came back zero now and then from the emulator's fault handling. Not a move over its own source (as before).
+static bool Repeatable(const void* dest, const void* src, size_t n) {
+	const auto to = reinterpret_cast<uintptr_t>(dest), from = reinterpret_cast<uintptr_t>(src);
+	return n > 32 && (to >= from + n || from >= to + n);
+}
+
 void* KYTY_SYSV_ABI memset(void* s, int c, size_t n) {
 	PRINT_NAME();
 
-	return ::memset(s, c, n);
+	if (n <= 32) return ::memset(s, c, n);
+	Common::HostException::RepeatAfterException([&] { ::memset(s, c, n); });
+	return s;
 }
 
 void* KYTY_SYSV_ABI memcpy(void* dest, const void* src, size_t n) {
-	return ::memcpy(dest, src, n);
+	if (!Repeatable(dest, src, n)) return ::memcpy(dest, src, n);
+	Common::HostException::RepeatAfterException([&] { ::memcpy(dest, src, n); });
+	return dest;
 }
 
 void* KYTY_SYSV_ABI memmove(void* dest, const void* src, size_t n) {
-	return ::memmove(dest, src, n);
+	if (!Repeatable(dest, src, n)) return ::memmove(dest, src, n);
+	Common::HostException::RepeatAfterException([&] { ::memmove(dest, src, n); });
+	return dest;
 }
 
 int KYTY_SYSV_ABI memcmp(const void* s1, const void* s2, size_t n) {

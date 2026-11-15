@@ -228,8 +228,16 @@ static void InstallFatalReports() {
 	_set_invalid_parameter_handler(OnInvalidParameter);
 }
 
+// (ThreadExceptions: every exception the filter enters on this thread, whatever becomes of it.)
+static thread_local uint64_t t_exceptions = 0;
+
+uint64_t ThreadExceptions() noexcept {
+	return t_exceptions;
+}
+
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
+	++t_exceptions;
 
 	// A guest page's read guard (KYTY_READ_GUARD): served as the access violation no access raises.
 	bool read_guard = false;
@@ -477,6 +485,13 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 	ChainToDefault(signal_number);
 }
 
+#endif
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+// (The signal frame keeps the whole extended state: nothing to count.)
+uint64_t ThreadExceptions() noexcept {
+	return 0;
+}
 #endif
 
 bool InstallHandler(Handler handler) {

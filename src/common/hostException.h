@@ -39,6 +39,23 @@ using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
 
+// Windows: the exceptions this thread's handler entered so far (0 elsewhere). A copy that holds data in ymm registers across
+// an instruction the emulator's fault handling serves (the CRT's AVX memmove: its first and last 32 bytes until it ends)
+// can come back with their upper 128 bits zero (11-15: ~1 in 120,000 copies that took an exception, each time one whose
+// context carried no AVX state); a caller compares this before and after and copies again (RepeatAfterException).
+[[nodiscard]] uint64_t ThreadExceptions() noexcept;
+
+// Runs `copy` (a copy or fill whose destination does not overlap its source: running it again writes the same bytes)
+// again while an exception came in during the run before, at most three times more.
+template <typename Copy>
+inline void RepeatAfterException(Copy&& copy) {
+	for (int run = 0; run < 4; ++run) {
+		const auto exceptions = ThreadExceptions();
+		copy();
+		if (ThreadExceptions() == exceptions) return;
+	}
+}
+
 // Guard-page violations (Windows): the touched address and the native context; true resumes the faulting thread.
 using GuardPageHandler = bool (*)(uint64_t address, void* native_context);
 
