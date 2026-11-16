@@ -90,16 +90,6 @@ static constexpr uint64_t           MINOR_RUN_PAGES   = 64;
 static constexpr uint64_t           MINOR_BLOCK_PAGES = 64;
 static constexpr uint64_t           MINOR_BLOCK_CAP   = 8192;
 
-// KYTY_WRITE_GUARD_UFFD=1 (default 0; issue #289): a guest view's mapping (SysVirtualWriteWatchMapped) records its
-// protection in g_protects, as SysVirtualProtect does (a placeholder keeps the old record: no guard arms there, it has no
-// backing view; and its mmap may fail with the view still mapped). Without
-// it a view page's recorded protection is unknown (read as no access) until an mprotect of it, and with the write watch
-// by userfaultfd the trackers make none on a page they keep writable. KYTY_WRITE_GUARD's Arm then saved no access for
-// a label page it had just written, and its lift left the page no-access with no guard and no tracker holding it: the
-// GPU thread's WAIT_REG_MEM read of the label faulted forever (base 2dd7a061a: page byte 0x40, a 4 KiB ---s VMA,
-// g_pages empty). With this switch the guard also stays on with KYTY_UFFD_WP (graphicsRun.cpp).
-static bool g_record_view_protection = false;
-
 static int OpenUffd(uint64_t features) {
 	const int fd = static_cast<int>(syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY));
 	uffdio_api api {};
@@ -114,8 +104,6 @@ static int OpenUffd(uint64_t features) {
 
 static void WriteWatchInit() {
 	// VirtualMemory::Init() runs more than once (main and the kernel memory module).
-	if (const char* record = std::getenv("KYTY_WRITE_GUARD_UFFD"); record != nullptr && record[0] == '1')
-		g_record_view_protection = true;
 	if (g_uffd >= 0) return;
 	const char* value = std::getenv("KYTY_UFFD_WP");
 	const char* minor = std::getenv("KYTY_UFFD_MINOR");
@@ -898,9 +886,21 @@ bool SysVirtualProtectWriteWatch(uint64_t address, uint64_t size, VirtualMemory:
 	return true;
 }
 
-// (KYTY_WRITE_GUARD_UFFD.) A view mapped over [address, address + size): its protection recorded.
+// A view mapped over [address, address + size) (SysVirtualWriteWatchMapped): its protection
+// recorded in g_protects, as SysVirtualProtect does (a placeholder keeps the old record: no guard
+// arms there, it has no backing view; and its mmap may fail with the view still mapped).
+// Unrecorded, a view page's protection reads as no access until an mprotect of it, and the trackers
+// make none on a page they keep writable. KYTY_WRITE_GUARD's Arm then saved no access for a page it
+// had just written, and its lift left the page no-access with no guard and no tracker holding it;
+// the next access faulted forever. Issue #289 met it with the userfaultfd write watch (the GPU
+// thread's WAIT_REG_MEM read of a label, before the menu), where it was fixed under
+// KYTY_WRITE_GUARD_UFFD=1 only. With mprotect, the default on the desktop, it is the same: the
+// guard is on by default in mode 4, and a fresh view page written by the GPU thread at a load step
+// was left no-access ("armed with no access as its saved protection"; the kernel had it rw-s): a
+// game or render thread then faulted on it ~140k times a frame, ~5 fps or frozen. So the record is
+// made in every mode.
 static void RecordMappedProtection(uint64_t address, uint64_t size, int protect) {
-	if (!g_record_view_protection || size == 0) return;
+	if (size == 0) return;
 	pthread_mutex_lock(&g_virtual_mutex);
 	g_protects->Set(address >> 12u, (address + size - 1) >> 12u, static_cast<uint8_t>(protect));
 	pthread_mutex_unlock(&g_virtual_mutex);
