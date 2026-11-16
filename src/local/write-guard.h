@@ -109,6 +109,18 @@ inline uint64_t (*g_upload_done)() = nullptr;
 	return on.load(std::memory_order_relaxed) != 0;
 }
 
+// KYTY_WRITE_GUARD_WAIT_LOCKFREE (live write_guard_wait_lockfree, default 1): a fault's wait for its page's lift without
+// g_lock (OnFault). The page is out once its filter bucket counts none (the filter's exact "no"), and maybe out once a
+// page of its bucket left (its g_gone moved): only then the lock, shared, to ask g_pages. A fault on a page of a bucket
+// that counts none (the trackers' faults, most of them) goes on without the lock. 0: as before, the exclusive lock at
+// every fault while any page is guarded and the shared lock at every turn of the wait. With ~10 game threads waiting on
+// a guarded label that way, the upload worker's lift spun 10-111 ms for the exclusive lock, and the frames waiting for
+// its queue took 40-280 ms (mode 4, 16 Nov).
+[[nodiscard]] inline bool WaitLockFree() {
+	static auto& on = LiveSwitch::Find("write_guard_wait_lockfree", 1);
+	return on.load(std::memory_order_relaxed) != 0;
+}
+
 // The guarded pages as a counting filter: a count of them a hash bucket, read without the lock (MayBeGuarded). Two
 // pages may share a bucket (a check of either takes the lock: a false "maybe", never a false "no"); the pages of one
 // 64 MiB block never do. Changed under the exclusive g_lock only: a bucket counts up before its page has no access
@@ -369,8 +381,14 @@ inline void Drop(uint64_t vaddr, uint64_t size) {
 // process hanging.
 [[nodiscard]] inline bool OnFault(uint64_t vaddr, uint64_t rip) {
 	if (g_count.load(std::memory_order_acquire) == 0) return false;
-	const uint64_t page = vaddr & ~(Page - 1);
-	{
+	const uint64_t page      = vaddr & ~(Page - 1);
+	const uint32_t bucket    = FilterIndex(page);
+	const bool     lock_free = WaitLockFree();
+	// (The bucket counts a guarded page from before its no access until after its protection is restored: none counted,
+	// the page is not guarded, as g_pages would say.)
+	if (lock_free && g_filter[bucket].load(std::memory_order_acquire) == 0) return false;
+	uint32_t gone = 0;
+	if (t_no_wait || !lock_free) {
 		std::unique_lock lock(g_lock);
 		const auto       it = g_pages.find(page);
 		if (it == g_pages.end()) return false;
@@ -382,12 +400,25 @@ inline void Drop(uint64_t vaddr, uint64_t size) {
 			LiftLocked(it);
 			return true;
 		}
+	} else {
+		std::shared_lock lock(g_lock);
+		if (g_pages.count(page) == 0) return false;
+		gone = g_gone[bucket].load(std::memory_order_relaxed); // (no page leaves g_pages while the lock is held)
 	}
 	const auto start      = std::chrono::steady_clock::now();
 	auto       moved      = start;
 	uint64_t   done       = g_upload_done != nullptr ? g_upload_done() : 0;
 	for (;;) {
-		{
+		if (lock_free) {
+			// (Out: its bucket counts none. Maybe out: a page of its bucket left since the last look, a lift or a Drop;
+			// it may have been guarded again since, which g_pages tells.)
+			if (g_filter[bucket].load(std::memory_order_acquire) == 0) break;
+			if (g_gone[bucket].load(std::memory_order_acquire) != gone) {
+				std::shared_lock lock(g_lock);
+				if (g_pages.count(page) == 0) break;
+				gone = g_gone[bucket].load(std::memory_order_relaxed);
+			}
+		} else {
 			std::shared_lock lock(g_lock);
 			if (g_pages.count(page) == 0) break;
 		}

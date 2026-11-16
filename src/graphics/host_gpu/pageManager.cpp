@@ -384,6 +384,7 @@ struct PageManager::Impl {
 		uint64_t  range_begin           = 0;
 		uint64_t  range_bytes           = 0;
 		uint64_t  potential_range_bytes = 0;
+		[[maybe_unused]] bool hints_to_clear = false; // (read watchers and offload holds)
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
@@ -417,10 +418,16 @@ struct PageManager::Impl {
 			}
 			const auto new_perms = PermsOf(region, page_index);
 			if constexpr (is_read || offload) {
-				// (A page the offload holds is read-watched to HasReadWatchers: a read of it faults.)
-				const bool faults = new_perms == NO_ACCESS_PROTECTION;
-				if (faults) MarkReadGranule(address); // (before the page's hint: the bits stay a superset)
-				region.read_hint[page_index].store(faults, std::memory_order_release);
+				// (A page the offload holds is read-watched to HasReadWatchers: a read of it faults.) A hint is set here,
+				// before the protection that takes the page's reads away, and cleared only after the one that gives them
+				// back (below): cleared here, a speculation's thread that asked in between was told the page was free
+				// and faulted reading it (SPEC_THREAD_GPU_FAULT; found by Bios2000 in PR #342's Linux runs).
+				if (new_perms == NO_ACCESS_PROTECTION) {
+					MarkReadGranule(address); // (before the page's hint: the bits stay a superset)
+					region.read_hint[page_index].store(1, std::memory_order_release);
+				} else if (region.read_hint[page_index].load(std::memory_order_relaxed) != 0) {
+					hints_to_clear = true;
+				}
 			}
 
 			if (new_perms != perms) [[unlikely]] {
@@ -445,7 +452,15 @@ struct PageManager::Impl {
 		}
 
 		release_pending();
-		if constexpr (is_read || offload) SyncReadGranules(region, base_addr, first, last);
+		if constexpr (is_read || offload) {
+			// (Every protection of the range made: the hints of the pages whose reads are back cleared now.)
+			if (hints_to_clear)
+				for (size_t page_index = first; page_index < last; page_index++)
+					if (region.read_hint[page_index].load(std::memory_order_relaxed) != 0 &&
+					    PermsOf(region, page_index) != NO_ACCESS_PROTECTION)
+						region.read_hint[page_index].store(0, std::memory_order_release);
+			SyncReadGranules(region, base_addr, first, last);
+		}
 	}
 
 	// A bit per 64 KiB granule: some page there may have read watchers. Set before a page's read_hint, cleared after
