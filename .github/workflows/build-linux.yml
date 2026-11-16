@@ -131,6 +131,12 @@ jobs:
           sched_ext scheduler works against that (`scx_lavd`, which CachyOS suggests for games: about 10% slower on an
           i5-14400, issue #80). A power profile (balanced or performance) made no measurable difference there.
 
+          If the game stalls for up to seconds at a time while it loads textures, with the SSD busy but reading little,
+          the NVMe drive's power saving (APST) may be waking it too slowly: on one PC (issue #343) single 128-512 KiB
+          reads took 0.5-2.4 s with APST on, and the stalls went with it off. The kernel parameter
+          `nvme_core.default_ps_max_latency_us=0` turns APST off (a value such as `5500` keeps only the drive's light
+          sleep states); `cat /sys/module/nvme_core/parameters/default_ps_max_latency_us` shows the current one.
+
           ## Shader precompile (optional)
 
           `./precompile-linux.sh --game <the game>` collects every shader and pipeline of the game into the static
