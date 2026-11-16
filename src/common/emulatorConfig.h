@@ -51,6 +51,14 @@ struct ConfigOptions {
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
+	// The HDR luminance range the game is told (sceSystemServiceGetHdrToneMapLuminance), in nits; a negative value: the
+	// display's own (Windows), else the defaults (1000, 80, 0).
+	float                  hdr_max_nits                = -1.0f;
+	float                  hdr_max_full_frame_nits     = -1.0f;
+	float                  hdr_min_nits                = -1.0f;
+	// The peak the game's HDR frames are taken to reach, fitted to the display's peak as they are shown (BT.2390); 0: shown
+	// as they are.
+	float                  hdr_source_nits             = 10000.0f;
 	uint32_t               vblank_frequency            = 60;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -85,6 +93,12 @@ PresentMode GetPresentMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     HdrEnabled();
+// --hdr-max-nits, --hdr-full-frame-nits, --hdr-min-nits: negative when not given.
+float    GetHdrMaxNits();
+float    GetHdrMaxFullFrameNits();
+float    GetHdrMinNits();
+// --hdr-source-nits: 0 when HDR frames are shown as they are.
+float    GetHdrSourceNits();
 uint32_t GetVblankFrequency();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();

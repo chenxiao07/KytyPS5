@@ -439,6 +439,7 @@ set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_imgui_hdr.frag"
 	"${gpu_tiler_shader_dir}/fsr_hud_mask.frag"
 	"${gpu_tiler_shader_dir}/present_dither.frag"
+	"${gpu_tiler_shader_dir}/present_hdr_tonemap.frag"
 )
 foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	get_filename_component(shader_name "${shader_source}" NAME_WE)

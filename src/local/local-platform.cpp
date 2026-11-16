@@ -25,7 +25,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <dxgi1_4.h>
+#include <dxgi1_6.h>
 #include <psapi.h>
 #include <softpub.h>
 #include <tlhelp32.h>
@@ -1284,6 +1284,40 @@ int DisplayRefreshHz(void* window) {
 	return mode.dmDisplayFrequency > 1 ? static_cast<int>(mode.dmDisplayFrequency) : 0;
 }
 
+bool DisplayHdrLuminance(void* window, float* max_nits, float* max_full_frame_nits, float* min_nits) {
+	const HMONITOR monitor = MonitorFromWindow(static_cast<HWND>(window), MONITOR_DEFAULTTONEAREST);
+	HMODULE        dxgi    = monitor != nullptr ? LoadLibraryA("dxgi.dll") : nullptr;
+	if (dxgi == nullptr) return false;
+	using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
+	const auto create =
+	    reinterpret_cast<CreateFactory>(reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")));
+	// (A new factory each time: a factory keeps the outputs' descriptions as they were when it was made.)
+	IDXGIFactory1* factory = nullptr;
+	if (create == nullptr || FAILED(create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) return false;
+	bool           found   = false;
+	IDXGIAdapter1* adapter = nullptr;
+	for (UINT a = 0; !found && factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; a++) {
+		IDXGIOutput* output = nullptr;
+		for (UINT o = 0; !found && adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; o++) {
+			IDXGIOutput6* output6 = nullptr;
+			if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput6), reinterpret_cast<void**>(&output6)))) {
+				DXGI_OUTPUT_DESC1 desc {};
+				if (SUCCEEDED(output6->GetDesc1(&desc)) && desc.Monitor == monitor) {
+					*max_nits            = desc.MaxLuminance;
+					*max_full_frame_nits = desc.MaxFullFrameLuminance;
+					*min_nits            = desc.MinLuminance;
+					found                = true;
+				}
+				output6->Release();
+			}
+			output->Release();
+		}
+		adapter->Release();
+	}
+	factory->Release();
+	return found;
+}
+
 // The largest visible top-level window of process `pid` or of a process it started: Steam's windows, Big Picture's full
 // screen one among them, belong to the steamwebhelper.exe it starts.
 static HWND LargestWindowOf(DWORD pid) {
@@ -2505,6 +2539,10 @@ NormalPriority::~NormalPriority() {
 
 int DisplayRefreshHz(void* /*window*/) {
 	return 0;
+}
+
+bool DisplayHdrLuminance(void* /*window*/, float* /*max_nits*/, float* /*max_full_frame_nits*/, float* /*min_nits*/) {
+	return false;
 }
 
 void ReturnFocus(void* /*window*/) {}

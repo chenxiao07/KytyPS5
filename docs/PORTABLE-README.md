@@ -119,6 +119,11 @@ stay at 60.
 "VSync" (off by default) waits for the display's refresh, so the picture does not tear; displays with
 adaptive sync (G-SYNC, FreeSync) keep it. "HDR" (off by default) outputs HDR10 when "Use HDR" is on for the
 display in Windows' display settings (the game is told the TV takes HDR); otherwise the picture stays SDR.
+Games that ask for the HDR calibration are told the display's brightness as Windows reports it (the display's own
+figures, or the Windows HDR Calibration app's once it was run), 1000 nits where the display reports none
+(`-HdrMaxNits` sets it by hand). Demon's Souls does not ask: its highlights go to thousands of
+nits, which most monitors clip. The emulator fits them to the display's peak (the BT.2390 roll-off TVs use), leaving
+the darker part of the picture as the game made it; `-HdrSourceNits 0` shows the game's picture as it is.
 "Low latency" (off by default) keeps one finished frame waiting for the screen instead of about two, so what you
 press shows sooner: at 60 Hz about 15-23 ms from the game's frame to the screen instead of about 30. A frame that
 comes late is then no longer covered by a waiting one, so the frame pacing is a little less even.
@@ -260,6 +265,8 @@ shortcut):
 | `-PresentMode Fifo` | VSync on (the launcher's "VSync") |
 | `-LowLatency` | Less input lag: one frame waiting for the screen instead of about two (the launcher's "Low latency") |
 | `-Hdr` | HDR10 output when Windows' "Use HDR" is on for the display |
+| `-HdrMaxNits 800` | With `-Hdr`: the peak brightness the game tones its HDR picture to, in nits (also `-HdrFullFrameNits`, `-HdrMinNits`; default: what Windows reports for the display, else 1000, 80 and 0) |
+| `-HdrSourceNits 4000` | With `-Hdr`: the brightest highlight the game's picture is taken to reach, fitted to the display's peak (default 10000; lower keeps more of the picture as it is but flattens the brightest highlights; 0 turns the fitting off) |
 | `-Upscaler dlss` | DLSS super resolution through the game's PS5 Pro path (NVIDIA RTX, needs Streamline: see "Upscaler" above) |
 | `-Upscaler fsr` | The same with AMD FSR 3, built in: any graphics card |
 | `-Set KYTY_DLSS_SHARPNESS=0.6` | With `-Upscaler dlss`: DLSS's picture sharpened, 0 to 1 (the launcher's "Sharpening": Low 0.3, Medium 0.6, High 0.9; none by default) |

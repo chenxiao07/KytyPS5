@@ -69,6 +69,18 @@ private:
 	void                  Present(Frame& frame, bool reuse);
 	std::unique_ptr<Impl> m_impl;
 };
+
+// The HDR10 output's luminance range in nits: what the game is told it may tone map to
+// (sceSystemServiceGetHdrToneMapLuminance; on a PS5 the system's HDR calibration). Each value from --hdr-*-nits, else
+// the display's (Windows' DXGI, read as the swapchain is made), else the defaults (1000, 80, 0).
+struct HdrLuminance {
+	float max_nits            = 1000.0f;
+	float max_full_frame_nits = 80.0f;
+	float min_nits            = 0.0f;
+	// The peak is the display's (reported by it, or --hdr-max-nits), not the default guess.
+	bool  peak_known          = false;
+};
+[[nodiscard]] HdrLuminance HdrOutputLuminance();
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_PRESENTATION_PRESENTER_H_

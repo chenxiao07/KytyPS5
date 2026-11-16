@@ -117,6 +117,10 @@ private:
 
 // The refresh rate in Hz of the display a window is on (its HWND on Windows; 0 when unknown or elsewhere).
 int DisplayRefreshHz(void* window);
+// The HDR luminance range in nits of the display a window is on (its HWND), as Windows reports it to apps (DXGI 1.6
+// IDXGIOutput6::GetDesc1: the display's EDID, or the Windows HDR Calibration app's values once it was run). Values
+// are as reported, unchecked. False when unknown (not Windows, no DXGI 1.6, the window's display not found).
+bool DisplayHdrLuminance(void* window, float* max_nits, float* max_full_frame_nits, float* min_nits);
 // KYTY_RETURN_FOCUS=<window handle> (the launcher's --play: the window that had the focus as it started, Steam's Big
 // Picture when Steam starts the game): the focus handed to that window and `window` (the game's, its HWND) hidden, as
 // the game quits (issue #217). That window gone or hidden: the largest of KYTY_RETURN_FOCUS_PID=<process> (the
