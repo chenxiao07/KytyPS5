@@ -35,9 +35,9 @@ static class KeyboardPrompts {
 				var fields = line.Split(' ');
 				if (fields.Length != 3 || Path.GetFileName(fields[0]) != fields[0])
 					throw new IOException("Invalid keyboard prompt manifest.");
-				using (var zip = new GZipStream(Resource(fields[0] + ".gz"), CompressionMode.Decompress))
+				using (var resource = Resource(fields[0]))
 				using (var bytes = new MemoryStream()) {
-					zip.CopyTo(bytes);
+					resource.CopyTo(bytes);
 					var icon = new Icon { Name = fields[0], OriginalHash = fields[1], ReplacementHash = fields[2], Replacement = bytes.ToArray() };
 					if (Hash(icon.Replacement) != icon.ReplacementHash)
 						throw new IOException("Damaged keyboard prompt: " + icon.Name);

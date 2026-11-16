@@ -69,7 +69,15 @@
     <Compile Include="KeyboardLayout.cs" />
     <Compile Include="PromptTexture.cs" />
     <Compile Include="KeyboardControlsWindow.cs" />
-    <EmbeddedResource Include="KeyboardPrompts\*">
+    <!-- The prompt textures are kept gzipped here and embedded unpacked (KeyboardPromptsUnpack below). Embedded
+         compressed data that the program unpacks and writes to disk is what Malwarebytes' machine-learning check flagged
+         (MachineLearning/Anomalous, every launcher from v20261105 on); the same data embedded unpacked is not flagged. -->
+    <KeyboardPromptPacked Include="KeyboardPrompts\*.gz" />
+    <EmbeddedResource Include="KeyboardPrompts\manifest.txt">
+      <WithCulture>false</WithCulture>
+      <LogicalName>KytyLauncher.KeyboardPrompts.manifest.txt</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="@(KeyboardPromptPacked->'$(IntermediateOutputPath)KeyboardPrompts\%(Filename)')">
       <WithCulture>false</WithCulture>
       <LogicalName>KytyLauncher.KeyboardPrompts.%(Filename)%(Extension)</LogicalName>
     </EmbeddedResource>
@@ -83,4 +91,32 @@
     <Resource Include="launcher.ico" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+  <UsingTask TaskName="KeyboardPromptsGunzip" TaskFactory="RoslynCodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <Files ParameterType="Microsoft.Build.Framework.ITaskItem[]" Required="true" />
+      <Folder ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.IO.Compression" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        Directory.CreateDirectory(Folder);
+        foreach (var file in Files) {
+          using (var input = new GZipStream(File.OpenRead(file.ItemSpec), CompressionMode.Decompress))
+          using (var output = File.Create(Path.Combine(Folder, Path.GetFileNameWithoutExtension(file.ItemSpec))))
+            input.CopyTo(output);
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+  <!-- KeyboardPrompts\*.gz unpacked into the intermediate folder, where the EmbeddedResource items above take them. -->
+  <Target Name="KeyboardPromptsUnpack" BeforeTargets="BeforeBuild" Inputs="@(KeyboardPromptPacked)"
+          Outputs="@(KeyboardPromptPacked->'$(IntermediateOutputPath)KeyboardPrompts\%(Filename)')">
+    <KeyboardPromptsGunzip Files="@(KeyboardPromptPacked)" Folder="$(IntermediateOutputPath)KeyboardPrompts" />
+  </Target>
+  <Target Name="KeyboardPromptsFileWrites" BeforeTargets="BeforeBuild">
+    <ItemGroup>
+      <FileWrites Include="@(KeyboardPromptPacked->'$(IntermediateOutputPath)KeyboardPrompts\%(Filename)')" />
+    </ItemGroup>
+  </Target>
 </Project>
