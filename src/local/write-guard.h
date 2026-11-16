@@ -273,8 +273,9 @@ template <typename InRange>
 		return false;
 	}
 	if (entry.saved == Common::VirtualMemory::Mode::NoAccess) {
-		// Mostly a view page whose protection was never recorded (issue #289, KYTY_WRITE_GUARD_UFFD): the lift leaves it
-		// no-access with no guard and no tracker holding it. (Also right after a lift to a tracker's no access.)
+		// A view page whose protection was never recorded (issue #289; views record it at mapping
+		// since): the lift leaves it no-access with no guard and no tracker holding it. (Also right
+		// after a lift to a tracker's no access.)
 		static std::atomic<uint32_t> reports {0};
 		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
 			std::printf("Write guard: page 0x%016llx armed with no access as its saved protection "
