@@ -5,7 +5,6 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Drawing.Text;
 using System.IO;
-using System.IO.Compression;
 using System.Linq;
 namespace KytyLauncher {
 static class PromptTexture {
@@ -13,14 +12,13 @@ static class PromptTexture {
 		using (var input = typeof(PromptTexture).Assembly.GetManifestResourceStream("KytyLauncher.KeyboardPrompts." + name)) {
 			if (input == null)
 				throw new IOException("Missing prompt texture resource: " + name);
-			using (var gzip = new GZipStream(input, CompressionMode.Decompress))
-			using (var output = new MemoryStream()) { gzip.CopyTo(output); return output.ToArray(); }
+			using (var output = new MemoryStream()) { input.CopyTo(output); return output.ToArray(); }
 		}
 	}
-	static readonly byte[] Blank = Resource("blank.ctxr.gz");
+	static readonly byte[] Blank = Resource("blank.ctxr");
 	static readonly int[] Offsets = ReadOffsets();
 	static int[] ReadOffsets() {
-		var data = Resource("pixel-offsets.bin.gz");
+		var data = Resource("pixel-offsets.bin");
 		if (data.Length != 21845 * 4 || Blank.Length != 131149)
 			throw new IOException("Invalid prompt texture layout");
 		var result = new int[21845];
