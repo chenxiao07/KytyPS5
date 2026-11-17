@@ -336,8 +336,10 @@ void Speculation::Retire(std::unique_ptr<Spec::State> record) {
 // upload threads still free over the whole render list; where there is no such list (Linux), off the render threads'
 // CPUs (KYTY_RENDER_CPUS). On the E-cores a worker translates a chunk slower than the GPU thread can wait for it: in
 // the 8 Nov placement trial the arena gained 2.8 fps in-process with the workers on CPUs 8-15, Latria and 1-1 were
-// level, and the translation lost to cancels fell by a third to a half everywhere. Live: speculate_cpus, a CPU mask
-// (0: this default), taken by each worker at its next wake. More workers than the list's CPUs share them (SMT).
+// level, and the translation lost to cancels fell by a third to a half everywhere. Live: speculate_cpu_mask
+// (KYTY_SPECULATE_CPU_MASK), a CPU mask (0: this default), taken by each worker at its next wake. (It was named
+// speculate_cpus, so LiveSwitch read KYTY_SPECULATE_CPUS, the list, as a number: "8,10,12,14" became mask 8, CPU 3, and
+// every worker was pinned there.) More workers than the list's CPUs share them (SMT).
 static const std::pair<std::string, const char*>& SpeculationCpus() {
 	static const auto cpus = []() -> std::pair<std::string, const char*> {
 		if (const char* list = std::getenv("KYTY_SPECULATE_CPUS"); list != nullptr && *list != 0) return {list, "KYTY_SPECULATE_CPUS"};
@@ -385,7 +387,7 @@ void Speculation::AheadRun(Translator& translator) {
 	// (Worker packets, live spec_worker_packets: its segments recorded as packets, spliced at commit. Armed only
 	// inside a segment recorded so: otherwise its calls go to the driver as before.)
 	const LocalVulkanRecording::PassiveProducerScope passive_producer;
-	static auto& live_cpus    = LiveSwitch::Find("speculate_cpus", 0);
+	static auto& live_cpus    = LiveSwitch::Find("speculate_cpu_mask", 0);
 	int64_t      applied_cpus = live_cpus.load(std::memory_order_relaxed);
 	if (translator.pass_only) {
 		// (Normal priority; never re-pinned live. The CPUs said are those the pin took, or none.)
