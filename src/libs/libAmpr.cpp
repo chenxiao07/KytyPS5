@@ -68,9 +68,11 @@ static std::mutex                                        g_mutex;
 static uint32_t                                          g_next_submission_id = 1;
 static uint32_t                                          g_next_file_id       = 1;
 static std::unordered_map<uint32_t, SubmissionState>     g_submissions;
-static std::unordered_map<uint32_t, std::string>         g_files;
-static std::unordered_map<uint32_t, uint64_t>            g_file_sizes;
 static std::unordered_map<std::string, ResolvedPathInfo> g_resolved_paths;
+// The files by id (at file_id - 1: ids are handed out in order from 1, under g_mutex): their g_resolved_paths entries,
+// which never move or go (a node map; a path is resolved once and kept). Two maps by id held a second copy of each
+// host path and its size before: the game resolves its ~250K paths at start-up, so the copies were tens of MiB of heap.
+static std::vector<const ResolvedPathInfo*> g_files_by_id;
 
 static bool IsValidGuestRange(uint64_t addr, uint64_t size, bool write = false) {
 	(void)write;
@@ -125,29 +127,34 @@ static int ReadGuestCString(uint64_t addr, char* out, size_t out_size) {
 	return LibKernel::KERNEL_ERROR_ENAMETOOLONG;
 }
 
-static void RegisterHostPathLocked(uint32_t file_id, const std::string& host_path,
-                                   uint64_t file_size, bool is_dir) {
-	g_files[file_id]      = host_path;
-	g_file_sizes[file_id] = is_dir ? 0 : file_size;
+static void RegisterHostPathLocked(uint32_t file_id, const ResolvedPathInfo* info) {
+	if (g_files_by_id.size() < file_id) {
+		g_files_by_id.resize(file_id, nullptr);
+	}
+	g_files_by_id[file_id - 1] = info;
+}
+
+static const ResolvedPathInfo* FindFileLocked(uint32_t file_id) {
+	return file_id != 0 && file_id <= g_files_by_id.size() ? g_files_by_id[file_id - 1] : nullptr;
 }
 
 static bool TryGetHostPath(uint32_t file_id, std::string* out) {
 	std::scoped_lock lock(g_mutex);
-	const auto       it = g_files.find(file_id);
-	if (it == g_files.end()) {
+	const auto*      info = FindFileLocked(file_id);
+	if (info == nullptr) {
 		return false;
 	}
-	*out = it->second;
+	*out = info->host_path;
 	return true;
 }
 
 static bool TryGetHostFileSize(uint32_t file_id, uint64_t* out) {
 	std::scoped_lock lock(g_mutex);
-	const auto       it = g_file_sizes.find(file_id);
-	if (it == g_file_sizes.end()) {
+	const auto*      info = FindFileLocked(file_id);
+	if (info == nullptr) {
 		return false;
 	}
-	*out = it->second;
+	*out = info->is_dir ? 0 : info->file_size;
 	return true;
 }
 
@@ -235,7 +242,7 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 				// One id per path. Ids hashed from the path collided (13 pairs among Demon's Souls' 250K
 				// files, which the game resolves at start-up): one file of a pair read the other's bytes.
 				info.file_id = it->second.file_id = g_next_file_id++;
-				RegisterHostPathLocked(info.file_id, info.host_path, info.file_size, info.is_dir);
+				RegisterHostPathLocked(info.file_id, &it->second);
 			} else if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
 				log_missing = true;
 			}
