@@ -232,6 +232,58 @@ static void ChainPixelInterlock(const GraphicContext& graphics, vk::DeviceCreate
 	device_features.shaderStorageImageReadWithoutFormat = VK_TRUE;
 }
 
+// VK_EXT_device_address_binding_report beside VK_EXT_device_fault (issue #314): a debug messenger told each GPU address
+// range the driver binds and unbinds (DeviceFault::BindingCallback), so a fault report names the memory bound at the
+// faulting address, also an image's or a freed block's, which the buffer registry does not hold. One record a bind and
+// one an unbind, nothing a draw. By default on Linux' RADV only, whose global pipeline key does not take the
+// extensions enabled; KYTY_FAULT_BINDINGS=1 enables it on other drivers that have it, =0 nowhere. The messenger is made
+// here, before the device, so the bindings the device makes at its creation are told too. Returns whether.
+static bool AddressBindingReport(vk::PhysicalDevice                          physical_device,
+                                 const std::vector<vk::ExtensionProperties>& available,
+                                 std::vector<const char*>& extensions, GraphicContext& graphics) {
+	graphics.address_binding_report = false;
+	const char* value               = std::getenv("KYTY_FAULT_BINDINGS");
+	const bool  forced              = value != nullptr && std::string_view(value) == "1";
+	const auto  off                 = [](const char* why) {
+		std::printf("Device fault: address binding report off (%s)\n", why);
+		return false;
+	};
+	if (value != nullptr && std::string_view(value) == "0") return off("KYTY_FAULT_BINDINGS=0");
+	if (!HasExtension(extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) return off("no VK_EXT_device_fault");
+	vk::PhysicalDeviceDriverProperties driver {};
+	vk::PhysicalDeviceProperties2      properties {};
+	properties.pNext = &driver;
+	physical_device.getProperties2(&properties);
+	if (!forced && driver.driverID != vk::DriverId::eMesaRadv) return off("not RADV: KYTY_FAULT_BINDINGS=1 enables it");
+	if (!HasExtension(available, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME))
+		return off("the driver has no VK_EXT_device_address_binding_report");
+	vk::PhysicalDeviceAddressBindingReportFeaturesEXT report {};
+	vk::PhysicalDeviceFeatures2                       features {};
+	features.pNext = &report;
+	physical_device.getFeatures2(&features);
+	if (report.reportAddressBinding != VK_TRUE) return off("the GPU does not report address bindings");
+	if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateDebugUtilsMessengerEXT == nullptr) return off("no VK_EXT_debug_utils");
+	vk::DebugUtilsMessengerCreateInfoEXT create_info {};
+	create_info.messageSeverity =
+	    vk::DebugUtilsMessageSeverityFlagBitsEXT::eVerbose | vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo |
+	    vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning | vk::DebugUtilsMessageSeverityFlagBitsEXT::eError;
+	create_info.messageType = vk::DebugUtilsMessageTypeFlagBitsEXT::eDeviceAddressBinding;
+	create_info.pfnUserCallback =
+	    reinterpret_cast<vk::PFN_DebugUtilsMessengerCallbackEXT>(&DeviceFault::BindingCallback);
+	if (graphics.binding_messenger == nullptr &&
+	    graphics.instance.createDebugUtilsMessengerEXT(&create_info, nullptr, &graphics.binding_messenger) !=
+	        vk::Result::eSuccess) {
+		graphics.binding_messenger = nullptr;
+		return off("the debug messenger was not made");
+	}
+	if (!HasExtension(extensions, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME))
+		extensions.push_back(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+	graphics.address_binding_report = true;
+	DeviceFault::g_bindings.on.store(true, std::memory_order_release);
+	std::printf("Device fault: address binding report on (a fault names the memory bound at its address)\n");
+	return true;
+}
+
 static bool HasLayer(const std::vector<vk::LayerProperties>& layers, const char* name) {
 	return std::any_of(layers.begin(), layers.end(),
 	                   [name](const auto& layer) { return strcmp(layer.layerName, name) == 0; });
@@ -1316,6 +1368,12 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	}
 	vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT pixel_interlock {};
 	ChainPixelInterlock(graphics, create_info, pixel_interlock, device_features);
+	vk::PhysicalDeviceAddressBindingReportFeaturesEXT binding_report {};
+	if (graphics.address_binding_report) {
+		binding_report.reportAddressBinding = VK_TRUE;
+		binding_report.pNext                = const_cast<void*>(create_info.pNext);
+		create_info.pNext                   = &binding_report;
+	}
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
@@ -1795,6 +1853,7 @@ void WindowContext::CreateVulkan() {
 		}
 		(void)AmdExplicitVertexBarycentrics(graphic_ctx.physical_device, available_extensions, device_extensions, graphic_ctx);
 		(void)PixelInterlockExtension(graphic_ctx.physical_device, available_extensions, device_extensions, graphic_ctx, true);
+		(void)AddressBindingReport(graphic_ctx.physical_device, available_extensions, device_extensions, graphic_ctx);
 		// KYTY_GPU_CHECKPOINTS (diagnostic): the pipelines a GPU hang or fault ran (device-fault.h).
 		if (DeviceFault::CheckpointsRequested() &&
 		    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
@@ -2107,6 +2166,10 @@ WindowContext::~WindowContext() {
 	if (graphic_ctx.debug_messenger != nullptr) {
 		graphic_ctx.instance.destroyDebugUtilsMessengerEXT(graphic_ctx.debug_messenger, nullptr);
 		graphic_ctx.debug_messenger = nullptr;
+	}
+	if (graphic_ctx.binding_messenger != nullptr) {
+		graphic_ctx.instance.destroyDebugUtilsMessengerEXT(graphic_ctx.binding_messenger, nullptr);
+		graphic_ctx.binding_messenger = nullptr;
 	}
 	if (graphic_ctx.instance != nullptr) {
 		graphic_ctx.instance.destroy(nullptr);
