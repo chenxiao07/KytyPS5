@@ -42,6 +42,12 @@ std::string SpeculationCpuList();
 // `avoid` where there is one, the lowest-numbered first: "16" on an 8 P-core + 16 E-core part. "" where every core is
 // alike or the query fails. Linux: "".
 std::string EfficiencyCpu(const char* avoid);
+// Linux: the highest-numbered logical CPU the process may run on (the main thread's affinity) whose physical core has no
+// CPU of the list `avoid` (SMT siblings: topology/thread_siblings_list; each CPU its own core where the file is missing);
+// where every such core does, the highest CPU outside the list; "" when there is none. The render thread's core
+// (KeepRenderCoreAlone) is avoided too. "8" with "1-7" avoided on an 8-core part numbered 0-7 cores, 8-15 siblings.
+// Windows: "" (not done).
+std::string SpareCpu(const char* avoid);
 // The logical CPUs of the performance cores (the highest efficiency class; all of them where every core is alike) the
 // process may run on; 0 where that is not known (Linux). KYTY_SIMULATE_PCORES=<n> stands in for it (a test).
 uint32_t PerformanceLogicalCpus();

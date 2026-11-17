@@ -362,11 +362,20 @@ static void PinSpeculationWorker(int64_t mask) {
 
 // KYTY_SPEC_PASS_CPUS: the state pass thread's CPUs. Unset: one CPU of the lowest efficiency class the process may run
 // on, outside the workers' CPUs where there is one (LocalPlatform::EfficiencyCpu: an E-core, 16 on an 8 P-core + 16
-// E-core part); where every core is alike (or on Linux) none, and the thread is not pinned.
+// E-core part). On Linux, where efficiency classes are not read: a CPU on a physical core with none of the render
+// threads' (KYTY_RENDER_CPUS) or the workers' CPUs (LocalPlatform::SpareCpu; 8, core 0, with KYTY_RENDER_CPUS=1-7 on an
+// 8-core part numbered 0-7, 8-15 siblings), else a sibling of one; with none left the thread is not pinned. Where every
+// core is alike on Windows it is not pinned.
 static const std::string& PassCpus() {
 	static const std::string cpus = [] {
 		const char* list = std::getenv("KYTY_SPEC_PASS_CPUS");
-		return list != nullptr && *list != 0 ? std::string(list) : LocalPlatform::EfficiencyCpu(SpeculationCpus().first.c_str());
+		if (list != nullptr && *list != 0) return std::string(list);
+		const std::string& workers = SpeculationCpus().first;
+		if (std::string efficiency = LocalPlatform::EfficiencyCpu(workers.c_str()); !efficiency.empty()) return efficiency;
+		std::string avoid  = workers;
+		const char* render = std::getenv("KYTY_RENDER_CPUS");
+		if (render != nullptr && *render != 0) avoid += (avoid.empty() ? "" : ",") + std::string(render);
+		return LocalPlatform::SpareCpu(avoid.c_str());
 	}();
 	return cpus;
 }

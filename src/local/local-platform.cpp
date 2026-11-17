@@ -297,6 +297,10 @@ std::string EfficiencyCpu(const char* avoid) {
 	return pick == UINT32_MAX ? std::string {} : std::to_string(pick);
 }
 
+std::string SpareCpu(const char* /*avoid*/) {
+	return {};
+}
+
 uint32_t PerformanceLogicalCpus() {
 	if (const char* simulate = std::getenv("KYTY_SIMULATE_PCORES"); simulate != nullptr && *simulate != '\0')
 		return static_cast<uint32_t>(std::strtoul(simulate, nullptr, 10));
@@ -2454,6 +2458,43 @@ void AvoidCpuList(const char* avoid_cpus) {
 				if ((avoid >> cpu) & 1u) CPU_CLR(cpu, &set);
 		if (CPU_COUNT(&set) != 0) (void)sched_setaffinity(0, sizeof(set), &set);
 	}
+}
+
+#if defined(__linux__)
+// A CPU's physical core: its SMT siblings (topology/thread_siblings_list, "0,8" or "0-1"), the CPU itself included; the CPU
+// alone where the file is missing.
+static uint64_t CoreSiblings(int cpu) {
+	uint64_t core = uint64_t {1} << cpu;
+	char     path[96];
+	std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+	if (FILE* file = std::fopen(path, "r"); file != nullptr) {
+		char list[256] = {};
+		if (std::fgets(list, sizeof(list), file) != nullptr) core |= CpuListMask(list);
+		std::fclose(file);
+	}
+	return core;
+}
+#endif
+
+std::string SpareCpu(const char* avoid) {
+#if defined(__linux__)
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (sched_getaffinity(getpid(), sizeof(set), &set) != 0) return {};
+	// (With KYTY_RENDER_CORE the render thread's core is avoided too: Kyty.CoreKeeper moves every other thread off it every
+	// 250 ms, a pin there included; a CPU off that core it never touches.)
+	const uint64_t avoid_mask = CpuListMask(avoid) | g_render_core.load(std::memory_order_relaxed);
+	int            sibling    = -1; // (the highest CPU outside the list whose core has one of the list's CPUs)
+	for (int cpu = 63; cpu >= 0; --cpu) {
+		if (!CPU_ISSET(cpu, &set) || ((avoid_mask >> cpu) & 1u) != 0) continue;
+		if ((CoreSiblings(cpu) & avoid_mask) == 0) return std::to_string(cpu);
+		if (sibling < 0) sibling = cpu;
+	}
+	return sibling < 0 ? std::string {} : std::to_string(sibling);
+#else
+	(void)avoid;
+	return {};
+#endif
 }
 
 int KeepRenderCoreAlone() {
