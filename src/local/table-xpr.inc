@@ -114,6 +114,7 @@ struct RenderExecutor::TableImageSet {
 	// pending slots are filled only if that translation commits the segment that proposed it (a worker's next translation
 	// bound a set its first one then forgot unfilled: null image slots).
 	uint64_t              proposer = 0;
+	size_t                proposed_segment = SIZE_MAX; // (the proposer's open segment then: spec_set_cpu_dirty_stop)
 	std::atomic<bool>     published {false};
 	vk::DescriptorSet     set  = nullptr;
 	vk::DescriptorPool    pool = nullptr;
@@ -1083,6 +1084,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			set->ResolutionEpoch(Role()) = set->resolution_epoch;
 			set->validated_frame         = UINT64_MAX; // (the owner proves it in full at its first use)
 			set->proposer                = spec->id;   // (before it is reachable: TableSet's foreign-proposal check)
+			set->proposed_segment        = spec->closed.size();
 			auto* const raw      = set.get();
 			auto* const owner    = &Catalog();
 			auto* const target   = &pair;
@@ -2506,6 +2508,34 @@ static bool TableSetApart(const Set& set, const State& draw_state) {
 bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk_buffer,
                                   const NativeXprDrawState* draw_state) {
 	auto& textures = m_context.GetTextureCache();
+	// spec_copy_image_refuse: a speculation's set reused without a lookup (a catalog set, the role's last) holding an image
+	// whose bytes its open segment writes, as the read-only lookups refuse one (TextureCache): looked at only when the
+	// open segment writes anything at all.
+	const auto* const open_writer = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 &&
+	                                        Spec::CopyImageRefuseOn()
+	                                    ? Spec::Current()
+	                                    : nullptr;
+	const bool open_writes = open_writer != nullptr && open_writer->OpenSegmentWritesAny();
+	const auto reused_written = [] {
+		LiveCounters::Add(LiveCounters::SpecImageOpenWritesReusedN);
+		return Spec::Refuse("table: written in its segment"), false;
+	};
+	// Its own set's pending slots too (spec_worker_images: completed in its commit's Before from the bytes before these
+	// writes), which set.images does not hold. (Only the translation that proposed a set binds it before it is published,
+	// and its commit completes the slots after the translation: its pending_images is this thread's to read.)
+	if (const auto* spec = Spec::On() ? Spec::Current() : nullptr; spec != nullptr && set.proposer == spec->id &&
+	                                                                 !set.pending_images.empty()) {
+		if (open_writes)
+			for (const auto& pending: set.pending_images)
+				if (open_writer->OpenSegmentWritesImage(pending.desc.info)) return reused_written();
+		// spec_set_cpu_dirty_stop: nor bound in a later segment than the one that proposed it. Its slots' images are
+		// completed in that one's Before and are no image entry of the later segment, whose commit's CPU-dirty and
+		// buffer-write stops never see them (a hole between the two writing them): refused.
+		if (set.proposed_segment != spec->closed.size() && Spec::SetCpuDirtyStopOn()) {
+			LiveCounters::Add(LiveCounters::SpecPendingReuseRefusedN);
+			return Spec::Refuse("table: pending set of an earlier segment"), false;
+		}
+	}
 	for (const auto& dep: set.images) {
 		auto* image = textures.m_slot_images.try_get(dep.id);
 		if (image == nullptr) return false;
@@ -2519,6 +2549,8 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 		    (is_target && (target->layout != dep.layout || (target->access | dep.target_read) != dep.access)))
 			return false;
 		if (is_target) continue;
+		if (open_writes && (open_writer->OpenSegmentWritesImage(image->info) || open_writer->OpenSegmentWritesImage(dep.desc.info)))
+			return reused_written();
 		// An image the shader writes is GPU-modified, CPU-clean and current with buffer writes (as the normal path's
 		// FindTexture leaves a storage image: it acquires it again otherwise). One written since the set was proven this
 		// frame (by the CPU, a GPU buffer write, or into its stencil plane) is uploaded by the normal path's FindTexture.

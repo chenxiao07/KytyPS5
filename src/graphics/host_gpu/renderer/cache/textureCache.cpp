@@ -3412,6 +3412,20 @@ void TextureCache::HoldLayers(ImageInfo& info, uint32_t& first) {
 	first = static_cast<uint32_t>((view_address - grown.data.address) / slice);
 }
 
+// spec_copy_image_refuse: the bytes of an image a speculation's set binds, written by its own open segment (a copy or
+// guest memory write it journaled, made in its After; a range its work writes on the GPU, obtained in its Before):
+// the normal path's binding comes after them in order and uploads them, this one before them (a pending image's
+// completion too: TableCompletePendingImages uploads in Before). A refusal then, as the depth layers2 target's test (its
+// bytes or its metadata).
+static bool OpenSegmentWrote(const ImageInfo& info) {
+	if (info.data.Empty() || !Spec::CopyImageRefuseOn()) return false;
+	const auto* spec = Spec::Current();
+	if (spec == nullptr || !spec->OpenSegmentWritesAny() || !spec->OpenSegmentWritesImage(info)) return false;
+	if (TextureCache::ReadOnlyFailed() == nullptr) LiveCounters::Add(LiveCounters::SpecImageOpenWritesN);
+	TextureCache::ReadOnlyFail("worker set: written in its segment");
+	return true;
+}
+
 // spec_worker_sets: FindImage on a speculation's thread building an image set (ReadOnlyScope). The exact
 // match FindImage's first lookups find (the last image of the same backing, by the page table or the region), registered,
 // current and holding the view's resources; anything FindImage would make, merge, free, alias or replace is a failure.
@@ -3443,10 +3457,12 @@ ImageId TextureCache::FindImageReadOnly(const ImageDesc& desc, bool exact_format
 		for (const auto id: FindImagesInRegion(desc.info.data.address, desc.info.data.size, false))
 			if (SameBacking(m_slot_images[id].info, desc.info, exact_format)) result = id;
 	if (!result) {
+		if (OpenSegmentWrote(desc.info)) return ImageId {};
 		if (t_pending_images_ok && !desc.info.HasMetadata()) return t_pending_hit = true, ImageId {}; // (spec_worker_images)
 		return ReadOnlyFail("worker set: no image"), ImageId {};
 	}
 	auto& image = m_slot_images[result];
+	if (OpenSegmentWrote(image.info) || OpenSegmentWrote(desc.info)) return ImageId {};
 	if (!image.registered || image.depth_id || image.binding.needs_rebind)
 		return ReadOnlyFail("worker set: image not current"), ImageId {};
 	if (exact_format && image.info.pixel_format != desc.info.pixel_format)
@@ -3462,6 +3478,7 @@ vk::ImageView TextureCache::FindTextureReadOnly(ImageId id, const ImageDesc& des
 	std::scoped_lock lock {m_lock};
 	auto*            image = m_slot_images.try_get(id);
 	if (image == nullptr) return ReadOnlyFail("worker set: image gone"), vk::ImageView {};
+	if (OpenSegmentWrote(image->info) || OpenSegmentWrote(desc.info)) return vk::ImageView {};
 	if (desc.type != BindingType::Texture) return ReadOnlyFail("worker set: storage"), vk::ImageView {};
 	if (!image->info.data.Empty()) {
 		if (!image->registered || image->depth_id || image->binding.needs_rebind)

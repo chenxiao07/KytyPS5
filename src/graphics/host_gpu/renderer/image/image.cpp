@@ -181,6 +181,7 @@ Spec::ImageEntry* Image::SpeculativeEntry() {
 		// (A GPU buffer write over it before the commit reaches this segment leaves it to be uploaded first: Speculation's
 		// CommitSegments.)
 		entry->found_buffer_modified = IsBufferModified();
+		entry->found_stencil_modified = IsStencilModified(); // (its stencil plane's, as above: spec_copy_image_refuse)
 		// (A CPU write since: spec_set_cpu_dirty_stop. The validity first: a write between the two reads moves it.)
 		entry->found_validity        = validity.load(std::memory_order_acquire);
 		entry->found_cpu_dirty       = IsCpuDirty();

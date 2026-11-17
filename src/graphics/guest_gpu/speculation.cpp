@@ -1208,6 +1208,14 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		for (const auto& use: state.closed[index].images)
 			if (!use.found_buffer_modified && use.image->IsBufferModified())
 				return ++m_stop_reasons["commit: GPU work wrote an image it uses"], Progress::Stopped;
+		// spec_copy_image_refuse (Spec::CopyImageRefuseOn): nor its stencil plane (MarkStencilModified: a buffer write over
+		// it), which the normal path's refresh uploads (RefreshImage) and this work was recorded without.
+		if (Spec::CopyImageRefuseOn())
+			for (const auto& use: state.closed[index].images)
+				if (!use.found_stencil_modified && use.image->IsStencilModified()) {
+					LiveCounters::Add(LiveCounters::SpecStencilModifiedStops);
+					return ++m_stop_reasons["commit: GPU work wrote a stencil it uses"], Progress::Stopped;
+				}
 		// spec_set_cpu_dirty_stop (Spec::SetCpuDirtyStopOn): nor written on the CPU since (a hole's host write over its
 		// pages, or an earlier segment's guest memory writes). The work's set reuse checked it only at translation
 		// (TableTransit's and TableValidateSet's refresh tests, which make its entry first); the normal path's next

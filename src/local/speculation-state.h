@@ -343,6 +343,15 @@ inline int64_t CommitVerifyEvery() {
 	const auto   value = stop.load(std::memory_order_relaxed);
 	return value > 0 || (value < 0 && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4);
 }
+// KYTY_SPEC_COPY_IMAGE_REFUSE (live spec_copy_image_refuse; the same rule): a speculation's copy (journaled or on the GPU)
+// or GPU fill over image memory is refused, a hole (BufferCache::CopyBuffer, FillBuffer), and so is a worker binding an
+// image its open segment writes (TextureCache's read-only lookups, TableTransit, NativeXprEmitTargets). Off: none of it,
+// as before.
+[[nodiscard]] inline bool CopyImageRefuseOn() {
+	static auto& refuse = LiveSwitch::Find("spec_copy_image_refuse", -1);
+	const auto   value  = refuse.load(std::memory_order_relaxed);
+	return value > 0 || (value < 0 && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4);
+}
 
 // An image's barrier state as a segment found it (the commit transitions the image there first if other work moved
 // it since) and as it left it.
@@ -358,6 +367,7 @@ struct ImageUse {
 	bool                          sample_other = false;
 	bool                          found_cpu_dirty = false; // (Image::IsCpuDirty, maybe-dirty too, when the segment found it)
 	uint64_t                      found_validity  = 0;     // (Image::validity then, read before it)
+	bool                          found_stencil_modified = false; // (Image::IsStencilModified then: spec_copy_image_refuse)
 };
 
 // The 64 KiB granules ranges were added over, hashed into 4096 bits, and up to BigRanges ranges over 64 granules or
@@ -466,6 +476,7 @@ struct ImageEntry {
 	bool                          sample_other = false;
 	bool                          found_cpu_dirty = false; // (spec_set_cpu_dirty_stop)
 	uint64_t                      found_validity  = 0;
+	bool                          found_stencil_modified = false; // (spec_copy_image_refuse)
 };
 
 // (spec_predict_dcc=3.) The fast clears speculations' holes will consume, by surface and slice, until that speculation
@@ -811,6 +822,26 @@ struct State {
 		return nullptr;
 	}
 	[[nodiscard]] Counts Sealed() const noexcept { return closed.empty() ? Counts {} : closed.back().end; }
+	// spec_copy_image_refuse: whether the open segment writes anything (a journaled copy or guest memory write, made in
+	// its After; a range its work writes on the GPU, obtained in its Before), and whether it writes over a range.
+	[[nodiscard]] bool OpenSegmentWritesAny() const noexcept {
+		return !open_journal_set.Empty() || written.size() > Sealed().written;
+	}
+	[[nodiscard]] bool OpenSegmentWrites(uint64_t address, uint64_t size) const {
+		if (size == 0) return false;
+		if (open_journal_set.Intersects(address, size)) return true;
+		for (size_t i = Sealed().written; i < written.size(); ++i)
+			if (written[i].begin < address + size && address < written[i].end) return true;
+		return false;
+	}
+	// ... over an image's bytes, its metadata or its stencil plane (an ImageInfo), as the depth layers2 target's test
+	// (and the plane, which the normal path's refresh uploads when GPU work wrote it: MarkStencilModified).
+	template <typename Info>
+	[[nodiscard]] bool OpenSegmentWritesImage(const Info& info) const {
+		return OpenSegmentWrites(info.data.address, info.data.size) ||
+		       (info.HasMetadata() && OpenSegmentWrites(info.metadata.range.address, info.metadata.range.size)) ||
+		       (info.HasStencil() && OpenSegmentWrites(info.stencil.address, info.stencil.size));
+	}
 
 	void NoteCurrent(uint64_t address, uint64_t size) {
 		if (Note(current, Sealed().current, address, size)) current_set.Add(address, size);
@@ -1284,7 +1315,8 @@ struct State {
 			segment.images.push_back({entry.image, entry.serial, entry.found, entry.state,
 			                          std::move(entry.found_subresources), entry.subresources, entry.found_group,
 			                          entry.group, entry.found_buffer_modified, entry.sample_lo, entry.sample_hi,
-			                          entry.sample_other, entry.found_cpu_dirty, entry.found_validity});
+			                          entry.sample_other, entry.found_cpu_dirty, entry.found_validity,
+			                          entry.found_stencil_modified});
 			entry.used = false;
 		}
 		used.clear();

@@ -3176,11 +3176,26 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 	auto&      textures   = m_context.GetTextureCache();
 	const auto meta_epoch = textures.MetaEpoch();
 	auto*      spec       = Spec::Current();
+	// spec_copy_image_refuse: a speculation's draw into a target whose bytes, metadata or stencil plane its open segment
+	// writes (a journaled copy or guest memory write, a range its work writes on the GPU: a shader's storage-buffer write
+	// over the target's memory), which the normal path's acquisition would see first: refused (looked at only when the
+	// open segment writes anything). So is one whose stencil plane GPU work wrote already (stencil-modified), which the
+	// normal path's FindDepthTarget uploads first (RefreshImage).
+	const bool refuse_written = spec != nullptr && Spec::CopyImageRefuseOn();
+	const bool open_writes    = refuse_written && spec->OpenSegmentWritesAny();
 	for (const auto& target: draw_state.targets) {
 		auto* image = textures.m_slot_images.try_get(target.id);
 		if (image == nullptr || image->serial != target.serial || !image->registered)
 			return Spec::Refuse("table: target released"), false;
 		if (image->binding.needs_rebind) return Spec::Refuse("table: target rebind"), false;
+		if (open_writes && (spec->OpenSegmentWritesImage(image->info) || spec->OpenSegmentWritesImage(target.requested))) {
+			LiveCounters::Add(LiveCounters::SpecTargetOpenWritesN);
+			return Spec::Refuse("target written in its segment"), false;
+		}
+		if (refuse_written && image->IsStencilModified()) {
+			LiveCounters::Add(LiveCounters::SpecTargetStencilN);
+			return Spec::Refuse("target stencil written"), false;
+		}
 		// spec_depth_layers2: a layered depth target's draw the checks below would refuse ('table: target download', 'table:
 		// cleared target') is left to the commit instead, one entry per draw, the draw recorded loading (the captured
 		// state's clears are zeroed). THE RULE THAT KEEPS IT EXACT: the commit (Speculation::Before) makes, for this draw and
