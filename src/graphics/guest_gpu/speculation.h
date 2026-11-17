@@ -121,6 +121,7 @@ private:
 	struct Hole {
 		const uint32_t* packet = nullptr;
 		uint32_t        dwords = 0;
+		uint32_t        header = 0; // (*packet as translated: a segment run as a hole checks it before RunHole)
 		const char*     reason = nullptr;
 		Pm4Execution    after;
 		Pm4Execution    at; // the execution at the packet (spec_stop_as_hole stops there)
@@ -239,6 +240,9 @@ private:
 	// as a hole (its recorded work dropped), so the commit can go on; NotTaken: the stop stands, nothing run. Reached or
 	// NotReached: result.resume_at is where `cp` stopped.
 	[[nodiscard]] AsHole SegmentAsHole(Result& result, CommandProcessor& cp, size_t index);
+	// At segment `index`'s commit (KYTY_SPECULATE=4): why a word it read from the journal that an earlier segment's
+	// write gave no longer holds (null: all hold).
+	[[nodiscard]] const char* JournalReadsMoved(const Result& result, size_t index) const;
 	// KYTY_SPECULATE=4: a speculation thread; the state pass of a submission (the state it starts from, null: none to
 	// translate, or the pass could not follow it); the state pass on from the GPU thread's last submission when it
 	// cannot follow or is behind (under m_mutex).

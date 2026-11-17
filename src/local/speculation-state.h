@@ -81,13 +81,21 @@ struct WaitCheck {
 	uint64_t address = 0, reference = 0, mask = 0;
 	uint32_t function = 0, bytes = 4;
 };
+// Words read from its own pending guest memory writes (Resolve, ReadCopyRun): `bytes` at `address`, as the write
+// `entry` (an index of State::writes) gave them, the words taken at `words` in State::journal_words.
+struct JournalRead {
+	uint64_t address = 0;
+	size_t   entry   = 0;
+	uint32_t words   = 0;
+	uint32_t bytes   = 0;
+};
 
 // The notes' counts: a segment's notes are those after the previous segment's counts, up to its own.
 struct Counts {
 	size_t current = 0, written = 0, bda = 0, invalidated = 0, writes = 0, touched_images = 0, touched_buffers = 0,
 	       clean_reads = 0, feedbacks = 0, buffer_ranges = 0, sets = 0, chain_reads = 0, waits = 0, cpu_copies = 0,
 	       late_reads = 0, texel_syncs = 0, pending_buffers = 0, table_ranges = 0, pending_targets = 0, indexed_draws = 0,
-	       scenes = 0, used_pairs = 0, left_clears = 0;
+	       scenes = 0, used_pairs = 0, left_clears = 0, journal_reads = 0, journal_words = 0;
 };
 
 // spec_pending_buffers (under KYTY_SPECULATE=4 only): a table V#'s range with no
@@ -497,6 +505,12 @@ struct State {
 	// - words it read from a previous speculation's pending writes, and the waits it found satisfied (ChainRead);
 	std::vector<ChainRead> chain_reads;
 	std::vector<WaitCheck> waits;
+	// - under KYTY_SPECULATE=4 (journal_reads_on, as the state is made or cleared): the words it read from its own
+	//   pending writes (JournalRead) and the words it took, which its commit checks against memory
+	//   (Speculation::JournalReadsMoved);
+	std::vector<JournalRead> journal_reads;
+	std::vector<uint32_t>    journal_words;
+	bool                     journal_reads_on = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 	// - the sources and destinations of the copies it makes on the CPU at its commit (in order: what the guest or the
 	//   processor writes there before is copied, or copied over): no GPU work may have written them since.
 	std::vector<Range> cpu_copies;
@@ -629,7 +643,8 @@ struct State {
 		        touched_images.size(), touched_buffers.size(), clean_reads.size(), feedbacks.size(), buffer_ranges.size(),
 		        sets.size(),           chain_reads.size(),     waits.size(),       cpu_copies.size(),
 		        late_reads.size(),     texel_syncs.size(),     pending_buffers.size(), table_ranges.size(), pending_targets.size(),
-		        indexed_draws,         scenes,                 used_pairs.size(),      left_clears.size()};
+		        indexed_draws,         scenes,                 used_pairs.size(),      left_clears.size(),
+		        journal_reads.size(),  journal_words.size()};
 	}
 	// Its pending guest memory writes or a previous speculation's over the range; the ranges its work or a previous
 	// one's writes.
@@ -1081,9 +1096,13 @@ struct State {
 		const auto source = latest->value + (address - latest->address);
 		if (owner->JournalIntersects(source, bytes) || owner->WrittenIntersects(source, bytes)) return Run::Refused;
 		if (!CopyGuest(out, source, bytes)) return Run::Refused;
-		if (owner == this) NoteCleanRead(source, bytes);
-		else
+		if (owner == this) {
+			NoteCleanRead(source, bytes);
+			const auto entry = static_cast<size_t>(latest.base() - writes.cbegin()) - 1;
+			NoteJournalRead(address, static_cast<uint32_t>(bytes), entry, out);
+		} else {
 			for (uint32_t i = 0; i < count; ++i) chain_reads.push_back({address + 4ull * i, out[i]});
+		}
 		return Run::Read;
 	}
 	// The word `state`'s latest pending write over it gives (a copy: its source's, with no write of that speculation
@@ -1094,15 +1113,44 @@ struct State {
 		});
 		if (latest == state.writes.rend()) return false;
 		by = &state;
+		const auto entry = static_cast<size_t>(latest.base() - state.writes.begin()) - 1;
 		if (!latest->copy) {
 			value = static_cast<uint32_t>(latest->value);
+			if (&state == this) NoteJournalRead(at, 4, entry, &value);
 			return true;
 		}
 		const auto source = latest->value + (at - latest->address);
 		if (state.JournalIntersects(source, 4) || state.WrittenIntersects(source, 4)) return false;
 		if (!CopyGuest(&value, source, 4)) return false;
-		if (&state == this) NoteCleanRead(source, 4);
+		if (&state == this) {
+			NoteCleanRead(source, 4);
+			NoteJournalRead(at, 4, entry, &value);
+		}
 		return true;
+	}
+	// (As Note: within the open segment's last few, the same write's words taken again are noted once, and the next
+	// words of the last one extend it when it was noted since the packet's Mark: Rollback cuts records and words
+	// together, so a record from before it is never grown.)
+	void NoteJournalRead(uint64_t address, uint32_t bytes, size_t entry, const uint32_t* taken) {
+		if (!journal_reads_on || bytes == 0) return;
+		const auto first =
+		    std::max(Sealed().journal_reads, journal_reads.size() - std::min<size_t>(journal_reads.size(), 8));
+		for (size_t i = journal_reads.size(); i > first; --i) {
+			auto& read = journal_reads[i - 1];
+			if (read.entry != entry) continue;
+			if (read.address <= address && address + bytes <= read.address + read.bytes &&
+			    (address - read.address) % 4 == 0 &&
+			    std::memcmp(journal_words.data() + read.words + (address - read.address) / 4, taken, bytes) == 0)
+				return;
+			if (i == journal_reads.size() && i > checkpoint.journal_reads && read.address + read.bytes == address &&
+			    read.words + read.bytes / 4 == journal_words.size()) {
+				journal_words.insert(journal_words.end(), taken, taken + bytes / 4);
+				read.bytes += bytes;
+				return;
+			}
+		}
+		journal_reads.push_back({address, entry, static_cast<uint32_t>(journal_words.size()), bytes});
+		journal_words.insert(journal_words.end(), taken, taken + bytes / 4);
 	}
 
 	void Mark(uint64_t work) noexcept {
@@ -1135,6 +1183,8 @@ struct State {
 		scenes        = std::min(scenes, checkpoint.scenes);
 		used_pairs.resize(std::min(used_pairs.size(), checkpoint.used_pairs));
 		left_clears.resize(std::min(left_clears.size(), checkpoint.left_clears));
+		journal_reads.resize(std::min(journal_reads.size(), checkpoint.journal_reads));
+		journal_words.resize(std::min(journal_words.size(), checkpoint.journal_words));
 		bda_all = checkpoint_bda_all;
 	}
 
@@ -1158,6 +1208,9 @@ struct State {
 		sets.clear();
 		chain_reads.clear();
 		waits.clear();
+		journal_reads.clear();
+		journal_words.clear();
+		journal_reads_on = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 		cpu_copies.clear();
 		late_reads.clear();
 		texel_syncs.clear();

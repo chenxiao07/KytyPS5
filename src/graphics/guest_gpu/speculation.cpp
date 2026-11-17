@@ -876,6 +876,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 			auto& hole  = r.holes.emplace_back();
 			hole.packet = packet;
 			hole.dwords = dwords;
+			hole.header = *packet;
 			hole.reason = r.state.refused;
 			hole.at     = spec; // (spec_stop_as_hole)
 			CommandProcessor::SkipSuspendedPacket(spec);
@@ -1174,6 +1175,20 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 				return ++m_stop_reasons["commit: a segment run as a hole did not reach its hole"], Progress::Stopped;
 			if (!cp.SameState(*result.hole_states[index]))
 				return ++m_stop_reasons["commit: a segment run as a hole ended in another state"], Progress::Stopped;
+			// (Its hole's header as translated: RunHole reads the packet's words as they are now but runs it with the
+			// translation's length, which the header holds. Nothing after Changed() checked the segment's command
+			// words, the hole's among them, and the run itself may have written them. Read as the chain reads are,
+			// through the backing view where a guest write is pending. A stop leaves the GPU thread at the hole's
+			// packet, Result::resume_at.)
+			{
+				const auto& hole = result.holes[index];
+				const void* word = hole.packet;
+				if (WriteGuard::g_count.load(std::memory_order_relaxed) != 0)
+					if (const auto* backing = WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(hole.packet), 4u))
+						word = backing;
+				if (*static_cast<const uint32_t*>(word) != hole.header)
+					return ++m_stop_reasons["commit: a segment run as a hole: its hole packet moved"], Progress::Stopped;
+			}
 			result.resume_at.reset();
 			// (Its Before did not run: the worker sets it proposed are the next segment's to check and complete before that
 			// one's replay, as they would have been this one's. A later segment may bind any of them, through the reuse of
@@ -1298,6 +1313,11 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 				if (*static_cast<const uint32_t*>(word) != read.value)
 					return ++m_stop_reasons["commit: a command buffer before wrote otherwise"], Progress::Stopped;
 			}
+			// The words it read from its own speculation's journal that an earlier segment's write gave, as the chain
+			// reads (KYTY_SPECULATE=4: JournalReadsMoved).
+			if (state.journal_reads_on && to.journal_reads > from.journal_reads)
+				if (const char* moved = JournalReadsMoved(result, index))
+					return ++m_stop_reasons[moved], Progress::Stopped;
 			for (size_t i = from.waits; i < to.waits; ++i) {
 				const auto& wait  = state.waits[i];
 				uint64_t    value = 0;
@@ -1761,6 +1781,57 @@ Speculation::AsHole Speculation::SegmentAsHole(Result& result, CommandProcessor&
 		return AsHole::NotReached;
 	}
 	return AsHole::Reached;
+}
+
+// Guest memory now as a speculation's thread reads it (Spec::State::CopyGuest): through the write guard's backing view
+// where a guest write is pending; on Linux, a page a read watcher guards refused (GPU-written bytes not downloaded yet,
+// which a pread of /proc/self/mem would read stale) and the rest through the backing view (spec_backing_reads 1, the
+// default); else a guarded copy (a page without access refuses). False: not read.
+static bool ReadGuestNow(void* out, uint64_t address, uint64_t bytes) {
+	if (const auto* backing = WriteGuard::GuardedBacking(address, bytes)) {
+		std::memcpy(out, backing, bytes);
+		return true;
+	}
+#if !defined(_WIN32)
+	static auto& backing_reads = LiveSwitch::Find("spec_backing_reads", 1);
+	if (backing_reads.load(std::memory_order_relaxed) != 0) {
+		if (Libs::LibKernel::Memory::ReadFaults(address, bytes)) return false;
+		if (Libs::LibKernel::Memory::TryReadBackingToHost(address, out, bytes)) return true;
+	}
+#endif
+	return Common::GuardedCopy(out, reinterpret_cast<const void*>(address), bytes) == 0;
+}
+
+// KYTY_SPECULATE=4: the words segment `index` read from the speculation's own journal that a write of an earlier
+// segment gave (Spec::State::journal_reads with `entry` before the segment's own writes), checked at its commit as the
+// chain reads are: such a word notes nothing else the commit checks (a wait over it pushes no WaitCheck). It runs among
+// the checks before the segment's Before. Memory then is what the in-order path reads at the segment's start: the
+// earlier segments' writes landed at their commits (After), the holes before it ran (RunHole), a segment run as a hole
+// (SegmentAsHole) ran its packets in order, and a previous speculation's commits are done; nothing of this segment's
+// has landed, and a word its own writes gave is not checked (in order it reads them). So each must be in memory as the
+// reader took it (Spec::State::journal_words), with no GPU write logged over it since the speculation began (logged as
+// recorded, before it reaches memory: memory cannot tell). Null: all hold.
+const char* Speculation::JournalReadsMoved(const Result& result, size_t index) const {
+	const auto&                            state = result.state;
+	const auto                             from  = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
+	const auto&                            to    = state.closed[index].end;
+	thread_local std::array<uint8_t, 4096> now;
+	for (size_t i = from.journal_reads; i < to.journal_reads; ++i) {
+		const auto& read = state.journal_reads[i];
+		if (read.entry >= from.writes) continue; // (its own writes gave it)
+		if (m_log.stamps.MaybeSince(read.address, read.bytes, result.effects_from) &&
+		    m_log.FirstGpuWriteOver(result.effects_from, read.address, read.bytes) != nullptr)
+			return "commit: a journal word read, a GPU write over it";
+		const auto* taken = reinterpret_cast<const uint8_t*>(state.journal_words.data() + read.words);
+		for (uint64_t done = 0; done < read.bytes;) { // (by page)
+			const auto address = read.address + done;
+			const auto n       = std::min<uint64_t>(read.bytes - done, now.size() - (address & (now.size() - 1)));
+			if (!ReadGuestNow(now.data(), address, n)) return "commit: a journal word read, not readable now";
+			if (std::memcmp(now.data(), taken + done, n) != 0) return "commit: a journal word read otherwise";
+			done += n;
+		}
+	}
+	return nullptr;
 }
 
 void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {
