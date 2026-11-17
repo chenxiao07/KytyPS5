@@ -10,6 +10,13 @@ last=, LIVE_COUNTERS):
   tail             the 10 frames after the crossing: peak, sum over calm, frames over 25 / 33 ms
   2nd window       the same around the longest frame from 11 frames after the crossing to the run's end (18 s)
   write faults     the mean write_faults a frame over the walk's measure windows: over 100 a STORM boot, 40-100 MILD
+Then, beside those (printed after them in both tables; "-" when the walk is too short for the row):
+  late burst       the worst frame +30..+60 frames after the crossing frame, and the sum of time over calm from that
+                   frame to +10 frames after it (11 frames)
+  plateau ms       the mean frame time over frames +60..+120 after the crossing
+  walk             the run (the pad's start to the release, 18 s): mean frame time, p95, p99 (nearest rank), frames over 25 ms
+  stand ms         the mean frame time over the -Tail standing windows (their LIVE_MEASURE replies: time over frames);
+                   "-" for a boot run with -Tail 0
 Boots flagged STORM are listed but left out of the means (their window rows measure the storm, not the crossing).
 Each walk's end position (its last LIVE_WHERE before the flipsx reply) is checked against the bridge's (z 390.3, SPIKE-WALK.md):
 a walk that ends elsewhere gets a WARNING line (a save without the Tower Knight beaten, a stuck run); no reply, or ok=0,
@@ -23,6 +30,39 @@ import sys
 from pathlib import Path
 
 END_Z, END_Z_TOLERANCE = 390.3, 1.5  # the run's end on the bridge: z 390.0-390.6, within 0.1 m walk to walk
+# The rows beside the crossing ones: kept out of the first table's key list and printed after it, "-" when None.
+NEW_ROWS = ['late burst worst ms', 'late burst over-calm ms', 'plateau ms', 'walk mean ms', 'walk p95 ms', 'walk p99 ms',
+            'walk >25', 'stand ms']
+
+
+def nearest_rank(v, p):
+    s = sorted(v)
+    return s[max(0, math.ceil(p / 100 * len(s)) - 1)]
+
+
+def new_rows(r, ft, x, pad, release, calm, live, walk):
+    """The late burst, plateau, whole-walk and stand rows (None: the walk is too short for the row)."""
+    r.update({k: None for k in NEW_ROWS})
+    if x + 60 < release:
+        j = max(range(x + 30, x + 61), key=lambda k: ft[k])
+        r['late burst worst ms'] = ft[j]
+        if j + 10 < release:
+            r['late burst over-calm ms'] = sum(max(0.0, v - calm) for v in ft[j:j + 11])
+    if x + 120 < release:
+        r['plateau ms'] = S.mean(ft[x + 60:x + 121])
+    if release < len(ft):  # the dump holds the whole 18 s run
+        run = ft[pad:release]
+        r['walk mean ms'] = S.mean(run)
+        r['walk p95 ms'] = nearest_rank(run, 95); r['walk p99 ms'] = nearest_rank(run, 99)
+        r['walk >25'] = sum(v > 25 for v in run)
+    # The standing windows (measure 0.5 <walk>tNN after the run): each reply's time is frames / fps (seconds is rounded
+    # to 0.01 s); a window with no frame counts its seconds.
+    stand = [re.search(r' seconds=([0-9.]+) frames=(\d+) fps=([0-9.]+)', l) for l in live
+             if l.startswith('LIVE_MEASURE') and re.search(rf' label={walk}t\d\d ', l)]
+    frames = sum(int(m.group(2)) for m in stand if m)
+    if frames:
+        secs = sum(int(m.group(2)) / float(m.group(3)) if int(m.group(2)) else float(m.group(1)) for m in stand if m)
+        r['stand ms'] = 1000 * secs / frames
 
 
 def walk_rows(d, label, walk):
@@ -82,6 +122,7 @@ def walk_rows(d, label, walk):
     wf = [float(m.group(1)) for l in live[start:end] if l.startswith('LIVE_COUNTERS')
           for m in [re.search(r' write_faults=([0-9.]+)', l)] if m]
     r['write faults a frame'] = S.mean(wf) if wf else float('nan')
+    new_rows(r, ft, x, pad, release, calm, live[start:end], walk)
     return r
 
 
@@ -99,12 +140,14 @@ def main(argv):
                 print(f'{label} {walk}: not read ({e})')
     if not res:
         sys.exit(__doc__)
-    keys = list(next(iter(res.values())))
+    keys = [k for k in next(iter(res.values())) if k not in NEW_ROWS]
     storm = {k for k, r in res.items() if r['write faults a frame'] > 100}
     mild = {k for k, r in res.items() if 40 <= r['write faults a frame'] <= 100}
     print(f'{"row":26}' + ''.join(f'{k[-16:]:>17}' for k in res))
     for key in keys:
         print(f'{key:26}' + ''.join(f'{r.get(key, math.nan):17.1f}' for r in res.values()))
+    for key in NEW_ROWS:
+        print(f'{key:26}' + ''.join(f'{"-":>17}' if r[key] is None else f'{r[key]:17.1f}' for r in res.values()))
     print('flag' + ' ' * 22 + ''.join(f'{"STORM" if k in storm else "mild" if k in mild else "calm":>17}' for k in res))
     use = [r for k, r in res.items() if k not in storm]
     print(f'\nmean +/- se over {len(use)} walks (STORM walks left out: {len(storm)})')
@@ -113,6 +156,11 @@ def main(argv):
         if v:
             se = S.stdev(v) / math.sqrt(len(v)) if len(v) > 1 else math.nan
             print(f'{key:26}{S.mean(v):10.2f} +/- {se:.2f}')
+    for key in NEW_ROWS:
+        v = [r[key] for r in use if r[key] is not None]
+        se = S.stdev(v) / math.sqrt(len(v)) if len(v) > 1 else math.nan
+        print(f'{key:26}' + (f'{S.mean(v):10.2f} +/- {se:.2f}' + (f' ({len(v)} walks)' if len(v) < len(use) else '')
+                             if v else f'{"-":>10}'))
 
 
 if __name__ == '__main__':
