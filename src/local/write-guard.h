@@ -283,6 +283,9 @@ template <typename InRange>
 		return true;
 	}
 	Entry entry {token};
+	// (The switch made here, before any page is guarded: OnFault reads it only once one is, never first in an exception
+	// handler, where its making's lock and getenv do not belong.)
+	(void)WaitLockFree();
 	FilterAdd(page); // (before the page has no access)
 	if (!Common::VirtualMemory::Protect(page, Page, Common::VirtualMemory::Mode::NoAccess, &entry.saved)) {
 		FilterRemove(page);
