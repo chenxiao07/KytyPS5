@@ -337,9 +337,10 @@ void Speculation::Retire(std::unique_ptr<Spec::State> record) {
 // CPUs (KYTY_RENDER_CPUS). On the E-cores a worker translates a chunk slower than the GPU thread can wait for it: in
 // the 8 Nov placement trial the arena gained 2.8 fps in-process with the workers on CPUs 8-15, Latria and 1-1 were
 // level, and the translation lost to cancels fell by a third to a half everywhere. Live: speculate_cpu_mask
-// (KYTY_SPECULATE_CPU_MASK), a CPU mask (0: this default), taken by each worker at its next wake. (It was named
-// speculate_cpus, so LiveSwitch read KYTY_SPECULATE_CPUS, the list, as a number: "8,10,12,14" became mask 8, CPU 3, and
-// every worker was pinned there.) More workers than the list's CPUs share them (SMT).
+// (KYTY_SPECULATE_CPU_MASK), a CPU mask written in decimal (LiveSwitch reads every switch in base 10, the variable and
+// `set` alike: CPUs 8-15 are 65280; "0xff00" reads as 0, this default), taken by each worker at its next wake. (It was
+// named speculate_cpus, so LiveSwitch read KYTY_SPECULATE_CPUS, the list, as a number: "8,10,12,14" became mask 8, CPU
+// 3, and every worker was pinned there.) More workers than the list's CPUs share them (SMT).
 static const std::pair<std::string, const char*>& SpeculationCpus() {
 	static const auto cpus = []() -> std::pair<std::string, const char*> {
 		if (const char* list = std::getenv("KYTY_SPECULATE_CPUS"); list != nullptr && *list != 0) return {list, "KYTY_SPECULATE_CPUS"};
