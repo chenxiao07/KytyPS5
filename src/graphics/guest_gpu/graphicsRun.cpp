@@ -1099,12 +1099,36 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	(void)poll;
 	BreakComputeChain();
-	const T value = ReadGuestMemory(addr);
+	const auto* const reader       = Spec::Current();
+	const size_t      chain_before = reader != nullptr ? reader->chain_reads.size() : 0;
+	const T           value        = ReadGuestMemory(addr);
 	// (A speculation's, satisfied by what memory holds: satisfied at its commit too, Spec::WaitCheck. By its pending
-	// writes: they come first; by a previous speculation's: its chain reads.)
-	if (auto* spec = Spec::Current(); spec != nullptr && TestWaitRegMemValue(value, ref, mask, func) &&
-	                                  !spec->JournalIntersects(reinterpret_cast<uint64_t>(addr), sizeof(T)))
-		spec->waits.push_back({reinterpret_cast<uint64_t>(addr), ref, mask, func, static_cast<uint32_t>(sizeof(T))});
+	// writes: they come first; by a previous speculation's: its chain reads. Each word by what gave it: its own pending
+	// writes when they are over it (ReadWord reads them first), a previous speculation's when the read noted a chain
+	// read of it, else memory (a chain unlinked since it began included). Some words of each (a 64-bit wait with one
+	// word pending): each word memory gave is checked equal at the commit, where memory holds it as the wait read it
+	// (no write of the segment is pending over it).)
+	if (auto* spec = Spec::Current(); spec != nullptr && TestWaitRegMemValue(value, ref, mask, func)) {
+		constexpr uint32_t count = sizeof(T) / 4;
+		const auto         at    = reinterpret_cast<uint64_t>(addr);
+		uint32_t           words[count];
+		std::memcpy(words, &value, sizeof(T));
+		bool     memory[count];
+		uint32_t from_memory = 0;
+		for (uint32_t i = 0; i < count; ++i) {
+			const uint64_t word    = at + 4ull * i;
+			bool           pending = spec->journal_set.Intersects(word, 4);
+			for (size_t k = chain_before; !pending && k < spec->chain_reads.size(); ++k)
+				pending = spec->chain_reads[k].address == word;
+			memory[i] = !pending;
+			from_memory += pending ? 0 : 1;
+		}
+		if (from_memory == count)
+			spec->waits.push_back({at, ref, mask, func, static_cast<uint32_t>(sizeof(T))});
+		else
+			for (uint32_t i = 0; i < count; ++i)
+				if (memory[i]) spec->waits.push_back({at + 4ull * i, words[i], 0xffffffffu, 3u, 4u});
+	}
 	if (!TestWaitRegMemValue(value, ref, mask, func)) {
 		// A speculation's: a hole on a label the processor writes (the commit waits there; what work of the GPU queues
 		// writes before the label is checked against what the speculation read). On memory only the CPU writes it
