@@ -171,6 +171,11 @@ public:
 	}
 	// The image, or null when `id` names no live image (an erased one a record kept): not touched.
 	[[nodiscard]] Image*        TryGetImage(ImageId id) noexcept { return m_slot_images.try_get(id); }
+	// The id `image` is live under now ({} once erased): TryGetImage of it later gives `image` until it is erased. (Its
+	// slot from serial_slot, which an erase leaves and a reuse of the slot sets to the same index.)
+	[[nodiscard]] ImageId       LiveImageId(const Image& image) const noexcept {
+		return m_slot_images.live_id(image.serial_slot, &image);
+	}
 	void MarkGpuWritten(ImageId id);
 	// A speculative translation's use of the image, when it is committed (`serial`: the image it used).
 	void TouchSpeculated(Image& image, uint64_t serial);

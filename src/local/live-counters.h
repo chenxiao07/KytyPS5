@@ -318,9 +318,10 @@ enum Id : uint32_t {
 	SpecStencilModifiedStops, // live spec_copy_image_refuse: commits stopped at an image whose stencil plane GPU work
 	                          // wrote since its segment found it
 	SpecTargetStencilN,       // ... worker draws refused into a target whose stencil plane is stencil-modified
-	SpecImageGoneInBeforeN,   // a commit's Before found an image of the segment's entries erased or replaced since Changed
-	                          // (ReclaimImageMemory under a failed creation in that Before): no barrier on it, the segment
-	                          // stopped before the splice (target_failed)
+	SpecImageGoneInBeforeN,   // a commit's Before found an image of the segment's entries erased or replaced, or
+	                          // unregistered in that Before (ReclaimImageMemory under a failed creation there), not one
+	                          // unregistered before it and still alive: no barrier on it, the segment stopped before the
+	                          // splice (target_failed)
 	Count
 };
 

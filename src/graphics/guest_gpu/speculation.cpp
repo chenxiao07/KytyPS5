@@ -1442,12 +1442,22 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 	return Progress::Complete;
 }
 
-// (Before: an image of the segment's entries no longer the object the entry names, or no longer registered (the null
-// image never is). Its Image* still reads after an erase: SlotVector chunks never move or free; erase leaves
-// `registered` false and the serial, a reused slot another serial.)
-static bool ImageGoneInBefore(const Image& image, uint64_t serial) {
-	return image.serial != serial ||
-	       !(image.registered || (image.info.data.address == 0 && image.info.data.size == 0));
+// (Before: an image of the segment's entries as Before's start found it (`at_start`, taken before anything there can
+// release one), and whether an image was erased since (`erased`: TextureCache::EraseEpoch moved).)
+struct ImageAtBeforeStart {
+	ImageId id;                 // (TextureCache::LiveImageId then: {} when it was erased already)
+	bool    registered = false;
+};
+
+// (Before: an image of the segment's entries gone: erased (before Before or in it: its slot's generation moved), its
+// slot another image's (the serial), or unregistered in this Before (ReclaimImageMemory takes registered images only:
+// a victim a speculation's packet still holds is erased by a later EraseRetired, whatever the GPU still has recorded).
+// Not one already unregistered when Before began and still alive (a parked image, one retired but not yet erased): its
+// VkImage lives, and it gets the barrier as before. The liveness is read first: the fields of an erased object are not.)
+static bool ImageGoneInBefore(TextureCache& textures, const Image& image, uint64_t serial,
+                              const ImageAtBeforeStart& at_start, bool erased) {
+	if (!at_start.id || (erased && textures.TryGetImage(at_start.id) != &image)) return true;
+	return image.serial != serial || (at_start.registered && !image.registered);
 }
 
 void Speculation::Before(Result& result, size_t index) {
@@ -1465,6 +1475,14 @@ void Speculation::Before(Result& result, size_t index) {
 	// (their CPU-dirty pages uploaded, then GPU-owned), those it reads made current, its BDA reads prepared, and each
 	// image where the work found it.
 	RenderLockGuard lock(m_renderer.GetMutex());
+	// Its images as they are before anything here can erase or unregister one (the last loop's ImageGoneInBefore).
+	const auto                      erase_epoch = textures.EraseEpoch();
+	std::vector<ImageAtBeforeStart> images_at_start;
+	images_at_start.reserve(segment.images.size());
+	for (const auto& use: segment.images) {
+		const auto id = textures.LiveImageId(*use.image);
+		images_at_start.push_back({id, id && use.image->registered});
+	}
 	// spec_pending_buffers: the V# ranges it found no buffer for, obtained in order first (made or joined, uploaded), so
 	// the check after Before (preparation registered buffers) sees what that moved under the segment's other ranges.
 	const auto registration_now = buffers.RegistrationEpoch(); // (an entry proven at it or after: nothing moved under it)
@@ -1642,13 +1660,18 @@ void Speculation::Before(Result& result, size_t index) {
 		                                               pending.base_layer, pending.layer_count, pending.clear);
 		if (!ok) state.target_failed = true;
 	}
-	// The images back in the states the segment's barriers start from. Changed found each the object it found before
-	// Before; this Before may have erased one since (a creation it made failed for memory: ReclaimImageMemory erases its
-	// victims at once, after a wait, and the segment's own images can be among them) or reused its slot: no barrier on
-	// it (it would name a destroyed VkImage, or another image), and the segment stops before the splice (target_failed).
-	// (Was an EXIT_IF on the serial alone: a reused slot exited, an erased one recorded a barrier on a null handle.)
-	for (const auto& use: segment.images) {
-		if (ImageGoneInBefore(*use.image, use.serial)) {
+	// The images back in the states the segment's barriers start from. This Before may have released one: a creation it
+	// made failed for memory (ReclaimImageMemory unregisters its victims, among them maybe the segment's own, and erases
+	// them after a wait), and any EraseRetired here (that one, a deferred RetireImage a Finish ran) erases retired images
+	// whose packets passed, among them maybe one the segment found already unregistered. One erased, its slot reused, or
+	// unregistered here gets no barrier (it would name a destroyed VkImage, or another image) and the segment stops before
+	// the splice (target_failed). One unregistered before Before and still alive (a parked image) gets it, as before.
+	// (Was an EXIT_IF on the serial alone; then registered-or-null-image too, which stopped ~0.9 segments a frame on the
+	// 1-3 walk in mode 4 for images merely unregistered before Before: 9,701 "a pending target not acquired" stops.)
+	const bool erased = textures.EraseEpoch() != erase_epoch;
+	for (size_t i = 0; i < segment.images.size(); ++i) {
+		const auto& use = segment.images[i];
+		if (ImageGoneInBefore(textures, *use.image, use.serial, images_at_start[i], erased)) {
 			state.target_failed = true;
 			LiveCounters::Add(LiveCounters::SpecImageGoneInBeforeN);
 			continue;

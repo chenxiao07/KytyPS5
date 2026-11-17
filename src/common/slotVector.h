@@ -68,6 +68,15 @@ public:
 		return slot.alive.load(std::memory_order_acquire) && slot.generation.load(std::memory_order_acquire) == id.generation;
 	}
 
+	// The id of `object` while it is the live object of slot `index` ({} when that slot holds none, or another): every
+	// erase moves the slot's generation, so is_allocated / try_get of it later says whether this object is still there.
+	[[nodiscard]] SlotId live_id(uint32_t index, const T* object) const noexcept {
+		if (index >= m_capacity.load(std::memory_order_acquire)) return {};
+		const auto& slot = At(index);
+		if (!slot.alive.load(std::memory_order_acquire) || !slot.value || &*slot.value != object) return {};
+		return SlotId {index, slot.generation.load(std::memory_order_acquire)};
+	}
+
 	template <typename... Args>
 	[[nodiscard]] SlotId insert(Args&&... args) {
 		uint32_t index = 0;
