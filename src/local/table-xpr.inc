@@ -1060,10 +1060,13 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 	};
 	if (spec != nullptr) {
 		if (WorkerSets() == 0) return Spec::Refuse("table image set"), nullptr;
-		// (One it built already in this translation.)
+		// (One it built already in this translation. spec_set_cpu_dirty_stop: not one with pending slots proposed in an
+		// earlier segment, which TableTransit refuses here: TableSet resolves its words afresh, into a set of this segment.)
 		for (const auto& proposed: spec->proposed_sets)
-			if (proposed.pair == &pair && proposed.hash == words_hash &&
-			    std::ranges::equal(static_cast<TableImageSet*>(proposed.set)->words, words))
+			if (const auto* built = static_cast<TableImageSet*>(proposed.set);
+			    proposed.pair == &pair && proposed.hash == words_hash && std::ranges::equal(built->words, words) &&
+			    !(!built->pending_images.empty() && built->proposed_segment != spec->closed.size() &&
+			      Spec::SetCpuDirtyStopOn()))
 				return static_cast<TableImageSet*>(proposed.set);
 		if (Catalog().m_native_xpr == nullptr || CatalogTable() == nullptr) return worker_refuse("worker set: no catalog");
 		read_only.emplace();
@@ -1923,6 +1926,18 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 		pair.LastSet(Role()) = set;
 		if (set == nullptr) return nullptr; // (a program still translating)
 	}
+	// spec_set_cpu_dirty_stop: not its own set with pending slots proposed in an earlier segment (the role's last,
+	// previous or memo set). Those slots are completed in that segment's Before and are no image entry of this one, so
+	// TableTransit refuses it; kept as the role's last set, every later draw with these words was refused too, each a
+	// hole, for the rest of the translation. Resolved afresh instead, as a set first proposed in this segment (its slots
+	// completed in this segment's Before; TableResolveSet passes over the earlier one) and the role's last set from here.
+	if (spec != nullptr && set->proposer == spec->id && !set->pending_images.empty() &&
+	    set->proposed_segment != spec->closed.size() && Spec::SetCpuDirtyStopOn()) {
+		LiveCounters::Add(LiveCounters::SpecPendingReuseFreshN);
+		set                  = TableResolveSet(buffer, pair, variant, draw_state, words);
+		pair.LastSet(Role()) = set;
+		if (set == nullptr) return nullptr; // (refused, or a program still translating)
+	}
 	set->used_frame.store(frame, std::memory_order_relaxed);
 	if (set->refused) return LiveCounters::Add(LiveCounters::TableRefusedSets), Spec::Refuse("table: refused set"), nullptr;
 	if (!TableValidateSet(*set)) {
@@ -2532,7 +2547,8 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 				if (open_writer->OpenSegmentWritesImage(pending.desc.info)) return reused_written();
 		// spec_set_cpu_dirty_stop: nor bound in a later segment than the one that proposed it. Its slots' images are
 		// completed in that one's Before and are no image entry of the later segment, whose commit's CPU-dirty and
-		// buffer-write stops never see them (a hole between the two writing them): refused.
+		// buffer-write stops never see them (a hole between the two writing them): refused. (TableSet resolves such a
+		// set's words afresh before it gets here: this is the guard.)
 		if (set.proposed_segment != spec->closed.size() && Spec::SetCpuDirtyStopOn()) {
 			LiveCounters::Add(LiveCounters::SpecPendingReuseRefusedN);
 			return Spec::Refuse("table: pending set of an earlier segment"), false;
