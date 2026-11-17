@@ -185,6 +185,10 @@ public:
 	// `keep_shards`: the shard files stay (a merge in the middle of a run, which its final pruning merge counts).
 	static bool MergePrecompileShards(GraphicContext& graphics, bool prune, bool keep_shards = false, bool stamp = false);
 #endif
+	// The translation features the static store was made with (ShaderRecompiler::Frontend::TranslatorFeatures, the
+	// precompile's stamp; all without a store), before the device is made: the emulator enables the pixel interlock's
+	// extension only where the store's translation may use it (vulkanWindow.cpp).
+	static uint32_t StaticStoreFeatures();
 
 	// A pipeline no cache holds, compiled without optimization so its draw or dispatch need not wait:
 	// a worker compiles the optimized one, which then replaces it (PromoteOptimized).

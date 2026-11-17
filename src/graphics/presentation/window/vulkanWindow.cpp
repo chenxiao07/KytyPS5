@@ -26,6 +26,7 @@
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/moduleStore.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "local/anti-lag.h"
@@ -172,6 +173,63 @@ static bool AmdExplicitVertexBarycentrics(vk::PhysicalDevice physical_device, co
 		extensions.push_back(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
 	graphics.amd_explicit_vertex_barycentrics = true;
 	return true;
+}
+
+// VK_EXT_fragment_shader_interlock where the GPU has its pixel-ordered interlock and reads storage images without a
+// format (both enabled by VulkanCreateDevice): the deferred decals' read and write of the G-buffer ordered per pixel
+// (TranslatorFeaturePixelInterlock, issues #315 and #341). Not AMD's Windows driver, which has no interlock. The
+// emulator (`emulator`) only where its static pipeline store's translation may use it: none, or one a precompile made
+// with it. A store made before keeps the old translation (TranslatorFeaturesWithNextPrecompile), and the device it was
+// made for: a driver's global pipeline key may take the extensions enabled (NVIDIA's did not, 11-17). The precompile
+// program enables it wherever the GPU has it, and stamps its store. KYTY_PIXEL_INTERLOCK=1 enables it whatever the
+// store; =0 neither the extension nor the translation (the Steam Deck build: only with =1, not measured there).
+// Returns whether.
+static bool PixelInterlockExtension(vk::PhysicalDevice physical_device, const std::vector<vk::ExtensionProperties>& available,
+                                    std::vector<const char*>& extensions, GraphicContext& graphics, bool emulator) {
+	graphics.fragment_shader_pixel_interlock = false;
+	const char* value  = std::getenv("KYTY_PIXEL_INTERLOCK");
+	const bool  forced = value != nullptr && std::string_view(value) == "1";
+	const auto  off    = [](const char* why) {
+		std::printf("Vulkan pixel interlock: off (%s)\n", why);
+		return false;
+	};
+#if defined(KYTY_STEAM_DECK)
+	if (!forced) return off("the Steam Deck build: KYTY_PIXEL_INTERLOCK=1 enables it");
+#endif
+	if (value != nullptr && std::string_view(value) == "0") return off("KYTY_PIXEL_INTERLOCK=0");
+	if (!HasExtension(available, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME))
+		return off("the driver has no VK_EXT_fragment_shader_interlock");
+	vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT interlock {};
+	vk::PhysicalDeviceFeatures2                          features {};
+	features.pNext = &interlock;
+	physical_device.getFeatures2(&features);
+	if (interlock.fragmentShaderPixelInterlock != VK_TRUE || features.features.shaderStorageImageReadWithoutFormat != VK_TRUE)
+		return off("the GPU lacks the pixel interlock or storage image reads without a format");
+	namespace Translate = ShaderRecompiler::Frontend;
+	if (emulator && !forced && (PipelineCache::StaticStoreFeatures() & Translate::TranslatorFeaturePixelInterlock) == 0)
+		return off("the static pipeline store was made without it: the next precompile brings it, or KYTY_PIXEL_INTERLOCK=1");
+	if (!HasExtension(extensions, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME))
+		extensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
+	graphics.fragment_shader_pixel_interlock = true;
+	std::printf("Vulkan pixel interlock: on (the deferred decals ordered per pixel)\n");
+	return true;
+}
+
+// The translation features without the pixel interlock where its extension is not enabled (PixelInterlockExtension).
+static uint32_t PixelInterlockFeatureMask(const GraphicContext& graphics) {
+	return graphics.fragment_shader_pixel_interlock ? ~0u : ~ShaderRecompiler::Frontend::TranslatorFeaturePixelInterlock;
+}
+
+// The device's pixel interlock and storage image reads without a format, where PixelInterlockExtension enabled the
+// extension (both supported there).
+static void ChainPixelInterlock(const GraphicContext& graphics, vk::DeviceCreateInfo& create_info,
+                                vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT& interlock,
+                                vk::PhysicalDeviceFeatures& device_features) {
+	if (!graphics.fragment_shader_pixel_interlock) return;
+	interlock.fragmentShaderPixelInterlock              = VK_TRUE;
+	interlock.pNext                                     = const_cast<void*>(create_info.pNext);
+	create_info.pNext                                   = &interlock;
+	device_features.shaderStorageImageReadWithoutFormat = VK_TRUE;
 }
 
 static bool HasLayer(const std::vector<vk::LayerProperties>& layers, const char* name) {
@@ -732,6 +790,8 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	// The AMD barycentrics only with AMD's older compiler, its extension enabled (AmdExplicitVertexBarycentrics), and
 	// whatever the store was made with: the KHR ones' pipelines are refused there (issue #305).
 	if (!graphics.amd_explicit_vertex_barycentrics) features &= ~Translate::TranslatorFeatureAmdBarycentrics;
+	// The pixel interlock only where its extension is enabled (PixelInterlockExtension).
+	features &= PixelInterlockFeatureMask(graphics);
 	const uint32_t amd_required =
 	    Translate::TranslatorFeatureTableSlotsAtUse |
 	    (graphics.amd_explicit_vertex_barycentrics ? Translate::TranslatorFeatureAmdBarycentrics : 0u);
@@ -1254,6 +1314,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		coherent.pNext                = const_cast<void*>(create_info.pNext);
 		create_info.pNext             = &coherent;
 	}
+	vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT pixel_interlock {};
+	ChainPixelInterlock(graphics, create_info, pixel_interlock, device_features);
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
@@ -1732,6 +1794,7 @@ void WindowContext::CreateVulkan() {
 			}
 		}
 		(void)AmdExplicitVertexBarycentrics(graphic_ctx.physical_device, available_extensions, device_extensions, graphic_ctx);
+		(void)PixelInterlockExtension(graphic_ctx.physical_device, available_extensions, device_extensions, graphic_ctx, true);
 		// KYTY_GPU_CHECKPOINTS (diagnostic): the pipelines a GPU hang or fault ran (device-fault.h).
 		if (DeviceFault::CheckpointsRequested() &&
 		    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
@@ -1985,6 +2048,7 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 			device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
 		}
 		(void)AmdExplicitVertexBarycentrics(graphic_ctx.physical_device, available_extensions, device_extensions, graphic_ctx);
+		(void)PixelInterlockExtension(graphic_ctx.physical_device, available_extensions, device_extensions, graphic_ctx, false);
 	}
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
 	const VulkanExtensions no_layers {};

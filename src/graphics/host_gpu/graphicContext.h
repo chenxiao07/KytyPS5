@@ -51,6 +51,9 @@ struct GraphicContext {
 	// VK_AMD_shader_explicit_vertex_parameter enabled for the barycentrics of AMD's older Windows compiler (issue #305;
 	// AmdExplicitVertexBarycentrics in vulkanWindow.cpp, ShaderRecompiler::Frontend::TranslatorFeatureAmdBarycentrics).
 	bool                               amd_explicit_vertex_barycentrics      = false;
+	// VK_EXT_fragment_shader_interlock's pixel interlock and storage image reads without a format enabled
+	// (PixelInterlockExtension in vulkanWindow.cpp, ShaderRecompiler::Frontend::TranslatorFeaturePixelInterlock).
+	bool                               fragment_shader_pixel_interlock       = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;

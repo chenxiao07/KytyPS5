@@ -4096,6 +4096,15 @@ static std::string StaticBlobsSignature(const vk::PhysicalDeviceProperties& prop
 	return "KytyPCBlobs1" + ShaderInputDeviceSignature(properties);
 }
 
+// (As InitializeStaticCache takes them: none of the store's files, all.)
+uint32_t PipelineCache::StaticStoreFeatures() {
+	std::error_code error;
+	for (const auto& path: {StaticFeaturesPath(), StaticCachePath(), StaticBinariesPath(), StaticBlobsPath()}) {
+		if (std::filesystem::exists(path, error)) return ReadStaticFeatures();
+	}
+	return ~0u;
+}
+
 // A static pipeline cache of this GPU and driver exists (its file begins with their signature).
 static bool StaticCacheFileMatches(const vk::PhysicalDeviceProperties& properties) {
 	const auto    signature = StaticCacheSignature(properties);

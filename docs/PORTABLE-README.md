@@ -485,12 +485,17 @@ hurts.
   little to fill the gaps instead of cutting out (`-Set KYTY_AUDIO_STRETCH=0` turns that off).
 - It uses a lot of memory and video memory: on PCs with too little it may just exit.
 - Small square holes that come and go where the game's decals overlap: the candle wax in the Nexus, the bottom of
-  some castle walls in 1-3 (issue #315). The game blends each decal into what the one before it left, without a
-  barrier between them; the PS5 runs them nearly in order, a PC graphics card at the same time.
-  `run.cmd -Set KYTY_DRAW_READ_AFTER_WRITE=1` (or `-Set KYTY_DRAW_READ_AFTER_WRITE=1` in the launcher's Advanced >
-  "Command-line options") orders them and the holes go, but where there are hundreds of decals the frame rate can
-  drop by up to ~15% (Boletaria's start without the 60 fps cap: 73 -> 61 fps on an RTX 5090; at 60 fps it still
-  held 60 there). Off by default.
+  some castle walls in 1-3 (issues #315, #341). The game blends each decal into what the one before it left, without a
+  barrier between them; the PS5 runs them nearly in order, a PC graphics card at the same time. Where the graphics
+  card has the pixel interlock (`VK_EXT_fragment_shader_interlock`: NVIDIA, Intel, AMD with Linux' RADV) the decals
+  now run in order per pixel, and the holes are gone (no cost measured on an RTX 5090). Shaders you precompiled
+  before stay as they are until your next precompile, which brings it (Precompile on the launcher's Shaders page:
+  only what is new is compiled); until then `-Set KYTY_PIXEL_INTERLOCK=1` uses it at once (those pipelines are then
+  compiled the first time the game draws them), and `-Set KYTY_PIXEL_INTERLOCK=0` turns it off. AMD's Windows driver
+  has no interlock: there `run.cmd -Set KYTY_DRAW_READ_AFTER_WRITE=1` (or `-Set KYTY_DRAW_READ_AFTER_WRITE=1` in the
+  launcher's Advanced > "Command-line options") orders the decals with barriers instead, but where there are hundreds
+  of decals the frame rate can drop by up to ~15% (Boletaria's start without the 60 fps cap: 73 -> 61 fps on an RTX
+  5090; at 60 fps it still held 60 there). With the interlock that switch is not needed.
 - NVIDIA's Low Latency Mode **Ultra** (NVIDIA Control Panel) makes the emulator's presents wait: uneven frame times
   (RTSS and the emulator's panel disagree) and fewer frames (issue #129). Set Low Latency Mode to Off or On for
   `kyty_emulator.exe` (Manage 3D settings > Program Settings).

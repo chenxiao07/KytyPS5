@@ -97,10 +97,18 @@ constexpr uint32_t TranslatorFeatureLaneLocalWide = 128u;
 // reports the KHR feature (issue #305: 7 of Demon's Souls' 173, the picture's post-processing among them: black screen).
 // No other GPU may use it (TranslatorDeviceFeatures): their SPIR-V is unchanged.
 constexpr uint32_t TranslatorFeatureAmdBarycentrics = 256u;
+// A pixel shader that loads an image it also stores through the same descriptor (Demon's Souls' deferred decals: they
+// read the G-buffer and write it back, no colour target, no barrier between them) reads it as the storage image it
+// writes (coherent), its whole body one critical section of VK_EXT_fragment_shader_interlock, ordered per pixel: two
+// overlapping decals run one after the other, as the PS5 runs them. Without it, a GPU that runs consecutive draws'
+// pixels together lets the next decal read before the last one's write lands and write back over it: holes of 2x2
+// pixels in the candle wax and wall marks, different every frame (issues #315, #341). Only where the device has the
+// pixel interlock and storage reads without a format (TranslatorDeviceFeatures: AMD's Windows driver has no interlock).
+constexpr uint32_t TranslatorFeaturePixelInterlock = 512u;
 constexpr uint32_t TranslatorFeatures = TranslatorFeatureCooperativeHalves | TranslatorFeatureTableSlotsAtUse |
                                         TranslatorFeatureNativeFloatMinMax | TranslatorFeatureExecSelects |
                                         TranslatorFeaturePixelQuadReads | TranslatorFeatureUnfusedMad |
-                                        TranslatorFeatureAmdBarycentrics
+                                        TranslatorFeatureAmdBarycentrics | TranslatorFeaturePixelInterlock
 #if defined(KYTY_STEAM_DECK)
                                         | TranslatorFeatureBdaGroupWalks
 #endif
@@ -108,7 +116,8 @@ constexpr uint32_t TranslatorFeatures = TranslatorFeatureCooperativeHalves | Tra
 // Those a store made without stays up to date for (no precompile offered for them alone): the next precompile, made
 // for another reason (a new graphics driver, new seeds), brings them; worth less than a precompile's time.
 constexpr uint32_t TranslatorFeaturesWithNextPrecompile = TranslatorFeatureExecSelects | TranslatorFeatureBdaGroupWalks |
-                                                          TranslatorFeaturePixelQuadReads | TranslatorFeatureUnfusedMad;
+                                                          TranslatorFeaturePixelQuadReads | TranslatorFeatureUnfusedMad |
+                                                          TranslatorFeaturePixelInterlock;
 // Those that change nearly every shader's SPIR-V: the next precompile of a store made without one compiles all of it
 // again, not only what is new (PipelineCache::StaticCacheRedoesAll; the launchers say so). The unfused multiply-adds
 // change 19,787 of the 1.07 seeds' 20,043 programs.
@@ -118,7 +127,8 @@ constexpr uint32_t TranslatorFeaturesBroad = TranslatorFeatureExecSelects | Tran
 // table slots' loads, KYTY_NATIVE_FLOAT_MIN_MAX=0/1 the float min/max, KYTY_EXEC_SELECTS=0/1 the EXEC selects,
 // KYTY_BDA_GROUP_WALKS=0/1 the shared page walks, KYTY_PIXEL_QUAD_READS=0/1 the pixel shaders' quad reads,
 // KYTY_UNFUSED_MAD=0/1 the multiply-adds, KYTY_AMD_BARYCENTRICS=0/1 the AMD barycentrics (1 only to look at that
-// translation elsewhere: a GPU without VK_AMD_shader_explicit_vertex_parameter refuses its pipelines).
+// translation elsewhere: a GPU without VK_AMD_shader_explicit_vertex_parameter refuses its pipelines),
+// KYTY_PIXEL_INTERLOCK=0/1 the pixel interlock (1 only where the device has it: whatever the store was made with).
 void                   SetTranslatorFeatures(uint32_t features);
 [[nodiscard]] uint32_t TranslatorFeatureSet();
 // Those this GPU's translation may use (default: all) and those it uses whatever the store was made with (`required`,
