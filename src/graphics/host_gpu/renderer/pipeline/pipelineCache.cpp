@@ -1470,6 +1470,7 @@ struct PipelineCache::ProgramCache {
 				}
 				p.inputs.records.clear();
 			}
+			p.inputs.KeepRecordsOnly(); // (the records alone are read: the recipes go)
 			const std::unordered_set<ProgramKey, ProgramKeyHash> skip(warm.begin(), warm.end());
 			for (uint32_t i = 0; i < p.inputs.records.size() && !p.stop.load(std::memory_order_relaxed); ++i) {
 				LocalShaderWarmup::Record record;

@@ -264,9 +264,12 @@ public:
 
     void StartWriter() {
         if (!Enabled() || worker.joinable()) return;
-        // Copy once at startup. The render thread subsequently enqueues only a
-        // new immutable record; serialization/checksums/disk I/O run here.
-        worker = std::jthread([this, saved = records, saved_pipelines = pipelines,
+        // The words where the cache holds them, viewed, not copied: a record's words never move or change once added
+        // (the vectors of records only grow, which moves each record's buffer along, not its words), and Open, Save and
+        // the destructor stop the writer before anything is dropped. A copy held the whole recording twice for as long
+        // as the game ran (1.07 played through: 19,212 inputs and 23,967 recipes, ~100 MiB). The render thread
+        // subsequently enqueues only a new immutable record; serialization/checksums/disk I/O run here.
+        worker = std::jthread([this, saved = Views(records), saved_pipelines = Views(pipelines),
                               dirty = changed](std::stop_token stop) mutable {
             for (;;) {
                 std::vector<Pending> updates;
@@ -276,7 +279,7 @@ public:
                     updates.swap(pending);
                 }
                 for (auto& update : updates) {
-                    (update.pipeline ? saved_pipelines : saved).push_back(std::move(update.words));
+                    (update.pipeline ? saved_pipelines : saved).push_back(update.words);
                     dirty = true;
                 }
                 if (dirty) {
@@ -291,9 +294,20 @@ public:
     bool Save() {
         StopWriter();
         if (!Enabled() || !changed) return true;
-        const bool ok = SaveSnapshot(records, pipelines);
+        const bool ok = SaveSnapshot(Views(records), Views(pipelines));
         if (ok) changed = false;
         return ok;
+    }
+
+    // A reader of the shader records alone (the shader prefetch's static inputs): the pipeline recipes and the look-up
+    // indexes dropped, nothing added or saved after. The prefetch never reads the recipes, which the 1.07 inputs held
+    // 78,428 of (58 MiB) for the whole session.
+    void KeepRecordsOnly() {
+        StopWriter();
+        std::vector<std::vector<uint32_t>>().swap(pipelines);
+        Index().swap(record_index);
+        Index().swap(pipeline_index);
+        path.clear();
     }
 
     // A seed file (tools/local/static-precompile): the same schema under its own identity line, with
@@ -315,7 +329,7 @@ public:
     }
 
 private:
-    struct Pending { bool pipeline; std::vector<uint32_t> words; };
+    struct Pending { bool pipeline; std::span<const uint32_t> words; }; // (the cache's own words: StartWriter)
     using Index = std::unordered_multimap<uint64_t, uint32_t>;
     std::filesystem::path path;
     std::string identity;
@@ -423,14 +437,21 @@ private:
             ? r.vertex_input.attribute_count == 0 && r.vertex_input.binding_count == 0
             : r.vertex_input.attribute_count == vertex.vertex.resources_num);
     }
-    bool SaveSnapshot(std::vector<std::vector<uint32_t>>& saved,
-                      std::vector<std::vector<uint32_t>>& saved_pipelines) {
+    static std::vector<std::span<const uint32_t>> Views(const std::vector<std::vector<uint32_t>>& entries) {
+        return std::vector<std::span<const uint32_t>>(entries.begin(), entries.end());
+    }
+    // (Each record as Words writes it: its size, then its words.)
+    bool SaveSnapshot(const std::vector<std::span<const uint32_t>>& saved,
+                      const std::vector<std::span<const uint32_t>>& saved_pipelines) {
         Writer writer;
-        for (auto* entries : {&saved, &saved_pipelines}) {
+        for (const auto* entries : {&saved, &saved_pipelines}) {
             uint32_t count = uint32_t(entries->size()); writer(count);
-            for (auto& record : *entries)
-                if (!Words(writer, record, 1024 * 1024) ||
-                    writer.words.size() * 4 > MaxBytes - identity.size() - 8) return false;
+            for (const auto record : *entries) {
+                uint32_t size = uint32_t(record.size()); writer(size);
+                if (record.size() > 1024 * 1024) return false;
+                writer.words.insert(writer.words.end(), record.begin(), record.end());
+                if (writer.words.size() * 4 > MaxBytes - identity.size() - 8) return false;
+            }
         }
         std::error_code ec;
         if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path(), ec);
