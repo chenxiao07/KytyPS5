@@ -172,17 +172,35 @@ static inline bool ReadGuestHere(void* out, const void* guest, size_t bytes) {
 	return ShaderReadGuest(out, guest, bytes);
 }
 
-static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
-	EXIT_IF(shader_addr == 0);
+// The code's declared hash (0: it has none), its words read by `read(address, out, bytes)`, which is false when they
+// cannot be read (and then so is the hash: false).
+template <class Read>
+static bool ReadDeclaredShaderHash(uint64_t shader_addr, Read&& read, uint64_t& declared) {
+	declared = 0;
 	std::array<uint32_t, 2> code {};
-	ReadShaderMemory(shader_addr, code.data(), sizeof(code));
-	if (code[0] != 0xBEEB03FF) return 0;
+	if (!read(shader_addr, code.data(), sizeof(code))) return false;
+	if (code[0] != 0xBEEB03FF) return true;
 	// The header's hash0 and hash1 (ShaderBinaryInfo).
 	std::array<uint32_t, 2> hash {};
-	ReadShaderMemory(shader_addr + static_cast<uint64_t>(code[1] + 1u) * 2u * sizeof(uint32_t) +
-	                     offsetof(ShaderBinaryInfo, hash0),
-	                 hash.data(), sizeof(hash));
-	return (static_cast<uint64_t>(hash[1]) << 32u) | hash[0];
+	if (!read(shader_addr + static_cast<uint64_t>(code[1] + 1u) * 2u * sizeof(uint32_t) +
+	              offsetof(ShaderBinaryInfo, hash0),
+	          hash.data(), sizeof(hash)))
+		return false;
+	declared = (static_cast<uint64_t>(hash[1]) << 32u) | hash[0];
+	return true;
+}
+
+static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
+	EXIT_IF(shader_addr == 0);
+	uint64_t declared = 0;
+	(void)ReadDeclaredShaderHash(
+	    shader_addr,
+	    [](uint64_t address, void* out, size_t bytes) {
+		    ReadShaderMemory(address, out, bytes);
+		    return true;
+	    },
+	    declared);
+	return declared;
 }
 
 static uint64_t HashShaderCode(std::span<const uint32_t> code) {
@@ -258,6 +276,37 @@ uint64_t ShaderHashAt(uint64_t addr) {
 	const auto data = ShaderGetMappedData(addr, "ShaderHashAt");
 	if (data.code_size_bytes == 0 || data.code_size_bytes % sizeof(uint32_t) != 0) return 0;
 	return ShaderCodeHash(addr, std::span {reinterpret_cast<const uint32_t*>(addr), data.code_size_bytes / sizeof(uint32_t)});
+}
+
+// ShaderCodeHash's answer (the declared hash, else the code's), never through the guest's view: a load from a page the
+// GPU wrote faults into a readback only the GPU thread serves, and a weave worker waiting for one inside a draw holds
+// up the GPU thread's next safepoint while the GPU thread waits there: both wait for good. The bytes come from the
+// backing, read between two looks at their pages' read watchers: with none before and after, the backing holds what
+// the guest's view would give. A watched page gives no answer (the worker's draw is a hole). No memo (ShaderCodeHash's
+// is per thread, kept by that thread's own uses). The map is read by ShaderLookupMappedData, under its lock, so an
+// address the map doesn't hold is no answer rather than ShaderGetMappedData's exit.
+bool ShaderHashAtNoFault(uint64_t addr, uint64_t& hash) {
+	hash = 0;
+	ShaderMappedData data {};
+	if (!ShaderLookupMappedData(addr, &data)) return false;
+	const uint64_t bytes = data.code_size_bytes;
+	if (bytes == 0 || bytes % sizeof(uint32_t) != 0) return true; // (ShaderHashAt's 0)
+	if (bytes > 1024 * 1024) return false;
+	using LibKernel::Memory::ReadFaults, LibKernel::Memory::TryReadBackingToHost;
+	const auto read = [](uint64_t address, void* out, uint64_t size) {
+		return !ReadFaults(address, size) && TryReadBackingToHost(address, out, size) && !ReadFaults(address, size);
+	};
+	uint64_t declared = 0;
+	if (!ReadDeclaredShaderHash(addr, read, declared)) return false;
+	if (declared != 0) {
+		hash = declared;
+		return true;
+	}
+	thread_local std::vector<uint32_t> scratch;
+	if (scratch.size() < bytes / sizeof(uint32_t)) scratch.resize(bytes / sizeof(uint32_t));
+	if (!read(addr, scratch.data(), bytes)) return false;
+	hash = XXH3_64bits(scratch.data(), bytes);
+	return true;
 }
 
 static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, std::span<const uint32_t> user_data,
