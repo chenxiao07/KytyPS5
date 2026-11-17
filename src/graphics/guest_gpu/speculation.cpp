@@ -1440,6 +1440,14 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 	return Progress::Complete;
 }
 
+// (Before: an image of the segment's entries no longer the object the entry names, or no longer registered (the null
+// image never is). Its Image* still reads after an erase: SlotVector chunks never move or free; erase leaves
+// `registered` false and the serial, a reused slot another serial.)
+static bool ImageGoneInBefore(const Image& image, uint64_t serial) {
+	return image.serial != serial ||
+	       !(image.registered || (image.info.data.address == 0 && image.info.data.size == 0));
+}
+
 void Speculation::Before(Result& result, size_t index) {
 	const Spec::EffectSourceScope source(Spec::EffectSource::Commit);
 	auto&       resources = m_renderer.GetGpuResources();
@@ -1632,8 +1640,17 @@ void Speculation::Before(Result& result, size_t index) {
 		                                               pending.base_layer, pending.layer_count, pending.clear);
 		if (!ok) state.target_failed = true;
 	}
+	// The images back in the states the segment's barriers start from. Changed found each the object it found before
+	// Before; this Before may have erased one since (a creation it made failed for memory: ReclaimImageMemory erases its
+	// victims at once, after a wait, and the segment's own images can be among them) or reused its slot: no barrier on
+	// it (it would name a destroyed VkImage, or another image), and the segment stops before the splice (target_failed).
+	// (Was an EXIT_IF on the serial alone: a reused slot exited, an erased one recorded a barrier on a null handle.)
 	for (const auto& use: segment.images) {
-		EXIT_IF(use.image->serial != use.serial); // (nothing released images since: Epochs)
+		if (ImageGoneInBefore(*use.image, use.serial)) {
+			state.target_failed = true;
+			LiveCounters::Add(LiveCounters::SpecImageGoneInBeforeN);
+			continue;
+		}
 		use.image->RestoreState(use.found, use.found_subresources, scheduler.Current().Handle());
 	}
 }
