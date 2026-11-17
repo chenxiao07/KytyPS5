@@ -110,6 +110,17 @@ B 为新的），abx 两轮 ABBA，120 Hz 上限，每次启动两个 10 秒窗�
   启动，每帧写异常多约 30%、上传多约 2 MB，两边都有）。scout 停下的只有核心很少的电脑；Steam Deck 用的是 Linux 的 profile。
 采用新 profile，旧的另存为 `_Build\pgo\windows\kyty-before-20261112.profdata`。
 
+2026-11-17（台式机）：合并 PR #342（1bcf96af，不含它用于验证的 profile 提交）之后，在 7a44a897 上用 `pgo-multi.ps1`
+默认的五次运行（模式 0）重新训练；训练前先清空 `_Build\windows-pgogen` 并删掉 `_Build\ab\pgogen` 里的旧插桩程序，链接失败时
+就不会拿旧程序去训练。这台电脑 11-16 换了 BIOS（微码 0x137），两个不稳的 P 核又开着，所以训练、构建和对比都在进程掩码
+0xFFFFCF 下进行（避开 CPU 4/5）。重扫只剩 redZonePatcher 17 和 graphicsRun 1（训练开关的分支，设计如此）。abx ABBA，
+120 Hz 上限，每次启动两个 10 秒窗口，同一份源码对比（A 为 11-12 的 profile，B 为新的），模式 0：
+- 1-1：渲染线程 13.74 → 14.19 ms/帧，fps 67.20 → 65.28（B1 那次每帧写异常 444，A 两次约 310：这个位置慢的那种启动）；
+- Latria：12.84 → 12.81 ms，fps 74.85 → 74.38；
+- 1-1 竞技场：8.36 → 8.07 ms，fps 112.85 → 114.55。
+另外 1-1 上合并前（3e5ecbfc，11-12 的 profile）对合并后（新 profile）：14.33 → 13.73 ms，fps 66.10 → 68.03（A1 写异常 460）。
+合并加重训后模式 0 没有变慢。采用新 profile，旧的另存为 `_Build\pgo\windows\kyty-before-20261117.profdata`。
+
 ## 推测模式（`KYTY_SPECULATE=4`）
 
 默认的五次训练都在模式 0 下运行，模式 4 自己的路径（推测线程上的翻译和状态遍历、提交检查，以及模式 0 的函数在
