@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <type_traits>
 #include <vector>
 
@@ -30,6 +31,10 @@ struct TextureBinding {
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
+	// spec_worker_images: the slot's image left to the commit (the null image bound meanwhile), and its own desc (out of
+	// line: a binding is copied by value on the normal path, where it is null).
+	bool                                           pending = false;
+	std::shared_ptr<const TextureCache::ImageDesc> pending_desc;
 };
 
 struct PreparedBindings {

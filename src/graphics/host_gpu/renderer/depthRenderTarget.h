@@ -41,6 +41,25 @@ inline constexpr float htile_fill_depth_value(uint32_t fill, bool stencil_compre
 	return static_cast<float>(z) / 16383.0f;
 }
 
+// A depth target's load from its HTile clear state (IsMetaCleared's answer and fill), as AcquireRenderTargets decides it.
+// One rule for both callers: the normal path, and the spec_depth_layers2 commit that decides it for a speculation's draw.
+struct HtileLoadDecision {
+	bool  depth_meta_clear   = false; // the depth loads CLEAR for the metadata's clear
+	bool  stencil_meta_clear = false; // the stencil does
+	bool  depth_uniform      = false; // the clear value is `uniform_value`, not DB_DEPTH_CLEAR's
+	float uniform_value      = 0.0f;
+};
+inline constexpr HtileLoadDecision htile_load_decision(bool meta_cleared, uint32_t fill, bool fill_known,
+                                                       bool stencil_compressed) {
+	HtileLoadDecision d {};
+	d.depth_uniform = meta_cleared && fill_known && !htile_fill_clears_depth(fill) &&
+	                  htile_fill_depth_uniform(fill, stencil_compressed);
+	d.depth_meta_clear   = meta_cleared && (!fill_known || htile_fill_clears_depth(fill) || d.depth_uniform);
+	d.stencil_meta_clear = meta_cleared && fill_known && stencil_compressed && htile_fill_clears_stencil(fill);
+	if (d.depth_uniform) d.uniform_value = htile_fill_depth_value(fill, stencil_compressed);
+	return d;
+}
+
 struct RenderDepthInfo {
 	// Discovery keeps guest image information but can remap the view into a larger cache image.
 	TextureCache::ImageDesc     desc;

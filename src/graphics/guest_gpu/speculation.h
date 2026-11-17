@@ -51,7 +51,11 @@ class Speculation {
 public:
 	// `interrupt_id`: the queue's processor's (0: the graphics queue; an async compute queue's: KYTY_SPECULATE_ASYNC);
 	// `base`: the first speculation thread's packet slot and executor role less one (after another speculation's).
-	explicit Speculation(RenderContext& renderer, int interrupt_id = 0, uint32_t base = 0, uint32_t threads = 0);
+	// `pass_thread`: KYTY_SPEC_PASS_THREAD, one translator after the `threads` that takes only the state pass.
+	explicit Speculation(RenderContext& renderer, int interrupt_id = 0, uint32_t base = 0, uint32_t threads = 0,
+	                     bool pass_thread = false);
+	// Its translators (the workers and the pass thread): the next instance's packet slots and roles start after them.
+	[[nodiscard]] uint32_t TranslatorCount() const { return static_cast<uint32_t>(m_translators.size()); }
 	~Speculation();
 	KYTY_CLASS_NO_COPY(Speculation);
 	// (Tooling, the live mode toggle: on the GPU thread, between submissions.) The threads stopped and every result not
@@ -119,9 +123,12 @@ private:
 		uint32_t        dwords = 0;
 		const char*     reason = nullptr;
 		Pm4Execution    after;
+		Pm4Execution    at; // the execution at the packet (spec_stop_as_hole stops there)
 	};
 	enum class Progress { Complete, Stopped, Blocked };
 	enum class HoleRun { Done, Changed, Blocked };
+	// SegmentAsHole: not taken (nothing run), or run by the GPU thread up to its hole's packet, or past it without reaching it.
+	enum class AsHole { NotTaken, Reached, NotReached };
 	// What the speculation's work assumed of the caches: no buffer or image registered or released, no mapping changed
 	// since (and the surface metadata it found not cleared still not: Spec::State::meta_facts).
 	struct Epochs {
@@ -148,6 +155,9 @@ private:
 		// recorded can be committed, whether it translated anything.
 		const char*  stop = nullptr;
 		Pm4Execution stop_execution;
+		// A commit stopped after the GPU thread ran a segment itself (SegmentAsHole): where it goes on the normal way (that
+		// segment's hole's packet, or where the run ended), on its own state.
+		std::optional<Pm4Execution> resume_at;
 		Pm4Execution start_at; // where its translation began
 		bool         failed = false, progressed = false;
 		bool         blind  = false; // translated without the one before it while that was not done (mode 4)
@@ -167,6 +177,7 @@ private:
 	struct Translator {
 		explicit Translator(RenderContext& renderer, uint32_t number, int interrupt_id);
 		uint32_t                                   index = 0;
+		bool                                       pass_only = false; // (KYTY_SPEC_PASS_THREAD: the state pass's own thread)
 		std::unique_ptr<RenderExecutor>            draw, compute;
 		RenderContext::Executors                   executors;
 		std::unique_ptr<CommandProcessor>          cp;
@@ -213,6 +224,8 @@ private:
 	// Why the work of the segment no longer holds (a buffer or image it used registered over, a mapping changed), or
 	// null.
 	[[nodiscard]] const char* Changed(const Result& result, size_t index) const;
+	// redo_level_precise: a used image's unmap left the levels its segment sampled mapped (speculation.cpp).
+	[[nodiscard]] bool SampledLevelsMapped(const Spec::ImageUse& use, uint64_t mapping) const;
 	// The segments committed, the holes after them run: all, or up to what the work after it no longer holds
 	// (Result::next: the segments committed).
 	[[nodiscard]] Progress CommitSegments(Result& result, CommandProcessor& cp);
@@ -220,7 +233,12 @@ private:
 	void Before(Result& result, size_t index);
 	void After(Result& result, size_t index);
 	// The hole translated the normal way: changed what the work after it assumed, or a wait not satisfied yet.
-	[[nodiscard]] HoleRun RunHole(Result& result, CommandProcessor& cp, size_t index);
+	// `copy_state` false: `cp` is already at the hole in the state it runs from (a segment run as a hole, its state checked).
+	[[nodiscard]] HoleRun RunHole(Result& result, CommandProcessor& cp, size_t index, bool copy_state = true);
+	// Under KYTY_SPECULATE=4: segment `index`, which Changed stopped, run by `cp` the normal way
+	// as a hole (its recorded work dropped), so the commit can go on; NotTaken: the stop stands, nothing run. Reached or
+	// NotReached: result.resume_at is where `cp` stopped.
+	[[nodiscard]] AsHole SegmentAsHole(Result& result, CommandProcessor& cp, size_t index);
 	// KYTY_SPECULATE=4: a speculation thread; the state pass of a submission (the state it starts from, null: none to
 	// translate, or the pass could not follow it); the state pass on from the GPU thread's last submission when it
 	// cannot follow or is behind (under m_mutex).
@@ -247,10 +265,14 @@ private:
 	// The segments from `first` on dropped (none of them submitted), and what the result fenced given the tick of the
 	// scheduler's open command buffer (after all it submitted); the result kept for reuse.
 	void Finish(std::unique_ptr<Result> result, size_t first);
+	// KYTY_SPEC_RESULT_POOL_CAP: a result taken out of a translator's `free` freed (its recorder destroyed; on the
+	// thread that translates with it).
+	void FreeResult(std::unique_ptr<Result> result);
 	void Report();
 
 	RenderContext&                           m_renderer;
 	std::vector<std::unique_ptr<Translator>> m_translators;
+	bool                                     m_pass_thread = false; // (KYTY_SPEC_PASS_THREAD: the last of m_translators)
 	std::deque<std::unique_ptr<Result>>      m_ahead;     // translated ahead (under m_mutex in mode 4)
 	std::unique_ptr<Result>                  m_blocked;   // a commit waiting at a wait hole
 	std::unique_ptr<CommandProcessor>        m_chain;     // mode 3: the state the next one ahead starts from
@@ -268,6 +290,7 @@ private:
 	// queue; the frame of the last report.
 	uint64_t m_kept_ns = 0, m_lost_ns = 0, m_commit_ns = 0, m_hole_ns = 0, m_queue_ns = 0, m_report_frame = 0;
 	uint32_t m_held_commits = 0; // commits since the last flush (KYTY_SPECULATE_FLUSH_EVERY; this instance's)
+	uint32_t m_stamp_trim_commits = 0; // commits since the stamps' leaves were last looked at (KYTY_SPEC_STAMP_TRIM)
 	std::mutex m_mutex;
 	bool       m_quit  = false;
 	uint64_t   m_clock = 0; // (under m_mutex) orders translations beginning and results retired

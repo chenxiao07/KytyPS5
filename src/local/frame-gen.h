@@ -7,6 +7,7 @@
 // and motion-vector images. The renderer thread gathers them per guest frame; at the guest flip
 // they are copied next to the presenter's frame; the present thread hands them to Streamline and
 // presents through it (sl.interposer.dll is the process' Vulkan loader, see Initialize()).
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
@@ -34,6 +35,12 @@ inline bool IsTaaShader(uint64_t hash) {
 }
 inline bool IsGbufferVertexShader(uint64_t hash) {
 	return std::find(GbufferVertexShaders.begin(), GbufferVertexShaders.end(), hash) != GbufferVertexShaders.end();
+}
+// The indexed draw packets TakeScene counts (a world drawn since the last flip).
+constexpr std::array<uint32_t, 4> IndexedDrawOpcodes {Pm4::IT_DRAW_INDEX_2, Pm4::IT_DRAW_INDEX_OFFSET_2,
+                                                      Pm4::IT_DRAW_INDEX_INDIRECT, Pm4::IT_DRAW_INDEX_INDIRECT_MULTI};
+inline bool IsIndexedDrawPacket(uint32_t opcode) {
+	return std::find(IndexedDrawOpcodes.begin(), IndexedDrawOpcodes.end(), opcode) != IndexedDrawOpcodes.end();
 }
 constexpr uint32_t SrtViewProj     = 29; // 16 floats, row-major, clip = M * world
 constexpr uint32_t SrtPrevViewProj = 45; // 12 floats: the previous frame's rows x, y and w
@@ -168,9 +175,14 @@ void RecordHudless(GraphicContext& graphics, vk::CommandBuffer command, const Fr
 
 // Renderer thread (Kyty.Gpu).
 // The guest frame ran the TAA pass: the game's 3D view (play, or a cutscene in the engine), not a movie, a menu or a
-// loading screen; with or without frame generation, by the normal or the table way. The guest flip takes it
+// loading screen; with or without frame generation, by the normal or the table way (a speculation's thread's table
+// dispatch: at the commit of its segment, Speculation::After, in order before the flip). The guest flip takes it
 // (Presenter::PrepareFrame): above 60 Hz the other frames keep 60 (videoOut.cpp).
 void NoteScene();
+// Renderer thread (Kyty.Gpu), a speculation's commit (KYTY_SPECULATE, Speculation::After): `count` indexed draw packets
+// a speculation's thread translated, in the segment committed (LiveCounters::AddPm4 counts only the packets the render
+// thread runs). TakeScene counts them with those.
+void NoteIndexedDraws(uint64_t count);
 // The guest frame's upscale (the PS5 Pro path) starts a new history: the game's own reset flag, set at a camera cut (a
 // dialogue's end, a cutscene's shots). Its flip's inputs carry it (FrameInputs::cut).
 void NoteCut();

@@ -5,6 +5,7 @@
 #include "live-census.h"
 #include "live-counters.h"
 #include "live-switch.h"
+#include "hoist-watch.h"
 #include "mode-toggle.h"
 #include "live-trace.h"
 #include "live-trace-gpu.h"
@@ -87,6 +88,17 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 #include "speculation-state.h"
 
 namespace Libs::Graphics {
+
+// Every read of the buffer page table goes through LoadOwner: one 8-byte load of the entry.
+// A speculation's thread reads a page-table entry once, as one 8-byte load: the GPU thread may clear it (an unregister)
+// between two plain reads, and a second read then names no slot (SlotVector::operator[]'s EXIT on a worker, a
+// terminate).
+static BufferId LoadOwner(const BufferId* owner) noexcept {
+	static_assert(sizeof(BufferId) == sizeof(uint64_t) && std::is_trivially_copyable_v<BufferId>);
+	if (owner == nullptr) return {};
+	// (seq_cst: after EnterPacket's store)
+	return std::bit_cast<BufferId>(__atomic_load_n(reinterpret_cast<const uint64_t*>(owner), __ATOMIC_SEQ_CST));
+}
 
 namespace {
 
@@ -223,7 +235,8 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	// fault, a request and a copy each otherwise. Only a wider window that is one mapping with no
 	// GPU-written image is taken; else the window stays this buffer's, as without the switch.
 	const auto owner_at = [&](uint64_t at) -> Buffer* {
-		const auto* owner = m_page_table.Find(at >> PageTable::kPageBits);
+		const BufferId owner_snapshot = LoadOwner(m_page_table.Find(at >> PageTable::kPageBits)); // (one read: LoadOwner)
+		const auto*    owner          = owner_snapshot ? &owner_snapshot : nullptr;
 		if (owner == nullptr || !*owner) return nullptr;
 		auto& next = m_slot_buffers[*owner];
 		return !next.is_deleted && next.IsInBounds(at, 1) ? &next : nullptr;
@@ -860,7 +873,8 @@ void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
 	    !LibKernel::Memory::IsUniqueGuestBackingRange(vaddr, size)) {
 		return;
 	}
-	const auto* owner_id = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	const BufferId owner_snapshot = LoadOwner(m_page_table.Find(vaddr >> PageTable::kPageBits)); // (one read: LoadOwner)
+	const auto*    owner_id       = owner_snapshot ? &owner_snapshot : nullptr;
 	auto* owner = owner_id && *owner_id ? m_slot_buffers.try_get(*owner_id) : nullptr;
 	if (!owner || owner->is_deleted || !owner->IsInBounds(vaddr, size)) {
 		return;
@@ -1187,7 +1201,25 @@ void BufferCache::ChangeRegister(BufferId id) {
 		__atomic_store_n(reinterpret_cast<uint64_t*>(&m_page_table[page]), std::bit_cast<uint64_t>(entry), __ATOMIC_RELEASE);
 	}
 	const auto epoch = m_registration_epoch.load(std::memory_order_relaxed) + 1;
-	if (m_registration_spans.size() < 64) {
+	// spec_exact_reg_stop: the granules' epochs, for RegisteredSinceExact (KYTY_SPECULATE=4 only).
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+		constexpr uint64_t leaf_mask = (uint64_t {1} << RegLeafBits) - 1;
+		const auto         begin     = m_slot_buffers[id].CpuAddress();
+		const auto         bytes     = m_slot_buffers[id].Size();
+		if (bytes != 0)
+			for (uint64_t g = begin >> RegGranuleBits, last = (begin + bytes - 1) >> RegGranuleBits; g <= last; ++g) {
+				auto& leaf = m_reg_granule_epochs[g >> RegLeafBits];
+				if (!leaf) leaf = std::make_unique<uint64_t[]>(leaf_mask + 1);
+				leaf[g & leaf_mask] = epoch;
+			}
+	}
+	// KYTY_BDA_SPAN_CAP (live bda_span_cap; -1, the default: 4096 under KYTY_SPECULATE=4, else 0; 0: 64 as before; N: N)
+	// the spans kept for the BDA preparation; past them it rebuilds its requests over the whole address space.
+	static auto& span_cap = LiveSwitch::Find("bda_span_cap", -1);
+	const auto   cap      = span_cap.load(std::memory_order_relaxed);
+	const size_t keep     = cap > 0 ? static_cast<size_t>(cap) : cap == 0 ? 64u
+	                      : kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 4096u : 64u;
+	if (m_registration_spans.size() < keep) {
 		m_registration_spans.push_back({m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size()});
 	} else {
 		m_registration_spans_lost = true;
@@ -1205,6 +1237,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 	m_registration_epoch.store(epoch, std::memory_order_release);
 	LiveCounters::Add(LiveCounters::BufferRegistrations);
 	auto& buffer = m_slot_buffers[id];
+	// The batch's hoist check: a registration over a hoisted range of a KernelBatchMap2 call in progress marks it touched.
+	if constexpr (insert) (void)HoistWatch::NoteRegistration(buffer.CpuAddress(), buffer.Size());
 	if (static const bool log_registrations = std::getenv("KYTY_BUFREG_LOG") != nullptr; log_registrations)
 		std::printf("[tsc %llu] BUFREG %c addr=0x%llx size=0x%llx\n", static_cast<unsigned long long>(__rdtsc()),
 		            insert ? '+' : '-', static_cast<unsigned long long>(buffer.CpuAddress()),
@@ -2104,7 +2138,8 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid buffer discovery request\n");
 	}
-	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	const BufferId owner_snapshot = LoadOwner(m_page_table.Find(vaddr >> PageTable::kPageBits)); // (one read: LoadOwner)
+	const auto*    owner          = owner_snapshot ? &owner_snapshot : nullptr;
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
@@ -2116,14 +2151,6 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 
 // A speculative translation's FindBuffer: no drain (its work reads the buffer on the GPU, after its commit), the range
 // noted (its commit checks nothing registered over it since), nothing registered.
-// A speculation's thread reads a page-table entry once, as one 8-byte load: the GPU thread may clear it (an unregister)
-// between two plain reads, and a second read then names no slot (SlotVector::operator[]'s EXIT on a worker, a
-// terminate).
-static BufferId LoadOwner(const BufferId* owner) noexcept {
-	static_assert(sizeof(BufferId) == sizeof(uint64_t) && std::is_trivially_copyable_v<BufferId>);
-	if (owner == nullptr) return {};
-	return std::bit_cast<BufferId>(__atomic_load_n(reinterpret_cast<const uint64_t*>(owner), __ATOMIC_SEQ_CST));
-}
 
 BufferId BufferCache::RegisteredBuffer(uint64_t vaddr, uint64_t size) {
 	const BufferId owner = LoadOwner(m_page_table.Find(vaddr >> PageTable::kPageBits)); // (one read: LoadOwner)
@@ -2145,11 +2172,53 @@ BufferId BufferCache::FindBufferSpec(uint64_t vaddr, uint64_t size) {
 		const auto* buffer = m_slot_buffers.try_get(owner);
 		if (buffer == nullptr) return Spec::Refuse("buffer registration (unregistered meanwhile)"), NULL_BUFFER_ID;
 		if (buffer->IsInBounds(vaddr, size)) {
-			Spec::Current()->NoteBufferRange(vaddr, size);
+			if (!Spec::t_no_range) Spec::Current()->NoteBufferRange(vaddr, size); // (spec_reloc_refs: the caller records it)
 			return owner;
 		}
 	}
+	PostAhead(vaddr, size);
 	return Spec::Refuse("buffer registration"), NULL_BUFFER_ID;
+}
+
+// (spec_buffer_ahead: 2 under KYTY_SPECULATE=4, 0 otherwise.)
+static int64_t BufferAhead() {
+	if (!Spec::On()) return 0;
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 2 : 0;
+}
+
+void BufferCache::PostAhead(uint64_t vaddr, uint64_t size) {
+	if (BufferAhead() == 0 || !GuestRange {vaddr, size}.Valid()) return;
+	std::scoped_lock lock(m_ahead_mutex);
+	if (m_ahead.size() >= 512) return;
+	for (const auto& [a, b]: m_ahead)
+		if (vaddr >= a && vaddr + size <= a + b) return; // (posted already)
+	m_ahead.emplace_back(vaddr, size);
+}
+
+// The GPU thread, at a commit (a command buffer open): each posted range still without a buffer and overlapping none is
+// registered as CreateBuffer registers one (the caching pages it spans), without the joins CreateBuffer makes (their
+// copies); one that overlaps a buffer is left to its use in order.
+void BufferCache::ServeAhead() {
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	{
+		std::scoped_lock lock(m_ahead_mutex);
+		if (m_ahead.empty()) return;
+		ranges.swap(m_ahead);
+	}
+	for (auto [vaddr, size]: ranges) {
+		const auto end = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
+		vaddr &= ~(CACHING_PAGESIZE - 1);
+		size               = end - vaddr;
+		const auto overlap = ResolveOverlaps(vaddr, size);
+		if (overlap.first != overlap.last || overlap.begin != vaddr || overlap.end != end) {
+			continue;
+		}
+		const auto id = m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, vaddr,
+		                                      AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
+		SetVulkanObjectNameF(m_graphics.device, m_slot_buffers[id].Handle(), "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x} ahead]",
+		                     vaddr, size);
+		Register(id);
+	}
 }
 
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
@@ -2169,10 +2238,44 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 		}
 		return first;
 	};
+	// KYTY_LEAP_GUEST_EDGE (live leap_guest_edge; 0, the default in every mode: as before): the padding below - the
+	// stream leap and the room - stays inside the guest's own placement the request lies in (LibKernel::Memory::
+	// GuestPlacement: the range one hint-less mapping or reservation got): to the right up to the end of the placement
+	// of the request's first byte, to the left down to the start of the placement of its last byte. Without it the
+	// padding runs to the end of the mapped run, over whatever allocation sits next to the request's, and which one does
+	// is first-fit in lock-arrival order (memory.cpp FindGuestFreeRange): one boot's 120 MiB pool became a 136 MiB buffer
+	// by joining a separate 16 MiB allocation that sat at its end that boot, another boot's only a 2.5 MiB one. Only
+	// padding is bounded: the request and the buffers it overlaps are joined as before, across an edge too (a request
+	// over two placements stays one buffer), and memory with no placement known pads as before.
+	// The placements are kept only when KYTY_LEAP_GUEST_EDGE is on at start-up (memory.cpp): set on live in a boot that
+	// started without it, the switch does nothing (said once); set off live, padding is unbounded again.
+	static auto& guest_edge   = LiveSwitch::Find("leap_guest_edge", 0);
+	bool         edges_known  = false;
+	bool         edge_clamped = false; // (a leap the edge shortened: one left with no bytes is no stream leap, below)
+	uint64_t     edge_left = 0, edge_right = UINT64_MAX;
+	const auto   guest_edges = [&] {
+		if (std::exchange(edges_known, true) || guest_edge.load(std::memory_order_relaxed) == 0) return;
+		if (!LibKernel::Memory::GuestPlacementsKept()) {
+			static std::atomic_bool said {false};
+			if (!said.exchange(true))
+				std::printf("leap_guest_edge: on, but KYTY_LEAP_GUEST_EDGE was off at start-up: no guest placements kept, "
+				            "padding unbounded\n");
+			return;
+		}
+		uint64_t base = 0, bytes = 0;
+		if (LibKernel::Memory::GuestPlacement(vaddr, &base, &bytes)) edge_right = base + bytes;
+		if (LibKernel::Memory::GuestPlacement(vaddr + size - 1, &base, &bytes)) edge_left = base;
+	};
 	// A leap covers memory the game maps only (its run from the edge): over an unmapped gap it joined the buffers of
 	// pieces mapped apart into one that held the gaps in video memory too (1-1 after two world trips: a pool mapping 256
 	// KiB of each MiB in one buffer of 369 MiB, 236 MiB of it unmapped; 349 MiB in 29 buffers).
 	const auto leap_right = [&](uint64_t from, uint64_t to) {
+		guest_edges();
+		if (edge_right < to) {
+			edge_clamped = true;
+			to           = std::max(from, edge_right);
+		}
+		if (to <= from) return from;
 		if (m_resources == nullptr) return to;
 		RangeSet mapped;
 		m_resources->MappedRanges(from, to - from, mapped);
@@ -2183,6 +2286,12 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 		return reach & ~(CACHING_PAGESIZE - 1);
 	};
 	const auto leap_left = [&](uint64_t from, uint64_t to) {
+		guest_edges();
+		if (edge_left > from) {
+			edge_clamped = true;
+			from         = std::min(to, edge_left);
+		}
+		if (from >= to) return to;
 		if (m_resources == nullptr) return from;
 		RangeSet mapped;
 		m_resources->MappedRanges(from, to - from, mapped);
@@ -2213,6 +2322,8 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 		end                       = std::max(end, buffer_end);
 		if (!has_stream_leap && (stream_score += buffer.StreamScore()) > StreamLeapThreshold) {
 			has_stream_leap = true;
+			edge_clamped    = false;
+			const auto leap_begin = begin, leap_end = end;
 			// Fix the shadPS4 bug that reserves space opposite to the incoming stream's growth.
 			// The old buffer extending left of the request predicts growth to the right, and vice versa.
 			if (expands_left) {
@@ -2226,6 +2337,9 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 				first = find_first(begin);
 				begin = std::min(begin, first->first);
 			}
+			// (leap_guest_edge: a leap the placement's edge left with no bytes is none: the stream scores still carry
+			// and the room below still applies, as for a buffer that never leapt.)
+			if (edge_clamped && begin == leap_begin && end == leap_end) has_stream_leap = false;
 		}
 	}
 	// A big buffer growing (a pool the game fills over minutes: one of 638 MB made whole again six times up to 910 MB, on
@@ -2630,7 +2744,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 void BufferCache::EnsureBdaReadable(std::span<const GuestRange> ranges) {
 	constexpr uint64_t HeadBytes = uint64_t {64} << 10u;
 	const auto         held      = [this](uint64_t page) {
-        const auto* owner = m_page_table.Find(page);
+        const BufferId owner_snapshot = LoadOwner(m_page_table.Find(page)); // (one read: LoadOwner)
+        const auto*    owner          = owner_snapshot ? &owner_snapshot : nullptr;
         return owner != nullptr && *owner;
 	};
 	for (const auto& range: ranges) {
@@ -2723,8 +2838,41 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSpec(Spec::State& spec, ui
 	const BufferId owner_id = LoadOwner(m_page_table.Find(vaddr >> PageTable::kPageBits)); // (one read: LoadOwner)
 	const auto*    owner    = &owner_id; // (its later use names the buffer found here, not a re-read)
 	auto*          buffer   = owner_id ? m_slot_buffers.try_get(owner_id) : nullptr;
-	if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size))
+	if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size)) {
+		// spec_pending_buffers: a table V#'s range (the caller allows it) left to the commit, which obtains it in order,
+		// unless what refuses a found buffer below refuses it too (its processor's writes over it; a texel range over a
+		// GPU-written image).
+		if (Spec::t_pending_ok && !(is_texel_buffer && m_texture_cache.HasGpuWrittenImageOverlap(vaddr, size)) &&
+		    !spec.open_journal_set.Intersects(vaddr, size) && !(is_written && spec.open_copy_sources.Intersects(vaddr, size))) {
+			Spec::t_pending_hit = true;
+			// spec_buffer_ahead (under KYTY_SPECULATE=4): posted at first sight as well, for ServeAhead to
+			// register at the next commit's start (no joins; one overlapping a buffer is skipped and left to the commit, as
+			// before).
+			if (BufferAhead() >= 2) PostAhead(vaddr, size);
+			if (is_written) spec.NoteWritten(vaddr, size);
+			return {nullptr, 0};
+		}
+		// spec_ring_index (under KYTY_SPECULATE=4 only): an index range no buffer holds yet, served from the speculation's
+		// ring as the small range above is, and posted ahead for the GPU thread to register (an area change: ~220 index
+		// lookup holes in one frame, each cutting a segment).
+		if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && !is_written && !is_texel_buffer &&
+		    t_ahead_site == 3 && size <= (uint64_t {4} << 20u) &&
+		    !IsRegionGpuModified(vaddr, size) && m_memory_tracker.IsRegionCpuModified(vaddr, size) &&
+		    !spec.JournalIntersects(vaddr, size) && !spec.WrittenIntersects(vaddr, size)) {
+			auto&      upload    = GetShaderUploadBuffer();
+			const auto alignment = std::max<uint64_t>(
+			    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 4);
+			auto [mapped, offset] = upload.Map(size, alignment, false);
+			if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(vaddr, mapped, size)) {
+				upload.Commit();
+				spec.NoteCleanRead(vaddr, size);
+				PostAhead(vaddr, size);
+				return {&upload, offset};
+			}
+		}
+		PostAhead(vaddr, size);
 		return Spec::Refuse("buffer lookup"), std::pair<Buffer*, uint64_t> {nullptr, 0};
+	}
 	// A texel buffer over an image GPU work wrote: the normal path copies the image in at the draw. Its commit does that
 	// before its work (KYTY_SPECULATE_TEXEL_SYNC) when its work does not use the image itself, nor writes the buffer;
 	// else the draw is a hole. (Storage and target images over memory the game reads as texel buffers: 160-360 such
@@ -2742,7 +2890,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSpec(Spec::State& spec, ui
 	else if (m_memory_tracker.IsRegionCpuModified(vaddr, size) || spec.JournalIntersects(vaddr, size))
 		spec.NoteCurrent(vaddr, size);
 	if (spec.touched_buffers.empty() || spec.touched_buffers.back() != *owner) spec.touched_buffers.push_back(*owner);
-	spec.NoteBufferRange(vaddr, size);
+	if (!Spec::t_no_range) spec.NoteBufferRange(vaddr, size); // (spec_reloc_refs: the caller records it)
 	return {buffer, buffer->Offset(vaddr)};
 }
 
@@ -2835,7 +2983,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
 	}
-	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	const BufferId owner_snapshot = LoadOwner(m_page_table.Find(vaddr >> PageTable::kPageBits)); // (one read: LoadOwner)
+	const auto*    owner          = owner_snapshot ? &owner_snapshot : nullptr;
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
@@ -2946,8 +3095,8 @@ bool BufferCache::RefillImageStaging(const Buffer& ring, uint64_t offset, uint64
 	    !ring.IsCoherent())
 		return false;
 	DrainGuestReadback(vaddr, size);
-	if (const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
-	    owner != nullptr && *owner && m_slot_buffers[*owner].IsInBounds(vaddr, size))
+	if (const BufferId owner = LoadOwner(m_page_table.Find(vaddr >> PageTable::kPageBits)); // (one read: LoadOwner)
+	    owner && m_slot_buffers[owner].IsInBounds(vaddr, size))
 		return false;
 	if (IsRegionGpuModified(vaddr, size)) return false;
 	(void)PushImageStagingCopies(ring.Mapped().data() + offset, vaddr, size);
@@ -2978,7 +3127,9 @@ std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<Sta
 		// buffer only takes CPU writes from it. Pieces in one refused before, and the whole image was uploaded: the
 		// shadow-map pool at 4-2, inside a buffer over a texture pool, 320 MiB at every layer the game streamed.)
 		if (IsRegionGpuModified(piece.vaddr, piece.size)) {
-			const auto* owner = m_page_table.Find(piece.vaddr >> PageTable::kPageBits);
+			// (One read: LoadOwner.)
+			const BufferId owner_snapshot = LoadOwner(m_page_table.Find(piece.vaddr >> PageTable::kPageBits));
+			const auto*    owner          = owner_snapshot ? &owner_snapshot : nullptr;
 			return refuse("gpu", piece.vaddr, piece.size, owner != nullptr && *owner ? &m_slot_buffers[*owner] : nullptr);
 		}
 	}
@@ -3205,7 +3356,7 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	if (const auto first = vaddr >> PageTable::kPageBits, last = (vaddr + size - 1) >> PageTable::kPageBits;
 	    last - first < 4) {
 		for (auto page = first; page <= last; ++page)
-			if (const auto* owner = m_page_table.Find(page); owner != nullptr && *owner) return true;
+			if (LoadOwner(m_page_table.Find(page))) return true; // (one read: LoadOwner)
 		return false;
 	}
 	// Cached buffers are ordered and non-overlapping. The last buffer beginning before the query

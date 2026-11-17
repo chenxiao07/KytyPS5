@@ -118,7 +118,8 @@ public:
 
 	[[nodiscard]] bool CreateFailed() const noexcept { return m_create_failed; }
 
-	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
+	// `find_only` (spec_worker_sets): an existing view or null, none made (the caller holds the texture cache's lock).
+	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info, bool find_only = false);
 	// A parked image taken back for `image_info` (TextureCache::TakeParkedImage, the same Vulkan image): the state the
 	// constructor gives a new one, but for its Vulkan image, views and barrier state (and serial: the same object).
 	void PrepareReuse(const ImageInfo& image_info);

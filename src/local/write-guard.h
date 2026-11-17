@@ -24,6 +24,7 @@
 // * An unmap drops the guards of its range (Drop), and so the GPU thread's own table's entries of them (g_gone).
 
 #include "common/virtualMemory.h"
+#include "hoist-watch.h"
 #include "live-switch.h"
 #include "mode-toggle.h"
 
@@ -32,6 +33,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include <shared_mutex>
 #include <thread>
 #include <unordered_map>
@@ -296,6 +300,9 @@ template <typename InRange>
 	}
 	g_pages.emplace(page, entry);
 	g_count.fetch_add(1, std::memory_order_release);
+	// (batch_map_syncs: a guard armed over a hoisted range marks it touched, so the entry's own GPU unmap runs and drops
+	// it; the hoist's unmap dropped only the guards armed before it.)
+	(void)HoistWatch::NoteRegistration(page, Page);
 	const uint64_t arm = g_arms.load(std::memory_order_relaxed);
 	g_armed[arm % ArmRing].store(page, std::memory_order_release); // (before g_arms counts it)
 	g_arms.fetch_add(1, std::memory_order_release);
@@ -327,15 +334,127 @@ inline void Lift(uint64_t page, uint64_t token) {
 	if (auto it = g_pages.find(page); it != g_pages.end() && it->second.token == token) LiftLocked(it);
 }
 
+// KYTY_GUARD_HONOUR_UNLOCKED (live guard_honour_unlocked; -1, the default: on under KYTY_SPECULATE=4; 1 on, 0 off):
+// Honour's protection change over a range with no guarded page is made outside g_lock (before, it held g_lock shared
+// across the protect, and
+// the GPU thread's arm waits behind it: 1.1 / 2.3 / 1.7 ms a frame held by the GPU thread / upload worker / others).
+// Instead the range is published in a slot, under the shared hold that found no guarded page in it, and the slot cleared
+// once the protect returned; an arm (TakeArm) of a page inside a published range waits for its slot to clear, outside
+// the lock, then takes the lock again. So no page of the range is armed while its protect runs (an arm before the
+// publication: Honour finds the page guarded and takes the locked path, as before; an arm after: it waits), and an arm's
+// saved protection is the changed one, as when the protect ran under the lock. A full set of slots: the locked path.
+inline constexpr uint32_t HonourSlots = 16;
+struct HonourSlot {
+	std::atomic<uint32_t> used {0};
+	std::atomic<uint64_t> begin {0}, end {0}; // page-rounded; written by the claimer under the shared g_lock
+};
+inline HonourSlot            g_honour[HonourSlots];
+inline std::atomic<uint32_t> g_honour_live {0}; // slots in use (the arm's fast path)
+// Made on the GPU thread by TakeArm before its first arm; Honour reads it only once a page was armed (g_arms, acquire),
+// so its first call is never in an exception handler (Honour runs in the trackers' fault handling too).
+inline std::atomic<int64_t>& HonourUnlockedSwitch() {
+	static auto& on = LiveSwitch::Find("guard_honour_unlocked", -1);
+	return on;
+}
+[[nodiscard]] inline bool HonourUnlockedOn() {
+	const auto v = HonourUnlockedSwitch().load(std::memory_order_relaxed);
+	return v > 0 || (v < 0 && ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4);
+}
+// (Shared g_lock, no guarded page in [vaddr, vaddr + size).) A slot holding the range, or null (all in use).
+[[nodiscard]] inline HonourSlot* ClaimHonourSlot(uint64_t vaddr, uint64_t size) {
+	for (auto& slot: g_honour) {
+		uint32_t expected = 0;
+		if (!slot.used.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) continue;
+		slot.begin.store(vaddr & ~(Page - 1), std::memory_order_relaxed);
+		slot.end.store((vaddr + size + Page - 1) & ~(Page - 1), std::memory_order_relaxed);
+		g_honour_live.fetch_add(1, std::memory_order_release);
+		return &slot;
+	}
+	return nullptr;
+}
+// After the protect returned (no lock).
+inline void ReleaseHonourSlot(HonourSlot& slot) {
+	slot.used.store(0, std::memory_order_release);
+	g_honour_live.fetch_sub(1, std::memory_order_release);
+}
+// Whether a published range overlaps [first, end). Under the exclusive g_lock exact (no claim can run; a release seen
+// as done is done); outside it a hint only (TakeArm checks again under the lock).
+[[nodiscard]] inline bool HonourOverlaps(uint64_t first, uint64_t end) {
+	if (g_honour_live.load(std::memory_order_acquire) == 0) return false;
+	for (const auto& slot: g_honour)
+		if (slot.used.load(std::memory_order_acquire) != 0 && first < slot.end.load(std::memory_order_relaxed) &&
+		    slot.begin.load(std::memory_order_relaxed) < end)
+			return true;
+	return false;
+}
+
+// A short pause in a spin (x64: PAUSE; elsewhere a yield).
+inline void SpinPause() {
+#if defined(_M_X64) || defined(__x86_64__)
+	_mm_pause();
+#else
+	std::this_thread::yield();
+#endif
+}
+
+// The GPU thread's exclusive take for an arm (GuardedWrite, CommitGuardedWriteRun, graphicsRun.cpp). KYTY_GUARD_SPIN (live
+// guard_spin; -1, the default: 20 under KYTY_SPECULATE=4, 0 otherwise; 0 off): a contended take tries again with a
+// pause between tries for up
+// to N us (1: 20 us) before it blocks, so a shared holder that lets go within that time costs no sleep and wake (the
+// arm's wait 0.79 -> 0.24 ms a frame). The same lock, held as before.
+[[nodiscard]] inline std::unique_lock<std::shared_mutex> TakeArmLock() {
+	static auto&  spin     = LiveSwitch::Find("guard_spin", -1);
+	const int64_t spin_set = spin.load(std::memory_order_relaxed);
+	const int64_t spin_us  = spin_set >= 0 ? spin_set : ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 20 : 0;
+	if (spin_us <= 0) return std::unique_lock<std::shared_mutex>(g_lock);
+	std::unique_lock<std::shared_mutex> lock(g_lock, std::try_to_lock);
+	if (lock.owns_lock()) return lock;
+	const auto limit = std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us == 1 ? 20 : spin_us);
+	for (;;) {
+		SpinPause();
+		if (lock.try_lock()) return lock;
+		if (std::chrono::steady_clock::now() >= limit) break;
+	}
+	lock.lock();
+	return lock;
+}
+
+// The arm's take for the pages [first, end) (KYTY_GUARD_HONOUR_UNLOCKED): held exclusively with no unlocked Honour over
+// them in flight. One that is: the lock let go, its slot waited for, the lock taken again (a new one over them can start
+// only after this take ends, and it then finds the armed pages guarded: the locked path).
+[[nodiscard]] inline std::unique_lock<std::shared_mutex> TakeArm(uint64_t first, uint64_t end) {
+	(void)HonourUnlockedSwitch(); // (made here first, see HonourUnlockedSwitch)
+	for (;;) {
+		auto lock = TakeArmLock();
+		if (!HonourOverlaps(first, end)) return lock;
+		lock.unlock();
+		// (A short spin, then yields: a preempted slot owner does not keep the GPU thread spinning.)
+		for (uint32_t spins = 0; HonourOverlaps(first, end); ++spins) {
+			if (spins < 2048) SpinPause();
+			else std::this_thread::yield();
+		}
+	}
+}
+
 // A protection change of guest memory (GuestAddressSpace::ProtectMappedUnlocked): its guarded pages keep no access
 // and take `mode` for when they are lifted; `protect` changes the others.
 template <typename Protect>
 [[nodiscard]] inline bool Honour(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode, Protect&& protect) {
 	if (!Enabled()) return protect(vaddr, size);
 	{
-		// (A guard armed meanwhile waits for this lock: the change cannot undo it.)
+		// (A guard armed meanwhile waits for this lock: the change cannot undo it. KYTY_GUARD_HONOUR_UNLOCKED: or for the
+		// range's slot, the protect made after the lock is let go.)
 		std::shared_lock lock(g_lock);
-		if (!AnyIn(vaddr, size)) return protect(vaddr, size);
+		if (!AnyIn(vaddr, size)) {
+			HonourSlot* slot = nullptr;
+			if (g_arms.load(std::memory_order_acquire) != 0 && HonourUnlockedOn())
+				slot = ClaimHonourSlot(vaddr, size);
+			if (slot == nullptr) return protect(vaddr, size);
+			lock.unlock();
+			const bool ok = protect(vaddr, size);
+			ReleaseHonourSlot(*slot);
+			return ok;
+		}
 	}
 	std::unique_lock      lock(g_lock);
 	std::vector<uint64_t> pages;

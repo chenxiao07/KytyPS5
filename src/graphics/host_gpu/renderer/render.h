@@ -10,6 +10,8 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include "live-switch.h"
+
 #include <array>
 #include <memory>
 #include <optional>
@@ -139,6 +141,8 @@ public:
 	[[nodiscard]] bool RenderingWith(const RenderState& state) const;
 	// A render pass is in progress.
 	[[nodiscard]] bool Rendering() const noexcept { return m_rendering; }
+	// The render pass in progress (none: nullptr), as BeginRendering began it (spec_depth_layers2's commit).
+	[[nodiscard]] const RenderState* OpenRendering() const noexcept { return m_rendering ? &m_render_state : nullptr; }
 	// Raw internal graphics operations must invalidate the values recorded by
 	// the ordinary draw path. Compute and transfer commands do not alter them.
 	void InvalidateGraphicsState() const noexcept;
@@ -467,10 +471,24 @@ private:
 	// The catalog's owner changes its pairs and dispatches, image sets, draw states and compute clears under its lock
 	// exclusively (CatalogWrite); another executor reads them under it shared (CatalogRead, on its own thread).
 	mutable std::shared_mutex m_catalog_mutex;
+	// catalog_writer_first (under KYTY_SPECULATE=4, the only mode with readers): the owner raises this while it waits for
+	// the lock exclusively, and a worker waits for it to fall before its table try takes the lock shared. std::shared_mutex gives a waiting writer no priority: in an
+	// area transition the workers' table tries, taking it shared in turns, held the owner's writes 123-193 us each.
+	mutable std::atomic<int32_t> m_catalog_writer_waiting {0};
+	[[nodiscard]] static bool CatalogWriterFirst() {
+		return ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+	}
 	// (Outside KYTY_SPECULATE=4 no other executor reads the catalog: no lock. The mode changes only between submissions.)
 	[[nodiscard]] std::unique_lock<std::shared_mutex> CatalogWrite() const {
-		return ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? std::unique_lock(m_catalog_mutex)
-		                                                                       : std::unique_lock<std::shared_mutex>();
+		if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return std::unique_lock<std::shared_mutex>();
+		std::unique_lock lock(m_catalog_mutex, std::try_to_lock);
+		if (!lock.owns_lock()) {
+			const bool first = CatalogWriterFirst();
+			if (first) m_catalog_writer_waiting.fetch_add(1, std::memory_order_acq_rel);
+			lock.lock();
+			if (first) m_catalog_writer_waiting.fetch_sub(1, std::memory_order_acq_rel);
+		}
+		return lock;
 	}
 	[[nodiscard]] std::shared_lock<std::shared_mutex> CatalogRead() { return std::shared_lock(Catalog().m_catalog_mutex); }
 	[[nodiscard]] uint32_t        Role() const noexcept { return m_role; }
@@ -484,6 +502,12 @@ private:
 	// before its program was prepared, and its dispatches since (every 64th takes the normal path again).
 	std::atomic<uint64_t> m_linear_copy_shader {0}, m_linear_copy_generation {0};
 	uint32_t              m_linear_copy_uses = 0;
+	// (spec_linear_copy_identity) the learned shader's identity beside the generation: the shader map's code size and
+	// user-data pointer at its address and its code hash (ShaderHashAt), stored before the address and generation.
+	std::atomic<uint64_t> m_linear_copy_size {0}, m_linear_copy_user_data {0}, m_linear_copy_hash {0};
+	// Is the shader at `data_addr` the learned linear copy shader: today's rule (the generation it was learned under), or
+	// on a speculation's thread / a state pass under KYTY_SPECULATE=4, its identity proven again.
+	[[nodiscard]] bool LinearCopyKnown(uint64_t data_addr, bool other_thread);
 	// The metadata surfaces compute dispatches cleared (TryConsumeComputeMetaClear), by their shader and user data: a
 	// speculation's hole of such a dispatch clears it (Spec::State::PredictClear). (Not the DCC fills
 	// TryConsumeComputeImageClear tracks: the normal path consumes those only where it can clear the image, 10-06.)
@@ -503,6 +527,8 @@ private:
 	                      const NativeXprDrawState& draw_state, std::span<const uint64_t> commands,
 	                      uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
 	                      const NativeXprDirectDraw* direct);
+	// spec_worker_images: a worker's set's pending slots completed by the GPU thread at its commit (Speculation::Before).
+	[[nodiscard]] bool TableCompletePendingImages(TableImageSet& set);
 	[[nodiscard]] TableImageSet* TableResolveSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
 	                                             const NativeXprDrawState* draw_state, std::span<const uint32_t> words);
 	[[nodiscard]] bool           TableValidateSet(TableImageSet& set);
@@ -522,8 +548,9 @@ private:
 	void NativeXprCaptureState(CommandBuffer& buffer, const DrawRenderState& state, const RenderState& rendering,
 	                           uint64_t state_key);
 	[[nodiscard]] bool NativeXprTargetsCurrent(const NativeXprDrawState& draw_state);
+	// (`command`: the draw's command buffer, its registers for spec_depth_layers2; none: no target is left to the commit.)
 	[[nodiscard]] bool NativeXprEmitTargets(const NativeXprDrawState& draw_state, vk::CommandBuffer vk_buffer,
-	                                        const TableImageSet* reading = nullptr);
+	                                        const TableImageSet* reading = nullptr, const CommandBuffer* command = nullptr);
 	// The shader access a table image set adds to target `id` (KYTY_TABLE_TARGET_READ; none: empty).
 	[[nodiscard]] static vk::AccessFlags2 TableTargetRead(const TableImageSet& set, ImageId id);
 

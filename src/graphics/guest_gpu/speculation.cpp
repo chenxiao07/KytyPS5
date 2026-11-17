@@ -7,16 +7,20 @@
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h" // (spec_depth_layers2: htile_load_decision)
 #include "async-upload.h"
 #include "draw-state-observer.h"
+#include "frame-gen.h"
 #include "local-platform.h"
 #include "mode-toggle.h"
 #include "vulkan-recording.h"
 #include "write-guard.h"
+#include <xxhash.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -38,6 +42,8 @@ volatile std::atomic_uint32_t kyty_local_pipelines_evicting {0};
 namespace Libs::Graphics {
 
 bool CommitGuardedWrite(void* dst, const void* src, uint32_t size); // (graphicsRun.cpp: KYTY_WRITE_GUARD_SPEC)
+// (after_guard_batch)
+size_t CommitGuardedWriteRun(const uint64_t* addresses, const uint64_t* values, const uint32_t* sizes, size_t count);
 
 // KYTY_SPECULATE_FLUSH_EVERY (live speculate_flush_every N; 8 by default under KYTY_SPECULATE=4, else 0; 0 and 1:
 // every commit): a commit's held segment buffers go to the GPU at its end only every Nth commit; the rest wait for the
@@ -83,6 +89,8 @@ static bool IsHole(uint32_t header) {
 
 // A chunk's translation stopped where the next chunk begins (Result::stop).
 static constexpr char ChunkEnd[] = "chunk end";
+// A result that ends before a packet whose command words lie on a page a read watcher guards (ProcessPm4Spec).
+static constexpr char CommandWordsWatched[] = "command words watched";
 
 // "Work wrote what it read", by the write's kind and what logged it (null: not found).
 static const char* WroteWhatItRead(const Spec::EffectsLog::Entry* entry) {
@@ -107,7 +115,7 @@ Speculation::Translator::Translator(RenderContext& renderer, uint32_t number, in
 	compute->ReadCatalogOf(renderer.DefaultComputeRenderExecutor(), 1 + number);
 }
 
-Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t base, uint32_t threads)
+Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t base, uint32_t threads, bool pass_thread)
     : m_renderer(renderer), m_chain(std::make_unique<CommandProcessor>(renderer, interrupt_id)),
       m_state(std::make_unique<CommandProcessor>(renderer, interrupt_id)), m_interrupt_id(interrupt_id) {
 	m_state->SetStateOnly(true);
@@ -118,6 +126,12 @@ Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t bas
 	// (Packet slots and executor roles: Spec::MaxPacketSlots, RenderExecutor::Roles less the GPU thread's.)
 	threads = std::clamp<uint32_t>(threads, 1u, static_cast<uint32_t>(Spec::MaxPacketSlots) - std::min<uint32_t>(base, Spec::MaxPacketSlots - 1));
 	for (uint32_t i = 0; i < threads; ++i) m_translators.push_back(std::make_unique<Translator>(renderer, base + i, interrupt_id));
+	// KYTY_SPEC_PASS_THREAD: the state pass's own translator, last (the caller left it a packet slot).
+	if (pass_thread && base + threads < Spec::MaxPacketSlots) {
+		m_translators.push_back(std::make_unique<Translator>(renderer, base + threads, interrupt_id));
+		m_translators.back()->pass_only = true;
+		m_pass_thread                   = true;
+	}
 }
 
 void Speculation::Stop() {
@@ -238,6 +252,7 @@ bool Speculation::StatePass(const Job& job, uint64_t which) {
 		Spec::t_record       = chunk.record.get();
 		const auto processed = m_state->Process(execution, job.commands);
 		Spec::t_record       = nullptr;
+		(void)m_state->TakeWatchedStop(); // (a stop before a packet on a page without access: the pass ends, not followed)
 		const bool boundary  = processed != Pm4ProcessResult::Complete && m_state->TakeBoundary();
 		chunk.end            = execution;
 		chunk.last           = !boundary;
@@ -345,18 +360,39 @@ static void PinSpeculationWorker(int64_t mask) {
 	}
 }
 
+// KYTY_SPEC_PASS_CPUS: the state pass thread's CPUs. Unset: one CPU of the lowest efficiency class the process may run
+// on, outside the workers' CPUs where there is one (LocalPlatform::EfficiencyCpu: an E-core, 16 on an 8 P-core + 16
+// E-core part); where every core is alike (or on Linux) none, and the thread is not pinned.
+static const std::string& PassCpus() {
+	static const std::string cpus = [] {
+		const char* list = std::getenv("KYTY_SPEC_PASS_CPUS");
+		return list != nullptr && *list != 0 ? std::string(list) : LocalPlatform::EfficiencyCpu(SpeculationCpus().first.c_str());
+	}();
+	return cpus;
+}
+
 void Speculation::AheadRun(Translator& translator) {
-	LocalPlatform::SetThreadName("Kyty.Speculation");
+	LocalPlatform::SetThreadName(translator.pass_only ? "Kyty.SpecPass" : "Kyty.Speculation");
 	// (Worker packets, live spec_worker_packets: its segments recorded as packets, spliced at commit. Armed only
 	// inside a segment recorded so: otherwise its calls go to the driver as before.)
 	const LocalVulkanRecording::PassiveProducerScope passive_producer;
 	static auto& live_cpus    = LiveSwitch::Find("speculate_cpus", 0);
 	int64_t      applied_cpus = live_cpus.load(std::memory_order_relaxed);
-	PinSpeculationWorker(applied_cpus);
+	if (translator.pass_only) {
+		// (Normal priority; never re-pinned live. The CPUs said are those the pin took, or none.)
+		const auto& cpus   = PassCpus();
+		const bool  pinned = !cpus.empty() && LocalPlatform::TryPinThreadToCpuList(cpus.c_str());
+		std::printf("Speculation: the state pass on its own thread, %s%s (KYTY_SPEC_PASS_THREAD; the workers take only "
+		            "chunks)\n",
+		            pinned ? "CPUs " : "not pinned", pinned ? cpus.c_str() : "");
+	} else {
+		PinSpeculationWorker(applied_cpus);
+	}
 	if (translator.index == 0) {
 		const auto& cpus   = SpeculationCpus();
 		const char* render = std::getenv("KYTY_RENDER_CPUS");
-		std::printf("Speculation: %u workers on CPUs %s (%s); render threads on CPUs %s\n", static_cast<unsigned>(m_translators.size()),
+		std::printf("Speculation: %u workers on CPUs %s (%s); render threads on CPUs %s\n",
+		            static_cast<unsigned>(m_translators.size() - (m_pass_thread ? 1u : 0u)),
 		            cpus.first.empty() ? "off the render threads' CPUs" : cpus.first.c_str(), cpus.first.empty() ? "no list" : cpus.second,
 		            render != nullptr && *render != 0 ? render : "any");
 	}
@@ -372,8 +408,11 @@ void Speculation::AheadRun(Translator& translator) {
 		m_ahead_wake.wait(lock, [&] {
 			if (m_quit) return true;
 			ResyncStatePass();
-			pass = !m_state_busy && !m_broken ? EntryOf(m_state_serial + 1) : nullptr;
-			work = nullptr;
+			// (KYTY_SPEC_PASS_THREAD: only its thread takes the pass, and it takes nothing else.)
+			const bool takes_pass = translator.pass_only || !m_pass_thread;
+			pass                  = takes_pass && !m_state_busy && !m_broken ? EntryOf(m_state_serial + 1) : nullptr;
+			work                  = nullptr;
+			if (translator.pass_only) return pass != nullptr;
 			if (pass == nullptr)
 				for (auto& entry: m_jobs) {
 					if (entry.pass != m_pass || entry.job.serial <= m_done_serial) continue;
@@ -387,7 +426,7 @@ void Speculation::AheadRun(Translator& translator) {
 			return pass != nullptr || work != nullptr;
 		});
 		if (m_quit) return;
-		if (const auto mask = live_cpus.load(std::memory_order_relaxed); mask != applied_cpus) {
+		if (const auto mask = live_cpus.load(std::memory_order_relaxed); !translator.pass_only && mask != applied_cpus) {
 			applied_cpus = mask;
 			PinSpeculationWorker(mask);
 		}
@@ -644,6 +683,18 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	auto&                                      scheduler = m_renderer.GetCommandScheduler();
 	std::unique_ptr<Result>                    result;
 	std::vector<std::pair<uint64_t, uint64_t>> resolved;
+	// KYTY_SPEC_RESULT_POOL_CAP (live spec_result_pool_cap; 0, the default: off): a translator keeps at most that many
+	// finished results for reuse. Without it `free` only grows: a translation finds none to reuse while a translation
+	// going on began before they were retired (a long one, a burst: a level load), makes one, and keeps it (two
+	// processor copies and its hole states, ~55 KB each). The rest is freed a few at a time as translations begin, on
+	// the thread that translates with them (that made them, their recorder's pool its own), only one no translation
+	// going on reaches (retired before the horizon, as reuse) whose command buffers the GPU is done with.
+	// KYTY_SPEC_HOLE_STATES_CAP (live spec_hole_states_cap; 0, the default: off): a result reused keeps at most that many
+	// hole states (more than its holes: kept for reuse; a translation with more makes them again).
+	static auto&            pool_cap        = LiveSwitch::Find("spec_result_pool_cap", 0);
+	static auto&            hole_states_cap = LiveSwitch::Find("spec_hole_states_cap", 0);
+	static constexpr size_t FreedATranslation = 4;
+	std::vector<std::unique_ptr<Result>> surplus;
 	{
 		std::lock_guard lock(m_mutex);
 		if (translator.since == 0) translator.since = ++m_clock;
@@ -654,10 +705,39 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 			result = std::move(*reusable);
 			translator.free.erase(reusable);
 		}
+		if (const auto cap = pool_cap.load(std::memory_order_relaxed); cap > 0) {
+			const auto& master = scheduler.GetMasterSemaphore();
+			for (auto it = translator.free.begin(); it != translator.free.end() &&
+			                                        translator.free.size() > static_cast<uint64_t>(cap) &&
+			                                        surplus.size() < FreedATranslation;) {
+				const auto& kept = **it;
+				// (Its recorder's pool: destroyed on the kind of thread that recorded with it last. Not the translator's
+				// current result: Unlink relinks it, the log's DropBefore reads it.)
+				const bool done = kept.retired < horizon && &kept != translator.current &&
+				                  // (A worker's recorder only, freed on a worker: a GPU-thread recorder's discarded buffers read
+				                  // tick 0 while their reset still waits on the Record stream, modes 1-3.)
+				                  kept.recorder->own_thread && !GuestGpu::IsGpuThread() &&
+				                  std::ranges::all_of(kept.recorder->buffers, [&](const auto& buffer) {
+					                  // (UINT64_MAX: being recorded or recorded, not yet submitted: not done; DestroyRecorder
+					                  // would not wait for it.)
+					                  return buffer.second != UINT64_MAX && (buffer.second == 0 || master.IsFree(buffer.second));
+				                  });
+				if (!done) {
+					++it;
+					continue;
+				}
+				surplus.push_back(std::move(*it));
+				it = translator.free.erase(it);
+			}
+		}
 		resolved.swap(translator.resolved);
 	}
+	for (auto& freed: surplus) FreeResult(std::move(freed));
 	// (What the commits released of its rings, released on the thread that uses them.)
 	for (const auto& [pending, tick]: resolved) ResolvePending(translator, pending, tick);
+	if (const auto cap = hole_states_cap.load(std::memory_order_relaxed);
+	    result && cap > 0 && result->hole_states.size() > static_cast<uint64_t>(cap))
+		result->hole_states.resize(static_cast<size_t>(cap));
 	if (!result) {
 		result              = std::make_unique<Result>();
 		result->owner       = &translator;
@@ -731,6 +811,12 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	// (What it kept of the catalogs from its last translation, dropped when a sweep or reset happened since.)
 	translator.draw->ForgetStaleCatalog();
 	translator.compute->ForgetStaleCatalog();
+	// (This thread's draw state shadow and state key as nothing known: a state pass on the same thread (no pass thread,
+	// KYTY_SPEC_PASS_THREAD=0 or no slot for it; the async queue always) writes this chunk's own register values into
+	// the shadow, and a write of the same value in the translation would then look unchanged: its next draw taken as
+	// clean, with the previous draw's key.)
+	DrawStateObserver::Invalidate();
+	translator.draw->NativeXprForgetState();
 	{
 	Spec::t_state = &r.state;
 	CommandScheduler::SetThreadRecorder(r.recorder.get());
@@ -740,7 +826,9 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 			const auto processed = processor.Process(spec, commands);
 			if (r.state.refused == nullptr) {
 				// (Its chunk's end, or a constant engine wait.)
-				if (processed != Pm4ProcessResult::Complete) r.stop = processor.TakeStopReached() ? ChunkEnd : "suspended";
+				// (CommandWordsWatched: its next packet's words on a page a read watcher guards, ProcessPm4Spec.)
+				if (processed != Pm4ProcessResult::Complete)
+					r.stop = processor.TakeStopReached() ? ChunkEnd : processor.TakeWatchedStop() ? CommandWordsWatched : "suspended";
 				break;
 			}
 			// (A packet that does not fit its buffer, refused "malformed packet" before its Mark: a command buffer the game
@@ -779,6 +867,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 			hole.packet = packet;
 			hole.dwords = dwords;
 			hole.reason = r.state.refused;
+			hole.at     = spec; // (spec_stop_as_hole)
 			CommandProcessor::SkipSuspendedPacket(spec);
 			hole.after = spec;
 			scheduler.EndRecording(*r.recorder);
@@ -802,6 +891,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	Spec::t_state = nullptr;
 	processor.SetStopAt(nullptr);
 	(void)processor.TakeStopReached();
+	(void)processor.TakeWatchedStop();
 	// (The draw state the translation goes on from is not this thread's shadow any more.)
 	DrawStateObserver::Invalidate();
 	translator.draw->NativeXprForgetState();
@@ -867,15 +957,29 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 		EXIT_IF(committed != r.state.closed.size());
 		// Committed whole: the processor state at its end (or at the packet it stopped at).
 		cp.CopyStateFrom(*r.end_state, false);
+		// (The registers are the worker's end state now, not what this thread's draw state shadow and state key saw
+		// before the chunk: without this, its next draw could be taken as clean, or keep the old context hash, and bind
+		// the draw state of the last draw it translated itself. As after a hole or spliced worker packets.)
+		DrawStateObserver::Invalidate();
+		m_renderer.GetRenderExecutor().NativeXprForgetState();
 		outcome = r.stop == nullptr ? Outcome::Whole : r.stop == ChunkEnd ? Outcome::Chunk : Outcome::Partly;
 		if (r.stop != nullptr) execution = std::move(r.stop_execution);
+	} else if (r.resume_at) {
+		// Stopped where `cp` ran a segment as a hole to (SegmentAsHole). A run that missed its hole and ended the
+		// submission (its stack empty) made it whole: an empty execution handed back would process it again from its start.
+		const bool ended = !r.resume_at->Started();
+		execution        = std::move(*r.resume_at);
+		outcome          = ended ? Outcome::Whole : Outcome::Partly;
 	} else if (committed != 0) {
 		// Stopped after the hole that followed the last segment committed (`cp` translated it).
 		execution = std::move(r.holes[committed - 1].after);
 		outcome   = Outcome::Partly;
 	}
+	r.resume_at.reset();
 	++(outcome == Outcome::Whole || outcome == Outcome::Chunk ? m_whole : outcome == Outcome::Partly ? m_partly : m_none);
 	Finish(std::move(result), committed);
+	uint64_t trim_from = 0; // (KYTY_SPEC_STAMP_TRIM: the bound, taken under the lock; the leaves freed after it)
+	bool     trim      = false;
 	{
 		// What no result began before: of those translated ahead (in the order they were done, not begun) and those
 		// being translated (from when their translator took them: its current result's until then).
@@ -886,12 +990,33 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 			if (translator->translating != 0 && translator->current != nullptr)
 				oldest = std::min(oldest, translator->current->effects_from);
 		m_log.DropBefore(oldest);
+		// KYTY_SPEC_STAMP_TRIM (live spec_stamp_trim; 0, the default: off): every 1024 commits, the stamps' leaves
+		// (128 KiB and 8.5 KiB, one a 4 MiB granule written, kept for good without it) of granules nothing was written
+		// over since what no result began before (nor the one waiting at a wait hole) freed: every question is asked
+		// from a result's beginning or later. (This thread made them: the thread that commits alone stamps.) The bound is
+		// taken here; the leaves are freed after the lock (up to ~270 MiB the first time, which workers would otherwise
+		// wait out on m_mutex): only this thread stamps and reads them (workers read the log's end alone).
+		static auto& stamp_trim = LiveSwitch::Find("spec_stamp_trim", 0);
+		if (stamp_trim.load(std::memory_order_relaxed) != 0 && ++m_stamp_trim_commits >= 1024) {
+			m_stamp_trim_commits = 0;
+			trim                 = true;
+			trim_from            = m_blocked ? std::min(oldest, m_blocked->effects_from) : oldest;
+		}
+	}
+	if (trim) {
+		m_log.stamps.FreeLeavesBefore(trim_from);
+		m_log.host_stamps.FreeLeavesBefore(trim_from);
 	}
 	Report();
 	return outcome;
 }
 
 const char* Speculation::Changed(const Result& result, size_t index) const {
+	extern thread_local bool t_unmap_list_site; // (spec_unmap_list: its checks share one `since`)
+	struct ListSite {
+		ListSite() { t_unmap_list_site = true; }
+		~ListSite() { t_unmap_list_site = false; }
+	} list_site;
 	auto&       buffers  = m_renderer.GetBufferCache();
 	auto&       textures = m_renderer.GetTextureCache();
 	const auto& state    = result.state;
@@ -905,11 +1030,31 @@ const char* Speculation::Changed(const Result& result, size_t index) const {
 	if (mapping || buffers.RegistrationEpoch() != epochs.buffers)
 		for (size_t i = from.buffer_ranges; i < segment.end.buffer_ranges; ++i) {
 			const auto& range = state.buffer_ranges[i];
-			if (buffers.RegisteredSince(range.begin, range.end - range.begin, epochs.buffers)) return "commit: buffers registered";
+			if (buffers.RegisteredSince(range.begin, range.end - range.begin, epochs.buffers)) {
+				// The 4 MiB region changed over the range itself, or only beside it (live spec_exact_reg_stop; -1, the default,
+				// and 1: on under KYTY_SPECULATE=4; 0 off: only a change over the range stops). Only mode 4 keeps the granule
+				// epochs RegisteredSinceExact reads, so outside it the switch is ignored whatever its value (a forced 1 there
+				// would let a registration over the read range pass): every region change stops, as without the switch.
+				static auto&       exact_stop = LiveSwitch::Find("spec_exact_reg_stop", -1);
+				static std::atomic exact_said {false};
+				const auto         exact_v    = exact_stop.load(std::memory_order_relaxed);
+				const bool         mode4      = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+				if (exact_v > 0 && !mode4 && !exact_said.exchange(true, std::memory_order_relaxed))
+					std::printf("Speculation: spec_exact_reg_stop=1 ignored outside KYTY_SPECULATE=4"
+					            " (no granule epochs there)\n");
+				const bool exact_on = exact_v != 0 && mode4;
+				if (!exact_on || buffers.RegisteredSinceExact(range.begin, range.end - range.begin, epochs.buffers))
+					return "commit: buffers registered";
+			}
 			if (mapping && resources.UnmappedSince(epochs.mapping, range.begin, range.end - range.begin))
 				return "commit: memory unmapped";
 		}
 	if (mapping) {
+		// (spec_pending_buffers / spec_reloc_refs: the table V# entries, noted as no buffer range, unmapped as any.)
+		for (size_t i = from.table_ranges; i < segment.end.table_ranges; ++i) {
+			const auto& range = state.table_ranges[i];
+			if (resources.UnmappedSince(epochs.mapping, range.begin, range.end - range.begin)) return "commit: memory unmapped";
+		}
 		for (size_t i = from.clean_reads; i < segment.end.clean_reads; ++i) {
 			const auto& read = state.clean_reads[i];
 			if (resources.UnmappedSince(epochs.mapping, read.begin, read.end - read.begin)) return "commit: memory unmapped";
@@ -919,16 +1064,65 @@ const char* Speculation::Changed(const Result& result, size_t index) const {
 			if (resources.UnmappedSince(epochs.mapping, read.begin, read.end - read.begin)) return "commit: memory unmapped";
 		}
 		for (const auto& use: segment.images)
-			if (resources.UnmappedSince(epochs.mapping, use.image->info.data.address, use.image->info.data.size))
+			if (resources.UnmappedSince(epochs.mapping, use.image->info.data.address, use.image->info.data.size)) {
+				// redo_level_precise: not over the bytes of the levels the segment sampled, when it only sampled it.
+				if (Spec::RedoLevelPreciseOn() && SampledLevelsMapped(use, epochs.mapping)) continue;
 				return "commit: memory unmapped";
+			}
 	}
 	if (textures.ResolutionEpoch() == epochs.images) return nullptr;
+	// (Live spec_exact_image_stop: the registration log's exact ranges; -1, the default: on under KYTY_SPECULATE=4; 1 on,
+	// 0 off.)
+	static auto& exact_image = LiveSwitch::Find("spec_exact_image_stop", -1);
+	const auto   exact_v     = exact_image.load(std::memory_order_relaxed);
+	const bool   exact_on    = exact_v > 0 || (exact_v < 0 && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4);
+	const auto   resolved    = [&](const auto& image, uint64_t serial) {
+		return exact_on ? textures.StillResolvedExact(image, serial, epochs.images)
+		                : textures.StillResolved(image, serial, epochs.images);
+	};
 	for (const auto& use: segment.images)
-		if (!textures.StillResolved(*use.image, use.serial, epochs.images)) return "commit: images registered";
+		if (!resolved(*use.image, use.serial))
+			return "commit: images registered";
 	for (size_t i = from.touched_images; i < segment.end.touched_images; ++i)
-		if (!textures.StillResolved(*state.touched_images[i].first, state.touched_images[i].second, epochs.images))
+		if (!resolved(*state.touched_images[i].first, state.touched_images[i].second))
 			return "commit: images registered";
 	return nullptr;
+}
+
+// redo_level_precise: whether a used image's unmap since the speculation began left the levels the segment sampled mapped,
+// so that what its work read of the image is what the in-order path would read. Only when every access the segment made
+// to it was a sampled view with a base level above 0 (ImageUse::sample_other clear: Image::GetBarriers records every
+// transition with an entry, and a speculation transits every image it uses each time), on a single-layer, non-volume
+// colour image with no metadata, its object the one the segment used (serial). The bytes are ViewLevelBytes': the
+// sampled levels' spans, grown over every level that shares a byte with them (the mip tail).
+bool Speculation::SampledLevelsMapped(const Spec::ImageUse& use, uint64_t mapping) const {
+	const auto* image = use.image;
+	if (use.sample_other || use.sample_lo == 0 || use.sample_lo >= use.sample_hi || image->serial != use.serial) return false;
+	const auto& info   = image->info;
+	const auto  levels = info.resources.levels;
+	if (info.resources.layers != 1 || info.IsVolume() || info.IsDepth() || info.HasMetadata() ||
+	    levels > info.mip_layout.size() || use.sample_hi > levels)
+		return false;
+	uint64_t first = UINT64_MAX, last = 0;
+	for (uint32_t level = use.sample_lo; level < use.sample_hi; ++level) {
+		first = std::min(first, info.mip_layout[level].offset);
+		last  = std::max(last, info.mip_layout[level].offset + info.mip_layout[level].size);
+	}
+	for (bool grew = true; grew;) {
+		grew = false;
+		for (uint32_t level = 0; level < levels; ++level) {
+			const auto& mip = info.mip_layout[level];
+			if (mip.size == 0 || mip.offset >= last || mip.offset + mip.size <= first) continue;
+			if (mip.offset < first || mip.offset + mip.size > last) {
+				first = std::min(first, mip.offset);
+				last  = std::max(last, mip.offset + mip.size);
+				grew  = true;
+			}
+		}
+	}
+	last = std::min(last, info.data.size);
+	if (first >= last) return false;
+	return !m_renderer.GetGpuResources().UnmappedSince(mapping, info.data.address + first, last - first);
 }
 
 // KYTY_SPEC_COMMIT_VERIFY: whether this one is the Nth (the thread that commits).
@@ -939,6 +1133,7 @@ static bool CommitVerifyDue() {
 }
 
 Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcessor& cp) {
+	m_renderer.GetBufferCache().ServeAhead(); // (spec_buffer_ahead: the ranges speculations found no buffer over)
 	auto&       scheduler = m_renderer.GetCommandScheduler();
 	const auto& state     = result.state;
 	const auto  segments  = state.closed.size();
@@ -956,7 +1151,31 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		// cleared since; the guest memory it read as no GPU work had written it not written since (the effects
 		// logged since it began); the words it read from a speculation before it in memory now; the waits it found
 		// satisfied satisfied.
-		if (const char* why = Changed(result, index)) return ++m_stop_reasons[why], Progress::Stopped;
+		if (const char* why = Changed(result, index)) {
+			// (spec_stop_as_hole: the segment run the normal way as a hole, its recorded work dropped; the hole after it as
+			// after any segment.)
+			const auto as_hole = SegmentAsHole(result, cp, index);
+			if (as_hole == AsHole::NotTaken) return ++m_stop_reasons[why], Progress::Stopped;
+			result.next = index + 1;
+			// (The GPU thread ran it: on the normal way from where it stopped, on its own state, when its run did not reach
+			// the hole (the packets changed under the walk), or reached it in another state than the work after it assumed
+			// (the worker's at the hole, which nothing checked: what Changed found moved may have moved a register).)
+			if (as_hole == AsHole::NotReached)
+				return ++m_stop_reasons["commit: a segment run as a hole did not reach its hole"], Progress::Stopped;
+			if (!cp.SameState(*result.hole_states[index]))
+				return ++m_stop_reasons["commit: a segment run as a hole ended in another state"], Progress::Stopped;
+			result.resume_at.reset();
+			// (Its Before did not run: the worker sets it proposed are the next segment's to check and complete before that
+			// one's replay, as they would have been this one's. A later segment may bind any of them, through the reuse of
+			// its own or the role's last / previous / memo set, so all move; one only the dropped replay bound may then
+			// stop that segment's commit for nothing: the price of the rule.)
+			for (auto& proposed: result.state.proposed_sets)
+				if (proposed.segment == index) proposed.segment = index + 1;
+			const auto run = RunHole(result, cp, index, false);
+			if (run == HoleRun::Blocked) return result.blocked = index, Progress::Blocked;
+			if (run == HoleRun::Changed) return Progress::Stopped;
+			continue;
+		}
 		// The images it uses as it found them: none written through a buffer since (a hole's storage-buffer write, fill or
 		// copy over its memory, or an earlier segment's, replayed in its Before). The normal path's binding uploads such an
 		// image from those bytes before the work; this work was recorded without the upload and would read it as it was
@@ -964,6 +1183,10 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		for (const auto& use: state.closed[index].images)
 			if (!use.found_buffer_modified && use.image->IsBufferModified())
 				return ++m_stop_reasons["commit: GPU work wrote an image it uses"], Progress::Stopped;
+		for (const auto& left: state.left_clears)
+			if (left.segment == index && (left.image->serial != left.serial ||
+			                              left.image->validity.load(std::memory_order_relaxed) != left.validity))
+				return ++m_stop_reasons["commit: a left clear's image moved"], Progress::Stopped;
 		for (const auto& fact: state.meta_facts)
 			if (!fact.cleared && fact.first <= index && index <= fact.last &&
 			    m_renderer.GetTextureCache().IsMetaCleared(fact.address, fact.slice))
@@ -997,7 +1220,8 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 						} else {
 							write = m_log.FirstWriteOver(result.effects_from, read.begin, size);
 						}
-						if (write != nullptr) return ++m_stop_reasons[WroteWhatItRead(write)], Progress::Stopped;
+						if (write != nullptr)
+							return ++m_stop_reasons[WroteWhatItRead(write)], Progress::Stopped;
 					}
 				}
 				// (KYTY_SPEC_LATE_READS: a late read, by the processor's writes logged after it was read, and GPU work's since
@@ -1081,6 +1305,46 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		// the recorded work leaves it reading a destroyed one. The work after it is translated in order.)
 		if (CurrentEpochs() != prepared && Changed(result, index) != nullptr)
 			return ++m_stop_reasons["commit: preparation registered buffers"], Progress::Stopped;
+		if (std::exchange(result.state.target_failed, false)) // (spec_commit_targets)
+			return ++m_stop_reasons["commit: a pending target not acquired"], Progress::Stopped;
+		if (std::exchange(result.state.images_failed, false)) // (spec_worker_images)
+			return ++m_stop_reasons["commit: a pending image not completed"], Progress::Stopped;
+		// spec_pending_buffers / spec_reloc_refs: the table V# entries, after Before's registrations. A pending one, one
+		// Before had to obtain, and (spec_reloc_refs) one with a buffer registered or unregistered over its range since
+		// its proof are looked up as they are now and written into the block; the others are left as they are (no
+		// lookup). Every entry that needs it, or the segment stops before it is spliced: a block never reaches the GPU
+		// unpatched.
+		if (const auto pfrom = index == 0 ? size_t {0} : state.closed[index - 1].end.pending_buffers,
+		    pto = state.closed[index].end.pending_buffers;
+		    pto != pfrom) {
+			auto&                pbuffers = m_renderer.GetBufferCache();
+			size_t               patched = 0, required = 0;
+			const auto           registration_now = pbuffers.RegistrationEpoch();
+			const auto           now = [&](const Spec::PendingBuffer& entry) -> uint64_t {
+                const auto* owner = pbuffers.GetBufferIfLive(pbuffers.RegisteredBuffer(entry.address, entry.size));
+                return owner != nullptr && owner->HasDeviceAddress() ? owner->BufferDeviceAddress() + owner->Offset(entry.address)
+				                                                                : 0;
+			};
+			for (size_t i = pfrom; i < pto; ++i) {
+				const auto& entry = state.pending_buffers[i];
+				const bool  moved = !entry.pending && entry.obtained && entry.since < registration_now &&
+				                   pbuffers.RegisteredSince(entry.address, entry.size, entry.since) &&
+				                   pbuffers.RegisteredSinceExact(entry.address, entry.size, entry.since);
+				if (!entry.pending && entry.obtained && !moved) continue;
+				++required;
+				const auto device = entry.obtained ? now(entry) : 0;
+				if (device == 0 || entry.ring == nullptr) continue;
+				const auto mapped = entry.ring->Mapped();
+				if (entry.offset + 3 * sizeof(uint32_t) > mapped.size()) continue;
+				const uint32_t words[3] = {static_cast<uint32_t>(device), static_cast<uint32_t>(device >> 32u),
+				                           static_cast<uint32_t>(std::min<uint64_t>(entry.size / 4, UINT32_MAX))};
+				std::memcpy(mapped.data() + entry.offset, words, sizeof(words));
+				entry.ring->Flush(entry.offset, sizeof(words));
+				pbuffers.TouchSpeculated(pbuffers.RegisteredBuffer(entry.address, entry.size));
+				++patched;
+			}
+			if (patched != required) return ++m_stop_reasons["commit: a pending buffer unpatched"], Progress::Stopped;
+		}
 		// KYTY_SPEC_DRAW_INDIRECT_VERIFY: its sampled DRAW_INDIRECT table draws, here where their arguments are current.
 		for (const auto& entry: state.draw_verifies)
 			if (entry.segment == index) VerifyDrawIndirect(m_renderer, entry);
@@ -1122,6 +1386,28 @@ void Speculation::Before(Result& result, size_t index) {
 	// (their CPU-dirty pages uploaded, then GPU-owned), those it reads made current, its BDA reads prepared, and each
 	// image where the work found it.
 	RenderLockGuard lock(m_renderer.GetMutex());
+	// spec_pending_buffers: the V# ranges it found no buffer for, obtained in order first (made or joined, uploaded), so
+	// the check after Before (preparation registered buffers) sees what that moved under the segment's other ranges.
+	const auto registration_now = buffers.RegistrationEpoch(); // (an entry proven at it or after: nothing moved under it)
+	for (size_t i = from.pending_buffers; i < to.pending_buffers; ++i) {
+		// (As the owner's table path: the range's game buffer, made or joined, then made current, then obtained, which
+		// then gives that buffer, not a copy in the shader ring (no device address: an exit in a long run). Anything but
+		// the range's live game buffer is left unobtained: the patch step then stops the segment.)
+		auto& entry   = state.pending_buffers[i];
+		// (spec_reloc_refs: a found buffer's entry still over a live game buffer needs nothing here: a join copied its
+		// bytes; the patch step decides whether its address moved. None any more: obtained as a pending one.)
+		if (!entry.pending && (entry.since >= registration_now ||
+		                       buffers.GetBufferIfLive(buffers.RegisteredBuffer(entry.address, entry.size)) != nullptr)) {
+			entry.obtained = true;
+			continue;
+		}
+		(void)buffers.FindBuffer(entry.address, entry.size);
+		if (!entry.written) buffers.EnsureBufferContents(entry.address, entry.size);
+		const auto [owner, offset] = buffers.ObtainBuffer(entry.address, entry.size, entry.written, entry.texel);
+		(void)offset;
+		const auto* game = buffers.GetBufferIfLive(buffers.RegisteredBuffer(entry.address, entry.size));
+		entry.obtained   = owner != nullptr && owner == game && game->HasDeviceAddress();
+	}
 	for (size_t i = from.written; i < to.written; ++i) {
 		const auto& range = state.written[i];
 		(void)buffers.ObtainBuffer(range.begin, range.end - range.begin, true);
@@ -1145,6 +1431,19 @@ void Speculation::Before(Result& result, size_t index) {
 				buffers.EnsureBufferContents(written.address, written.size);
 			});
 		}
+	// (spec_reloc_refs: the table V# entries, noted as no buffer range: the same for theirs.)
+	for (size_t i = from.table_ranges; i < to.table_ranges; ++i) {
+		const auto& entry = state.table_ranges[i];
+		if (m_effects.stamped) {
+			if (m_log.End() > result.effects_from)
+				m_log.ForEachHostWriteOver(result.effects_from, entry.begin, entry.end - entry.begin,
+				                           [&](uint64_t address, uint64_t size) { buffers.EnsureBufferContents(address, size); });
+		} else if (!m_effects.host_writes.Empty()) {
+			m_effects.host_writes.ForEachIntersection(entry.begin, entry.end - entry.begin, [&](RangeSet::Range written) {
+				buffers.EnsureBufferContents(written.address, written.size);
+			});
+		}
+	}
 	// The texel buffers it reads over images GPU work wrote (KYTY_SPECULATE_TEXEL_SYNC), synchronized from them as the
 	// normal path does at the draw: after the uploads above (the image's bytes win, as there), before the work (what it
 	// writes over them lands after the copy, as in order).
@@ -1164,6 +1463,106 @@ void Speculation::Before(Result& result, size_t index) {
 		const auto& range = state.invalidated[i];
 		textures.InvalidateMemoryFromGPU(range.begin, range.end - range.begin, "speculation");
 	}
+	// spec_worker_images: the sets its worker built with pending slots, completed by the owner now (the set is bound by
+	// the replay after this; their images are not among the segment's, which RestoreState below restores).
+	// spec_proposed_check (under KYTY_SPECULATE=4, the only mode with worker sets):
+	// the sets its worker proposed in this segment, or handed on by one re-run as a hole (bound by the replay after this)
+	// still current: the BDA page table's
+	// generation theirs, their images the ones they were built with. One not stops the segment.
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4)
+		for (const auto& proposed: state.proposed_sets)
+			if (proposed.segment == index && proposed.check) {
+				if (!proposed.check()) state.images_failed = true;
+			}
+	for (auto& proposed: state.proposed_sets)
+		if (proposed.segment == index && proposed.complete) {
+			if (!proposed.complete()) state.images_failed = true;
+			proposed.complete = nullptr;
+		}
+	// spec_commit_targets: the targets it left to its commit, acquired as the normal path does at the draw, before their
+	// states are restored to those its barriers start from (the acquisition's upload and clear stay: RestoreState
+	// transitions from them). A target found Undefined or per subresource, or not acquired, fails the segment (the
+	// caller stops it before the splice).
+	std::vector<std::pair<const Image*, uint32_t>> layers2_drawn; // (spec_depth_layers2: the (image, layer)s acted on)
+	for (size_t i = from.pending_targets; i < to.pending_targets; ++i) {
+		const auto& pending = state.pending_targets[i];
+		const auto  use     = std::ranges::find(segment.images, pending.image, &Spec::ImageUse::image);
+		if (pending.depth_layers2) {
+			// spec_depth_layers2: this draw's acquisition and load, as the normal path makes them at the draw, in record
+			// order, ahead of the segment's replay: FindDepthTarget (the layers' upload, the metadata, the HTile entry), the
+			// clean check, IsMetaCleared, the load rule (htile_load_decision, AcquireRenderTargets' own), the clear (an empty
+			// rendering of the draw's view over its area, depth load op CLEAR: the draw's load op exactly), TouchMeta. Each
+			// act is one the normal path makes for this draw; a stop before an entry's acts leaves the earlier entries' acts,
+			// which the segment's re-run on the normal path repeats identically (FindDepthTarget finds nothing to do; a
+			// consumed clear loads the bytes the commit cleared). Stopped (nothing more done, from the first failure on): not
+			// on the GPU thread; an earlier pending target failed; the image used otherwise in the segment (its state left in
+			// a layout that is not a depth attachment's); a second clear of a layer an earlier entry drew (it would come
+			// after that draw's replay); an open rendering of the view that already clears it (BeginRendering would continue
+			// it: the normal path would not clear again); the image found Undefined (the acquisition's upload / clear would be
+			// discarded by RestoreState's barrier back to Undefined, and the replayed draw would load garbage).
+			const auto stop = [&] { state.target_failed = true; };
+			if (state.target_failed || !GuestGpu::IsGpuThread() || use == segment.images.end() ||
+			    Spec::UsedOtherwise(use->found, use->found_subresources, use->left, use->left_subresources) ||
+			    (use->found_subresources.empty() ? use->found.layout == vk::ImageLayout::eUndefined
+			                                     : std::ranges::any_of(use->found_subresources, [](const auto& s) {
+				                                       return s.layout == vk::ImageLayout::eUndefined;
+			                                       }))) {
+				stop();
+				continue;
+			}
+			const auto& desc = *static_cast<const TextureCache::ImageDesc*>(pending.depth_desc.get());
+			TextureCache::DepthDrawState drawn {};
+			if (!textures.AcquireDepthDrawAtCommit(pending.id, pending.serial, desc, &drawn)) {
+				stop();
+				continue;
+			}
+			const auto key      = std::make_pair(static_cast<const Image*>(pending.image), desc.view_info.base_layer);
+			const bool repeated = std::ranges::find(layers2_drawn, key) != layers2_drawn.end();
+			if (!repeated) layers2_drawn.push_back(key);
+			const auto decision = htile_load_decision(drawn.meta_cleared, drawn.fill, drawn.fill_known,
+			                                          desc.info.metadata.stencil_compressed);
+			if (decision.depth_meta_clear) {
+				auto&       command = scheduler.Current();
+				const auto* open    = command.OpenRendering();
+				if (repeated || (open != nullptr && open->depth_stencil_attachment.image_view == drawn.view &&
+				                 open->depth_stencil_attachment.depth_clear)) {
+					stop();
+					continue;
+				}
+				const auto& view   = desc.view_info;
+				const auto  layout = vk::ImageLayout::eDepthAttachmentOptimal;
+				command.EndRendering();
+				pending.image->Transit(
+				    layout, vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+				    ImageSubresourceRange {view.base_level, view.level_count, view.base_layer, view.layer_count},
+				    command.Handle());
+				RenderState clear {};
+				clear.width                 = pending.layers2_width;
+				clear.height                = pending.layers2_height;
+				clear.num_layers            = pending.layers2_layers;
+				clear.num_color_attachments = 0;
+				auto& depth                 = clear.depth_stencil_attachment;
+				depth.image_view            = drawn.view;
+				depth.image_layout          = layout;
+				depth.clear_value[0]        = std::bit_cast<uint32_t>(decision.depth_uniform ? decision.uniform_value
+				                                                                             : pending.layers2_db_depth_clear);
+				depth.has_depth             = true;
+				depth.depth_clear           = true;
+				command.BeginRendering(clear);
+				command.EndRendering();
+			}
+			if (drawn.meta_cleared && !textures.TouchMeta(desc.info.metadata.range.address, desc.view_info.base_layer, false)) {
+				stop(); // (cannot happen after FindDepthTarget made the entry HTile; slices >= 32 are never cleared)
+				continue;
+			}
+			continue;
+		}
+		const bool  ok      = use != segment.images.end() && use->found.layout != vk::ImageLayout::eUndefined &&
+		                use->found_subresources.empty() &&
+		                textures.AcquireTargetAtCommit(pending.id, pending.serial, pending.base_level, pending.level_count,
+		                                               pending.base_layer, pending.layer_count, pending.clear);
+		if (!ok) state.target_failed = true;
+	}
 	for (const auto& use: segment.images) {
 		EXIT_IF(use.image->serial != use.serial); // (nothing released images since: Epochs)
 		use.image->RestoreState(use.found, use.found_subresources, scheduler.Current().Handle());
@@ -1178,6 +1577,19 @@ void Speculation::After(Result& result, size_t index) {
 	const auto& segment  = state.closed[index];
 	const auto  from     = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
 	const auto& to       = segment.end;
+	// spec_worker_sets: the image sets it built up to this segment, into the catalog (the owner's, under its write).
+	if (!state.proposed_sets.empty()) state.SettleProposedSets(index, false);
+	// What its thread could not note for the presenter (Spec::State::scenes): its indexed draws and its TAA dispatch,
+	// noted here, where the GPU thread would have run them, before the flip after them takes them (FrameGen::TakeScene).
+	// (A segment not committed is not here: its packets are translated again the normal way, which notes them.)
+	if (to.indexed_draws != from.indexed_draws) FrameGen::NoteIndexedDraws(to.indexed_draws - from.indexed_draws);
+	if (to.scenes != from.scenes) FrameGen::NoteScene();
+	// The table pairs its draws and dispatches used (Spec::State::used_pairs), stamped as the GPU thread's lookup of them
+	// would have: the sweep keeps a pair used within PairKeepFrames. (Alive: the sweep waits for no speculation live.)
+	if (to.used_pairs != from.used_pairs) {
+		const auto frame = m_renderer.FrameNumber();
+		for (size_t i = from.used_pairs; i < to.used_pairs; ++i) *state.used_pairs[i] = frame;
+	}
 	// Its writes are the latest GPU work over those ranges; the images as it left them; the caches' LRU; the command
 	// processor's guest memory writes.
 	for (size_t i = from.written; i < to.written; ++i) {
@@ -1218,8 +1630,40 @@ void Speculation::After(Result& result, size_t index) {
 		m_renderer.GetCommandScheduler().FlushRecorded();
 		if (!guard) drain();
 	}
+	// after_guard_batch (under KYTY_SPECULATE=4 only): a run of labels on one guard page, guarded once for the page
+	// (graphicsRun.cpp).
+	const int64_t batch = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 1 : 0;
 	for (size_t i = from.writes; i < to.writes; ++i) {
 		const auto& write = state.writes[i];
+		if (batch != 0 && guard && !write.copy) {
+			const uint64_t page = write.address >> 12u;
+			size_t         end  = i;
+			while (end < to.writes && !state.writes[end].copy && (state.writes[end].address >> 12u) == page &&
+			       ((state.writes[end].address + state.writes[end].size - 1) >> 12u) == page)
+				++end;
+			if (end - i >= 2) {
+				thread_local std::vector<uint64_t> addresses, values;
+				thread_local std::vector<uint32_t> sizes;
+				addresses.clear(), values.clear(), sizes.clear();
+				for (size_t k = i; k < end; ++k) {
+					addresses.push_back(state.writes[k].address);
+					values.push_back(state.writes[k].value);
+					sizes.push_back(state.writes[k].size);
+				}
+				const size_t done = CommitGuardedWriteRun(addresses.data(), values.data(), sizes.data(), end - i);
+				for (size_t k = i; k < end; ++k) {
+					const auto& w = state.writes[k];
+					if (k >= i + done && !CommitGuardedWrite(reinterpret_cast<void*>(w.address), &w.value, w.size)) {
+						drain();
+						std::memcpy(reinterpret_cast<void*>(w.address), &w.value, w.size);
+					}
+					Spec::NoteHostWrite(w.address, w.size);
+					Spec::NoteLabel(w.address);
+				}
+				i = end - 1;
+				continue;
+			}
+		}
 		if (write.copy) {
 			drain();
 			buffers.CopyGuestMemory(write.address, write.value, write.size);
@@ -1240,11 +1684,11 @@ void Speculation::After(Result& result, size_t index) {
 	}
 }
 
-Speculation::HoleRun Speculation::RunHole(Result& result, CommandProcessor& cp, size_t index) {
+Speculation::HoleRun Speculation::RunHole(Result& result, CommandProcessor& cp, size_t index, bool copy_state) {
 	const Spec::EffectSourceScope source(Spec::EffectSource::Hole);
 	const auto& hole  = result.holes[index];
 	const auto& state = *result.hole_states[index];
-	cp.CopyStateFrom(state, false);
+	if (copy_state) cp.CopyStateFrom(state, false);
 	// (The draw state it starts from is not the shadow's.)
 	auto& executor = m_renderer.GetRenderExecutor();
 	DrawStateObserver::Invalidate();
@@ -1268,10 +1712,55 @@ Speculation::HoleRun Speculation::RunHole(Result& result, CommandProcessor& cp, 
 	return HoleRun::Done;
 }
 
+Speculation::AsHole Speculation::SegmentAsHole(Result& result, CommandProcessor& cp, size_t index) {
+	// (Under KYTY_SPECULATE=4 only; otherwise the stop stands.)
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4 || index >= result.holes.size())
+		return AsHole::NotTaken;
+	const auto& state = result.state;
+	const auto  from  = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
+	const auto& to    = state.closed[index].end;
+	// (A wait inside it: the GPU thread could block there, before the hole it must stop at.)
+	if (to.waits != from.waits) return AsHole::NotTaken;
+	// From the segment's start (the chunk's, or past the hole before it: `cp` is in that state, the commit checked the
+	// chunk's start state and ran the hole) up to its hole's packet.
+	Pm4Execution execution = index == 0 ? result.start_at : result.holes[index - 1].after;
+	if (!execution.Started() || !result.holes[index].at.Started()) return AsHole::NotTaken;
+	// Its recorded work dropped, never submitted: the GPU thread records it again.
+	m_renderer.GetCommandScheduler().DiscardFirst(*result.recorder, state.closed[index].recorded - result.submitted);
+	result.submitted = state.closed[index].recorded;
+	const Spec::EffectSourceScope source(Spec::EffectSource::Hole);
+	auto&                         executor = m_renderer.GetRenderExecutor();
+	DrawStateObserver::Invalidate();
+	executor.NativeXprForgetState();
+	const auto stop = result.holes[index].at;
+	cp.SetStopAt(&stop);
+	const auto start     = NowNs();
+	const auto processed = cp.Process(execution, {});
+	m_hole_ns += NowNs() - start;
+	cp.SetStopAt(nullptr);
+	const bool reached = cp.TakeStopReached();
+	DrawStateObserver::Invalidate();
+	executor.NativeXprForgetState();
+	result.resume_at = std::move(execution); // (at the hole's packet, or where the run ended)
+	if (!reached) {
+		// (The packets changed under the walk: the commit stops, the GPU thread goes on from where its run ended.)
+		const auto& hole = result.holes[index];
+		std::printf("Speculation: hole %zu of %zu not reached (processed %d): %s, %u dwords, header 0x%08x\n", index,
+		            result.holes.size(), static_cast<int>(processed), hole.reason != nullptr ? hole.reason : "(no reason)",
+		            hole.dwords, hole.packet != nullptr ? *hole.packet : 0u);
+		return AsHole::NotReached;
+	}
+	return AsHole::Reached;
+}
+
 void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {
 	auto& scheduler = m_renderer.GetCommandScheduler();
 	auto& r         = *result;
 	r.state.ReleaseConsumePending(); // (its holes' clears are consumed now, or never: spec_predict_dcc=3)
+	// (spec_worker_sets: its proposed sets no commit settled, settled here on the GPU thread while it still counts as live,
+	// not at its Result's reuse on a worker: the catalog's pair sweeps wait for no speculation live, so the pairs those
+	// sets name are alive, and the aside release's queue and the owner's state are the GPU thread's.)
+	if (!r.state.proposed_sets.empty()) r.state.SettleProposedSets(0, true);
 	for (const auto& hole: r.holes) ++m_hole_reasons[hole.reason];
 	if (first < r.state.closed.size() || !r.recorder->recorded.empty() || r.recorder->open != SIZE_MAX)
 		scheduler.DiscardRecorded(*r.recorder);
@@ -1292,6 +1781,11 @@ void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {
 	kyty_local_speculations_live.fetch_sub(1, std::memory_order_seq_cst);
 	r.retired = ++m_clock;
 	owner.free.push_back(std::move(result));
+}
+
+void Speculation::FreeResult(std::unique_ptr<Result> result) {
+	result->state.Clear(); // (as a reuse would: what it held of the caches let go)
+	m_renderer.GetCommandScheduler().DestroyRecorder(std::move(result->recorder));
 }
 
 void Speculation::ResolvePending(Translator& translator, uint64_t pending, uint64_t tick) {

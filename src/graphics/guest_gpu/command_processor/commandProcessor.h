@@ -14,6 +14,19 @@ namespace Libs::Graphics {
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
 
+// Off the GPU thread (ProcessPm4Spec: a speculation's or a state pass's thread), a SET_*_REG_INDIRECT packet's register
+// table read once, in a guarded copy before the packet is entered: the observer (DrawStateObserver::ObservePacket) reads
+// this copy, never the table, and so does a state pass's handler (GuardTable; a speculation's copies after its check and
+// compares: `shared` false). Keyed by the packet and the table it names (`packet` null: none; GuardTable takes it).
+struct IndirectTableCopy {
+	const uint32_t*       packet = nullptr;
+	uint64_t              table  = 0;
+	uint32_t              pairs  = 0;
+	bool                  shared = false;
+	std::vector<uint32_t> words;
+};
+inline thread_local IndirectTableCopy t_indirect_table_copy;
+
 enum class Pm4ProcessResult { Complete, Blocked };
 
 enum class ContextStateOperation : uint32_t {
@@ -26,6 +39,8 @@ enum class ContextStateOperation : uint32_t {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	// A position within a command buffer (not an empty execution that Process begins at its commands).
+	[[nodiscard]] bool Started() const noexcept { return !m_buffer_stack.empty(); }
 	// Each buffer's commands through `rebase`, which gives another view of the same bytes back (KYTY_WRITE_GUARD). The
 	// guest view's address is kept: a position is the buffer's guest address and offset, whichever view reads it
 	// (SamePosition; 4 Nov wg6: compared by the view's pointer, a rebased in-order run missed its chunk's end).
@@ -93,7 +108,12 @@ public:
 	[[nodiscard]] bool        TakeBoundary() noexcept { return std::exchange(m_at_boundary, false); }
 	void                      SetStopAt(const Pm4Execution* at) noexcept { m_stop_at = at; }
 	[[nodiscard]] bool        TakeStopReached() noexcept { return std::exchange(m_stop_reached, false); }
+	// The execution suspended before a packet on a page a read watcher guards (ProcessPm4Spec, off the GPU thread).
+	[[nodiscard]] bool        TakeWatchedStop() noexcept { return std::exchange(m_watched_stop, false); }
 	[[nodiscard]] static bool SamePosition(const Pm4Execution& a, const Pm4Execution& b);
+	// (DIAG, SegmentAsHole's exit: the packet at a position, whether the packet 5 dwords before it is an indexed indirect
+	// draw of the same words 2-4 (a run of indirect draws passed it) and how far past a 4 KiB boundary it is.)
+	static void PrintPacketAt(const Pm4Execution& at, const char* what);
 	// The packet a suspended execution stopped at (its length in `dwords`), and past it.
 	[[nodiscard]] static const uint32_t* SuspendedPacket(const Pm4Execution& execution, uint32_t& dwords);
 	// SuspendedPacket would size it (the packet is in its buffer: not past a rewritten buffer's end).
@@ -205,7 +225,7 @@ private:
 	uint32_t            m_draw_run_skip = 0;
 	bool                m_state_only    = false;
 	uint32_t            m_chunk_every = 0, m_chunk_work = 0, m_chunk_last_opcode = 0;
-	bool                m_at_boundary = false, m_stop_reached = false;
+	bool                m_at_boundary = false, m_stop_reached = false, m_watched_stop = false;
 	const Pm4Execution* m_stop_at = nullptr;
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,

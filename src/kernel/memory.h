@@ -149,9 +149,12 @@ bool                   TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, 
 // Avoid false-sharing read faults only when exact ownership proves clean.
 bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t size);
 bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean);
-// A speculation thread's raw read of guest memory without a fault: what the GPU thread would read, or false (the caller
-// refuses).
+// A speculation thread's raw read of guest memory without a fault (spec_worker_sets' program lookup): what the GPU
+// thread would read, or false (the caller refuses).
 bool TryReadGuestNoFault(uint64_t vaddr, void* data, uint64_t size);
+// batch_busy_once: the calling batch thread's busy section closed while it waits for the GPU thread (true: it had one).
+bool BatchBusySuspend();
+void BatchBusyResume();
 bool                   SyncGpuCleanBacking(uint64_t vaddr, uint64_t size);
 // A read of the range faults (a page the GPU wrote, its bytes read back when the GPU thread reads them): a thread
 // that is not the GPU thread must not read it.
@@ -176,6 +179,11 @@ bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t si
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // The end of the guest mapping (one committed virtual range) `vaddr` lies in; 0 when none.
 [[nodiscard]] uint64_t MappingEnd(uint64_t vaddr);
+// The guest's own placement `vaddr` lies in (the range one hint-less mapping or reservation got, or a fixed one outside
+// any: memory.cpp GuestPlacements), mapped or not; false when none. Takes a leaf lock of its own only (any thread).
+bool                   GuestPlacement(uint64_t vaddr, uint64_t* base, uint64_t* size);
+// Whether placements are kept this boot (KYTY_LEAP_GUEST_EDGE non-zero at start-up); else GuestPlacement knows none.
+bool                   GuestPlacementsKept();
 // Whether guest mappings cover all of [vaddr, vaddr + size), and the parts they cover (as
 // (address, size), in order): what can be read of a range that reaches into unmapped memory.
 [[nodiscard]] bool     IsFullyMapped(uint64_t vaddr, uint64_t size);
@@ -213,11 +221,15 @@ bool TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size);
 // Whether a page of the range is one the GPU caches' trackers protect (PageManager::WatchedSpan: no system call).
 [[nodiscard]] bool GuestRangeWatched(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
+// upload_at_copy: the streamer's copy into [vaddr, vaddr + size) just done; its levels uploaded ahead (GPU thread).
+void                   PostLevelUploadAhead(uint64_t vaddr, uint64_t size);
 // Whether a guest mapping holds vaddr once a mapping change under way is done (it waits for one).
 [[nodiscard]] bool     IsGuestMappedAfterChanges(uint64_t vaddr);
 // Whether the address is in a view a partial unmap is mapping again (Windows; statistics: remap_window_writes).
 [[nodiscard]] bool     InRemapWindow(uint64_t vaddr) noexcept;
-[[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// (`rip`, `rsp`: the faulting instruction and stack, for the spec_thread_gpu_faults tripwire: GuestGpu::NoteFault.)
+[[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr, uint64_t rip = 0,
+                                  uint64_t rsp = 0) noexcept;
 // Windows with guard pages: the pages read back lately that were not for a while get guards again (the render thread's,
 // once a frame; GuestAddressSpace::CoolHotReads).
 void CoolHotReads();

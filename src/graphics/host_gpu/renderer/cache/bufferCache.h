@@ -23,7 +23,9 @@
 #include <memory>
 #include <shared_mutex>
 #include <span>
+#include <unordered_map>
 #include <utility>
+#include <mutex>
 #include <vector>
 
 namespace ReadbackQueue { class Queue; }
@@ -72,8 +74,9 @@ public:
 	// FindBuffer's speculative-translation form, out of line (bufferCache.cpp).
 	[[gnu::noinline]] [[nodiscard]] BufferId FindBufferSpec(uint64_t vaddr, uint64_t size);
 	// FindBuffer's registered buffer over the range, none registered: the null id (a speculative translation's
-	// question whether ObtainBuffer gave the range's buffer). Out of line (bufferCache.cpp): its page-table entry read
-	// once (LoadOwner), as on any speculation thread.
+	// question whether ObtainBuffer gave the range's buffer).
+	// (Out of line, bufferCache.cpp: its page-table entry read once, LoadOwner; a worker calls it, table-xpr.inc's held
+	// index / indirect args lookup.)
 	[[nodiscard]] BufferId RegisteredBuffer(uint64_t vaddr, uint64_t size);
 	void                   EnsureBufferContents(uint64_t vaddr, uint64_t size);
 	// As EnsureBufferContents, for a texel buffer: an image GPU work wrote over the range is copied in (SynchronizeBuffer).
@@ -190,6 +193,24 @@ public:
 	[[nodiscard]] bool RegisteredSince(uint64_t vaddr, uint64_t size, uint64_t epoch) const {
 		for (auto region = vaddr / TRACKER_REGION_SIZE, last = (vaddr + size - 1) / TRACKER_REGION_SIZE; region <= last; ++region)
 			if (RegionRegistrationEpoch(region * TRACKER_REGION_SIZE) > epoch) return true;
+		return false;
+	}
+	// spec_exact_reg_stop: as RegisteredSince, over the range's 16 KiB granules: a buffer registered or
+	// unregistered over the range itself since `epoch` (KYTY_SPECULATE=4 marks them; the render thread's, as the
+	// commit that asks). False also when nothing was marked (another mode).
+	[[nodiscard]] bool RegisteredSinceExact(uint64_t vaddr, uint64_t size, uint64_t epoch) const {
+		if (size == 0) return false;
+		// (Each leaf looked up once for its granules.)
+		constexpr uint64_t leaf_mask = (uint64_t {1} << RegLeafBits) - 1;
+		for (uint64_t g = vaddr >> RegGranuleBits, last = (vaddr + size - 1) >> RegGranuleBits; g <= last;) {
+			const auto stop = std::min(last, g | leaf_mask);
+			if (const auto it = m_reg_granule_epochs.find(g >> RegLeafBits); it != m_reg_granule_epochs.end()) {
+				const auto* epochs = it->second.get();
+				for (auto i = g & leaf_mask; i <= (stop & leaf_mask); ++i)
+					if (epochs[i] > epoch) return true;
+			}
+			g = stop + 1;
+		}
 		return false;
 	}
 	// The registration epoch of the last change of a buffer covering the tracker region of `vaddr`: a region
@@ -329,6 +350,24 @@ private:
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
+
+public:
+	// spec_buffer_ahead (under KYTY_SPECULATE=4 only; a V# range left pending is posted too): a speculation's thread
+	// posts a range no buffer covers (PostAhead: once, at most 512 waiting); the
+	// GPU thread registers the posted ranges nothing overlaps (ServeAhead, at each commit).
+	void PostAhead(uint64_t vaddr, uint64_t size);
+	// The table path's call site of a speculation's lookup (0 other): spec_ring_index's index ranges.
+	static inline thread_local int t_ahead_site = 0;
+	struct AheadSite {
+		int old;
+		explicit AheadSite(int site): old(t_ahead_site) { t_ahead_site = site; }
+		~AheadSite() { t_ahead_site = old; }
+	};
+	void ServeAhead();
+
+private:
+	std::mutex                                 m_ahead_mutex;
+	std::vector<std::pair<uint64_t, uint64_t>> m_ahead;
 	void                   Register(BufferId id);
 	void Unregister(BufferId id);
 	template <bool insert>
@@ -404,6 +443,9 @@ private:
 	// Per tracker region, see RegionRegistrationEpoch.
 	std::unique_ptr<std::atomic<uint64_t>[]> m_region_registrations =
 	    std::make_unique<std::atomic<uint64_t>[]>(TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE);
+	// spec_exact_reg_stop: per 16 KiB granule, the epoch of the last registration change over it (RegisteredSinceExact).
+	static constexpr uint64_t                                 RegGranuleBits = 14, RegLeafBits = 16;
+	std::unordered_map<uint64_t, std::unique_ptr<uint64_t[]>> m_reg_granule_epochs;
 	std::vector<GuestRange> m_registration_spans; // see TakeRegistrationSpans
 	bool                    m_registration_spans_lost = true;
 	struct SyncBuffer {

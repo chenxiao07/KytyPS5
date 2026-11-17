@@ -169,6 +169,11 @@ void PinThreadToCpuList(const char* list) {
 	if (const auto mask = CpuListMask(list); mask != 0) (void)SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(mask));
 }
 
+bool TryPinThreadToCpuList(const char* list) {
+	const auto mask = CpuListMask(list);
+	return mask != 0 && SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(mask)) != 0;
+}
+
 bool PinThreadHandleToCpuList(uint64_t handle, const char* list) {
 	const auto mask = CpuListMask(list);
 	return handle != 0 && mask != 0 &&
@@ -236,6 +241,42 @@ std::string SpeculationCpuList() {
 		if (std::find(cores.begin(), cores.end(), cpu.core) != cores.end())
 			list += (list.empty() ? "" : ",") + std::to_string(cpu.index);
 	return list;
+}
+
+std::string EfficiencyCpu(const char* avoid) {
+	DWORD_PTR process = 0, system = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) == 0) process = ~DWORD_PTR(0);
+	ULONG length = 0;
+	(void)GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+	std::vector<uint8_t> buffer(length);
+	auto* first = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data());
+	if (length == 0 || !GetSystemCpuSetInformation(first, length, &length, GetCurrentProcess(), 0)) return {};
+	struct Cpu {
+		uint32_t index, efficiency;
+	};
+	std::vector<Cpu> cpus;
+	uint32_t         lowest = UINT32_MAX, highest = 0;
+	for (ULONG offset = 0; offset < length;) {
+		const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+		if (info->Type == CpuSetInformation && info->CpuSet.Group == 0 && info->CpuSet.LogicalProcessorIndex < 64 &&
+		    ((process >> info->CpuSet.LogicalProcessorIndex) & 1u) != 0) {
+			cpus.push_back({info->CpuSet.LogicalProcessorIndex, info->CpuSet.EfficiencyClass});
+			lowest  = std::min<uint32_t>(lowest, info->CpuSet.EfficiencyClass);
+			highest = std::max<uint32_t>(highest, info->CpuSet.EfficiencyClass);
+		}
+		offset += info->Size;
+	}
+	if (cpus.empty() || lowest == highest) return {}; // (every core alike: no pin)
+	const uint64_t avoid_mask = CpuListMask(avoid);
+	uint32_t       pick = UINT32_MAX;
+	bool           pick_avoided = true;
+	for (const auto& cpu: cpus) {
+		if (cpu.efficiency != lowest) continue;
+		const bool avoided = ((avoid_mask >> cpu.index) & 1u) != 0;
+		if (pick == UINT32_MAX || (pick_avoided && !avoided) || (avoided == pick_avoided && cpu.index < pick))
+			pick = cpu.index, pick_avoided = avoided;
+	}
+	return pick == UINT32_MAX ? std::string {} : std::to_string(pick);
 }
 
 uint32_t PerformanceLogicalCpus() {
@@ -1012,28 +1053,64 @@ void PrefetchKeptFile(const std::string& path) {
 	g_prefetch_ready.notify_one();
 }
 
+// (A TH32CS_SNAPTHREAD snapshot is system-wide and walking it maps and unmaps a snapshot view a step: ~4,000 host view
+// maps a call in an ETW memory trace, two calls a LiveControl::Measure window (Kyty.Record's CPU time), so every
+// quarter-second measure window put ~8,000 view map / unmaps on the address space. The named threads' handles are found
+// once and kept; the threads are looked for again (new ones of the name added) while none is found and whenever one of
+// them has exited since the last call. An exited thread's CPU time, final, is read once into the name's sum and its
+// handle closed: a window that spans its exit never reads low, and a live `mode 4`'s new workers leave no handles.)
 double NamedThreadsCpuSeconds(const char* name) {
-	std::wstring wanted;
-	for (const char* p = name; *p != '\0'; ++p) wanted.push_back(static_cast<wchar_t>(*p));
-	double       total    = 0;
-	const DWORD  process  = GetCurrentProcessId();
-	HANDLE       snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-	if (snapshot == INVALID_HANDLE_VALUE) return 0;
-	THREADENTRY32 entry {};
-	entry.dwSize = sizeof(entry);
-	for (BOOL more = Thread32First(snapshot, &entry); more != 0; more = Thread32Next(snapshot, &entry)) {
-		if (entry.th32OwnerProcessID != process) continue;
-		HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
-		if (thread == nullptr) continue;
-		PWSTR description = nullptr;
-		if (SUCCEEDED(GetThreadDescription(thread, &description)) && description != nullptr) {
-			if (wanted == description) total += HandleCpuSeconds(thread);
-			LocalFree(description);
+	struct Kept {
+		HANDLE handle = nullptr;
+		DWORD  id     = 0;
+	};
+	struct Named {
+		std::vector<Kept> live;
+		double            exited_seconds = 0; // (the exited threads' final CPU time)
+	};
+	static std::mutex                                    cache_mutex;
+	static std::unordered_map<std::string, Named>        cache;
+	const std::lock_guard                                lock(cache_mutex);
+	auto&                                                named = cache[name];
+	auto&                                                kept  = named.live;
+	const auto                                           before = kept.size();
+	std::erase_if(kept, [&](const Kept& thread) {
+		DWORD code = 0;
+		if (GetExitCodeThread(thread.handle, &code) != 0 && code == STILL_ACTIVE) return false;
+		named.exited_seconds += HandleCpuSeconds(thread.handle);
+		CloseHandle(thread.handle);
+		return true;
+	});
+	// (Looked for again on an exit, and while no live thread of the name is kept.)
+	if (kept.size() != before || kept.empty()) {
+		std::wstring wanted;
+		for (const char* p = name; *p != '\0'; ++p) wanted.push_back(static_cast<wchar_t>(*p));
+		const DWORD process  = GetCurrentProcessId();
+		HANDLE      snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+		if (snapshot != INVALID_HANDLE_VALUE) {
+			THREADENTRY32 entry {};
+			entry.dwSize = sizeof(entry);
+			for (BOOL more = Thread32First(snapshot, &entry); more != 0; more = Thread32Next(snapshot, &entry)) {
+				if (entry.th32OwnerProcessID != process) continue;
+				// (A live kept thread is not opened twice; an id an exited one held is a new thread.)
+				if (std::ranges::any_of(kept, [&](const Kept& k) { return k.id == entry.th32ThreadID; })) continue;
+				HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+				if (thread == nullptr) continue;
+				PWSTR description = nullptr;
+				bool  keep        = false;
+				if (SUCCEEDED(GetThreadDescription(thread, &description)) && description != nullptr) {
+					keep = wanted == description;
+					LocalFree(description);
+				}
+				if (keep) kept.push_back({thread, entry.th32ThreadID});
+				else CloseHandle(thread);
+			}
+			CloseHandle(snapshot);
 		}
-		CloseHandle(thread);
 	}
-	CloseHandle(snapshot);
-	return total;
+	double sum = named.exited_seconds;
+	for (const auto& thread: kept) sum += HandleCpuSeconds(thread.handle);
+	return sum;
 }
 
 std::vector<std::pair<uint32_t, std::string>> ProcessThreads() {
@@ -2112,7 +2189,16 @@ void PinThreadToCpuList(const char* list) {
 	if (MaskToSet(CpuListMask(list), &set)) (void)sched_setaffinity(0, sizeof(set), &set);
 }
 
+bool TryPinThreadToCpuList(const char* list) {
+	cpu_set_t set;
+	return MaskToSet(CpuListMask(list), &set) && sched_setaffinity(0, sizeof(set), &set) == 0;
+}
+
 std::string SpeculationCpuList() {
+	return {};
+}
+
+std::string EfficiencyCpu(const char* /*avoid*/) {
 	return {};
 }
 

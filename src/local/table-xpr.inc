@@ -100,6 +100,21 @@ struct RenderExecutor::TableImageSet {
 		uint64_t                validity = 0;
 	};
 	TableWords            words; // without the LOD statistics fields (NativeXprLodStatsMask)
+	// spec_worker_images: its slots holding a null image until the commit completes them (Speculation::Before).
+	struct PendingImage {
+		uint32_t                binding = 0, element = 0;
+		vk::DescriptorType      type    = vk::DescriptorType::eSampledImage;
+		TextureCache::ImageDesc desc;
+		vk::ImageLayout         layout  = vk::ImageLayout::eShaderReadOnlyOptimal;
+	};
+	std::vector<PendingImage> pending_images;
+	// A speculation's proposal (spec_worker_sets): the Spec::State::id of the translation that built it (0: the owner's),
+	// set before the set is reachable and never changed; `published` once the commit puts it in the catalog (under the
+	// catalog's write). Until then only that translation takes it from a role's last / previous set (TableSet): its
+	// pending slots are filled only if that translation commits the segment that proposed it (a worker's next translation
+	// bound a set its first one then forgot unfilled: null image slots).
+	uint64_t              proposer = 0;
+	std::atomic<bool>     published {false};
 	vk::DescriptorSet     set  = nullptr;
 	vk::DescriptorPool    pool = nullptr;
 	std::vector<Image>    images;
@@ -261,6 +276,17 @@ struct RenderExecutor::TablePair {
 	TableImageSet*& LastSet(uint32_t role) { return role == 0 ? last_set : roles.Get().last_set[role - 1]; }
 	TableImageSet*& PreviousSet(uint32_t role) { return role == 0 ? previous_set : roles.Get().previous_set[role - 1]; }
 	uint64_t&       Generation(uint32_t role) { return role == 0 ? generation : roles.Get().generation[role - 1]; }
+	// Every role's last and previous pointer to `set` dropped (a worker set that goes unpublished: spec_worker_images).
+	void ForgetSet(const TableImageSet* set) noexcept {
+		if (last_set == set) last_set = nullptr;
+		if (previous_set == set) previous_set = nullptr;
+		if (auto* side = roles.Peek()) {
+			for (auto& at: side->last_set)
+				if (at == set) at = nullptr;
+			for (auto& at: side->previous_set)
+				if (at == set) at = nullptr;
+		}
+	}
 	// Every role's last and previous set dropped (a set replaced or retired).
 	void ClearSets() noexcept {
 		last_set = previous_set = nullptr;
@@ -637,13 +663,43 @@ static void TablePrefetchNext(Pair*& previous, Pair& pair) {
 	if (auto* const after = next->next; after != nullptr && after != &pair && after != next) TablePrefetchPair(*after);
 }
 
+// spec_worker_sets: the catalog read lock the speculation's table draw or dispatch holds (TableTry, TableDispatch,
+// TableContinue). The set build keeps it across the program lookup (`unlocked` there only tests it), so the lookup's guest
+// reads are made without a fault: a fault there would wait for the GPU thread while it waits for the catalog's write.
+static thread_local std::shared_lock<std::shared_mutex>* t_catalog_read = nullptr;
+// catalog_writer_first: before a worker's table try takes the catalog shared, it waits while the owner waits to write
+// (pause, then yield), unless this thread holds the catalog shared already.
+static void CatalogGate(const std::atomic<int32_t>& writer_waiting, bool on) {
+	if (!on || writer_waiting.load(std::memory_order_acquire) == 0) return;
+	if (t_catalog_read != nullptr && t_catalog_read->owns_lock()) return;
+	for (uint32_t spins = 0; writer_waiting.load(std::memory_order_acquire) != 0; ++spins) {
+		if (spins < 64) _mm_pause();
+		else std::this_thread::yield();
+	}
+}
+// (t_catalog_read is read only by a speculation's executor (CatalogGate behind Role() != 0, the set build's `unlocked`
+// behind a speculation), which runs only while the mode is not 0: mode 0 tests the global and touches no thread-local.)
+struct CatalogReadScope {
+	std::shared_lock<std::shared_mutex>* old = nullptr;
+	const bool                           on;
+	explicit CatalogReadScope(std::shared_lock<std::shared_mutex>* lock): on(Spec::On()) {
+		if (on) old = t_catalog_read, t_catalog_read = lock;
+	}
+	~CatalogReadScope() {
+		if (on) t_catalog_read = old;
+	}
+	CatalogReadScope(const CatalogReadScope&)            = delete;
+	CatalogReadScope& operator=(const CatalogReadScope&) = delete;
+};
+
 RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands,
                                                      uint64_t index_base, uint64_t index_bytes,
                                                      vk::IndexType index_type, const NativeXprDirectDraw* direct) {
 	auto& table = OwnTable();
 	// (Another executor's catalog is read under its lock.)
 	std::shared_lock<std::shared_mutex> catalog_read;
-	if (Role() != 0) catalog_read = CatalogRead();
+	if (Role() != 0) CatalogGate(Catalog().m_catalog_writer_waiting, CatalogWriterFirst()), catalog_read = CatalogRead();
+	const CatalogReadScope catalog_read_scope(&catalog_read); // (spec_worker_sets)
 	DropStaleCatalog();
 	TableSweepPairs();
 	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1e, 0); // census: the table path's phases (b)
@@ -688,7 +744,10 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	}
 	auto& pair = *known;
 	TablePrefetchPair(pair);
+	// (A speculation's thread notes the pair in its segment, whose commit stamps it (Speculation::After): only the GPU
+	// thread writes it, and a pair only speculations use is not swept as unused. A refused draw's note goes with it.)
 	if (Role() == 0) pair.used_frame = frame;
+	else if (auto* spec = Spec::Current(); spec != nullptr) spec->NoteUsedPair(&pair.used_frame);
 	if (pair.vs != vs_address || pair.ps != ps_address || pair.start_instance != vs.start_instance_user_sgpr)
 		return Spec::Refuse("table: pair key"), TableResult::Native;
 	if (const auto generation = ShaderMapGeneration(); generation != pair.Generation(Role())) {
@@ -830,7 +889,8 @@ bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64
                                    uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct) {
 	if (kyty_local_table_xpr_mode.load(std::memory_order_relaxed) < 2 || !m_table_xpr || !m_native_xpr) return false;
 	std::shared_lock<std::shared_mutex> catalog_read;
-	if (Role() != 0) catalog_read = CatalogRead();
+	if (Role() != 0) CatalogGate(Catalog().m_catalog_writer_waiting, CatalogWriterFirst()), catalog_read = CatalogRead();
+	const CatalogReadScope catalog_read_scope(&catalog_read); // (spec_worker_sets)
 	DropStaleCatalog();
 	auto& table = OwnTable();
 	if (table.last_pair == nullptr || buffer.IsInvalid() || index_base == 0 || index_bytes == 0 ||
@@ -866,11 +926,145 @@ static int64_t TableLearnPortable() {
 	return Spec::On() ? value.load(std::memory_order_relaxed) : 0;
 }
 
+// spec_worker_sets and spec_worker_images (under KYTY_SPECULATE=4 only, the mode whose descriptor pools a worker may
+// share): a speculation's thread builds an image set
+// itself (TableResolveSet) when every image is resident, current and already acquired for sampling (the texture cache
+// read only: TextureCache::ReadOnlyScope); the set is its own (Spec::State::proposed_sets) until a segment from the one
+// that made it on is committed, when the owner publishes it into the catalog (or keeps it aside: never freed, a recorded
+// draw may hold it). Anything else is refused as before ('table image set').
+[[nodiscard]] static bool WorkerImagesOn() {
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+}
+
+static int64_t WorkerSets() {
+	if (!Spec::On()) return 0;
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 1 : 0;
+}
+static thread_local bool t_table_revalidating = false; // (spec_worker_revalidate: TableResolveSet's caller)
+static void TableKeepAside(std::shared_ptr<void> holder) {
+	static std::mutex                          mutex;
+	static std::vector<std::shared_ptr<void>> kept;
+	std::scoped_lock                           lock(mutex);
+	kept.push_back(std::move(holder));
+}
+// spec_aside_release (under KYTY_SPECULATE=4; otherwise kept for good as above): a set kept
+// aside is released instead. When it goes aside, the roles' pointers to it are dropped under the catalog's write (as an
+// unpublished pending set's are: no later lookup finds it). At a commit two frames after it went aside (every speculation
+// that could still bind it is done), the GPU thread retires its descriptor set as the owner retires one
+// (NativeXprRetireSet: in flight until the
+// current tick; a speculation that bound it and commits later stops, "a hole retired a set"), and the set itself is
+// destroyed once the translations in flight then have passed (Spec::PacketsPassed).
+[[nodiscard]] static bool TableAsideReleaseOn() {
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+}
+struct TableAsideQueue {
+	struct Queued {
+		uint64_t              frame = 0; // (the frame it went aside in)
+		std::shared_ptr<void> holder;
+		std::function<void()> retire; // (its descriptor set: on the GPU thread)
+	};
+	std::mutex                                                       mutex;
+	std::vector<Queued>                                              queued;
+	std::vector<std::pair<Spec::PacketMarks, std::shared_ptr<void>>> retiring;
+};
+static TableAsideQueue& TableAside() {
+	static TableAsideQueue aside;
+	return aside;
+}
+// (The GPU thread, at a commit.)
+static void TableAsideDrain(uint64_t frame) {
+	auto&                                aside = TableAside();
+	std::vector<TableAsideQueue::Queued> due;
+	{
+		std::scoped_lock lock(aside.mutex);
+		std::erase_if(aside.retiring, [](const auto& item) { return Spec::PacketsPassed(item.first); });
+		std::erase_if(aside.queued, [&](auto& item) {
+			if (item.frame + 2 > frame) return false;
+			due.push_back(std::move(item));
+			return true;
+		});
+	}
+	if (due.empty()) return;
+	for (auto& item: due) item.retire();
+	const auto       marks = Spec::PacketNow();
+	std::scoped_lock lock(aside.mutex);
+	for (auto& item: due) aside.retiring.emplace_back(marks, std::move(item.holder));
+}
+
+// spec_worker_images: the GPU thread, at the commit of the segment that built `set` (Speculation::Before, before the replay
+// binds it): each pending slot's image as its own TableResolveSet would find it now (FindImage: made if needed;
+// FindTexture: uploaded, its view), transited to the sampled layout in the open buffer, its view written into the slot,
+// and the image added to the set's (its later draws validate and transit it as any). All of them, or false (the
+// segment stops; the set is never published).
+bool RenderExecutor::TableCompletePendingImages(TableImageSet& set) {
+	auto&                                textures = m_context.GetTextureCache();
+	const auto                           handle   = m_context.GetCommandScheduler().Current().Handle();
+	std::vector<vk::DescriptorImageInfo> infos(set.pending_images.size());
+	std::vector<vk::WriteDescriptorSet>  writes;
+	size_t                               done = 0;
+	for (size_t i = 0; i < set.pending_images.size(); ++i) {
+		auto&      pending = set.pending_images[i];
+		auto       desc    = pending.desc;
+		const auto id      = textures.FindImage(desc, false, true); // (may fail: no memory for it, a refusal)
+		if (!id) continue;
+		const auto view = textures.FindTexture(id, desc);
+		if (!view) continue;
+		auto& image = textures.GetImage(id);
+		image.usage.texture = true;
+		const ImageSubresourceRange range {desc.view_info.base_level, desc.view_info.level_count, desc.view_info.base_layer,
+		                                   desc.view_info.layer_count};
+		image.Transit(pending.layout, vk::AccessFlagBits2::eShaderRead, range, handle);
+		infos[i] = vk::DescriptorImageInfo {nullptr, view, pending.layout};
+		vk::WriteDescriptorSet write;
+		write.dstSet          = set.set;
+		write.dstBinding      = pending.binding;
+		write.dstArrayElement = pending.element;
+		write.descriptorCount = 1;
+		write.descriptorType  = pending.type;
+		write.pImageInfo      = &infos[i];
+		writes.push_back(write);
+		auto& dep  = set.images.emplace_back();
+		dep.id     = id;
+		dep.serial = image.serial;
+		dep.layout = pending.layout;
+		dep.range  = range;
+		dep.desc   = desc;
+		set.image_ids.push_back(id);
+		++done;
+	}
+	if (!writes.empty())
+		m_context.GetGraphics().device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		                                                    , LocalVulkanRecording::DirectDispatch()
+#endif
+		);
+	bool ok = done == set.pending_images.size();
+	set.span_begin = set.span_end = 0; // (its span grew: found again at its next proof)
+	if (ok) set.pending_images.clear();
+	return ok;
+}
+
 RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& buffer, TablePair& pair,
                                                                const TableVariant*       variant,
                                                                const NativeXprDrawState* draw_state,
                                                                std::span<const uint32_t> words) {
-	if (Spec::Current() != nullptr) return Spec::Refuse("table image set"), nullptr;
+	auto* const spec       = Spec::Current();
+	// (A speculation's set only: its proposals are found by the words' hash. Mode 0 hashes nothing here.)
+	const auto  words_hash = spec != nullptr ? XXH3_64bits(words.data(), words.size() * sizeof(uint32_t)) : uint64_t {0};
+	std::optional<TextureCache::ReadOnlyScope> read_only;
+	const auto worker_refuse = [](const char* why) -> TableImageSet* {
+		return Spec::Refuse(why), nullptr;
+	};
+	if (spec != nullptr) {
+		if (WorkerSets() == 0) return Spec::Refuse("table image set"), nullptr;
+		// (One it built already in this translation.)
+		for (const auto& proposed: spec->proposed_sets)
+			if (proposed.pair == &pair && proposed.hash == words_hash &&
+			    std::ranges::equal(static_cast<TableImageSet*>(proposed.set)->words, words))
+				return static_cast<TableImageSet*>(proposed.set);
+		if (Catalog().m_native_xpr == nullptr || CatalogTable() == nullptr) return worker_refuse("worker set: no catalog");
+		read_only.emplace();
+	}
 	auto       set      = std::make_unique<TableImageSet>();
 	auto&      textures = m_context.GetTextureCache();
 	// (Before the lookups: a registration they make over a depth image's pages is one IsSampledDepthCurrent sees.)
@@ -881,7 +1075,84 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 	const auto& ctx     = buffer.GetRegisters();
 	set->words.assign(words.begin(), words.end());
 	set->validated_frame = m_context.FrameNumber();
-	const auto publish = [&] {
+	const auto publish = [&]() -> TableImageSet* {
+		if (spec != nullptr) {
+			// A worker's: its own until committed (Speculation::After), then the catalog's, under the owner's write,
+			// when the catalog did not change since (its slot free, the pair's sets not cleared); else kept aside.
+			set->ValidatedFrame(Role())  = set->validated_frame;
+			set->ResolutionEpoch(Role()) = set->resolution_epoch;
+			set->validated_frame         = UINT64_MAX; // (the owner proves it in full at its first use)
+			set->proposer                = spec->id;   // (before it is reachable: TableSet's foreign-proposal check)
+			auto* const raw      = set.get();
+			auto* const owner    = &Catalog();
+			auto* const target   = &pair;
+			const auto  since    = CatalogTable()->epoch;
+			const bool  replaces = t_table_revalidating; // (spec_worker_revalidate: built for a set found no longer valid)
+			auto        holder   = std::make_shared<std::unique_ptr<TableImageSet>>(std::move(set));
+			spec->proposed_sets.push_back({&pair, words_hash, raw, spec->closed.size(), false,
+			                               [owner, target, words_hash, since, holder, replaces](bool commit) {
+				                               if (commit && TableAsideReleaseOn()) TableAsideDrain(owner->m_context.FrameNumber());
+				                               // (spec_worker_images: never completed, never published or kept; the roles' pointers to it
+				                               // dropped first, under the write lock their reads exclude; its descriptor set retired as the
+				                               // owner retires one. No other translation binds it (an unpublished proposal is foreign to
+				                               // them, TableSet), and its own segment's commit stopped before any replay that binds it ran.)
+				                               if (*holder && !(*holder)->pending_images.empty()) {
+					                               const auto write = owner->CatalogWrite();
+					                               target->ForgetSet(holder->get());
+					                               owner->NativeXprRetireSet((*holder)->pool, (*holder)->set);
+					                               return;
+				                               }
+				                               if (commit && *holder) {
+					                               const auto write = owner->CatalogWrite();
+					                               auto*      table = owner->m_table_xpr.get();
+					                               if (table != nullptr && table->epoch == since) {
+						                               auto& slot = target->sets[words_hash];
+						                               if (!slot) {
+							                               (*holder)->published.store(true, std::memory_order_release);
+							                               slot = std::move(*holder);
+							                               return;
+						                               }
+						                               // (spec_worker_revalidate: the slot's set replaced as the owner's own
+						                               // resolution replaces one.)
+						                               if (replaces && slot.get() != holder->get()) {
+							                               owner->NativeXprRetireSet(slot->pool, slot->set);
+							                               target->ClearSets();
+							                               ++table->epoch;
+							                               (*holder)->published.store(true, std::memory_order_release);
+							                               slot = std::move(*holder);
+							                               return;
+						                               }
+					                               }
+				                               }
+				                               if (*holder && TableAsideReleaseOn()) { // (spec_aside_release)
+					                               {
+						                               const auto write = owner->CatalogWrite();
+						                               target->ForgetSet(holder->get());
+					                               }
+					                               auto&            aside = TableAside();
+					                               std::scoped_lock lock(aside.mutex);
+					                               aside.queued.push_back({owner->m_context.FrameNumber(), holder, [owner, holder] {
+						                                                       owner->NativeXprRetireSet((*holder)->pool, (*holder)->set);
+					                                                       }});
+					                               return;
+				                               }
+				                               TableKeepAside(holder);
+			                               }});
+			if (!raw->pending_images.empty())
+				spec->proposed_sets.back().complete = [owner, raw] { return owner->TableCompletePendingImages(*raw); };
+			// (spec_proposed_check: what TableValidateSet's first steps ask, at the commit: the BDA page table's generation
+			// the set's, and each image the one it was built with.)
+			spec->proposed_sets.back().check = [owner, raw] {
+				if (raw->bda_generation != BufferCache::BdaTableGeneration()) return false;
+				auto& textures = owner->m_context.GetTextureCache();
+				for (const auto& dep: raw->images) {
+					const auto* image = textures.m_slot_images.try_get(dep.id);
+					if (image == nullptr || image->serial != dep.serial) return false;
+				}
+				return true;
+			};
+			return raw;
+		}
 		const auto write = CatalogWrite();
 		auto&      slot  = pair.sets[XXH3_64bits(words.data(), words.size() * sizeof(uint32_t))];
 		if (slot) {
@@ -892,7 +1163,8 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		slot = std::move(set);
 		return slot.get();
 	};
-	const auto refuse = [&](const char* reason) {
+	const auto refuse = [&](const char* reason) -> TableImageSet* {
+		if (spec != nullptr) return worker_refuse("worker set: refused set");
 		static std::atomic<uint32_t> reports[2] {}; // (dispatches, draws)
 		if (reports[pair.ps != 0 ? 1 : 0].fetch_add(1, std::memory_order_relaxed) < 32)
 			std::printf("Table: VS 0x%llx PS 0x%llx image set refused: %s\n", static_cast<unsigned long long>(pair.vs),
@@ -907,16 +1179,58 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 	if (variant != nullptr) {
 		ResetNativeVertexInput(vertex_info);
 		ResetNativeStageInput(pixel_info);
+		// RULE (from a freeze in a long run): a speculation thread never holds a lock the GPU thread can take (the
+		// catalog read, the pipeline cache m_mutex, the texture cache m_lock, the descriptor pools alloc_mutex) across anything
+		// that can fault into tracked guest memory or send a sync to the GPU thread: a fault there waits for the GPU thread,
+		// which waits for the lock. Under these locks a worker reads guest memory only non-faulting with a refusal (SRT words:
+		// t_no_fault_reads here; SRT spans: TryReadGpuShaderSpan guarded copy); shader code is GPU-written too (a level load's
+		// DMA: a freeze in Get's table job copy), copied before m_mutex (CopyShaderCode); anything else before the lock is taken. New worker paths (pair proposals) are audited against this list.
+		PipelineCache::t_no_fault_reads  = spec != nullptr;
+		PipelineCache::t_no_fault_failed = false;
+		// (A speculation's lookup runs under the catalog's read lock (TableTry / TableContinue / TableDispatch hold it across
+		// it: nothing releases it here), which the GPU thread's CatalogWrite waits for: its guest reads (PrepareProgramInto's
+		// hash, AGC metadata and vertex tables, Get's code and SRT words) are made without a fault, the set refused when
+		// one cannot be (PipelineCache: "worker set: code unread", "GPU-written shader code"; t_no_fault_failed). The
+		// epoch and variant checks after it hold for the lock; they stay for a lookup made without it.)
+		// (Copies held by a speculation only. Mode 0 reads them in place.)
+		struct Held {
+			std::remove_cvref_t<decltype(variant->mapping)> mapping;
+			std::remove_cvref_t<decltype(variant->state)>   state;
+			std::remove_cvref_t<decltype(variant->pipeline)> pipeline; // (an in-place update meanwhile, below)
+			std::remove_cvref_t<decltype(pair.portable)>    portable;
+		};
+		std::optional<Held> held;
+		if (spec != nullptr) held.emplace(Held {variant->mapping, variant->state, variant->pipeline, pair.portable});
+		const auto* mapping  = held ? &held->mapping : &variant->mapping;
+		const auto* portable = held ? &held->portable : &pair.portable;
+		const auto  since    = spec != nullptr && CatalogTable() != nullptr ? CatalogTable()->epoch : 0;
+		const bool  unlocked = spec != nullptr && t_catalog_read != nullptr && t_catalog_read->owns_lock();
 		(void)m_context.GetPipelineCache().GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx,
-		                                                       buffer.GetUserConfig(), variant->mapping, stages == 2,
-		                                                       vertex_info, pixel_info, true, pair.portable);
-		if (m_context.GetPipelineCache().TablePending()) return nullptr;
+		                                                       buffer.GetUserConfig(), *mapping, stages == 2,
+		                                                       vertex_info, pixel_info, true, *portable);
+		PipelineCache::t_no_fault_reads = false;
+		if (spec != nullptr && PipelineCache::t_no_fault_failed) return worker_refuse("worker set: program read");
+		if (unlocked) {
+			if (CatalogTable() == nullptr || CatalogTable()->epoch != since) return worker_refuse("worker set: catalog changed");
+			// (The owner's TableStore adds a variant under its write without moving the epoch: a pair's variants vector that
+			// grew meanwhile moved the variant TableDraw holds by reference, and reads after this set (its pipeline, its
+			// index as the role's last variant). Refused then, as when the variant left.)
+			const auto again = std::ranges::find(pair.variants, held->state, &TableVariant::state);
+			if (again == pair.variants.end() || &*again != variant) return worker_refuse("worker set: catalog changed");
+			// (TableStore's targets path updates a variant in place, without moving the epoch or
+			// the vector: its pipeline swapped, or null while TryCreateGraphicsPipeline is pending, or the variant refused.
+			// The set's layout and TableDraw's bind read that pipeline: refused unless it is the one held before the unlock.)
+			if (again->pipeline != held->pipeline || again->pipeline == nullptr || again->refused)
+				return worker_refuse("worker set: catalog changed");
+		}
+		if (m_context.GetPipelineCache().TablePending())
+			return spec != nullptr ? worker_refuse("worker set: program pending") : nullptr;
 		if (vertex_info.stage.program != pair.programs[0] || (stages == 2 && pixel_info.stage.program != pair.programs[1])) {
 			// A format of a buffer's V# alone: the buffers learned as portable, as TableBlocks learns them when it sees a
 			// format change (it never runs for a draw whose set is refused), and the pair compiled again (respecialize,
 			// TableReset) instead of the set refused for RetryFrames, its draws native. (Demon's Souls at the view of
 			// 9 Nov: 11 pairs at spawn; ~38 refused draws a frame gone, s1-10 fps +2.4, settled +2.2.)
-			if (TableLearnPortable() != 0) {
+			if (TableLearnPortable() != 0 && spec == nullptr) {
 				bool                      other = false;
 				const ShaderStageRuntime* got[2] {&vertex_info.stage, &pixel_info.stage};
 				std::array<uint32_t, 2>   masks {};
@@ -948,10 +1262,23 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		ResetNativeStageInput(compute_info);
 		compute_info.dispatch_thread_dimensions = pair.compute->dispatch_thread_dimensions;
 		auto&      pipelines = m_context.GetPipelineCache();
+		PipelineCache::t_no_fault_reads  = spec != nullptr;
+		PipelineCache::t_no_fault_failed = false;
+		// (Held by a speculation only, as above.)
+		std::optional<std::remove_cvref_t<decltype(pair.portable[0])>> held_portable;
+		if (spec != nullptr) held_portable.emplace(pair.portable[0]);
+		const auto* portable0 = held_portable ? &*held_portable : &pair.portable[0];
+		const auto since     = spec != nullptr && CatalogTable() != nullptr ? CatalogTable()->epoch : 0;
+		const bool unlocked  = spec != nullptr && t_catalog_read != nullptr && t_catalog_read->owns_lock();
 		const auto handle    = pipelines.GetComputeProgram(sh.GetCs(), ctx.GetShaderRegisters(), compute_info, nullptr, true,
-		                                                   pair.portable[0]);
-		if (pipelines.TablePending()) return nullptr;
+		                                                   *portable0);
+		PipelineCache::t_no_fault_reads = false;
+		if (spec != nullptr && PipelineCache::t_no_fault_failed) return worker_refuse("worker set: program read");
+		if (unlocked && (CatalogTable() == nullptr || CatalogTable()->epoch != since))
+			return worker_refuse("worker set: catalog changed");
+		if (pipelines.TablePending()) return spec != nullptr ? worker_refuse("worker set: program pending") : nullptr;
 		if (compute_info.stage.program != pair.programs[0]) {
+			if (spec != nullptr) return worker_refuse("worker set: other specialization");
 			// Another specialization the table way alike (a particle simulation's texture 2D in one emitter and 3D in
 			// another, at Latria 90 programs): the set is made for it, with its pipeline.
 			const auto* other = compute_info.stage.program;
@@ -967,8 +1294,14 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		runtimes[0] = &compute_info.stage;
 	}
 	std::array<PreparedBindings, 2>                prepared;
+	TextureCache::t_pending_images_ok = spec != nullptr && WorkerImagesOn(); // (spec_worker_images)
 	for (uint32_t st = 0; st < stages; ++st) PrepareBindingsInto(*runtimes[st], prepared[st]);
 	for (uint32_t st = 0; st < stages; ++st) RebindImages(prepared[st]);
+	TextureCache::t_pending_images_ok = false;
+	if (spec != nullptr && TextureCache::ReadOnlyFailed() != nullptr) {
+		ResetBindings();
+		return worker_refuse(TextureCache::ReadOnlyFailed());
+	}
 	// An address probe's indirect image (a dispatch's): its root's elements in the order of the candidates the set's
 	// key holds (TableEvaluate's), each found among the dispatch's own (the normal path's materialization: the same
 	// enumeration, in the order the records name them); past them the null images it was padded with.
@@ -1001,6 +1334,10 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 	for (uint32_t st = 0; st < stages && ok; ++st)
 		for (auto& binding: prepared[st].images) {
 			auto&       image   = textures.GetImage(binding.image_id);
+			// (spec_worker_sets: the set's own bindings' state, which a speculation's read-only build does not mark (BindImage):
+			// all sampled textures there, neither written nor bound twice apart; the image's fields are the GPU thread's draw.)
+			const bool  bound_general = spec == nullptr && image.binding.force_general;
+			const bool  bound_written = spec == nullptr && image.binding.shader_write;
 			const bool  storage = binding.desc.type == TextureCache::BindingType::Storage;
 			const auto  found   = draw_state == nullptr ? decltype(draw_state->targets.end()) {}
 			                                                : std::ranges::find(draw_state->targets, binding.image_id,
@@ -1041,23 +1378,23 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			}();
 			if (image.info.data.Empty() ||
 			    (target != nullptr && !target_read && (storage || !(target->access & vk::AccessFlagBits2::eShaderRead))) ||
-			    ((storage || (image.binding.force_general && image.binding.shader_write)) && !image.info.IsTiled())) {
+			    ((storage || (bound_general && bound_written)) && !image.info.IsTiled())) {
 				ok = false;
 				break;
 			}
 			if (target != nullptr) {
 				binding.layout  = target->layout;
 				dep.target_read = target_read ? vk::AccessFlagBits2::eShaderRead |
-				                                    (storage || image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
+				                                    (storage || bound_written ? vk::AccessFlagBits2::eShaderWrite
 				                                                                           : vk::AccessFlags2 {})
 				                              : vk::AccessFlags2 {};
 				dep.access      = target->access | dep.target_read;
 				dep.target      = true;
-			} else if (image.binding.force_general && !image.info.IsDepth()) {
+			} else if (bound_general && !image.info.IsDepth()) {
 				binding.layout = vk::ImageLayout::eGeneral;
 				dep.access     = vk::AccessFlagBits2::eShaderRead |
-				                 (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlags2 {});
-				dep.storage    = image.binding.shader_write;
+				                 (bound_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlags2 {});
+				dep.storage    = bound_written;
 				dep.whole      = true;
 			} else if (storage) {
 				binding.layout = vk::ImageLayout::eGeneral;
@@ -1099,8 +1436,19 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				for (const auto resource: binding.resources)
 					image_infos.emplace_back(prepared[st].samplers.at(resource), nullptr, vk::ImageLayout::eUndefined);
 			} else if (item.image) {
-				for (const auto resource: binding.resources)
-					image_infos.push_back(MakeImageInfo(prepared[st].images.at(resource), occurrences.at(resource)++));
+				uint32_t element = 0;
+				for (const auto resource: binding.resources) {
+					const auto& bound = prepared[st].images.at(resource);
+					// (spec_worker_images: the slot the commit completes; the null image's view meanwhile.)
+					if (bound.pending && occurrences.at(resource) == 0) {
+						const auto& desc = *bound.pending_desc;
+						set->pending_images.push_back({item.write.dstBinding, element, item.write.descriptorType, desc,
+						                               desc.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+						                                                   : vk::ImageLayout::eShaderReadOnlyOptimal});
+					}
+					image_infos.push_back(MakeImageInfo(bound, occurrences.at(resource)++));
+					++element;
+				}
 			} else if (binding.kind == Kind::LodStats) {
 				buffer_infos.push_back(fixed(buffers.GetLodStatsBuffer()));
 			} else if (binding.kind == Kind::BdaPagetable) {
@@ -1120,11 +1468,13 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				set->holds_target |= dep.target;
 				set->read_after_write |= dep.whole && dep.storage;
 				// (Its view's metadata, which may not be the image's own: KYTY_TABLE_SERIALS.)
-				if (dep.desc.info.metadata.kind != ImageMetadataKind::None)
+				if (dep.desc.info.metadata.kind != ImageMetadataKind::None) {
+					if (spec != nullptr) return worker_refuse("worker set: metadata view");
 					m_context.GetTextureCache().NoteMetaUse(dep.desc.info.metadata.range.address, dep.id.index);
+				}
 			}
 	}
-	set->set = NativeXprAllocateSet((variant != nullptr      ? variant->pipeline
+	set->set = (spec != nullptr ? Catalog() : *this).NativeXprAllocateSet((variant != nullptr      ? variant->pipeline
 	                                 : set->pipeline != nullptr ? set->pipeline
 	                                                            : pair.pipeline)
 	                                    ->descriptor_set_layout,
@@ -1503,12 +1853,22 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 	const auto& words = table.words;
 	const auto  frame = m_context.FrameNumber();
 	auto*       set   = pair.LastSet(Role());
-	if (set == nullptr || set->words != words) {
+	// (A set another translation proposed and its commit has not published: not taken from these caches, which only the
+	// role's own translations fill: its pending slots are filled only if that translation commits its segment. Looked up
+	// again below: the catalog holds only published ones.)
+	const auto* const spec    = Spec::Current();
+	const auto        foreign = [spec](const TableImageSet* s) {
+		if (s == nullptr || s->proposer == 0 || (spec != nullptr && s->proposer == spec->id) ||
+		    s->published.load(std::memory_order_acquire))
+			return false;
+		return true;
+	};
+	if (set == nullptr || set->words != words || foreign(set)) {
 		auto* const last     = set;
 		auto* const previous = pair.PreviousSet(Role());
 		auto* const memo     = std::exchange(table.memo_set, nullptr); // (KYTY_TABLE_MEMO: the set the pair and key drew with)
 		const bool  verify   = std::exchange(table.memo_verify, false);
-		if (memo != nullptr && memo != last && !memo->refused && memo->words == words) {
+		if (memo != nullptr && memo != last && !memo->refused && memo->words == words && !foreign(memo)) {
 			set = memo;
 			// (KYTY_TABLE_MEMO_VERIFY: the set the words' lookup finds, read only; another one is taken as the full
 			// path would take it.)
@@ -1524,7 +1884,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 			}
 		// (The set before the last next, without the words' hash or the map's cold bucket and node.)
 		} else if ((kyty_local_table_mru.load(std::memory_order_relaxed) & 4u) != 0 && previous != nullptr && previous != last &&
-		    !previous->refused && previous->words == words) {
+		    !previous->refused && previous->words == words && !foreign(previous)) {
 			set = previous;
 		} else {
 			const auto found = pair.sets.find(XXH3_64bits(words.data(), words.size() * sizeof(uint32_t)));
@@ -1538,9 +1898,18 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 			if (set == nullptr || (set->refused && retry_due(*set))) {
 				auto* const retried = set;
 				set                 = TableResolveSet(buffer, pair, variant, draw_state, words);
-				// (A retry that came back pending: the refused set is still the slot's.)
-				if (retried != nullptr && set == nullptr && TableLearnPortable() == 2 && m_context.GetPipelineCache().TablePending())
-					retried->retry_wait = m_context.GetPipelineCache().TableWaiting();
+				// (A retry that came back pending: the refused set is still the slot's.) (The GPU thread's only: workers
+				// would write the shared_ptr under the shared lock while others read it. A speculation's TableResolveSet keeps
+				// the catalog's read across its program lookup, its guest reads made without a fault; were it ever released
+				// there, the owner could destroy `retried` meanwhile (TableReset, the set collection, a publish).)
+				if (Spec::Current() == nullptr && retried != nullptr && set == nullptr && TableLearnPortable() == 2 &&
+				    m_context.GetPipelineCache().TablePending()) {
+					// (Under the catalog's write lock: workers read retry_wait under the shared one, and this assignment can drop
+					// the last reference to the old job's flag. The old one is released after the unlock.)
+					auto       waiting = m_context.GetPipelineCache().TableWaiting();
+					const auto write   = CatalogWrite();
+					retried->retry_wait.swap(waiting);
+				}
 			}
 		}
 		// (TableResolveSet may have cleared both: a set it replaced.)
@@ -1551,16 +1920,34 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 	set->used_frame.store(frame, std::memory_order_relaxed);
 	if (set->refused) return LiveCounters::Add(LiveCounters::TableRefusedSets), Spec::Refuse("table: refused set"), nullptr;
 	if (!TableValidateSet(*set)) {
-		if (Spec::Current() != nullptr) return Spec::Refuse("table: set validation"), nullptr;
-		// Resolved again at the next draw that uses it.
-		const auto write = CatalogWrite();
-		if (table.last_set == set) table.last_set = nullptr;
-		pair.ClearSets();
-		++table.epoch;
-		const auto found = pair.sets.find(XXH3_64bits(set->words.data(), set->words.size() * sizeof(uint32_t)));
-		NativeXprRetireSet(set->pool, set->set);
-		if (found != pair.sets.end() && found->second.get() == set) pair.sets.erase(found);
-		return nullptr;
+		// spec_worker_revalidate (under KYTY_SPECULATE=4 only): a speculation resolves the set afresh itself, as it does a
+		// set it finds none for (a proposed set: published at its commit, replacing the slot's, or kept aside; the
+		// worker-set checks at the commit), instead of the hole. The set found is proven as one the lookup above found
+		// (TableValidateSet); the set that just failed (one this translation proposed, found again by its words) is refused.
+		if (Spec::Current() != nullptr && Role() != 0 && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+			t_table_revalidating = true;
+			auto* const fresh    = TableResolveSet(buffer, pair, variant, draw_state, words);
+			t_table_revalidating = false;
+			if (fresh == nullptr || fresh == set) return Spec::Refuse("table: set validation"), nullptr;
+			pair.LastSet(Role()) = fresh;
+			if (fresh->refused)
+				return LiveCounters::Add(LiveCounters::TableRefusedSets), Spec::Refuse("table: refused set"), nullptr;
+			if (!TableValidateSet(*fresh)) return Spec::Refuse("table: set validation"), nullptr;
+			fresh->used_frame.store(frame, std::memory_order_relaxed);
+			set = fresh;
+		} else if (Spec::Current() != nullptr) {
+			return Spec::Refuse("table: set validation"), nullptr;
+		} else { // (the owner's path, as before)
+			// Resolved again at the next draw that uses it.
+			const auto write = CatalogWrite();
+			if (table.last_set == set) table.last_set = nullptr;
+			pair.ClearSets();
+			++table.epoch;
+			const auto found = pair.sets.find(XXH3_64bits(set->words.data(), set->words.size() * sizeof(uint32_t)));
+			NativeXprRetireSet(set->pool, set->set);
+			if (found != pair.sets.end() && found->second.get() == set) pair.sets.erase(found);
+			return nullptr;
+		}
 	}
 	// Unused image sets leave once a second (the catalog's owner drops them).
 	if (Role() == 0 && frame >= table.collected + 60) {
@@ -1727,11 +2114,35 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 	};
 	if (table.gathered != &pair) TableGather(pair, user_data);
 	table.gathered = nullptr; // (taken: a later draw or dispatch gathers its own)
+	// spec_pending_buffers: the stage's V#s left to the commit (their dword in the block, range, written, texel).
+	// (spec_reloc_refs: the V#s of found game buffers too, with the epoch their address was proven at.)
+	struct PendingHere {
+		uint32_t dword;
+		uint64_t address, size;
+		bool     written, texel;
+		bool     pending = true;
+		uint64_t since   = 0;
+	};
+	std::vector<PendingHere> pending_here;
+	// (Outside a speculation, mode 0 always, none of the bookkeeping below is read: the flags and the lookup site are
+	// read only by ObtainBufferSpec, a speculation's lookup. It is skipped there.)
+	const bool               spec_here  = Spec::Current() != nullptr;
+	const bool               pending_ok = spec_here && Spec::PendingBuffersOn();
+	const bool               reloc      = pending_ok && Spec::RelocRefsOn();
+	// (spec_reloc_refs: the V#'s own lookups note no buffer range, the entry stands for it; restored on every return.)
+	struct NoRange {
+		bool old;
+		explicit NoRange(bool on): old(Spec::t_no_range) { Spec::t_no_range = on; }
+		~NoRange() { Spec::t_no_range = old; }
+		NoRange(const NoRange&)            = delete;
+		NoRange& operator=(const NoRange&) = delete;
+	};
 	for (uint32_t st = 0; st < stages; ++st) {
 		const auto& program = *pair.programs[st];
 		const auto& plan    = program.table_plan;
 		auto&       block   = table.blocks[st];
 		auto&       entries = table.entries[st];
+		pending_here.clear();
 		// The buffers it writes first: a range it also reads through another V# is GPU-written by then, as the
 		// normal path's second lookup (RebindBuffers) sees it (not a copy of the guest's bytes in the ring).
 		for (size_t n = 0; n < 2 * plan.buffers.size(); ++n) {
@@ -1768,12 +2179,38 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						if (image_starts(address)) return false;
 						proof.image_checked = true;
 					}
+					std::optional<BufferCache::AheadSite> ahead_site; // (the lookup's site: spec_ring_index)
+					std::optional<NoRange>                no_range;
+					uint64_t                              written_since = 0; // (spec_reloc_refs: before its lookup)
+					if (spec_here) {
+						ahead_site.emplace(2);
+						written_since = buffer_cache.RegistrationEpoch();
+						no_range.emplace(reloc);
+						Spec::t_pending_ok  = pending_ok;
+						Spec::t_pending_hit = false;
+					}
 					const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, true, formatted);
+					if (spec_here) Spec::t_pending_ok = false;
 					region_epochs.fill({UINT64_MAX, 0}); // (its uploads may have moved them)
+					if (spec_here && owner == nullptr && Spec::t_pending_hit) {
+						// (spec_pending_buffers: the null buffer, size 0, until the commit writes the range's.)
+						if (formatted) textures.InvalidateMemoryFromGPU(address, size, "storage-buffer");
+						pending_here.push_back({plan.BufferDword(i), address, size, true, formatted});
+						const auto [word, stride]      = word_of(words4);
+						block[plan.BufferDword(i)]     = static_cast<uint32_t>(null_device);
+						block[plan.BufferDword(i) + 1] = static_cast<uint32_t>(null_device >> 32u);
+						block[plan.BufferDword(i) + 2] = 0;
+						block[plan.BufferDword(i) + 3] = word;
+						block[plan.BufferDword(i) + 4] = stride;
+						continue;
+					}
 					if (owner == nullptr || buffer_cache.GetBufferIfLive(buffer_cache.FindBuffer(address, size)) != owner)
 						return false;
 					if (formatted) textures.InvalidateMemoryFromGPU(address, size, "storage-buffer");
 					device = owner->BufferDeviceAddress() + offset;
+					// (spec_reloc_refs: proven at the epoch read before its lookup.)
+					if (reloc)
+						pending_here.push_back({plan.BufferDword(i), address, size, true, formatted, false, written_since});
 				}
 				const auto [word, stride]      = word_of(words4);
 				block[plan.BufferDword(i)]     = static_cast<uint32_t>(device);
@@ -1898,8 +2335,29 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 					}
 					if (cpu_written) buffer_cache.EnsureBufferContents(address, size);
 					const auto registration_before = buffer_cache.RegistrationEpoch(); // (a speculation's: before its lookup)
+					std::optional<BufferCache::AheadSite> ahead_site; // (the lookup's site)
+					std::optional<NoRange>                no_range;
+					if (spec_here) {
+						ahead_site.emplace(1);
+						no_range.emplace(reloc);
+						Spec::t_pending_ok  = pending_ok;
+						Spec::t_pending_hit = false;
+					}
 					const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, false, formatted);
+					if (spec_here) Spec::t_pending_ok = false;
 					region_epochs.fill({UINT64_MAX, 0});
+					if (spec_here && owner == nullptr && Spec::t_pending_hit) {
+						// (spec_pending_buffers: the null buffer, size 0, until the commit writes the range's; nothing
+						// held, nothing noted: the commit obtains the range itself.)
+						pending_here.push_back({plan.BufferDword(i), address, size, false, formatted});
+						const auto [word, stride]      = word_of(words4);
+						block[plan.BufferDword(i)]     = static_cast<uint32_t>(null_device);
+						block[plan.BufferDword(i) + 1] = static_cast<uint32_t>(null_device >> 32u);
+						block[plan.BufferDword(i) + 2] = 0;
+						block[plan.BufferDword(i) + 3] = word;
+						block[plan.BufferDword(i) + 4] = stride;
+						continue;
+					}
 					// (The epoch before the dirty check: a write after it moves the epoch.)
 					fresh.cpu_epoch = buffer_cache.CpuModificationEpoch(address, size);
 					if (owner == nullptr || buffer_cache.GetBufferIfLive(buffer_cache.FindBuffer(address, size)) != owner ||
@@ -1917,7 +2375,15 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				held = fresh;
 			}
 			// (A speculation's: the buffer of the range its device address is in.)
-			if (auto* spec = Spec::Current(); spec != nullptr && held.size != 0) spec->NoteBufferRange(held.address, held.size);
+			// (spec_reloc_refs: an entry instead, proven at its held proof's epoch: the commit looks again only when a
+			// buffer was registered or unregistered over its range since that, and writes the address it finds then.)
+			if (auto* spec = Spec::Current(); spec != nullptr && held.size != 0) {
+				if (reloc)
+					pending_here.push_back({plan.BufferDword(i), held.address, held.size, false,
+					                        program.info.buffers[i].formatted, false, held.registration});
+				else
+					spec->NoteBufferRange(held.address, held.size);
+			}
 			const auto [word, stride]      = word_of(words4);
 			block[plan.BufferDword(i)]     = static_cast<uint32_t>(held.device);
 			block[plan.BufferDword(i) + 1] = static_cast<uint32_t>(held.device >> 32u);
@@ -1932,6 +2398,21 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 			                        : upload.TryCopy(block.data(), block.size() * sizeof(uint32_t), 16);
 			if (!copied) return Spec::Refuse("table: upload ring busy"), false;
 			blocks[st] = upload.BufferDeviceAddress() + *copied;
+			// (spec_pending_buffers: where the commit writes each one's buffer.)
+			if (!pending_here.empty()) {
+				auto& pending = Spec::Current()->pending_buffers;
+				for (const auto& here: pending_here) {
+					pending.push_back({.address = here.address,
+					                   .size    = here.size,
+					                   .ring    = &upload,
+					                   .offset  = *copied + uint64_t {here.dword} * 4u,
+					                   .written = here.written,
+					                   .texel   = here.texel,
+					                   .pending = here.pending,
+					                   .since   = here.since});
+					Spec::Current()->NoteTableRange(here.address, here.size);
+				}
+			}
 		}
 	}
 	return true;
@@ -2032,6 +2513,14 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 				// The normal path's FindTexture clears its layers first. A speculation's packet is a hole that does:
 				// the work after it finds them cleared (speculation-state.h).
 				if (auto* spec = Spec::Current()) {
+					// Not where the normal path's FindTexture leaves every clear of the image pending, whatever its metadata
+					// holds (TextureCache::DccClearLeftPending: 94% of these holes at 5-1, an image of more than one level):
+					// it binds the image uncleared, as here, and so does the commit while the image's validity has not moved
+					// (Spec::State::left_clears). As the normal path's, no other layer of it is asked.
+					if (uint64_t serial = 0, validity = 0; textures.DccClearLeftPending(dep.id, dep.desc, serial, validity)) {
+						spec->left_clears.push_back({image, serial, validity, spec->closed.size()});
+						break;
+					}
 					// (KYTY_SPEC_PREDICT_DCC: not where the normal path's FindTexture was seen to leave the clear pending,
 					// TextureCache::DccClearSticks: the work after the hole finds it cleared still, and a "not cleared" fact
 					// would fail at its commit. Its later uses read the cache, and are holes too.)
@@ -2394,6 +2883,8 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		LiveCensus::Scope miss(LiveCensus::DrawPhase, 0x7ab1e, &held == &table.args ? 10 : 11);
 		prepare();
 		const auto registration_before = buffer_cache.RegistrationEpoch(); // (a speculation's: before its lookup)
+		std::optional<BufferCache::AheadSite> ahead_site; // (the lookup's site: read by a speculation's lookup only)
+		if (spec_state != nullptr) ahead_site.emplace(&held == &table.args ? 4 : 3);
 		const auto result = buffer_cache.ObtainBuffer(address, size, false);
 		region_epochs.fill({UINT64_MAX, 0}); // (its uploads may have moved them)
 		const auto owner  = spec_state != nullptr ? buffer_cache.RegisteredBuffer(address, size)
@@ -2487,7 +2978,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		const bool due_targets   = serials == 1 ? sum_targets : epoch_targets;
 		if (serials != 0 && epoch_targets != sum_targets)
 			LiveCounters::Add(sum_targets ? LiveCounters::SerialsExtra : LiveCounters::SerialsSkipped);
-		if (due_targets && !NativeXprEmitTargets(draw_state, vk_buffer, set)) {
+		if (due_targets && !NativeXprEmitTargets(draw_state, vk_buffer, set, &buffer)) {
 			if (serials == 2 && !sum_targets) TableSerialsUnsafe("targets refused");
 			return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: targets"), TableResult::Native;
 		}
@@ -2937,7 +3428,8 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	m_dispatch_declined = "dispatch: nothing learned";
 	if (catalog == nullptr || FrameCapture::Active() || XprCapture::Enabled()) return false;
 	std::shared_lock<std::shared_mutex> catalog_read;
-	if (Role() != 0) catalog_read = CatalogRead();
+	if (Role() != 0) CatalogGate(Catalog().m_catalog_writer_waiting, CatalogWriterFirst()), catalog_read = CatalogRead();
+	const CatalogReadScope catalog_read_scope(&catalog_read); // (spec_worker_sets)
 	DropStaleCatalog();
 	TableSweepPairs();
 	const auto& sh    = buffer.GetShaders();
@@ -2961,15 +3453,21 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 		return m_dispatch_declined = known->special != nullptr ? known->special : "dispatch: refused", false;
 	if ((Role() == 0 && known->sightings < 2) || known->vs != cs.cs_regs.data_addr) return false;
 	auto& pair = *known;
-	// (The game's 3D view; a dispatch declined below goes the normal way, which notes it too.)
-	if (Role() == 0 && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))
-		FrameGen::NoteScene();
+	// (The game's 3D view; a dispatch declined below goes the normal way, which notes it too. A speculation's thread,
+	// translating ahead of the flips, notes it in its segment, which its commit notes in order (Speculation::After): it
+	// was never noted, and the frame of its commit, as a menu's, waited a second vblank at 120 Hz. A refused dispatch's
+	// note goes with its packet's (Rollback): the hole that runs it notes it.)
+	if (pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash)) {
+		if (Role() == 0) FrameGen::NoteScene();
+		else if (auto* spec = Spec::Current(); spec != nullptr) ++spec->scenes;
+	}
 	// KYTY_FRAMEGEN: the TAA dispatch goes the normal way, whose hook reads its depth and motion-vector images (all
 	// dispatches did: +3 ms a frame at 1-1).
 	if (FrameGen::Enabled() && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))
 		return m_dispatch_declined = "dispatch: frame generation inputs", false;
 	TablePrefetchPair(pair);
 	if (Role() == 0) pair.used_frame = m_context.FrameNumber();
+	else if (auto* spec = Spec::Current(); spec != nullptr) spec->NoteUsedPair(&pair.used_frame); // (as TableTry's)
 	if (Role() == 0) TablePrefetchNext(OwnTable().previous_dispatch, pair);
 	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1f, 0); // census: the dispatches' phases (b)
 	// The dispatch executor's sets retire here too (NativeXprTry collects only the draw executor's): without it they

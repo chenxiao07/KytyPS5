@@ -5,6 +5,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -34,6 +35,7 @@
 #include "device-fault.h"
 #include "local-platform.h"
 #include "slow-log.h"
+#include "speculation-state.h"
 #include "startup-progress.h"
 
 #include <algorithm>
@@ -196,6 +198,13 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 	// unmapped and untracked addresses retain the original load/fault behavior.
 	if (NoGuestMemory(address, sizeof(*value))) {
 		*value = 0;
+	} else if (Spec::On() && PipelineCache::t_no_fault_reads) [[unlikely]] {
+		// (A speculation's program lookup: never a fault, which would wait for the GPU thread under the cache's lock. Set
+		// only under a speculation: mode 0 tests the global, as the base reads no thread-local here.)
+		if (!Libs::LibKernel::Memory::TryReadGuestNoFault(address, value, sizeof(*value))) {
+			PipelineCache::t_no_fault_failed = true;
+			*value                           = 0;
+		}
 	} else if (Libs::LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, value, sizeof(*value))) {
 		LiveCounters::Add(LiveCounters::SrtWatchedReads);
 	} else {
@@ -213,6 +222,59 @@ bool ReadShaderMemorySpan(void*, uint64_t address, uint32_t* values, uint32_t co
 	// null page goes word by word (the readers above).
 	return count >= 2 && count <= (clean ? 1024u : 16u) && !NoGuestMemory(address, uint64_t {count} * 4u) &&
 	       Libs::LibKernel::Memory::TryReadGpuShaderSpan(address, values, count * 4u, clean);
+}
+
+// A guest read can fault into a GPU-thread readback (BufferCache::ReadMemory -> SendCommandSync); never under
+// PipelineCache::m_mutex, which the GPU thread takes for its own lookups: a speculation's thread that faulted in
+// ProgramCache::Get copying a table job's code (pages a level load's DMA had just written) waited for the GPU thread
+// holding it, the GPU thread for it (a mode 4 freeze). Off the GPU thread the program's code is copied here, before the
+// lock, and Get reads the copy. A speculation's thread copies without a fault: code it cannot copy (GPU-written bytes)
+// stays unread, and Get refuses the lookup only where it would read it (UnreadCode); a lookup that finds its
+// permutation reads no code. (The GPU thread reads the code in place: its own fault reads back on it.)
+void CopyShaderCode(ShaderParams& params, std::vector<uint32_t>& code, std::vector<uint32_t>& back_code) {
+	const auto copy = [](std::span<const uint32_t> from, std::vector<uint32_t>& to) {
+		to.resize(from.size());
+		if (from.empty()) return true;
+		if (!GuestGpu::IsTranslatingThread()) {
+			std::memcpy(to.data(), from.data(), from.size_bytes());
+			return true;
+		}
+		return Libs::LibKernel::Memory::TryReadGuestNoFault(reinterpret_cast<uint64_t>(from.data()), to.data(),
+		                                                    from.size_bytes());
+	};
+	if (!copy(params.code, code) || !copy(params.back_code, back_code)) {
+		params.code_unread = true;
+		return;
+	}
+	params.code_address = reinterpret_cast<uint64_t>(params.code.data()); // (Base(): the SRT's shader base stays the guest's)
+	params.code         = code;
+	params.back_code    = back_code;
+}
+
+// A lookup that would read code CopyShaderCode could not copy: refused (the GPU thread looks it up itself). (A worker
+// set's lookup, t_no_fault_reads: t_no_fault_failed, as for an SRT word it cannot read.)
+ShaderProgram UnreadCode() {
+	Spec::Refuse("GPU-written shader code");
+	if (PipelineCache::t_no_fault_reads) PipelineCache::t_no_fault_failed = true;
+	return {};
+}
+
+// The invariant: a speculation (non-GPU) thread never takes a fault that needs the GPU thread. Its lookup holds the
+// catalog read (TableResolveSet), which the GPU thread's CatalogWrite waits for, so PrepareProgramInto's guest reads too
+// are made without a fault there (PrepareNoFault: the code's hash on a miss of the thread's hash cache, the AGC metadata,
+// the vertex tables; ShaderReadGuest); one it could not make refuses the lookup before m_mutex ("worker set: code unread").
+// (Speculation threads run only while the mode is not 0: started after it is set, joined before it is cleared. Mode 0
+// tests the global and calls neither: only the GPU thread looks programs up there.)
+bool PrepareNoFault() {
+	return Spec::On() && GuestGpu::IsTranslatingThread() && !GuestGpu::IsGpuThread();
+}
+// Off the GPU thread (a speculation's): the code copied before the lock (CopyShaderCode). Mode 0: never, as the base.
+bool CopiesCodeFirst() {
+	return Spec::On() && !GuestGpu::IsGpuThread();
+}
+void PrepareUnread() {
+	Spec::Refuse("worker set: code unread");
+	if (PipelineCache::t_no_fault_reads) PipelineCache::t_no_fault_failed = true;
 }
 
 } // namespace
@@ -403,6 +465,22 @@ static bool LoadPlanBytes(const SpilledPlan& in, ShaderRecompiler::IR::ResourceP
 	std::vector<uint8_t> bytes(in.raw);
 	return LocalPlatform::ReadScratchFile(in.file, in.offset, packed.data(), packed.size()) &&
 	       ZstdUnpack(packed, bytes.data(), bytes.size()) && ResourcePlanSerial::Load(bytes, plan, &linear);
+}
+
+// KYTY_TABLE_FORMAT_INDEX (live table_format_index; -1, the default: on under KYTY_SPECULATE=4).
+static bool TableFormatIndexOn() {
+	static auto& index_on = LiveSwitch::Find("table_format_index", -1);
+	const auto   value    = index_on.load(std::memory_order_relaxed);
+	return value >= 0 ? value != 0 : ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+}
+
+// KYTY_TABLE_DEAD_USER_DATA (live table_dead_user_data; mode-toggle.h: on under KYTY_SPECULATE=4, off otherwise): a
+// table mode translation whose user data do not fit the push constants laid out again without the registers only
+// handles the table module emits nothing for read (IR::AllocateBindings). Read where a table translation is asked for
+// (the job's options, the static precompile's): a module made keeps its layout.
+static bool TableDeadUserDataOn() {
+	static auto& on = LiveSwitch::Find("table_dead_user_data", ModeToggle::Default("table_dead_user_data"));
+	return on.load(std::memory_order_relaxed) != 0;
 }
 
 struct PipelineCache::ProgramCache {
@@ -682,9 +760,27 @@ struct PipelineCache::ProgramCache {
 	// Runs a job on the pipeline cache's compile workers (set by PipelineCache).
 	std::function<void(std::function<void()>)> push_job;
 	// The last table mode Get found its permutation still translating (empty, not refused), and that translation's
-	// completion.
-	bool                                     table_pending = false;
-	std::shared_ptr<const std::atomic<bool>> table_waiting;
+	// completion. Mode 0: the members, as the base (only the GPU thread looks programs up). Under a speculation, per
+	// thread (spec_worker_sets: a speculation's set build looks programs up beside the GPU thread; each reads the
+	// answer of its own lookup). (The mode changes only on the GPU thread between submissions, with no speculation
+	// thread running, so a lookup and its answer read the same pair.)
+	bool                                                                table_pending = false;
+	std::shared_ptr<const std::atomic<bool>>                            table_waiting;
+	static inline thread_local bool                                     t_table_pending = false;
+	// (Defined out of the class, below: an inline thread_local shared_ptr member made lld-link fail an instrumented
+	// ThinLTO build with "Associative COMDAT symbol ... table_waiting".)
+	static thread_local std::shared_ptr<const std::atomic<bool>> t_table_waiting;
+	bool&                                     Pending() noexcept { return Spec::On() ? t_table_pending : table_pending; }
+	std::shared_ptr<const std::atomic<bool>>& Waiting() noexcept { return Spec::On() ? t_table_waiting : table_waiting; }
+	void                                      ClearTable() noexcept {
+		if (Spec::On()) {
+			t_table_pending = false;
+			t_table_waiting.reset();
+		} else {
+			table_pending = false;
+			table_waiting.reset();
+		}
+	}
 
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
@@ -829,6 +925,9 @@ struct PipelineCache::ProgramCache {
 	// `prefetch` for threads without the pipeline cache's lock (GetPrefetchProgress, the live report): a warmup beside
 	// the game starts the prefetch once done.
 	std::atomic<Prefetch*> prefetch_live {nullptr};
+	// Whether the prefetch is over, for a game held until it is (PipelineCache::HoldForShaderPrefetch): 0 not yet (or not
+	// started yet), 1 every program translated, 2 none runs (KYTY_SHADER_PREFETCH=0, no inputs, no scratch file).
+	std::atomic<uint32_t> prefetch_end {0};
 
 	// Heap bytes of a prefetched group by part (container capacities, list and string nodes; allocator headers left
 	// out): what keeping every program's plan and infos costs.
@@ -1366,6 +1465,7 @@ struct PipelineCache::ProgramCache {
 				                 "writes them){}", Common::PathToString(path), recorded.empty() ? "" : ": the recording's only");
 				if (recorded.empty()) {
 					ReleaseDiskIndex();
+					prefetch_end.store(2, std::memory_order_release);
 					return;
 				}
 				p.inputs.records.clear();
@@ -1454,6 +1554,7 @@ struct PipelineCache::ProgramCache {
 			if (p.spill == 0) p.spill = LocalPlatform::OpenScratchFile();
 			if (p.spill == 0) {
 				PipelineCacheLog("Shader prefetch: no temporary file for the SPIR-V");
+				prefetch_end.store(2, std::memory_order_release);
 				return;
 			}
 			uint32_t threads = SpareThreads();
@@ -1476,6 +1577,11 @@ struct PipelineCache::ProgramCache {
 			                 p.groups.size(), p.inputs.records.size(), added, ranked, threads, p.gentle_threads,
 			                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
 			p.ready.store(true, std::memory_order_release);
+			// (No program at all, every input the warmup's: no worker reaches the "all" line, so it is written here.)
+			if (p.groups.empty()) {
+				PipelineCacheLog("Shader prefetch: all 0 programs translated (every input the warmup's)");
+				prefetch_end.store(1, std::memory_order_release);
+			}
 			for (uint32_t t = 0; t < threads; ++t) p.threads.emplace_back([this, t] { PrefetchWork(t); });
 			// (KYTY_SHADER_FOLLOW_THREADS: that many helpers, 0 none.)
 			uint32_t helpers = p.by_record.empty() ? 0 : 2;
@@ -1538,6 +1644,7 @@ struct PipelineCache::ProgramCache {
 				                 p.spilled_plans.load(std::memory_order_relaxed),
 				                 p.spilled_plan_bytes.load(std::memory_order_relaxed) >> 20u,
 				                 p.dropped_linear.load(std::memory_order_relaxed));
+				prefetch_end.store(1, std::memory_order_release);
 			}
 		}
 	}
@@ -2008,6 +2115,7 @@ struct PipelineCache::ProgramCache {
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
 		if (entry != programs.end() && !entry->second.warm_code.empty()) {
+			if (params.code_unread) return UnreadCode();
 			if (!std::ranges::equal(params.code, entry->second.warm_code) ||
 			    !std::ranges::equal(params.back_code, entry->second.warm_back_code)) {
 				std::erase_if(by_program, [&](const auto& item) { return item.second.first == &entry->second; });
@@ -2158,6 +2266,7 @@ struct PipelineCache::ProgramCache {
 				return job->push_data_cursor == push_data_cursor && job->specialization == table_specialization;
 			});
 			if (found == jobs.end()) {
+				if (params.code_unread) return UnreadCode();
 				auto job              = std::make_shared<TableJob>();
 				job->specialization   = table_specialization;
 				job->push_data_cursor = push_data_cursor;
@@ -2166,6 +2275,7 @@ struct PipelineCache::ProgramCache {
 				job->user_data         = params.user_data;
 				job->options           = options;
 				job->options.table_mode = true;
+				job->options.table_dead_user_data = TableDeadUserDataOn();
 				job->options.user_data = job->user_data;
 				job->options.back_code = job->back_code;
 				job->options.input_info = {};
@@ -2195,14 +2305,14 @@ struct PipelineCache::ProgramCache {
 					}
 					job->done.store(true, std::memory_order_release);
 				});
-				table_pending = true;
-				table_waiting = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
+				Pending() = true;
+				Waiting() = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 				return {};
 			}
 			const auto job = *found;
 			if (!job->done.load(std::memory_order_acquire)) {
-				table_pending = true;
-				table_waiting = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
+				Pending() = true;
+				Waiting() = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 				return {};
 			}
 			jobs.erase(found);
@@ -2222,10 +2332,13 @@ struct PipelineCache::ProgramCache {
 			}
 			const auto& stored = entry->second.permutations.emplace_back(std::move(permutation));
 			if (!stored.handle) return {};
+			if (TableFormatIndexOn()) // (TableFormatOnlyBuffers' index: KYTY_TABLE_FORMAT_INDEX only, mode 0 as before)
+				by_program.try_emplace(&stored.program, std::pair {&entry->second, &stored});
 			publish_stage(stored.program);
 			stored.program.bindings.AdvancePushData(push_data_cursor);
 			return stored.handle;
 		}
+		if (params.code_unread) return UnreadCode(); // (the prefetch's digest, the translation, the warmup record)
 		// A program met for the first time that the prefetch translated: its plan, materialized for
 		// this draw, and its modules are taken over.
 		if (entry == programs.end()) {
@@ -2746,6 +2859,7 @@ struct PipelineCache::ProgramCache {
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 };
+thread_local std::shared_ptr<const std::atomic<bool>> PipelineCache::ProgramCache::t_table_waiting;
 
 // A pipeline a CompileWorkers thread creates; `done` publishes the finished object.
 struct PipelineCache::PendingComputePipeline {
@@ -3424,8 +3538,13 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 			// (No scene in SceneWaitSeconds: every recorded pipeline, as without scenes.)
 			constexpr int64_t SceneWaitSeconds = 300;
 			programs.warm_phase.store(0, std::memory_order_release);
+			// (A game held for the shader prefetch, KYTY_PREFETCH_WAIT: the scene wait starts once it is let go, or a long
+			// hold would make every recorded pipeline before its first scene.)
+			while (m_game_held.load(std::memory_order_acquire) && !m_warmup_stop.load(std::memory_order_relaxed))
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			const auto scene_wait_begin = std::chrono::steady_clock::now();
 			while (SceneTags::Current() == SceneTags::None && !m_warmup_stop.load(std::memory_order_relaxed) &&
-			       std::chrono::steady_clock::now() - pipelines_begin < std::chrono::seconds(SceneWaitSeconds))
+			       std::chrono::steady_clock::now() - scene_wait_begin < std::chrono::seconds(SceneWaitSeconds))
 				std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			if (!m_warmup_stop.load(std::memory_order_relaxed))
 				WarmScene(SceneTags::Current(), settings.compute_video, true);
@@ -3579,6 +3698,7 @@ void PipelineCache::StartShaderPrefetch(std::vector<std::vector<uint32_t>> recor
 	if ((prefetch != nullptr && std::string_view(prefetch) == "0") || KYTY_BUILD != KYTY_BUILD_RELEASE ||
 	    PipelineCacheTitleId().empty()) {
 		m_program_cache->ReleaseDiskIndex(); // (the warmup's)
+		m_program_cache->prefetch_end.store(2, std::memory_order_release);
 		return;
 	}
 	auto identity = PipelineCacheTitleId() + ShaderInputDeviceSignature(m_graphics.GetPhysicalDeviceProperties());
@@ -3613,6 +3733,61 @@ PipelineCache::PrefetchProgress PipelineCache::GetPrefetchProgress() const {
 	if (prefetch == nullptr || !prefetch->ready.load(std::memory_order_acquire)) return {};
 	const auto total = prefetch->groups.size();
 	return {std::min(prefetch->finished.load(std::memory_order_relaxed), total), total};
+}
+
+bool PipelineCache::PrefetchWaitEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PREFETCH_WAIT");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return on;
+}
+
+// No deadlock: the game is held before its first instruction (no guest thread exists yet, no guest submission, the GPU
+// thread idle), and what the hold waits for needs none of it. The warmup beside the game (TranslateWarmup, and
+// WarmPipelines when not by scene: m_mutex, which the idle GPU thread does not hold, and the driver) and the prefetch (its
+// loader: the input files and the shader cache; its workers and helpers: the recompiler on recorded inputs, the scratch
+// file) read no guest memory and wait for no guest work; the pipelines by scene (the one part that waits for the game,
+// its first scene) come after the prefetch has started and are not waited for here. The window's message loop
+// stays on the main thread (WindowRun), and the progress is painted there by posted tasks, never waited for. Ends
+// early: the prefetch done (1) or not running (2: off, no inputs, no scratch file); else after KYTY_PREFETCH_WAIT_S (a
+// PC short of memory, WaitForMemory, makes no programs play has not met: the hold times out there and the game starts).
+void PipelineCache::HoldForShaderPrefetch(const std::function<void(const PrefetchProgress&)>& show) {
+	if (!PrefetchWaitEnabled()) return;
+	// (KYTY_PREFETCH_WAIT_S: whole seconds, clamped to 1-7200; unset, empty or not a number: 600.)
+	static const int64_t limit = [] {
+		constexpr int64_t Default = 600, Least = 1, Most = 7200;
+		const char*       value   = std::getenv("KYTY_PREFETCH_WAIT_S");
+		if (value == nullptr || *value == '\0') return Default;
+		char*           rest   = nullptr;
+		const long long parsed = std::strtoll(value, &rest, 10);
+		if (rest == value || *rest != '\0') return Default;
+		return std::clamp<int64_t>(parsed, Least, Most);
+	}();
+	auto&      programs = *m_program_cache;
+	const auto begin    = std::chrono::steady_clock::now();
+	PipelineCacheLog("Shader prefetch wait: the game starts once every program is translated (KYTY_PREFETCH_WAIT=1, at "
+	                 "most {} s)",
+	                 limit);
+	uint32_t end = 0;
+	while ((end = programs.prefetch_end.load(std::memory_order_acquire)) == 0 &&
+	       std::chrono::steady_clock::now() - begin < std::chrono::seconds(limit)) {
+		if (show) show(GetPrefetchProgress());
+		std::this_thread::sleep_for(std::chrono::milliseconds(250));
+	}
+	m_game_held.store(false, std::memory_order_release);
+	const double waited   = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+	const auto   progress = GetPrefetchProgress();
+	const auto*  prefetch = programs.prefetch_live.load(std::memory_order_acquire);
+	const size_t cached   = prefetch != nullptr && prefetch->ready.load(std::memory_order_acquire) ? prefetch->cache_loaded : 0;
+	if (end == 1)
+		PipelineCacheLog("Shader prefetch wait: done in {:.1f} s, {} programs translated ({} of them from the prefetch cache)",
+		                 waited, progress.total, cached);
+	else if (end == 2)
+		PipelineCacheLog("Shader prefetch wait: no shader prefetch runs; the game starts after {:.1f} s", waited);
+	else
+		PipelineCacheLog("Shader prefetch wait: timed out after {:.1f} s, {} of {} programs translated; the game starts",
+		                 waited, progress.done, progress.total);
 }
 
 void PipelineCache::WarmPipelines(uint64_t compute_video, bool background, const std::unordered_set<uint64_t>* only) {
@@ -4412,10 +4587,11 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info, bool table_mode,
     std::array<uint32_t, 2> table_portable) {
 	LiveCensus::Scope census(LiveCensus::GraphicsPrograms, 0);
-	m_program_cache->table_pending = false;
-	m_program_cache->table_waiting.reset();
+	m_program_cache->ClearTable();
 	// Reused per thread: every normal-path draw prepares both (their user data were new vectors).
 	thread_local ShaderParams vertex_params, pixel_params;
+	std::optional<ShaderHashNoFaultScope> no_fault; // (PrepareNoFault)
+	if (PrepareNoFault()) no_fault.emplace(true), t_shader_read_failed = false;
 	PrepareProgramInto(vertex_regs, context, user_config, vertex_info, vertex_params);
 	const bool mesh_active   = vertex_info.mesh.threads_num[0] != 0;
 	if (mesh_active) {
@@ -4439,6 +4615,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	if (pixel_active) {
 		PrepareProgramInto(pixel_regs, sh, target_export_mapping, pixel_info, pixel_params);
 	}
+	if (no_fault) {
+		no_fault.reset();
+		if (t_shader_read_failed) return PrepareUnread(), GraphicsPrograms {};
+	}
 	if (context.GetClipControl().clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];
 		const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;
@@ -4452,6 +4632,11 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		clip.half_extent[1] =
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
+	}
+	if (CopiesCodeFirst()) { // (the code before the lock: CopyShaderCode)
+		thread_local std::vector<uint32_t> vertex_code, vertex_back_code, pixel_code, pixel_back_code;
+		CopyShaderCode(vertex_params, vertex_code, vertex_back_code);
+		if (pixel_active) CopyShaderCode(pixel_params, pixel_code, pixel_back_code);
 	}
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor =
@@ -4475,15 +4660,33 @@ uint32_t PipelineCache::TableFormatOnlyBuffers(const void* want, const void* got
 	// (TranslateWarmup) inserts them from its own thread. The callers (TableResolveSet, TableStore) look the
 	// programs up with GetGraphicsPrograms first, which has released it by then (Common::Mutex is recursive anyway).
 	Common::LockGuard lock(m_mutex);
-	const ProgramCache::ProgramKey*  kw = nullptr;
-	const ProgramCache::ProgramKey*  kg = nullptr;
+	// KYTY_TABLE_FORMAT_INDEX (live table_format_index; -1, the default: on under KYTY_SPECULATE=4): the two programs'
+	// sources and permutations from the program index (by_program: a table job's permutation enters it when stored) instead
+	// of a pass over every permutation of every program (~0.8 ms under the cache's lock, on the GPU thread); a program the
+	// index lacks takes the pass.
+	const bool                       use = TableFormatIndexOn();
+	const void*                      kw = nullptr;
+	const void*                      kg = nullptr;
 	const ProgramCache::Permutation* mw = nullptr;
 	const ProgramCache::Permutation* mg = nullptr;
-	for (const auto& [key, entry]: m_program_cache->programs)
-		for (const auto& p: entry.permutations) {
-			if (&p.program == want) mw = &p, kw = &key;
-			if (&p.program == got) mg = &p, kg = &key;
+	bool                             indexed = false;
+	if (use) {
+		const auto& index = m_program_cache->by_program;
+		const auto  fw    = index.find(static_cast<const ShaderRecompiler::IR::CompiledShaderInfo*>(want));
+		const auto  fg    = index.find(static_cast<const ShaderRecompiler::IR::CompiledShaderInfo*>(got));
+		if (fw != index.end() && fg != index.end()) {
+			mw = fw->second.second, kw = fw->second.first;
+			mg = fg->second.second, kg = fg->second.first;
+			indexed = true;
 		}
+	}
+	if (!indexed) {
+		for (const auto& [key, entry]: m_program_cache->programs)
+			for (const auto& p: entry.permutations) {
+				if (&p.program == want) mw = &p, kw = &entry;
+				if (&p.program == got) mg = &p, kg = &entry;
+			}
+	}
 	if (mw == nullptr || mg == nullptr || kw != kg || !mw->table_mode || !mg->table_mode ||
 	    mw->program.bindings.push_data_start_dword != mg->program.bindings.push_data_start_dword)
 		return UINT32_MAX;
@@ -4508,10 +4711,20 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	// Reused per thread: every dispatch prepares one (its user data was a new vector each time).
 	thread_local ShaderParams params;
-	PrepareProgramInto(regs, sh, input_info, params);
+	if (PrepareNoFault()) {
+		const ShaderHashNoFaultScope no_fault {true};
+		t_shader_read_failed = false;
+		PrepareProgramInto(regs, sh, input_info, params);
+		if (t_shader_read_failed) return PrepareUnread(), ShaderProgram {};
+	} else {
+		PrepareProgramInto(regs, sh, input_info, params);
+	}
+	if (CopiesCodeFirst()) { // (the code before the lock: CopyShaderCode)
+		thread_local std::vector<uint32_t> code, back_code;
+		CopyShaderCode(params, code, back_code);
+	}
 	Common::LockGuard lock(m_mutex);
-	m_program_cache->table_pending = false;
-	m_program_cache->table_waiting.reset();
+	m_program_cache->ClearTable();
 	uint32_t          push_data_cursor = 0;
 	g_unevaluated     = unevaluated;
 	const auto program = m_program_cache->Get(params, input_info, push_data_cursor, table_mode, table_portable);
@@ -4918,11 +5131,11 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	return *iter->second;
 }
 bool PipelineCache::TablePending() const {
-	return m_program_cache->table_pending;
+	return m_program_cache->Pending();
 }
 
 std::shared_ptr<const std::atomic<bool>> PipelineCache::TableWaiting() const {
-	return m_program_cache->table_waiting;
+	return m_program_cache->Waiting();
 }
 
 PipelineCache::Pipeline* PipelineCache::TryCreateComputePipeline(const ShaderComputeInputInfo& input_info,

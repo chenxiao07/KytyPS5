@@ -1,3 +1,4 @@
+#include "hoist-watch.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "slow-log.h"
 #include "live-switch.h"
@@ -715,6 +716,17 @@ bool TextureCache::StillResolved(const Image& image, uint64_t serial, uint64_t e
 	       !RegistrationsSince(image.info.data.address, image.info.data.size, epoch);
 }
 
+bool TextureCache::StillResolvedExact(const Image& image, uint64_t serial, uint64_t epoch) const {
+	if (image.serial != serial || !image.registered) return false;
+	if (!RegistrationsSince(image.info.data.address, image.info.data.size, epoch)) return true;
+	const auto& log     = m_registration_log;
+	const auto  address = image.info.data.address, end = image.info.data.End();
+	if (!log.empty() && log.front().epoch > epoch + 1) return false; // (the log does not reach back to the proof)
+	for (auto entry = log.rbegin(); entry != log.rend() && entry->epoch > epoch; ++entry)
+		if (entry->begin < end && address < entry->end) return false;
+	return true;
+}
+
 bool TextureCache::RegistrationsSince(uint64_t address, uint64_t size, uint64_t epoch) const {
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) return true;
@@ -803,6 +815,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	}
 	image.registered = true;
 	++image.registrations;
+	(void)HoistWatch::NoteRegistration(image.info.data.address, image.info.data.size); // (the batch's hoist check: marks it touched)
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
 }
@@ -985,6 +998,12 @@ void TextureCache::FreeGuestAliases(ImageId written) {
 
 void TextureCache::TouchImage(Image& image) {
 	if (auto* spec = Spec::Current()) { // (touched when the speculative translation is committed)
+		// spec_touch_null_skip (under KYTY_SPECULATE=4): the null image
+		// (GetNullImage: no guest memory, never registered) is not one its commit must find still resolved; recorded, its
+		// commit always stopped ("images registered").
+		if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && !image.registered &&
+		    image.info.data.address == 0 && image.info.data.size == 0)
+			return;
 		auto& touched = spec->touched_images;
 		if (touched.empty() || touched.back().first != &image) touched.emplace_back(&image, image.serial);
 		return;
@@ -1129,16 +1148,17 @@ void TextureCache::UntrackImage(ImageId id, const char* why) {
 	}
 }
 
-void TextureCache::UntrackImagePages(Image& image, uint64_t begin, uint64_t end) {
+bool TextureCache::UntrackImagePages(Image& image, uint64_t begin, uint64_t end) {
 	const auto tracked_begin = image.track_addr & ~(TRACKER_PAGE_SIZE - 1);
 	const auto tracked_end =
 	    (image.track_addr_end + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 	begin = std::max(begin, tracked_begin);
 	end   = std::min(end, tracked_end);
 	if (begin >= end) {
-		return;
+		return false;
 	}
-	auto cursor = begin;
+	bool released = false;
+	auto cursor   = begin;
 	for (const auto& [hole_begin, hole_end]: image.untracked_holes) {
 		if (hole_end <= cursor) {
 			continue;
@@ -1148,13 +1168,16 @@ void TextureCache::UntrackImagePages(Image& image, uint64_t begin, uint64_t end)
 		}
 		if (cursor < hole_begin) {
 			m_page_manager.UpdatePageWatchers<false>(cursor, hole_begin - cursor);
+			released = true;
 		}
 		cursor = std::max(cursor, hole_end);
 	}
 	if (cursor < end) {
 		m_page_manager.UpdatePageWatchers<false>(cursor, end - cursor);
+		released = true;
 	}
 	Image::AddRange(image.untracked_holes, begin, end);
+	return released;
 }
 
 void TextureCache::RetrackHoles(Image& image) {
@@ -1219,15 +1242,20 @@ bool TextureCache::PartialDirtyCandidate(const Image& image) {
 // its free layers to the texture streamer, which remaps one layer at a time and tiles textures into it from the CPU
 // while shadows render into others: the whole array went to the GPU again every few seconds (100-270 ms frames) and the
 // rendered layers were lost.
-bool TextureCache::TryInvalidatePartial(Image& image, uint64_t address, uint64_t size,
-                                        uint64_t granule) {
+bool TextureCache::TakesPartialDirty(const Image& image) {
 	const auto& info = image.info;
 	// (With GPU buffer writes over known ranges of it too: a refresh uploads those with the dirty ranges, InitializeImage.
 	// One written all over, or where not known, goes up whole anyway.)
-	if (!PartialDirtyCandidate(image) || !image.registered || !image.IsTracked() ||
-	    image.track_addr != info.data.address || image.track_addr_end != info.data.End() ||
-	    !image.CanTakePartialDirty() || (image.IsBufferModified() && image.BufferModifiedRanges().empty()) ||
-	    image.IsStencilModified()) {
+	return PartialDirtyCandidate(image) && image.registered && image.IsTracked() &&
+	       image.track_addr == info.data.address && image.track_addr_end == info.data.End() &&
+	       image.CanTakePartialDirty() && !(image.IsBufferModified() && image.BufferModifiedRanges().empty()) &&
+	       !image.IsStencilModified();
+}
+
+bool TextureCache::TryInvalidatePartial(Image& image, uint64_t address, uint64_t size,
+                                        uint64_t granule) {
+	const auto& info = image.info;
+	if (!TakesPartialDirty(image)) {
 		return false;
 	}
 	const auto base  = info.data.address;
@@ -1242,8 +1270,12 @@ bool TextureCache::TryInvalidatePartial(Image& image, uint64_t address, uint64_t
 	const auto page_end   = (granule_end + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 	// The released pages are dirty wherever they hold image bytes.
 	image.InvalidateCpuWritePartial(std::max(page_begin, base), std::min(page_end, info.data.End()));
-	UntrackImagePages(image, page_begin, page_end);
-	LiveCounters::Add(LiveCounters::PartialDirtyFaults);
+	// Counted where it released pages only: a write fault into a granule already released (the fault being another
+	// watcher's, a buffer's) marked it again and counted again (in a partial-dirty storm the counter then read about
+	// the write faults' count).
+	if (UntrackImagePages(image, page_begin, page_end)) {
+		LiveCounters::Add(LiveCounters::PartialDirtyFaults);
+	}
 	return true;
 }
 
@@ -3158,6 +3190,58 @@ bool TextureCache::RefreshTextureLevels(ImageId id, const ImageViewInfo& view) {
 	return true;
 }
 
+// (upload_at_copy; textureCache.h) EXACT: the same steps as RefreshTextureLevels' partial path (the range watched again
+// before its bytes are read, so a guest write after the read faults and dirties it; the dirty bytes uploaded; the range
+// marked complete), made ~one frame earlier: right after the guest's copy instead of at the first view. Only levels the
+// image holds (info.resources.levels), whole and on whole pages, as a view's range is grown.
+void TextureCache::UploadLevelAhead(uint64_t vaddr, uint64_t size) {
+	if (size == 0) return;
+	const uint64_t page = TRACKER_PAGE_SIZE;
+	const uint64_t from = vaddr & ~(page - 1), to = (vaddr + size + page - 1) & ~(page - 1);
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(from, to - from, false)) {
+		auto* found = m_slot_images.try_get(id);
+		if (found == nullptr) continue;
+		auto&       image = *found;
+		const auto& info  = image.info;
+		if (!LevelRefreshCandidate(image) || !image.IsPartiallyCpuDirty() || image.IsMaybeCpuDirty() ||
+		    image.track_addr != info.data.address || image.track_addr_end != info.data.End())
+			continue;
+		const uint64_t lo = std::max(vaddr, info.data.address) - info.data.address;
+		const uint64_t hi = std::min(vaddr + size, info.data.End()) - info.data.address;
+		if (lo >= hi) continue;
+		const auto levels = info.resources.levels;
+		uint64_t   first = UINT64_MAX, last = 0;
+		for (uint32_t level = 0; level < levels; ++level) {
+			const auto& mip = info.mip_layout[level];
+			if (mip.size == 0 || mip.offset >= hi || mip.offset + mip.size <= lo) continue;
+			first = std::min(first, mip.offset);
+			last  = std::max(last, mip.offset + mip.size);
+		}
+		if (first >= last) continue; // (bytes of no level the image holds)
+		for (bool grew = true; grew;) { // (the levels sharing those bytes, whole, as ViewLevelBytes)
+			grew = false;
+			for (uint32_t level = 0; level < levels; ++level) {
+				const auto& mip = info.mip_layout[level];
+				if (mip.size == 0 || mip.offset >= last || mip.offset + mip.size <= first) continue;
+				if (mip.offset < first || mip.offset + mip.size > last) {
+					first = std::min(first, mip.offset);
+					last  = std::max(last, mip.offset + mip.size);
+					grew  = true;
+				}
+			}
+		}
+		const uint64_t begin = info.data.address + first, end = info.data.address + std::min(last, info.data.size);
+		if (begin >= end || begin % page != 0 || end % page != 0) continue;
+		if (!IntersectsRanges(image.CpuDirtyRanges(), begin, end)) continue; // (already current)
+		RetrackHoles(image, begin, end);
+		g_partial_fail = "";
+		if (!UploadImagePartial(image, begin, end)) continue; // (left dirty: the view's own refresh uploads it)
+		image.staged_ring = nullptr;
+		image.RefreshRangeComplete(begin, end);
+	}
+}
+
 void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	if (!stencil.Valid()) {
 		EXIT("TextureCache: invalid stencil association range\n");
@@ -3283,6 +3367,10 @@ void TextureCache::HoldLayers(ImageInfo& info, uint32_t& first) {
 			return;
 		}
 	}
+	// (A speculation's thread building an image set (spec_worker_sets) only reads: growing the image inserts, tracks,
+	// copies and uploads through the buffer cache's staging, all the GPU thread's. The set is refused; the GPU thread
+	// builds it and grows the image there.)
+	if (ReadOnly()) return ReadOnlyFail("worker set: hold layers");
 	// (Guest memory current before its bytes are uploaded, as FindImage does.)
 	m_buffer_cache.DrainGuestReadback(grown.data.address, grown.data.size);
 	std::scoped_lock lock {m_lock};
@@ -3324,7 +3412,82 @@ void TextureCache::HoldLayers(ImageInfo& info, uint32_t& first) {
 	first = static_cast<uint32_t>((view_address - grown.data.address) / slice);
 }
 
+// spec_worker_sets: FindImage on a speculation's thread building an image set (ReadOnlyScope). The exact
+// match FindImage's first lookups find (the last image of the same backing, by the page table or the region), registered,
+// current and holding the view's resources; anything FindImage would make, merge, free, alias or replace is a failure.
+// (DrainGuestReadback is a speculation's no-op anyway: its ranges are obtained again when it is committed.)
+ImageId TextureCache::FindImageReadOnly(const ImageDesc& desc, bool exact_format) {
+	if (desc.type != BindingType::Texture) return ReadOnlyFail("worker set: not a texture"), ImageId {};
+	std::scoped_lock lock {m_lock};
+	if (desc.info.data.Empty()) {
+		const auto type = desc.info.type == Prospero::ImageType::kColor1D || desc.info.type == Prospero::ImageType::kColor3D
+		                      ? desc.info.type
+		                      : Prospero::ImageType::kColor2D;
+		const auto found = m_null_images.find(std::pair {desc.info.pixel_format, type});
+		if (found == m_null_images.end()) return ReadOnlyFail("worker set: new null image"), ImageId {};
+		return found->second;
+	}
+	ImageId result {};
+	if (kyty_local_preparation_lookup_mode.load(std::memory_order_relaxed) != 0) {
+		ImagePageTable::PageRange pages {};
+		if (ImagePageTable::TryGetPageRange(desc.info.data.address, desc.info.data.size, pages)) {
+			if (const auto* owners = m_image_page_table.Find(pages.first)) {
+				owners->ForEach([&](ImageId id) {
+					const auto* image = m_slot_images.try_get(id);
+					if (image != nullptr && SameBacking(image->info, desc.info, exact_format)) result = id;
+				});
+			}
+		}
+	}
+	if (!result)
+		for (const auto id: FindImagesInRegion(desc.info.data.address, desc.info.data.size, false))
+			if (SameBacking(m_slot_images[id].info, desc.info, exact_format)) result = id;
+	if (!result) {
+		if (t_pending_images_ok && !desc.info.HasMetadata()) return t_pending_hit = true, ImageId {}; // (spec_worker_images)
+		return ReadOnlyFail("worker set: no image"), ImageId {};
+	}
+	auto& image = m_slot_images[result];
+	if (!image.registered || image.depth_id || image.binding.needs_rebind)
+		return ReadOnlyFail("worker set: image not current"), ImageId {};
+	if (exact_format && image.info.pixel_format != desc.info.pixel_format)
+		return ReadOnlyFail("worker set: image format"), ImageId {};
+	if (!image.info.resources.Contains(desc.info.resources)) return ReadOnlyFail("worker set: image resources"), ImageId {};
+	TouchImage(image); // (a speculation's: noted for its commit)
+	return result;
+}
+
+// spec_worker_sets: FindTexture on a set-building speculation's thread (ReadOnlyScope): the view of a current image that
+// needs no upload, no metadata clear and no new view, which the normal path already acquired for sampling.
+vk::ImageView TextureCache::FindTextureReadOnly(ImageId id, const ImageDesc& desc) {
+	std::scoped_lock lock {m_lock};
+	auto*            image = m_slot_images.try_get(id);
+	if (image == nullptr) return ReadOnlyFail("worker set: image gone"), vk::ImageView {};
+	if (desc.type != BindingType::Texture) return ReadOnlyFail("worker set: storage"), vk::ImageView {};
+	if (!image->info.data.Empty()) {
+		if (!image->registered || image->depth_id || image->binding.needs_rebind)
+			return ReadOnlyFail("worker set: image not current"), vk::ImageView {};
+		if (image->info.HasMetadata()) return ReadOnlyFail("worker set: metadata"), vk::ImageView {};
+		if (RefreshPending(*image, desc)) {
+			if (t_pending_images_ok && !image->depth_id) return t_pending_hit = true, vk::ImageView {}; // (spec_worker_images)
+			return ReadOnlyFail("worker set: upload"), vk::ImageView {};
+		}
+	}
+	if (!image->usage.texture) {
+		if (t_pending_images_ok && !image->info.HasMetadata() && !image->depth_id) return t_pending_hit = true, vk::ImageView {};
+		return ReadOnlyFail("worker set: first sampling"), vk::ImageView {};
+	}
+	const auto view = image->FindView(desc.view_info, true);
+	if (!view) {
+		if (t_pending_images_ok && !image->info.HasMetadata() && !image->depth_id) return t_pending_hit = true, vk::ImageView {};
+		return ReadOnlyFail("worker set: new view"), vk::ImageView {};
+	}
+	// (The sampled aspects AcquireImages notes are the draw's binding state, which the set build resets: none here.)
+	TouchImage(*image);
+	return view;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool may_fail) {
+	if (ReadOnly()) return FindImageReadOnly(desc, exact_format);
 	size_t         slow_candidates = 0;
 	SlowLog::Scope slow([&](double ms) {
 		std::printf("SLOW FindImage %.1f ms addr=0x%llx size=0x%llx type=%u fmt=%u %ux%ux%u levels=%u layers=%u "
@@ -3702,6 +3865,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	if (ReadOnly()) return FindTextureReadOnly(id, desc);
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	SlowLog::Scope   slow([&](double ms) {
@@ -3747,6 +3911,37 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	return view;
 }
 
+bool TextureCache::AcquireTargetAtCommit(ImageId id, uint64_t serial, uint32_t base_level, uint32_t level_count,
+                                         uint32_t base_layer, uint32_t layer_count, bool clear) {
+	std::scoped_lock lock {m_lock};
+	auto*            image = m_slot_images.try_get(id);
+	if (image == nullptr || image->serial != serial || !image->registered || image->depth_id || image->binding.needs_rebind)
+		return false;
+	TouchImage(*image);
+	image->MarkGpuModified();
+	const bool depth = image->info.IsDepth();
+	auto&      used  = depth ? image->usage.depth_target : image->usage.render_target;
+	if (!used) ++image->validity;
+	used = true;
+	if (!depth && image->info.metadata.kind == ImageMetadataKind::Dcc) {
+		// (The draw's own metadata, as the worker found it equal to the image's.)
+		ImageDesc desc;
+		desc.type                  = BindingType::RenderTarget;
+		desc.info                  = image->info;
+		desc.view_info.base_level  = base_level;
+		desc.view_info.level_count = level_count;
+		desc.view_info.base_layer  = base_layer;
+		desc.view_info.layer_count = layer_count;
+		PrepareDccClear(id, desc);
+	} else if (clear) {
+		return false; // (only a color DCC clear is the acquisition's)
+	}
+	RefreshImage(id);
+	CommitGpuWrite(*image);
+	TrackImageDownload(id, *image);
+	return image->SafeToDownload();
+}
+
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.type != BindingType::RenderTarget) {
 		EXIT("TextureCache: invalid color-target binding\n");
@@ -3767,6 +3962,38 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	const auto view = image.FindView(desc.view_info);
 	NameImageBinding(m_graphics, image, view, desc.type, desc.view_info);
 	return view;
+}
+
+bool TextureCache::AcquireDepthDrawAtCommit(ImageId id, uint64_t serial, const ImageDesc& desc, DepthDrawState* out) {
+	{
+		std::scoped_lock lock {m_lock};
+		auto*            image = m_slot_images.try_get(id);
+		if (image == nullptr || image->serial != serial || !image->registered || image->depth_id || image->binding.needs_rebind ||
+		    !image->info.IsDepth() || desc.info.HasStencil())
+			return false;
+	}
+	// (The normal path's acquisition: its own upload choice, metadata and entry, and the draw's view.)
+	const auto view = FindDepthTarget(id, desc);
+	{
+		std::scoped_lock lock {m_lock};
+		auto&            image  = m_slot_images[id];
+		const auto&      info   = image.info;
+		const auto       layers = std::max(info.resources.layers, 1u);
+		bool             clean  = !image.IsCpuDirty();
+		if (!clean && image.IsPartiallyCpuDirty() && info.data.size % layers == 0) {
+			const uint64_t slice = info.data.size / layers;
+			const uint64_t begin = info.data.address + slice * desc.view_info.base_layer;
+			clean = !IntersectsRanges(image.CpuDirtyRanges(), begin, begin + slice * desc.view_info.layer_count);
+		}
+		if (!clean || !(image.info.metadata == desc.info.metadata)) return false;
+	}
+	*out      = {};
+	out->view = view;
+	if (!view) return false;
+	const auto& metadata = desc.info.metadata;
+	if (metadata.kind == ImageMetadataKind::Htile)
+		out->meta_cleared = IsMetaCleared(metadata.range.address, desc.view_info.base_layer, &out->fill, &out->fill_known);
+	return true;
 }
 
 vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
@@ -4867,14 +5094,85 @@ TextureCache::ReadOnlyBufferOverlap TextureCache::ClassifyReadOnlyBufferOverlap(
 	return images.empty() ? ReadOnlyBufferOverlap::None : ReadOnlyBufferOverlap::CpuSampled;
 }
 
+namespace {
+
+// [begin, end) inside the union of sorted, disjoint [first, second) ranges.
+[[nodiscard]] bool RangesCover(const std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t begin,
+                               uint64_t end) {
+	for (const auto& [from, to]: ranges) {
+		if (begin >= end) break;
+		if (to <= begin) continue;
+		if (from > begin) return false;
+		begin = to;
+	}
+	return begin >= end;
+}
+
+} // namespace
+
+// KYTY_WRITE_WINDOW_IMAGES (live write_window_images; -1, the default: on under KYTY_SPECULATE=4; 1 on, 0 off). A buffer the CPU
+// rewrites every frame under a large image's released granule (the shadow-map pool's free layers stay released until a
+// binding covers them, RefreshDepthLayers) faulted one page at a time every frame: any image over the window refused it
+// (~1 boot in 6: 150-380 write faults a frame, ~1 ms). An image lets the window through when a write into it would take it
+// partially, every window page holding its bytes is among its released holes (it watches none of them) and its bytes
+// there are already dirty: the window hides no write from it and marks nothing of it dirty that was not (the bytes the GPU
+// rendered stay outside its dirty ranges). Off: any image refuses.
+bool TextureCache::WriteWindowPassesImages(const ImageIds& images, uint64_t begin, uint64_t size) const {
+	static auto& on    = LiveSwitch::Find("write_window_images", -1);
+	const int64_t mode = on.load(std::memory_order_relaxed);
+	if (mode == 0 || (mode < 0 && ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4)) {
+		return false;
+	}
+	const auto end = begin + size;
+	for (const auto id: images) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr) {
+			continue;
+		}
+		const auto& info = image->info;
+		if (!TakesPartialDirty(*image)) {
+			return false;
+		}
+		const auto page_begin = std::max(begin, info.data.address & ~(TRACKER_PAGE_SIZE - 1));
+		const auto page_end   = std::min(end, (info.data.End() + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1));
+		if (page_begin >= page_end || !RangesCover(image->untracked_holes, page_begin, page_end)) {
+			return false;
+		}
+		const auto byte_begin = std::max(begin, info.data.address);
+		const auto byte_end   = std::min(end, info.data.End());
+		if (byte_begin >= byte_end || !image->IsPartiallyCpuDirty() ||
+		    !RangesCover(image->CpuDirtyRanges(), byte_begin, byte_end)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// The CPU-dirty notice a write fault into their released pages gave (validity, the CPU-dirty epoch): the ranges are dirty
+// already (WriteWindowPassesImages, under the same lock), so they do not change.
+void TextureCache::NoteWriteWindowImages(const ImageIds& images, uint64_t begin, uint64_t size) {
+	for (const auto id: images) {
+		auto* image = m_slot_images.try_get(id);
+		if (image == nullptr) {
+			continue;
+		}
+		const auto& info = image->info;
+		image->InvalidateCpuWritePartial(std::max(begin, info.data.address), std::min(begin + size, info.data.End()));
+	}
+}
+
 bool BufferCache::TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size) {
 	if (!GuestRange {begin, size}.Valid()) return false;
 	// Follow image -> buffer-region -> page lock order. Hold the image lock
 	// through invalidation so registration cannot introduce an alias in between.
 	std::unique_lock lock(m_texture_cache.m_lock);
-	if (!m_texture_cache.FindImagesInRegion(begin, size, true).empty()) return false;
+	// (An image over the window refuses it, but with write_window_images one partially dirty there that watches none of
+	// its pages: TextureCache::WriteWindowPassesImages.)
+	const auto images = m_texture_cache.FindImagesInRegion(begin, size, true);
+	if (!images.empty() && !m_texture_cache.WriteWindowPassesImages(images, begin, size)) return false;
 	// (Nor a page a pending image download holds: its write fault goes to the texture cache, which lets it go.)
 	if (m_texture_cache.HasPendingDownload(begin, size)) return false;
+	if (!images.empty()) m_texture_cache.NoteWriteWindowImages(images, begin, size);
 	// Registration takes the image lock and then this region lock, so handing the image
 	// lock over once the region lock is held keeps the check and the state change atomic
 	// for it, while the page protection change no longer blocks image lookups.
@@ -5092,6 +5390,24 @@ bool TextureCache::DccClearSticks(uint64_t address) {
 	if (predict.load(std::memory_order_relaxed) == 0) return false;
 	std::scoped_lock lock {m_lock};
 	return m_dcc_sticky.contains(address);
+}
+
+// PrepareDccClear's no-op, read only: its record update changes nothing (the image's metadata the view's, the record
+// there a DCC one: nothing inserted, retyped or moved), and its clear is never applied (levels != 1, range.size == 0:
+// the image's own, the same at the commit while its serial is). FindTexture's checks before it as the caller's
+// (registered, no depth_id, no rebind).
+bool TextureCache::DccClearLeftPending(ImageId id, const ImageDesc& desc, uint64_t& serial, uint64_t& validity) {
+	if (desc.info.metadata.kind != ImageMetadataKind::Dcc) return false;
+	std::scoped_lock lock {m_lock};
+	const auto*      image = m_slot_images.try_get(id);
+	if (image == nullptr || image->info.data.Empty() || !image->registered || image->depth_id ||
+	    image->binding.needs_rebind || !(image->info.metadata == desc.info.metadata))
+		return false;
+	const auto found = m_surface_metas.find(desc.info.metadata.range.address);
+	if (found == m_surface_metas.end() || found->second.type != MetaDataInfo::Type::Dcc) return false;
+	serial   = image->serial; // (under the lock: the slot not reused before the serial is read)
+	validity = image->validity.load(std::memory_order_relaxed);
+	return image->info.resources.levels != 1 || desc.info.metadata.range.size == 0;
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {

@@ -128,19 +128,8 @@ void ValidateNativeProgram(const IR::Program& program) {
 		Fail(program, "native shader-data layout is inconsistent");
 	}
 
-	const auto planning_only_handle = [&](const IR::Inst& handle) {
-		return !handle.Uses().empty() &&
-		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
-			       const auto op = use.user->GetOpcode();
-			       if (op != IR::ValueOpcode::LoadAddressU32 &&
-			           op != IR::ValueOpcode::ReadConstBuffer) {
-				       return false;
-			       }
-			       const auto index = use.user->Flags<IR::MemoryFlags>().index;
-			       return index < program.memory_info.size() &&
-			              program.memory_info[index].planning_only;
-		       });
-	};
+	// (IR::PlanningOnlyHandle: AllocateBindings's table-mode user data rule asks the same.)
+	const auto planning_only_handle = [&](const IR::Inst& handle) { return IR::PlanningOnlyHandle(program, handle); };
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			const auto dense = inst.Flags<uint32_t>();

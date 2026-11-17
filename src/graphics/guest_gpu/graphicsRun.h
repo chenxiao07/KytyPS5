@@ -45,6 +45,8 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// (upload_at_copy: a queued command that takes the render lock as the draw path does.)
+	[[nodiscard]] RenderContext& Renderer() noexcept { return m_renderer; }
 	// KYTY_SERVE_IN_WAITS (live serve_in_waits, default 1): where the GPU thread runs the guest commands queued for it (a
 	// game thread's readback fault among them) besides before each packet: 1 while it waits for the upload worker (only
 	// from the drains told to serve, never inside a command), 2 after each segment a speculation commits, 4 while it
@@ -60,6 +62,21 @@ public:
 
 	// Offline tools (xpr_replay_tests) run the renderer on their own thread.
 	static void SetOfflineGpuThread(bool gpu_thread) noexcept;
+
+	// Tripwire (spec_thread_gpu_faults): the fault this thread's exception handler serves (KytyExceptionHandler around
+	// HandleGpuFault; null outside one), returning the one it replaces. A SendCommandSync made under it from a host thread
+	// other than the GPU thread (a speculation's; not a guest thread) is a fault that waits for the GPU thread: counted
+	// and logged, then served as before. The invariant says it never happens: it must read 0. It is the only
+	// unconditional rule: the GPU thread serves queued commands in some of its waits only: a flip's (WAIT_FLIP_DONE,
+	// FlipQueue::Wait: live serve_in_flip_waits, default 1, 2face264), the upload worker's from the drains told to serve
+	// (KYTY_SERVE_IN_WAITS & 1), after a committed segment (& 2) and a speculation's chunk's, outside a command (& 4)
+	// (serve_in_waits: 7, all three, under KYTY_SPECULATE=4; 1 otherwise); not in its other waits (joining the workers
+	// in Speculation::Stop / ~Speculation, any plain lock: PipelineCache m_mutex, CatalogWrite, the texture cache m_lock,
+	// the descriptor pools' alloc_mutex).
+	struct FaultSite {
+		uint64_t vaddr = 0, rip = 0, rsp = 0;
+	};
+	static const FaultSite* NoteFault(const FaultSite* site) noexcept;
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;

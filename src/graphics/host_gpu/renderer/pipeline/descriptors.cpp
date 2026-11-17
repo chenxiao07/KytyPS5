@@ -855,7 +855,8 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	// invalid; it is bound as a null image like an unrepresentable one. A storage view loses its writes
 	// that way, which beats the game ending over one binding (they exited before).
 	const auto bind_null = [&](const std::string& report) -> TextureBinding {
-		if (m_unrepresentable_textures.insert(address).second) {
+		// (spec_worker_sets: a read-only lookup that found nothing is a refusal, not an image that could not be made.)
+		if (!TextureCache::ReadOnly() && m_unrepresentable_textures.insert(address).second) {
 			if (storage) {
 				std::printf("TextureCache: %s, storage view bound as null\n", report.c_str());
 				std::fflush(stdout);
@@ -1101,18 +1102,36 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	// (A texture or storage image the GPU cannot make, its memory full: a null image, not the end of the emulator; a
 	// storage view loses its writes until the collector made room. Issue #53: a 320x180x61 storage image of the cinematic
 	// mode on a 16 GB RX 7800 XT whose video memory the 4K targets had filled.)
+	TextureCache::ClearPendingHit();
 	auto id = texture_cache.FindImage(desc, shader_conversion, true);
+	if (!id && TextureCache::ReadOnly() && !storage && std::exchange(TextureCache::t_pending_hit, false)) {
+		// (spec_worker_images: left to the commit; the null image holds the slot meanwhile.)
+		auto pending         = bind_null("");
+		pending.pending      = true;
+		pending.pending_desc = std::make_shared<const TextureCache::ImageDesc>(desc);
+		return pending;
+	}
 	if (!id) {
 		return bind_null(fmt::format("no image could be made for the texture: {}x{} layers={} levels={} format={} "
 		                             "addr=0x{:016x} size=0x{:x}",
 		                             width, height, desc.info.resources.layers, desc.info.resources.levels,
 		                             static_cast<uint32_t>(format), desc.info.data.address, desc.info.data.size));
 	}
-	auto*      image               = &texture_cache.GetImage(id);
+	// (A speculation's thread: FindImageReadOnly's id may have been erased by the GPU thread since its lock was dropped;
+	// try_get, never GetImage's ending slot check, and a refusal when it is gone.)
+	const auto get_image = [&](ImageId image_id) -> Image* {
+		if (!TextureCache::ReadOnly()) return &texture_cache.GetImage(image_id);
+		auto* found = texture_cache.TryGetImage(image_id);
+		if (found == nullptr) TextureCache::ReadOnlyFail("worker set: image gone");
+		return found;
+	};
+	auto* image = get_image(id);
+	if (image == nullptr) return {ImageId {}, nullptr, std::move(desc)};
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
 		id    = image->depth_id;
-		image = &texture_cache.GetImage(id);
+		image = get_image(id);
+		if (image == nullptr) return {ImageId {}, nullptr, std::move(desc)};
 	} else if (image->info.IsDepth()) {
 		if (storage) {
 			return bind_null(fmt::format("depth target bound as a storage image addr=0x{:016x}", address));
@@ -1230,7 +1249,8 @@ void RenderExecutor::PrepareBindingsInto(const ShaderStageRuntime& runtime,
 	prepared.images.reserve(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
-		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+		// (spec_worker_sets: a speculation's read-only set build marks nothing bound: the normal path's per-draw state.)
+		if (!TextureCache::ReadOnly()) BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		prepared.images.push_back(std::move(binding));
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
@@ -1339,6 +1359,15 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	EXIT_IF(images.size() != program.info.images.size());
 	auto&      texture_cache = m_context.GetTextureCache();
 	const auto acquirable    = [&](const TextureBinding& binding) { return AcquirableImage(binding); };
+	// spec_worker_sets: a speculation's read-only set build resolves once; an image that does not hold is a failure
+	// (the loop below resolves again, unbinds and binds null: the normal path's).
+	if (TextureCache::ReadOnly()) {
+		if (TextureCache::ReadOnlyFailed() != nullptr) return;
+		if (!std::ranges::all_of(images, acquirable)) return TextureCache::ReadOnlyFail("worker set: not acquirable");
+		if (!AcquireImages(prepared) && TextureCache::ReadOnlyFailed() == nullptr)
+			TextureCache::ReadOnlyFail("worker set: not acquirable");
+		return;
+	}
 	// (Diagnostics: the views that take each other's away, once per binding that falls back, for a few bindings.)
 	bool       reported = false;
 	const auto report   = [&] {
@@ -1418,6 +1447,8 @@ bool RenderExecutor::AcquireImages(PreparedBindings& prepared) {
 	const auto& program       = *prepared.runtime->program;
 	auto&       images        = prepared.images;
 	auto&       texture_cache = m_context.GetTextureCache();
+	// (Once a call: a speculation's ReadOnlyScope is set around the whole set build, never inside it. Mode 0: the global.)
+	const bool  read_only     = TextureCache::ReadOnly();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto& binding = images[i];
 		// An earlier acquisition took this image away: RebindImages resolves and acquires again.
@@ -1440,7 +1471,27 @@ bool RenderExecutor::AcquireImages(PreparedBindings& prepared) {
 			if (desc.type == TextureCache::BindingType::Storage) {
 				desc.view_info.level_count = 1;
 			}
+			TextureCache::ClearPendingHit();
 			binding.image_view = texture_cache.FindTexture(binding.image_id, desc);
+			if (read_only && desc.type == TextureCache::BindingType::Texture &&
+			    std::exchange(TextureCache::t_pending_hit, false)) {
+				// (spec_worker_images: left to the commit; the null image of its type holds the slot meanwhile.)
+				binding.pending      = true;
+				binding.pending_desc = std::make_shared<const TextureCache::ImageDesc>(binding.desc);
+				auto null_desc       = NullTextureDesc(resource, TextureCache::BindingType::Texture);
+				binding.image_id     = texture_cache.FindImage(null_desc);
+				binding.desc         = null_desc;
+				binding.image_view =
+				    binding.image_id ? texture_cache.FindTexture(binding.image_id, null_desc) : vk::ImageView {};
+			}
+		}
+		// (spec_worker_sets: a read-only acquisition changes no usage: FindTextureReadOnly checked it is noted already. Before
+		// GetImage: on a speculation's thread the id may be null (spec_worker_images' null image of a type not made yet:
+		// FindImageReadOnly refused it) or its slot erased by the GPU thread since; GetImage's slot check ends the process
+		// there (a crash at launch). The set fails; the hole makes the null image on the GPU thread.)
+		if (read_only) {
+			if (TextureCache::ReadOnlyFailed() != nullptr || !binding.image_id || !binding.image_view) return false;
+			continue;
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;

@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include <array>
+#include <deque>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -61,11 +62,17 @@ public:
 	// `releasing`: the caller unmaps or decommits the range right after (munmap, free,
 	// memory pool decommit), not a range about to receive a mapping.
 	void               UnmapMemory(uint64_t vaddr, uint64_t size, bool releasing = false);
+	// batch_map_syncs: a guest batch's ranges in one GPU-thread command each way (KernelBatchMap2).
+	void MapMemoryBatch(const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
+	void UnmapMemoryBatch(const std::vector<std::pair<uint64_t, uint64_t>>& ranges, bool releasing = false);
 	// The game freed the range and keeps it mapped (LibKernel::Memory::NoteGameFree): queued for the GPU thread, whose
 	// commands run before any later submission (and between the packets of the one under way), without waiting. The
 	// buffers it holds go as for an unmap (BufferCache::DropFreedRange). KYTY_ENGINE_FREE_BUFFERS=0: nothing; =2: their
 	// GPU-written bytes dropped instead of read back first.
 	void               FreedByGame(uint64_t vaddr, uint64_t size);
+	// upload_at_copy: from the streamer's thread, right after its copy into [vaddr, vaddr + size): the GPU thread uploads
+	// the streamed levels there ahead of their first view (TextureCache::UploadLevelAhead). Never waits.
+	void               PostLevelUploadAhead(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
 	void BeginAliasWrite() noexcept;
 	void EndAliasWrite() noexcept;
@@ -91,6 +98,9 @@ public:
 	void               AdvanceFrame();
 
 private:
+	// The GPU thread's side of MapMemory / UnmapMemory (and of their batch forms).
+	void MapOnGpuThread(uint64_t vaddr, uint64_t size);
+	void UnmapOnGpuThread(uint64_t vaddr, uint64_t size, bool releasing);
 	void                      RunCollectors();
 	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault);
 	// One window of the fault's mapped range: [window_begin, window_begin + window_size) within it.
@@ -128,6 +138,23 @@ private:
 	static constexpr uint64_t UnmapGranuleBits = 14, UnmapLeafBits = 16;
 	std::unordered_map<uint64_t, std::unique_ptr<uint64_t[]>> m_unmap_epochs;
 	uint64_t m_unmap_latest = 0; // the latest unmap's mapping epoch
+	// spec_unmap_list (under KYTY_SPECULATE=4 only, the mode read at each use): the unmaps
+	// in epoch order, rounded out to granules (GPU
+	// thread); `m_unmap_log_dropped` the newest epoch dropped from its front. The commit's Changed asks for one `since` (the
+	// result's mapping epoch) over every range it read, ~40,000 a frame in an area transition, each a hash lookup and a
+	// granule walk; from the merged ranges unmapped after `since` (built once a (since, latest unmap)) each is a span test
+	// and a binary search, whatever the range's size. Only inside Changed (t_unmap_list_site): other callers ask with their
+	// own epochs, which would rebuild the list between the commit's checks.
+	struct UnmapLogEntry {
+		uint64_t epoch, begin, end;
+	};
+	std::deque<UnmapLogEntry>                          m_unmap_log;
+	uint64_t                                           m_unmap_log_dropped = 0;
+	mutable std::vector<std::pair<uint64_t, uint64_t>> m_unmap_list;
+	mutable uint64_t                                   m_unmap_list_since = UINT64_MAX, m_unmap_list_latest = 0;
+	mutable bool                                       m_unmap_list_ok = false;
+	// 1: unmapped (by the list), 0: not, -1: the list cannot answer.
+	[[nodiscard]] int UnmappedSinceByList(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept;
 	// The spans whose part of RefreshBdaRanges' list (registered buffers' mapped parts) may have changed since it
 	// last ran: mapping changes over a registered buffer and buffers (un)registered. Only their tracker regions are
 	// collected again: the whole list (0.4 ms over ~2200 buffers) was, several times a frame while the game streams

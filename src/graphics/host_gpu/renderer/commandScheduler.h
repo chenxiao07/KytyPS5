@@ -144,6 +144,8 @@ public:
 	void DiscardRecorded(Recorder& recorder);
 	// One recorded buffer dropped (DiscardRecorded's, and an empty one's: KYTY_SPECULATE_KEEP_PASS).
 	void DiscardOne(Recorder& recorder, const Recorder::Recorded& recorded);
+	// spec_stop_as_hole: the first `count` recorded buffers dropped (a segment the GPU thread runs itself).
+	void DiscardFirst(Recorder& recorder, size_t count);
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	// SubmitRecorded's worker packets path.
 	uint64_t SpliceRecorded(Recorder& recorder, size_t count);

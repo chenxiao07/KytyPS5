@@ -57,6 +57,11 @@ public:
 	// `may_fail` (a sampled texture's lookup): no image when the GPU cannot make one (its memory full, or more layers or
 	// bytes than the format allows), an invalid id, and none tried again for that memory for a while.
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false, bool may_fail = false);
+	[[nodiscard]] ImageId FindImageReadOnly(const ImageDesc& desc, bool exact_format); // (t_read_only)
+	// spec_commit_targets: a speculation's target acquired at its commit, as FindRenderTarget / FindDepthTarget do
+	// (the color DCC clear over the view's layers when `clear`); false: not that image any more, or not safe after.
+	[[nodiscard]] bool AcquireTargetAtCommit(ImageId id, uint64_t serial, uint32_t base_level, uint32_t level_count,
+	                                         uint32_t base_layer, uint32_t layer_count, bool clear);
 	// An image of exactly this guest texture is registered (what FindImage takes first; no lookup side effects).
 	[[nodiscard]] bool          HoldsImage(const ImageInfo& info);
 	// The layers of a one-level array a sampled view reads, `info` (slices one after another: descriptors.cpp
@@ -74,12 +79,38 @@ public:
 	// The image (of `serial`) still registered, and no image registered or unregistered over its pages since `epoch`
 	// (a speculation's work used it: speculation.cpp).
 	[[nodiscard]] bool StillResolved(const Image& image, uint64_t serial, uint64_t epoch) const;
+	// spec_exact_image_stop (GPU thread): as StillResolved, the pages' stamps refined by the registration log's exact ranges:
+	// no image registered or unregistered over the image's bytes since `epoch` (false when the log does not reach back).
+	[[nodiscard]] bool StillResolvedExact(const Image& image, uint64_t serial, uint64_t epoch) const;
 	[[nodiscard]] uint64_t ResolutionEpoch() const {
 		return m_resolution_epoch.load(std::memory_order_acquire);
 	}
 	// Moves whenever an image's slot is erased (EraseRetired, the only place): an id allocated when it was E is still
 	// allocated while it is E.
 	[[nodiscard]] uint64_t EraseEpoch() const { return m_erase_epoch.load(std::memory_order_acquire); }
+	// spec_worker_sets (mode 4): a speculation's image set built on its own thread resolves read only
+	// (ReadOnlyScope): FindImage finds an exact, registered image or fails; FindTexture an existing view of a current
+	// image the normal path already acquired for sampling, or fails. Nothing is made, merged, freed, refreshed or
+	// drained; the first failure's reason is kept (ReadOnlyFailed) and the caller refuses the set.
+	static inline thread_local bool        t_read_only        = false;
+	static inline thread_local const char* t_read_only_failed = nullptr;
+	// spec_worker_images: a sampled texture not made or not ready may be left to the commit (a hit, no refusal).
+	static inline thread_local bool t_pending_images_ok = false;
+	static inline thread_local bool t_pending_hit       = false;
+	struct ReadOnlyScope {
+		ReadOnlyScope() { t_read_only = true; t_read_only_failed = nullptr; }
+		~ReadOnlyScope() { t_read_only = false; }
+		KYTY_CLASS_NO_COPY(ReadOnlyScope);
+	};
+	static void ReadOnlyFail(const char* why) noexcept { if (t_read_only_failed == nullptr) t_read_only_failed = why; }
+	[[nodiscard]] static const char* ReadOnlyFailed() noexcept { return t_read_only_failed; }
+	// The normal path's tests: the global first. Both flags are set only on a speculation's thread, which runs only
+	// while the mode is not 0 (started after it is set, joined before it is cleared), so mode 0 reads no thread-local
+	// here, as the base.
+	[[nodiscard]] static bool ReadOnly() noexcept { return Spec::On() && t_read_only; }
+	static void               ClearPendingHit() noexcept {
+		if (Spec::On()) t_pending_hit = false;
+	}
 	// Only reuses discovery. FindTexture still refreshes contents and selects the current view.
 	[[nodiscard]] bool TryReuseSampledImage(ImageId id, const ImageDesc& desc, uint64_t& epoch);
 	// TryReuseSampledImage without the resolution-epoch proof, for caches that must
@@ -110,6 +141,7 @@ public:
 	[[nodiscard]] ImageId FindImageAt(uint64_t address, uint32_t width, uint32_t height,
 	                                  vk::Format format = vk::Format::eUndefined, uint32_t* count = nullptr);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
+	[[nodiscard]] vk::ImageView FindTextureReadOnly(ImageId id, const ImageDesc& desc); // (t_read_only)
 	// Whether FindTexture with `desc` uploads anything first: guest bytes the CPU wrote, a GPU buffer write over them or
 	// over the stencil plane. A sampled view of a texture whose levels below it stay dirty (RefreshTextureLevels) needs
 	// its own levels' bytes only. Caller holds no lock (the render thread's images).
@@ -119,6 +151,19 @@ public:
 	}
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
+	// spec_depth_layers2: a layered depth target's draw acquired at a speculation's commit as the normal path does at the
+	// draw (FindDepthTarget: the layers' upload, the metadata, the HTile entry), then its HTile clear state as the normal
+	// path reads it next (IsMetaCleared with the fill, after the acquisition). False when the image is not the one the
+	// worker left (serial, registration, a depth link, a rebind, stencil), or the draw's layers are not CPU-clean after the
+	// acquisition: the segment stops, and what was done is the normal path's own first step for this draw (its re-run
+	// finds nothing to do).
+	struct DepthDrawState {
+		vk::ImageView view;                 // (FindDepthTarget's, as the normal path's draw gets it)
+		bool          meta_cleared = false;
+		uint32_t      fill         = 0;
+		bool          fill_known   = false;
+	};
+	[[nodiscard]] bool AcquireDepthDrawAtCommit(ImageId id, uint64_t serial, const ImageDesc& desc, DepthDrawState* out);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);
@@ -179,6 +224,11 @@ public:
 
 	void MapMemory(uint64_t address, uint64_t size);
 	void UnmapMemory(uint64_t address, uint64_t size);
+	// upload_at_copy (GPU thread, takes m_lock): the guest has just copied a streamed level's bytes into
+	// [vaddr, vaddr + size) (the streamer's apply, eboot+0x901459): each streamed image there (a level-refresh candidate,
+	// partially dirty) has the held levels those bytes touch watched again and their dirty bytes uploaded now, as
+	// RefreshTextureLevels does at its first view of them, so that view finds them current.
+	void UploadLevelAhead(uint64_t vaddr, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
 	// KYTY_TEXTURE_OFFLOAD(_PROBE) (texture-offload.h): the guest bytes of clean sampled textures probed for touches, or
@@ -311,10 +361,17 @@ private:
 	void                      UntrackImageTail(ImageId id);
 	// Partial CPU writes of large images (KYTY_PARTIAL_IMAGE_DIRTY). Caller holds m_lock.
 	[[nodiscard]] static bool PartialDirtyCandidate(const Image& image);
+	// A CPU write into the image now would take it partially (TryInvalidatePartial's precondition).
+	[[nodiscard]] static bool TakesPartialDirty(const Image& image);
 	// `granule`: the released span grows to these boundaries (counted from the image start).
 	[[nodiscard]] bool TryInvalidatePartial(Image& image, uint64_t address, uint64_t size,
 	                                        uint64_t granule);
-	void               UntrackImagePages(Image& image, uint64_t begin, uint64_t end);
+	// True when it released a page the image still watched.
+	bool               UntrackImagePages(Image& image, uint64_t begin, uint64_t end);
+	// KYTY_WRITE_WINDOW_IMAGES (BufferCache::TryInvalidateCpuWriteWindow): every image over [begin, begin + size) lets the
+	// CPU write window through; then their CPU-dirty notice, their dirty ranges unchanged.
+	[[nodiscard]] bool WriteWindowPassesImages(const ImageIds& images, uint64_t begin, uint64_t size) const;
+	void               NoteWriteWindowImages(const ImageIds& images, uint64_t begin, uint64_t size);
 	void               RetrackHoles(Image& image);
 	// The holes' pages inside [begin, end) only (page-aligned); the others stay released.
 	void               RetrackHoles(Image& image, uint64_t begin, uint64_t end);
@@ -446,6 +503,11 @@ public:
 	// such a use consumes the clear).
 	void               NoteDccClear(uint64_t address, bool sticks);
 	[[nodiscard]] bool DccClearSticks(uint64_t address);
+	// Whether FindTexture's PrepareDccClear with `desc` would change nothing and clear nothing of image `id` whatever its
+	// metadata record holds (more than one level, or an empty metadata range: its pending clears stay pending, and the
+	// normal path binds it uncleared). Read only, under m_lock. `validity`: the image's then (a record change
+	// PrepareDccClear would make moves it).
+	[[nodiscard]] bool DccClearLeftPending(ImageId id, const ImageDesc& desc, uint64_t& serial, uint64_t& validity);
 
 private:
 	std::atomic<uint64_t>                             m_meta_epoch {1};

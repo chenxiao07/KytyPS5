@@ -306,7 +306,7 @@ bool FormatsCompatible(vk::Format base, vk::Format view) noexcept {
 
 } // namespace ImageViewOps
 
-vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
+vk::ImageView Image::FindView(const ImageViewInfo& view_info, bool find_only) {
 	const auto& image      = backing;
 	auto        normalized = view_info;
 	const bool  is_storage = static_cast<bool>(normalized.usage & vk::ImageUsageFlagBits::eStorage);
@@ -356,6 +356,7 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 			return cached.view;
 		}
 	}
+	if (find_only) return nullptr;
 
 	vk::ImageViewUsageCreateInfo usage {};
 	usage.usage = image.usage;

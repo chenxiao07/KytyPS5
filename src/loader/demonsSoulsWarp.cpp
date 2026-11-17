@@ -746,6 +746,25 @@ void ShowNotice(std::string message, int seconds) {
 	Show(std::move(message), seconds);
 }
 
+bool Place(float x, float y, float z, float yaw) {
+#if defined(_WIN32) || defined(__linux__)
+	uint64_t ctrl = 0, body = 0;
+	if (!IsPlayerBuild() || !FindPlayer(&ctrl, &body) || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+	    !std::isfinite(yaw))
+		return false;
+	{
+		std::lock_guard lock(g_glide.mutex);
+		g_glide.active = false; // (a glide under way stops)
+	}
+	const float at[3] {x, y, z};
+	WarpPlayer(at, yaw);
+	return true;
+#else
+	(void)x, (void)y, (void)z, (void)yaw;
+	return false;
+#endif
+}
+
 bool PlayerPlace(float xyz[3], float* yaw) {
 #if defined(_WIN32) || defined(__linux__)
 	uint64_t ctrl = 0, body = 0;

@@ -22,6 +22,14 @@ static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t 
 	return candidate <= range_end && size <= range_end - candidate;
 }
 
+// A live switch's value, -1 (its default) meaning `on4` under KYTY_SPECULATE=4 and 0 otherwise. (Every platform's:
+// KernelBatchMap2 reads it.)
+static int64_t ModeFourDefault(const std::atomic<int64_t>& value, int64_t on4) {
+	const auto v = value.load(std::memory_order_relaxed);
+	if (v >= 0) return v;
+	return ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? on4 : 0;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 // (A placeholder split or coalesce, counted with its time: placeholder_calls, placeholder_kt.)
 static bool PlaceholderFree(void* vaddr, uint64_t size, DWORD type) {
@@ -38,6 +46,98 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 
 // Kyty.Trim's trim of a parked range: GuestAddressSpace::TrimParked while the address space lives (below).
 static void TrimParkedRange(uint64_t vaddr, uint64_t size);
+// (trim_idle's bound: the bytes queued for Kyty.Trim not trimmed yet; over live trim_idle_cap_mb, 2048 the default, a chunk
+// no longer waits for the GPU thread's idle, which a stretch with the GPU thread always busy never gives.)
+static std::atomic<uint64_t> g_trim_backlog_bytes {0};
+// A parked whole view released off the game's thread (memory.cpp: under the guest memory operations' lock, through
+// GuestAddressSpace::ReleaseParkedView).
+static void ReleaseParkedView(uint64_t vaddr, uint64_t size);
+static bool TryReleaseParkedView(uint64_t vaddr, uint64_t size); // (release_gate)
+// KYTY_PARK_WHOLE_VIEWS (live park_whole_views; -1, the default: 50 under KYTY_SPECULATE=4, 0 otherwise; 0 off): N > 0:
+// a guest unmap of a whole view (UnmapOne How::Whole, and a view emptied of its last mapping, How::Release) parks the view
+// and queues its release, which Kyty.Release makes N ms later or after.
+static int64_t ParkWholeViewsMs() {
+	static auto& value = LiveSwitch::Find("park_whole_views", -1);
+	return ModeFourDefault(value, 50);
+}
+// KYTY_RELEASE_GATE (live release_gate; -1, the default: on under KYTY_SPECULATE=4, off otherwise; 1 on, 0 off): a
+// parked view's release starts only when no guest thread waits on the guest memory-operations lock and the lock is free.
+// (It replaces a wait for the GPU thread's idle, which is when the game's job threads are busiest: in a Demon's Souls
+// area transition a job thread's virtual-range reserves waited 21 ms of an 83 ms frame on releases.) Off: a due release
+// is made at once.
+static bool ReleaseGateOn() {
+	static auto& value = LiveSwitch::Find("release_gate", -1);
+	return ModeFourDefault(value, 1) != 0;
+}
+// (release_gate's bound, live release_gate_cap_mb, 1024 the default: with more parked than that, a release waits its turn on
+// the lock as without the gate; the gate's own wait has no end while guest threads keep the lock busy.)
+static uint64_t ReleaseGateCapBytes() {
+	static auto& value = LiveSwitch::Find("release_gate_cap_mb", 1024);
+	return static_cast<uint64_t>(std::max<int64_t>(value.load(std::memory_order_relaxed), 0)) << 20u;
+}
+class ParkedViewReleaser {
+public:
+	static void Queue(uint64_t vaddr, uint64_t size) {
+		auto& r = Get();
+		{
+			std::lock_guard lock(r.m_mutex);
+			r.m_views.push_back({vaddr, size, std::chrono::steady_clock::now()});
+			r.m_parked_bytes += size;
+		}
+		r.m_ready.notify_one();
+	}
+
+private:
+	struct View {
+		uint64_t                              vaddr = 0, size = 0;
+		std::chrono::steady_clock::time_point parked {};
+	};
+	static ParkedViewReleaser& Get() {
+		static auto* releaser = new ParkedViewReleaser; // (never destroyed: its thread may outlive static destructors)
+		return *releaser;
+	}
+	ParkedViewReleaser() {
+		std::thread([this] {
+			LocalPlatform::SetThreadName("Kyty.Release");
+			for (;;) {
+				View view {};
+				{
+					std::unique_lock lock(m_mutex);
+					m_ready.wait(lock, [this] { return !m_views.empty(); });
+					view = m_views.front();
+				}
+				const auto delay = std::chrono::milliseconds(std::max<int64_t>(ParkWholeViewsMs(), 1));
+				std::this_thread::sleep_until(view.parked + delay);
+				if (ReleaseGateOn()) {
+					while (!TryReleaseParkedView(view.vaddr, view.size)) {
+						bool over = false;
+						{
+							std::lock_guard lock(m_mutex); // (not held across the release: a guest call parking a view takes it)
+							over = m_parked_bytes > ReleaseGateCapBytes();
+						}
+						if (over) {
+							ReleaseParkedView(view.vaddr, view.size); // (the bound: queued behind the guest's calls)
+							break;
+						}
+						std::this_thread::sleep_for(std::chrono::microseconds(200));
+					}
+					std::lock_guard lock(m_mutex);
+					m_views.pop_front();
+					m_parked_bytes -= view.size;
+					continue;
+				}
+				ReleaseParkedView(view.vaddr, view.size);
+				std::lock_guard lock(m_mutex);
+				m_views.pop_front();
+				m_parked_bytes -= view.size;
+			}
+		}).detach();
+	}
+	std::mutex              m_mutex;
+	std::condition_variable m_ready;
+	std::deque<View>        m_views;
+	uint64_t                m_parked_bytes = 0; // (release_gate's bound)
+};
 
 // Ranges parked in their views (GuestBackingStore::UnmapOne) taken out of the working set by a thread of its own: mapped,
 // their pages stayed counted in use (~1.5 GB of the game's freed streaming memory at a time), and dropping them costs
@@ -60,6 +160,7 @@ public:
 			std::lock_guard lock(trimmer->m_mutex);
 			trimmer->m_ranges.emplace_back(vaddr, size);
 		}
+		g_trim_backlog_bytes.fetch_add(size, std::memory_order_relaxed);
 		trimmer->m_ready.notify_one();
 	}
 
@@ -75,7 +176,10 @@ private:
 					m_ready.wait(lock, [this] { return !m_ranges.empty(); });
 					ranges.swap(m_ranges);
 				}
-				for (const auto& [vaddr, size]: ranges) TrimParkedRange(vaddr, size);
+				for (const auto& [vaddr, size]: ranges) {
+					TrimParkedRange(vaddr, size);
+					g_trim_backlog_bytes.fetch_sub(size, std::memory_order_relaxed);
+				}
 				ranges.clear();
 			}
 		}).detach();
@@ -716,6 +820,8 @@ public:
 		enum class How { Whole, Split, Park, Release };
 		const auto park_mode = kyty_local_park_unmaps.load(std::memory_order_relaxed);
 		const bool park_new  = park_mode != 0;
+		const bool park_whole    = ParkWholeViewsMs() > 0; // (park_whole_views)
+		bool       release_later = false;
 		MapEntry   old {};
 		uint64_t   view_base = 0, view_size = 0;
 		How        how = How::Whole;
@@ -737,7 +843,7 @@ public:
 			view_size             = view->second;
 			const bool whole_view = old.vaddr == view_base && old.size == view_size;
 			const bool exact      = vaddr == old.vaddr && size == old.size;
-			how                   = !whole_view ? How::Park : exact ? How::Whole : park_new ? How::Park : How::Split;
+			how = !whole_view ? How::Park : exact ? (park_whole ? How::Park : How::Whole) : park_new ? How::Park : How::Split;
 			BackingWriteFence fence(*this);
 			InvalidateMappingLookup();
 			MapsErase(entry);
@@ -752,7 +858,13 @@ public:
 					                               old.backing_offset + (right - old.vaddr), old.mode}));
 				}
 				const auto view_end = view_base + view_size;
-				if (const auto live = m_maps.lower_bound(view_base); live == m_maps.end() || live->first >= view_end) {
+				const auto live  = m_maps.lower_bound(view_base);
+				const bool empty = live == m_maps.end() || live->first >= view_end;
+				if (empty && park_whole) {
+					// (park_whole_views: the emptied view stays mapped, parked whole; Kyty.Release releases it.)
+					ParkUnlocked(vaddr, size, view_base, view_end);
+					release_later = true;
+				} else if (empty) {
 					how = How::Release;
 					m_parked.erase(m_parked.lower_bound(view_base), m_parked.lower_bound(view_end));
 					m_views.erase(view);
@@ -762,6 +874,12 @@ public:
 			}
 		}
 
+		if (how == How::Park && release_later) {
+			ParkedViewReleaser::Queue(view_base, view_size);
+			if (parked != nullptr) *parked = true;
+			if (placeholder_preserved != nullptr) *placeholder_preserved = true;
+			return true;
+		}
 		if (how == How::Park) {
 			// The range keeps its protection: the guest has no mapping there (a map over it splits the view first), and the
 			// emulator's reads and writes of guest memory find none either (m_maps). Made no-access, ~0.5 us per 4 KiB page
@@ -1603,6 +1721,17 @@ public:
 		ReserveGuestRegions();
 		m_backing = new GuestBackingStore(backing_size);
 		g_trim_space.store(this, std::memory_order_release);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (SerialPressureGateOn()) {
+			m_serial_sampler = std::thread([this] {
+				LocalPlatform::SetThreadName("Kyty.MemPressure");
+				while (!m_serial_stop.load(std::memory_order_acquire)) {
+					SampleSerialPressure();
+					std::this_thread::sleep_for(std::chrono::milliseconds(100));
+				}
+			});
+		}
+#endif
 		if (!m_backing->IsAvailable()) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			EXIT("could not reserve %" PRIu64 " MB for guest direct memory. Windows commits\n"
@@ -1616,6 +1745,10 @@ public:
 	}
 
 	~GuestAddressSpace() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		m_serial_stop.store(true, std::memory_order_release);
+		if (m_serial_sampler.joinable()) m_serial_sampler.join();
+#endif
 		g_trim_space.store(nullptr, std::memory_order_release);
 		delete m_backing;
 		m_backing = nullptr;
@@ -1880,6 +2013,33 @@ public:
 	// RAM. Each guard is a gap other threads read stale bytes in: at the Tower of Latria's start ~1 a frame with guards
 	// everywhere, none with these pages' no access (KYTY_READ_GUARD_RACES=1); and 16 GB PCs spend whole sessions around
 	// 2 GB left (issue #159: 2.0-2.5 GB the median), so from 2 GB, leaving at 3, they flickered as before the hot pages.
+	// protect_serial_pressure's sample (Kyty.MemPressure, every 100 ms; never a protect's): short of memory below 6 GiB of free
+	// RAM or 4 GiB of commit left, or while the hot pages' pressure holds; no longer short only at 8 GiB / 6 GiB (2 GiB of
+	// hysteresis). The 6 GiB entry is the park code's 4 GiB floor (the bug checks' low-memory precondition) plus 2 GiB: the
+	// broad wait is in force before that floor even if 2 GiB go in one sample. An unreadable figure counts as short.
+	void SampleSerialPressure() {
+		constexpr uint64_t GiB       = uint64_t {1} << 30u;
+		const uint64_t     available = LocalPlatform::AvailablePhysicalMemory();
+		const auto         commit    = LocalPlatform::SystemCommit();
+		// (was before hot: a HotReadsPressure that raises both between the two loads is then seen as hot, never cleared.)
+		const bool         was       = m_serial_pressure.load(std::memory_order_acquire);
+		const bool         hot       = m_hot_pressure.load(std::memory_order_acquire);
+		bool               next      = true;
+		if (available != 0 && commit.limit != 0)
+			next = was ? hot || available < 8 * GiB || commit.available < 6 * GiB
+			           : hot || available < 6 * GiB || commit.available < 4 * GiB;
+		if (next != was) m_serial_pressure.store(next, std::memory_order_release);
+		// (The staleness watchdog's stamp (SerialBroad) after the result: a fresh stamp never stands beside an older result.)
+		m_serial_stamp.store(GetTickCount64(), std::memory_order_release);
+		if (next == was) return;
+		static uint32_t reports = 0; // (this thread's only)
+		if (reports++ < 16)
+			std::printf("Memory: %llu MiB free, %llu MiB of commit left: protection changes wait for %s "
+			            "(KYTY_PROTECT_SERIAL_PRESSURE)\n",
+			            static_cast<unsigned long long>(available >> 20u),
+			            static_cast<unsigned long long>(commit.available >> 20u),
+			            next ? "any map or unmap" : "maps and unmaps in their page-table pages only");
+	}
 	bool HotReadsPressure() {
 		static const uint64_t minimum = [] {
 			const char* value = std::getenv("KYTY_HOT_READS_MIN_AVAIL_MB");
@@ -1892,6 +2052,8 @@ public:
 		const bool next = pressure ? available < minimum + (uint64_t {512} << 20u) : available < minimum;
 		if (next != pressure) {
 			m_hot_pressure.store(next, std::memory_order_relaxed);
+			// (protect_serial_pressure: hot-reads pressure brings the broad wait back at once, before CoolHotReads drains.)
+			if (next) m_serial_pressure.store(true, std::memory_order_release);
 			static std::atomic<uint32_t> reports {0};
 			if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
 				std::printf("Memory: %llu MiB left on the PC: the pages read back %s\n",
@@ -1973,6 +2135,7 @@ public:
 	                VirtualMemory::Mode               mode,
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
 		LiveTrace::SlowOsCallScope slow(LiveTrace::OsMapBacking, vaddr, size);
+		BatchEntry(); // (batch_busy_once)
 		// (Offloaded ranges of the memory mapped given back first: the new view would not fault.)
 		TextureOffload::OnBackingMapped(GetBackingBase() + backing_offset, size);
 		MaterializeParked(vaddr, size);
@@ -1980,14 +2143,14 @@ public:
 		{
 			ExclusiveLock lock(m_mutex);
 			// (Guest maps and unmaps run one at a time: another one over the range is only waited for here.)
-			m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(vaddr, size); });
+			if (!t_batch_section) m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(vaddr, size); });
 			if (!ConsumeDeferredUnlocked(vaddr, size, &split)) {
 				if (failure_reason != nullptr) {
 					*failure_reason = GuestBackingStore::FailureReason::AddressRangeUnavailable;
 				}
 				return false;
 			}
-			m_busy.emplace_back(vaddr, vaddr + size);
+			if (!t_batch_section) m_busy.emplace_back(vaddr, vaddr + size); // (batch_busy_once: its section's)
 		}
 		// The system calls without the lock (BusyUnlocked): the trackers' protections of other ranges go on.
 		const auto called     = __rdtsc();
@@ -2005,9 +2168,9 @@ public:
 			} else {
 				RestoreSplitUnlocked(split, vaddr, size);
 			}
-			EraseBusyUnlocked(vaddr, vaddr + size);
+			if (!t_batch_section) EraseBusyUnlocked(vaddr, vaddr + size);
 		}
-		m_busy_done.notify_all();
+		if (!t_batch_section) m_busy_done.notify_all();
 		return mapped;
 	}
 
@@ -2033,6 +2196,7 @@ public:
 					busy_begin = vaddr;
 					busy_end   = vaddr + size;
 					m_backing->ViewSpan(vaddr, size, &busy_begin, &busy_end);
+					if (t_batch_section) break; // (batch_busy_once: its section's)
 					if (!BusyUnlocked(busy_begin, busy_end - busy_begin)) {
 						m_busy.emplace_back(busy_begin, busy_end);
 						break;
@@ -2055,9 +2219,9 @@ public:
 						spans    = AddFreedUnlocked(freed);
 						unmapped = true;
 					}
-					EraseBusyUnlocked(busy_begin, busy_end);
+					if (!t_batch_section) EraseBusyUnlocked(busy_begin, busy_end);
 				}
-				m_busy_done.notify_all();
+				if (!t_batch_section) m_busy_done.notify_all();
 				// (The free placeholders around them made one without the lock: guest maps and unmaps, the only users of
 				// the free list, run one at a time.)
 				CoalesceSpans(spans);
@@ -2256,11 +2420,51 @@ private:
 	// one section: their prototype PTEs are shared): two reporters of #5 still bug-checked with v20261018, whose waits
 	// were per page-table page; no measurable cost (an RTX 5090 desktop and an RTX 3080 laptop, 1-1 routes A-B-A).
 	// KYTY_PROTECT_SERIAL=0: the per page-table page waits only.
-	[[nodiscard]] bool BusyUnlocked(uint64_t vaddr, uint64_t size) const {
-		static const bool serial = [] {
-			const char* value = std::getenv("KYTY_PROTECT_SERIAL");
-			return value == nullptr || *value != '0';
+	// protect_serial_pressure (env KYTY_PROTECT_SERIAL_PRESSURE; unset: on under KYTY_SPECULATE=4, off otherwise; =0 / 1
+	// force it; KYTY_PROTECT_SERIAL set overrides it): the any-map-anywhere wait only while the PC is short of memory (the
+	// precondition of the #5 / #50 / #91 bug checks), the per page-table page wait always (KYTY_PROTECT_SERIAL=0 took render
+	// protect 11.5 -> 3.5 us a call, no bug check at ~49 GB free). KYTY_PROTECT_SERIAL=0 forces the narrow wait, any other
+	// value the broad one, as before; mode 0, or the gate off: broad. 'Short' is m_serial_pressure, sampled every 100 ms by
+	// Kyty.MemPressure (SampleSerialPressure), never by a protect; a sample older than 300 ms counts as short. The switch
+	// toward broad needs no barrier: a protect runs its system call under the shared lock (ProtectTransient), and a map or
+	// unmap registers its busy range under the exclusive lock, so a map / unmap that begins after the flag rose waits for
+	// every protect still running (narrow ones included) to leave, and every protect after it sees the flag and its busy
+	// range and waits; only pairs already overlapping when the flag rose (both begun under the narrow rule) finish as they
+	// began. (ArmReadGuard's first VirtualProtect runs without the lock under either rule, as before.)
+	[[nodiscard]] static int ProtectSerialEnv() { // (-1 unset, 0 narrow, 1 broad)
+		static const int value = [] {
+			const char* v = std::getenv("KYTY_PROTECT_SERIAL");
+			return v == nullptr || *v == '\0' ? -1 : *v == '0' ? 0 : 1;
 		}();
+		return value;
+	}
+	[[nodiscard]] static bool SerialPressureGateOn() {
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+		return false; // (no sampler outside Windows: the broad wait, and batch_busy_once, off by default, stays allowed)
+#else
+		static const bool on = [] {
+			const char* v      = std::getenv("KYTY_PROTECT_SERIAL_PRESSURE");
+			const char* mode   = std::getenv("KYTY_SPECULATE");
+			const bool  wanted = v != nullptr && *v != '\0' ? *v != '0' : mode != nullptr && mode[0] == '4' && mode[1] == '\0';
+			// (Not with the texture offload: it gives backing pages real no-access and discards them at any free RAM.)
+			return ProtectSerialEnv() < 0 && wanted && TextureOffload::GetMode() != TextureOffload::Mode::Offload;
+		}();
+		return on;
+#endif
+	}
+	[[nodiscard]] bool SerialBroad() const {
+		if (const int forced = ProtectSerialEnv(); forced >= 0) return forced == 1;
+		if (!SerialPressureGateOn() || ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return true;
+		if (m_serial_pressure.load(std::memory_order_acquire)) return true;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// (Staleness watchdog: a sample older than 300 ms, e.g. Kyty.MemPressure starved among busy threads, counts as short:
+		// the broad wait until the sampler runs again. GetTickCount64 reads shared user data, no system call.)
+		if (GetTickCount64() - m_serial_stamp.load(std::memory_order_acquire) > 300) return true;
+#endif
+		return false;
+	}
+	[[nodiscard]] bool BusyUnlocked(uint64_t vaddr, uint64_t size) const {
+		const bool serial = SerialBroad();
 		if (serial && !m_busy.empty()) return true;
 		constexpr uint64_t PageTablePage = uint64_t {2} << 20u;
 		for (const auto& [begin, end]: m_busy) {
@@ -2273,13 +2477,34 @@ private:
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 public:
+	// park_whole_views: Kyty.Release's release of a parked view (its caller holds the guest memory operations' lock, as a
+	// guest map that materializes one does).
+	void ReleaseParkedView(uint64_t vaddr, uint64_t size) { MaterializeParked(vaddr, size); }
+
 	// Kyty.Trim's trim of a parked range (VirtualUnlock), 16 MiB at a time, each busy meanwhile: no map or unmap runs in
 	// its page-table pages then, nor it during theirs (it ran unlocked before, during a view's map again too: one of the
 	// overlaps of the bug check above). No lock is held during the trim.
+	// KYTY_TRIM_IDLE (live trim_idle; -1, the default: on under KYTY_SPECULATE=4, off otherwise; 1 on, 0 off): with
+	// every protection change waiting for any busy range (BusyUnlocked), a chunk held busy while the GPU thread works made
+	// its protects wait (8.9 ms of an 83 ms frame in a Demon's Souls area transition). A chunk now starts only while the
+	// GPU thread sits in its idle wait (GpuIdle) and nothing waits on a busy range: a state, no timer; the parked memory
+	// stays in the working set meanwhile (the backlog, g_trim_backlog_bytes).
 	void TrimParked(uint64_t vaddr, uint64_t size) {
-		constexpr uint64_t Chunk = uint64_t {16} << 20u;
+		constexpr uint64_t Chunk       = uint64_t {16} << 20u;
+		static auto&       idle_switch = LiveSwitch::Find("trim_idle", -1);
 		for (uint64_t at = vaddr, end = vaddr + size; at < end;) {
 			const uint64_t next = std::min(end, (at & ~(Chunk - 1u)) + Chunk);
+			if (const auto idle = idle_switch.load(std::memory_order_relaxed);
+			    idle > 0 || (idle < 0 && ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4)) {
+				static auto& cap   = LiveSwitch::Find("trim_idle_cap_mb", 2048);
+				const auto   ready = [&] {
+					return (GpuIdle::g_idle.load(std::memory_order_acquire) &&
+					        m_busy_waiters.load(std::memory_order_acquire) == 0) ||
+					       g_trim_backlog_bytes.load(std::memory_order_relaxed) >
+					           (static_cast<uint64_t>(std::max<int64_t>(cap.load(std::memory_order_relaxed), 0)) << 20u);
+				};
+				while (!ready()) std::this_thread::sleep_for(std::chrono::microseconds(200));
+			}
 			{
 				ExclusiveLock lock(m_mutex);
 				m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(at, next - at); });
@@ -2302,10 +2527,12 @@ private:
 
 	// (With m_mutex held shared.) Returns once no map or unmap is changing [vaddr, vaddr + size).
 	void WaitNotBusy(std::shared_lock<std::shared_mutex>& lock, uint64_t vaddr, uint64_t size) {
-		if (!BusyUnlocked(vaddr, size)) return;
+		if (t_batch_section || !BusyUnlocked(vaddr, size)) return; // (batch_busy_once: its own section)
 		LiveCounters::Add(LiveCounters::AddressSpaceBusyWaits);
 		const auto start = __rdtsc();
+		m_busy_waiters.fetch_add(1, std::memory_order_acq_rel); // (trim_idle: a thread waits on a busy range)
 		m_busy_done.wait(lock, [&] { return !BusyUnlocked(vaddr, size); });
+		m_busy_waiters.fetch_sub(1, std::memory_order_acq_rel);
 		LiveCounters::Add(LiveCounters::AddressSpaceBusyWaitKt, (__rdtsc() - start) >> 10u);
 	}
 
@@ -2314,6 +2541,61 @@ private:
 		EXIT_IF(it == m_busy.end());
 		m_busy.erase(it);
 	}
+
+public:
+	// batch_busy_once (KernelBatchMap2): the batch thread's busy section, N entries long.
+	static inline thread_local bool     t_batch_section = false;
+	static inline thread_local uint32_t t_batch_count = 0, t_batch_per = 0;
+	static constexpr uint64_t           BatchBegin = 0, BatchEnd = 1; // (a range nothing maps: any busy range stops all)
+	// (A section's busy range [0, 1) stops protection changes only under the broad wait; under the narrow one its maps, whose
+	// own ranges it doesn't register, would go unwaited even per page-table page: off with KYTY_PROTECT_SERIAL=0, and off
+	// whenever protect_serial_pressure is on, so a section never spans a switch from broad to narrow.)
+	[[nodiscard]] static bool BatchSectionsAllowed() {
+		return ProtectSerialEnv() != 0 && !SerialPressureGateOn();
+	}
+	void BatchSectionBegin(uint32_t per) {
+		t_batch_per = per;
+		OpenBatchSection();
+	}
+	void BatchSectionEnd() {
+		if (t_batch_section) CloseBatchSection();
+		t_batch_per = 0;
+	}
+	[[nodiscard]] bool BatchSectionSuspend() {
+		if (!t_batch_section) return false;
+		CloseBatchSection();
+		return true;
+	}
+	void BatchSectionResume() { OpenBatchSection(); }
+	// (An entry's map or unmap: past N in the section, the section is closed and opened again: its waiters run between.)
+	void BatchEntry() {
+		if (!t_batch_section) return;
+		if (++t_batch_count > t_batch_per) {
+			CloseBatchSection();
+			OpenBatchSection();
+			t_batch_count = 1;
+		}
+	}
+
+private:
+	void OpenBatchSection() {
+		{
+			ExclusiveLock lock(m_mutex);
+			m_busy_done.wait(lock.Lock(), [&] { return m_busy.empty(); });
+			m_busy.emplace_back(BatchBegin, BatchEnd);
+		}
+		t_batch_section = true;
+		t_batch_count   = 0;
+	}
+	void CloseBatchSection() {
+		{
+			ExclusiveLock lock(m_mutex);
+			EraseBusyUnlocked(BatchBegin, BatchEnd);
+		}
+		t_batch_section = false;
+		m_busy_done.notify_all();
+	}
+
 
 	// `trackers`: the GPU trackers' protection (VirtualMemory::ProtectWriteWatch), not the guest's.
 	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode, bool trackers = false) {
@@ -2543,17 +2825,19 @@ private:
 		if (!m_backing->ParkedViews(vaddr, size, &begin, &end)) return;
 		{
 			ExclusiveLock lock(m_mutex);
-			m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(begin, end - begin); });
-			m_busy.emplace_back(begin, end);
+			if (!t_batch_section) { // (batch_busy_once: its section's)
+				m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(begin, end - begin); });
+				m_busy.emplace_back(begin, end);
+			}
 		}
 		std::vector<std::pair<uint64_t, uint64_t>> freed, spans;
 		m_backing->Materialize(vaddr, size, &freed);
 		{
 			ExclusiveLock lock(m_mutex);
 			spans = AddFreedUnlocked(freed);
-			EraseBusyUnlocked(begin, end);
+			if (!t_batch_section) EraseBusyUnlocked(begin, end);
 		}
-		m_busy_done.notify_all();
+		if (!t_batch_section) m_busy_done.notify_all();
 		CoalesceSpans(spans);
 		if (g_remapped_count != 0) {
 			LiveCounters::Add(LiveCounters::RemappedViews, std::exchange(g_remapped_count, 0u));
@@ -2988,6 +3272,9 @@ private:
 	// operation mutex).
 	std::vector<std::pair<uint64_t, uint64_t>> m_busy;
 	std::condition_variable_any                m_busy_done;
+	std::atomic<int32_t>                       m_busy_waiters {0}; // (trim_idle: the threads asleep in WaitNotBusy)
+	std::atomic<bool>     m_serial_pressure {true}; // (protect_serial_pressure: short of memory; broad until the first sample)
+	std::atomic<uint64_t> m_serial_stamp {0};       // (protect_serial_pressure: GetTickCount64 of the last sample; stale = broad)
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	// Moves with every change of m_mapped (under m_mutex exclusive): a region a thread found earlier is still m_mapped's
@@ -3026,6 +3313,8 @@ private:
 	uint64_t                     m_hot_cooled = 0; // (CoolHotReads: one thread)
 	bool                         m_hot_draining = false; // (CoolHotReads: short of memory, pages left to cool)
 	std::atomic<bool>            m_hot_pressure {false}; // HotReadsPressure
+	std::atomic<bool>            m_serial_stop {false}; // (Kyty.MemPressure's end)
+	std::thread                  m_serial_sampler;      // (protect_serial_pressure)
 #endif
 };
 

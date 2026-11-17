@@ -15,6 +15,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/presentation/window.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/demonsSoulsIdle.h"
@@ -876,7 +877,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			LiveTrace::Event(LiveTrace::FaultCaller, *reinterpret_cast<const uint64_t*>(info->rsp),
 			                 info->exception_address);
 		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr, info->exception_address, info->rsp)) {
 			LiveTrace::Event(LiveTrace::FaultDone, access == GpuAccess::Write ? 1 : 0, info->access_violation_vaddr);
 			return true;
 		}
@@ -1640,6 +1641,10 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	DemonsSoulsTextureMips::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsEnginePools::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsLanguages::Install(m_programs.empty() ? nullptr : m_programs.front());
+	// KYTY_PREFETCH_WAIT=1: no guest code before the shader prefetch is done (a PGO training plays nothing beside it). The
+	// graphics and the pipeline cache are up (Libs::Graphics::Initialize, before the program was loaded), the window's
+	// loop runs on the host main thread, and no guest thread exists yet.
+	Libs::Graphics::WindowHoldForShaderPrefetch();
 	// The main thread runs guest code from here (module initializers, then main): the console's floating-point
 	// environment, as its other threads get it (RunThread) and fibers that ask for it.
 	Common::EnterGuestFpEnv();

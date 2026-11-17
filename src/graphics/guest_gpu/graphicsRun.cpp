@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/guardedCopy.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -22,6 +23,7 @@
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
+#include "kernel/pthread.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
 
@@ -33,6 +35,8 @@
 #include "write-guard.h"
 #include "draw-state-observer.h"
 #include "frame-capture.h"
+#include "frame-gen.h"
+#include "gpu-idle.h"
 #include "hud-anchor.h"
 #include "live-control.h"
 #include "mode-toggle.h"
@@ -80,6 +84,7 @@ static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_mutex_owned   = false;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
+static thread_local BufferCache*      g_gpu_buffers       = nullptr; // (the GPU thread's: spec_label_cpu_backing)
 
 struct DrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
@@ -337,6 +342,27 @@ void GuestGpu::ProcessCommands() {
 	}
 }
 
+// spec_thread_gpu_faults: the fault this thread's exception handler serves (GuestGpu::NoteFault).
+static thread_local const GuestGpu::FaultSite* t_fault_site = nullptr;
+
+const GuestGpu::FaultSite* GuestGpu::NoteFault(const FaultSite* site) noexcept {
+	return std::exchange(t_fault_site, site);
+}
+
+// A host thread other than the GPU thread (not a guest thread) whose fault waits for the GPU thread: the deadlock shape
+// of the mode 4 freezes (the GPU thread may wait for a lock this thread holds, or for this thread's translation).
+[[gnu::noinline]] static void NoteSpecThreadGpuFault(const GuestGpu::FaultSite& site) {
+	if (Libs::LibKernel::PthreadSelfOrNull() != nullptr) return; // (a guest thread: its readback is the normal path)
+	LiveCounters::Add(LiveCounters::SpecThreadGpuFaults);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) >= 8) return;
+	// (The return address at the stack top names the caller of a leaf routine such as memcpy; the stack is this thread's.)
+	const uint64_t caller = site.rsp != 0 ? *reinterpret_cast<const uint64_t*>(site.rsp) : 0;
+	std::printf("SPEC_THREAD_GPU_FAULT addr=0x%016" PRIx64 " rip=0x%016" PRIx64 " ret=0x%016" PRIx64 " thread=%s\n",
+	            site.vaddr, site.rip, caller, GuestGpu::IsTranslatingThread() ? "speculation" : "host");
+	std::fflush(stdout);
+}
+
 void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
 	if (IsGpuThread()) {
@@ -344,10 +370,20 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
+	// (NoteFault is called only under a non-zero mode (HandleGpuFault): mode 0 tests the global, no thread-local.)
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && t_fault_site != nullptr) [[unlikely]]
+		NoteSpecThreadGpuFault(*t_fault_site);
 	// The caller spins a while (~20 us, about the time a guest readback command waits for its turn and runs) before it
 	// sleeps: waking a sleeping caller cost the GPU thread a system call each, ~200 a frame at 1-1 (same process: GPU
 	// thread 16.66 -> 16.38 ms a frame). 0 waiting, 1 done, 2 the caller sleeps.
 	constexpr uint32_t    Spins = 500;
+	// batch_busy_once: a batch thread's busy section closed while it waits here (the command's protections run).
+	struct BatchPause {
+		bool paused = Libs::LibKernel::Memory::BatchBusySuspend();
+		~BatchPause() {
+			if (paused) Libs::LibKernel::Memory::BatchBusyResume();
+		}
+	} batch_pause;
 	std::atomic<uint32_t> state {0};
 	// (Its time waiting for the GPU thread, running there and until this thread runs again: guest_sync_*_kt.)
 	const uint64_t        enqueued = __rdtsc();
@@ -502,6 +538,29 @@ bool CommandProcessor::SamePosition(const Pm4Execution& a, const Pm4Execution& b
 		    a.m_buffer_stack[i].offset_dw != b.m_buffer_stack[i].offset_dw)
 			return false;
 	return true;
+}
+
+void CommandProcessor::PrintPacketAt(const Pm4Execution& at, const char* what) {
+	if (at.m_buffer_stack.empty()) {
+		std::printf("%s: no position\n", what);
+		return;
+	}
+	const auto&    cursor  = at.m_buffer_stack.back();
+	const auto*    words   = cursor.commands.data();
+	const auto     size    = cursor.commands.size();
+	const uint32_t offset  = cursor.offset_dw;
+	const uint32_t header  = offset < size ? words[offset] : 0u;
+	const uint32_t before  = offset >= 5u ? words[offset - 5u] : 0u;
+	const bool     same    = offset >= 5u && offset + 5u <= size && before == 0xc0032500u &&
+	                         words[offset - 3u] == words[offset + 2u] && words[offset - 2u] == words[offset + 3u] &&
+	                         words[offset - 1u] == words[offset + 4u];
+	const auto     address = reinterpret_cast<uint64_t>(words + offset);
+	std::printf("%s: header 0x%08x at dword %u of %zu (depth %zu), %u bytes past a 4 KiB boundary%s; 5 dwords before: 0x%08x, "
+	            "%s\n",
+	            what, header, offset, size, at.m_buffer_stack.size(), static_cast<uint32_t>(address & 4095u),
+	            (address & 4095u) < 20u ? " (within 20)" : "", before,
+	            same ? "an indexed indirect draw of the same words 2-4 (inside a run)" : "not a run's packet before it");
+	std::fflush(stdout);
 }
 
 // A draw or dispatch: what chunks of a command buffer are counted in.
@@ -753,6 +812,23 @@ static void TouchForWrite(uint64_t address) {
 // KYTY_WRITE_GUARD (local/write-guard.h): the write made at once and hidden from the game until the upload jobs pending
 // now are done. False: the caller drains them and writes, as without it (no older job is pending, so there is nothing
 // to hide the write behind; or the form does not apply).
+// A guarded write's bytes through the backing view. Under KYTY_SPECULATE=4 only (spec_label_cpu_backing): where no
+// page of the range is GPU-modified, as the CPU-owned writer (TryWriteCpuBacking: its own mutex and fence) instead of
+// as a data
+// writer (TryWriteBacking: the data mutex it shares with the readbacks' write-backs, which the guarded labels waited
+// behind, 0.65 ms in a spike frame). Exact: the data writers write GPU results only to pages the
+// tracker still holds GPU-modified (BufferCache::WriteBackGpuOwned), and every write-back gives a page back only after
+// writing it; only this thread (the GPU thread) marks a page GPU-modified, so a range it finds unmodified has no data
+// writer now or until it marks it. (The test creates no region manager: Iterate<false>.) False as before: the caller
+// drains and writes through the guest mapping.
+static bool WriteGuardedBacking(uint64_t address, const void* data, uint64_t size) {
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 &&
+	    g_gpu_buffers != nullptr &&
+	    !g_gpu_buffers->IsRegionGpuModified(address, size) && Libs::LibKernel::Memory::TryWriteCpuBacking(address, data, size))
+		return true;
+	return Libs::LibKernel::Memory::TryWriteBacking(address, data, size);
+}
+
 static bool GuardedWrite(void* dst, const void* src, uint32_t size) {
 	// (Not under a speculation's translation, whose writes are journaled, nor in mode 4, whose threads read the
 	// processor's writes: KYTY_SPECULATE=0, the default, only.)
@@ -842,7 +918,7 @@ static bool GuardedWrite(void* dst, const void* src, uint32_t size) {
 	uint64_t token = 0;
 	bool     armed = true;
 	{
-		std::unique_lock lock(WriteGuard::g_lock);
+		auto lock = WriteGuard::TakeArm(first, end); // (KYTY_GUARD_SPIN, KYTY_GUARD_HONOUR_UNLOCKED)
 		token = WriteGuard::NextToken();
 		for (uint64_t page = first, i = 0; page < end; page += WriteGuard::Page, ++i) {
 			const bool ok = WriteGuard::Arm(page, token);
@@ -853,11 +929,64 @@ static bool GuardedWrite(void* dst, const void* src, uint32_t size) {
 	for (uint64_t page = first; page < end; page += WriteGuard::Page)
 		(void)worker.PushCall(LiftGuardCall, nullptr, page, token, 0, 1);
 	worker.Kick();
-	const bool written = armed && Libs::LibKernel::Memory::TryWriteBacking(address, bytes.data(), size);
+	const bool written = armed && WriteGuardedBacking(address, bytes.data(), size);
 	// (Not written: the caller's drain waits for the lifts too, then writes through the guest mapping.)
 	if (!written) return false;
 	RebaseGuardedCommands(g_current_execution);
 	return true;
+}
+
+// after_guard_batch (under KYTY_SPECULATE=4): a commit's labels on one 4 KiB guard page, in their order:
+// GuardedWrite's steps once for the page (the drain over the run's span, the guard lookups, one TouchForWrite, one Arm, one
+// lift job, one rebase), then each label's bytes through the backing view. Returns how many were written, in order (0:
+// none; the caller writes the rest as before).
+size_t CommitGuardedWriteRun(const uint64_t* addresses, const uint64_t* values, const uint32_t* sizes, size_t count) {
+	if (count == 0 || !WriteGuard::Enabled() || !AsyncUpload::g_used.load(std::memory_order_relaxed) ||
+	    !GuestGpu::IsGpuThread() ||
+	    (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && !WriteGuard::InSpeculation()))
+		return 0;
+	auto&    worker = AsyncUpload::Get();
+	uint64_t low = UINT64_MAX, high = 0;
+	for (size_t i = 0; i < count; ++i) {
+		if (sizes[i] == 0) return 0;
+		low  = std::min(low, addresses[i]);
+		high = std::max(high, addresses[i] + sizes[i]);
+	}
+	const uint64_t page = low & ~(WriteGuard::Page - 1);
+	if (((high - 1) & ~(WriteGuard::Page - 1)) != page) return 0;
+	if (worker.Pushed() <= worker.Done()) return 0;
+	if (Libs::LibKernel::Memory::TryGetBackingPointer(low, high - low) == nullptr) return 0;
+	if (WriteGuard::g_upload_done == nullptr) WriteGuard::g_upload_done = [] { return AsyncUpload::Get().Done(); };
+	AsyncUpload::DrainRange(low, high - low); // (the pending copies of these bytes take their old values)
+	if (worker.Pushed() <= worker.Done()) return 0;
+	bool guarded = false;
+	{
+		std::shared_lock lock(WriteGuard::g_lock);
+		if (const auto it = WriteGuard::g_pages.find(page); it != WriteGuard::g_pages.end()) {
+			if (it->second.saved != Common::VirtualMemory::Mode::ReadWrite &&
+			    it->second.saved != Common::VirtualMemory::Mode::ExecuteReadWrite)
+				return 0;
+			guarded = true;
+		}
+	}
+	if (!guarded) TouchForWrite(low);
+	uint64_t token = 0;
+	bool     armed = false;
+	{
+		auto lock = WriteGuard::TakeArm(page, page + WriteGuard::Page); // (KYTY_GUARD_SPIN, KYTY_GUARD_HONOUR_UNLOCKED)
+		token = WriteGuard::NextToken();
+		armed = WriteGuard::Arm(page, token);
+	}
+	(void)worker.PushCall(LiftGuardCall, nullptr, page, token, 0, 1);
+	worker.Kick();
+	if (!armed) return 0;
+	size_t written = 0;
+	for (; written < count; ++written) {
+		if (!WriteGuardedBacking(addresses[written], &values[written], sizes[written])) break;
+		if (Scout::Running()) Scout::NoteWrite(reinterpret_cast<void*>(addresses[written]), sizes[written], &values[written]);
+	}
+	if (written != 0) RebaseGuardedCommands(g_current_execution);
+	return written;
 }
 
 // KYTY_WRITE_GUARD_SPEC: a commit's guest memory write (Speculation::After) guarded as the normal path's are; false: the
@@ -1175,6 +1304,7 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
+	g_gpu_buffers = &gpu->m_renderer.GetBufferCache();
 	PageManager::DeferReadProtection(true);
 	gpu->m_renderer.GetMutex().BecomeOwner();
 	BdaDirtyRegions::g_translating = true;
@@ -1214,7 +1344,12 @@ void GuestGpu::ThreadRun(void* data) {
 	};
 	// (Mode 4's machinery: at the start, and again on a live `mode 4` (mode-toggle.h, below).)
 	const auto start_speculation = [gpu] {
-		gpu->m_speculation = std::make_unique<Speculation>(gpu->m_renderer);
+		// KYTY_SPEC_PASS_THREAD (unset: on, mode 4 only as all of this; 0 off): the state pass on its own thread
+		// (Speculation::AheadRun), its packet slot after the workers'.
+		const char* pass_env    = std::getenv("KYTY_SPEC_PASS_THREAD");
+		const bool  pass_thread = (pass_env == nullptr || std::atoi(pass_env) > 0) &&
+		                          kyty_local_speculate_threads.load(std::memory_order_relaxed) + 1 < Spec::MaxPacketSlots;
+		gpu->m_speculation = std::make_unique<Speculation>(gpu->m_renderer, 0, 0, 0, pass_thread);
 		gpu->m_ahead.store(gpu->m_speculation.get(), std::memory_order_release);
 		// (The async queue's threads take the packet slots after the graphics queue's: none left, no async speculation.)
 		// KYTY_SPECULATE_ASYNC unset: the compute queue 49 (Demon's Souls' async compute; a queue a game does not use
@@ -1222,10 +1357,10 @@ void GuestGpu::ThreadRun(void* data) {
 		const char* async_value = std::getenv("KYTY_SPECULATE_ASYNC");
 		const int   async       = async_value != nullptr ? std::atoi(async_value) : 49;
 		if (async > 0 && static_cast<uint32_t>(async) < QueueCount &&
-		    kyty_local_speculate_threads.load(std::memory_order_relaxed) < Spec::MaxPacketSlots) {
+		    gpu->m_speculation->TranslatorCount() < Spec::MaxPacketSlots) {
 			const auto  queue   = static_cast<uint32_t>(async);
 			const char* threads = std::getenv("KYTY_SPECULATE_ASYNC_THREADS");
-			const auto  base    = kyty_local_speculate_threads.load(std::memory_order_relaxed);
+			const auto  base    = gpu->m_speculation->TranslatorCount(); // (its translators, the workers and the pass thread)
 			gpu->m_speculation_async = std::make_unique<Speculation>(
 			    gpu->m_renderer, static_cast<int>(ComputeQueueBase + queue - 1), base,
 			    threads != nullptr && std::atoi(threads) > 0 ? static_cast<uint32_t>(std::atoi(threads))
@@ -1326,7 +1461,9 @@ void GuestGpu::ThreadRun(void* data) {
 				LiveTrace::Event(LiveTrace::RenderIdle, 1, 0);
 				const auto idle = std::chrono::steady_clock::now();
 				LiveControl::NoteRenderIdle(idle.time_since_epoch().count());
+				GpuIdle::g_idle.store(true, std::memory_order_release); // (gpu-idle.h)
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				GpuIdle::g_idle.store(false, std::memory_order_release);
 				LiveControl::g_render_idle_ns += (std::chrono::steady_clock::now() - idle).count();
 				LiveTrace::Event(LiveTrace::RenderIdle, 0, 0);
 			}
@@ -1360,7 +1497,9 @@ void GuestGpu::ThreadRun(void* data) {
 					LiveTrace::Event(LiveTrace::RenderIdle, 1, 1);
 					const auto idle = std::chrono::steady_clock::now();
 					LiveControl::NoteRenderIdle(idle.time_since_epoch().count());
+					GpuIdle::g_idle.store(true, std::memory_order_release); // (gpu-idle.h)
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					GpuIdle::g_idle.store(false, std::memory_order_release);
 					LiveControl::g_render_idle_ns += (std::chrono::steady_clock::now() - idle).count();
 					LiveTrace::Event(LiveTrace::RenderIdle, 0, 1);
 					for (auto& queue: gpu->m_queues) {
@@ -1385,6 +1524,7 @@ void GuestGpu::ThreadRun(void* data) {
 			gpu->m_gfx_cp->BufferWait();
 			gpu->m_renderer.GetMutex().ResignOwner();
 			g_gpu_state  = nullptr;
+			g_gpu_buffers = nullptr;
 			g_gpu_thread = false;
 			return;
 		}
@@ -2180,15 +2320,67 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 	}
 }
 
+// The most DRAW_INDEX_INDIRECT packets (0xc0032500, 5 dwords each) a run of indirect draws takes in one step
+// (TryNativeXprDraws, TryDrawIndirectRun): what they read from a run's first word is within DrawIndirectRunMax * 5 dwords.
+static constexpr uint32_t DrawIndirectRunMax = 64;
+
 // KYTY_SPECULATE=4's PM4 loop (ProcessPm4 chooses it): the state pass's and a speculation's checks, refusals and
 // recoverable exits, and the GPU thread's chunk stops.
 void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth) {
 	// (Behind a plain global: KYTY_SPECULATE unset, no thread-local read.)
 	auto* const spec = kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr;
+	// (A speculation's translation off the GPU thread: its command words among its segment's reads, Spec::State::
+	// NoteCommandWords. The GPU thread's holes read them when they run.)
+	const bool note_words = spec != nullptr && !GuestGpu::IsGpuThread();
+	// (spec_flush_keep: read once a call; mode 4 only.)
+	const bool flush_keep = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 	// A speculation's refused packet suspends the execution there (speculation.cpp goes on past it, or stops).
 	const auto refuse = [&](const char* why) {
 		Spec::Refuse(why);
 		execution.m_suspended = true;
+	};
+	// A speculation's or the state pass's thread (not the GPU thread) reads no command word on a page a read watcher
+	// guards: GNM allocates labels in its command buffers, a page holding a label the GPU wrote is no-access until it is
+	// downloaded, and that fault waits for the GPU thread (spec_thread_gpu_faults), which may be waiting for this thread.
+	// The execution suspends before the packet, as at a chunk's end: a speculation's result ends there ("command words
+	// watched", nothing refused or rolled back) and the GPU thread translates on from it in order; a state pass ends there.
+	// Each packet is probed anew, from its first word to the end of the page of its last (clean_end); PrefetchNextDraw, which
+	// reads past the packet, is held to that range, and a run of indirect draws is read from a guarded copy of its words
+	// (below, at the stop check). (A protection added after the probe is the race the tripwire still counts.)
+	// The pages are probed, not asked: a guarded one-byte copy of each page's first byte read (Common::GuardedCopy, which the
+	// exception filter resumes before any fault handler, so a probe never waits for the GPU thread). Asking the read watchers
+	// (Memory::ReadFaults) missed the other protections (KYTY_READ_GUARD's guard pages among them): the tripwire still read 0.1
+	// a frame (fxv6r, 14 Nov). The probe reads the pointer the packet is read through (a backing view's when rebased).
+	// Linux: asked, not probed. A GuardedCopy is a pread of /proc/self/mem there, a system call a page and so at least one
+	// a packet, and it reads a page mprotect left without access, so it never stops. Asked instead are the protections a
+	// plain load faults on there: the read watchers (Spec::WorkerReadable; a backing view's range readable) and the write
+	// guard's no-access pages (KYTY_WRITE_GUARD, Spec::WriteGuarded: a load there waits in WriteGuard::OnFault for the
+	// lift), so it stops where Windows' probe stops. The read guards are Windows' only (PAGE_GUARD).
+	const bool off_gpu_thread = (spec != nullptr || m_state_only) && !GuestGpu::IsGpuThread();
+	uint64_t   clean_end      = 0;
+	const auto watched        = [&](uint64_t host, uint64_t bytes) {
+		if (!off_gpu_thread) return false;
+		const uint64_t end = ((host + bytes - 1) | uint64_t {4095}) + 1;
+#if defined(_WIN32)
+		for (uint64_t at = std::max(host, clean_end); at < end; at = (at | uint64_t {4095}) + 1) {
+			uint8_t probe = 0;
+			if (Common::GuardedCopy(&probe, reinterpret_cast<const void*>(at), 1) != 0) {
+				m_watched_stop        = true;
+				execution.m_suspended = true;
+				return true;
+			}
+		}
+#else
+		if (const uint64_t from = std::max(host, clean_end);
+		    from < end && (Spec::WorkerReadable(reinterpret_cast<const void*>(from), end - from) != end - from ||
+		                   Spec::WriteGuarded(reinterpret_cast<const void*>(from), end - from))) {
+			m_watched_stop        = true;
+			execution.m_suspended = true;
+			return true;
+		}
+#endif
+		clean_end = std::max(clean_end, end);
+		return false;
 	};
 	while (execution.m_buffer_stack.size() > stop_depth) {
 		if (spec != nullptr && spec->refused != nullptr) return refuse(spec->refused);
@@ -2232,6 +2424,10 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			continue;
 		}
 
+		// (Its header's page first, to the page's end; then its words' pages once its length is read.)
+		const auto packet_at = reinterpret_cast<uint64_t>(cursor.commands.data() + cursor.offset_dw); // (the pointer read)
+		clean_end               = 0;
+		if (watched(packet_at, 4u)) return;
 		const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
 		const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
@@ -2248,8 +2444,13 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			execution.m_suspended = true;
 			return;
 		}
+		if (packet_header != 0x80000000u && watched(packet_at, uint64_t {KYTY_PM4_LEN(packet_header)} * 4u)) return;
+		// (The words a prefetch, a hint, may read from here: off the GPU thread, the checked range only.)
+		const auto run_dw = off_gpu_thread ? static_cast<uint32_t>(std::min<uint64_t>(remaining_dw, (clean_end - packet_at) / 4u))
+		                                   : remaining_dw;
 
 		if (packet_header == 0x80000000u) {
+			if (note_words) spec->NoteCommandWords(reinterpret_cast<uint64_t>(cursor.Position() + cursor.offset_dw), 4u);
 			cursor.offset_dw++;
 			execution.m_made_progress = true;
 			continue;
@@ -2292,6 +2493,9 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 					     dst, val, packet[1], packet[2]);
 				}
 			}
+			if (note_words)
+				spec->NoteCommandWords(reinterpret_cast<uint64_t>(cursor.Position() + cursor.offset_dw),
+				                       uint64_t {packet_dw} * 4u);
 			cursor.offset_dw += packet_dw;
 			execution.m_made_progress = true;
 			continue;
@@ -2302,6 +2506,118 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			m_stop_reached        = true;
 			execution.m_suspended = true;
 			return;
+		}
+		// A run of indirect draws (TryNativeXprDraws, TryDrawIndirectRun: up to DrawIndirectRunMax packets in one step). Off
+		// the GPU thread its readers parse a guarded copy of its words (Common::GuardedCopy into a thread-local buffer), never
+		// the command memory: a copy stops at the first page without access, so the readers' span ends before that page and
+		// the worker takes the run's head part; the packet on that page is the next one, whose probe suspends the execution
+		// before it. Only a copy that cannot take the head packet's own words suspends before the head. No word of the run is
+		// read outside the copy (no window between a probe and the read). The threads' runs may then differ (a worker's ends
+		// before a page without access; a worker tries only the table draw, a refusal is a hole, while the GPU thread in
+		// SegmentAsHole, its draw state shadow not clean, falls through to TryDrawIndirectRun; m_draw_run_skip differs after
+		// a hole), so a run on the GPU thread may begin before and reach past a point where a worker's ended. (5606d838 held
+		// the readers to the packet's own pages: the GPU thread's whole run passed the hole after the worker's first half, "a
+		// segment run as a hole did not reach its hole", 14 Nov.) What guarantees that SegmentAsHole reaches its hole is the
+		// stop cap below, on every thread. The state pass reads no run (draws are passed over).
+		uint32_t        draw_run_dw = remaining_dw;
+		const uint32_t* run_words   = packet;
+		if (packet_header == 0xc0032500u && !m_state_only) {
+			// A stop (SetStopAt) ahead in this buffer caps the run there, on every thread and always, so a stop inside a run is
+			// honoured. A stop at or past the run's end leaves the run as it was (it ends at its last matching packet either
+			// way); with no stop set nothing changes.
+			const uint32_t reach_dw = std::min(remaining_dw, DrawIndirectRunMax * 5u);
+			uint32_t       to_stop  = 0;
+			if (m_stop_at != nullptr && m_stop_at->m_buffer_stack.size() == execution.m_buffer_stack.size()) {
+				const auto& stop_stack = m_stop_at->m_buffer_stack;
+				bool        same       = true;
+				for (size_t i = 0; same && i <= buffer_index; ++i)
+					same = stop_stack[i].Position() == execution.m_buffer_stack[i].Position() &&
+					       (i == buffer_index || stop_stack[i].offset_dw == execution.m_buffer_stack[i].offset_dw);
+				const uint32_t stop_dw = stop_stack[buffer_index].offset_dw;
+				to_stop                = same && stop_dw > cursor.offset_dw ? stop_dw - cursor.offset_dw : 0u;
+			}
+			const bool capped = to_stop >= 5u && to_stop < reach_dw;
+			if (capped) draw_run_dw = to_stop;
+			// (Off the GPU thread, the copy: the head and the next packet first (a lone head copies 40 bytes), the rest of the
+			// reach only when the next packet continues the run as the readers match it. The span is the words copied: a
+			// packet the copy did not take whole is outside it ((count + 1) * 5 <= the span), so no reader reads it.)
+			if (off_gpu_thread) {
+				static thread_local std::array<uint32_t, DrawIndirectRunMax * 5u> run_copy;
+				const uint32_t reach = std::min(draw_run_dw, DrawIndirectRunMax * 5u);
+				// (Words [from, to) copied; returns the end of what was, up to a page without access: Spec::WorkerCopy, on
+				// Linux a page a read watcher guards.)
+				const auto copy = [&](uint32_t from, uint32_t to) {
+					const uint64_t bytes = uint64_t {to - from} * 4u;
+					return from + static_cast<uint32_t>((bytes - Spec::WorkerCopy(run_copy.data() + from, packet + from, bytes, false)) / 4u);
+				};
+				uint32_t copied = copy(0, std::min(reach, 10u));
+				if (copied < 5u) { // (the head's own words: before the packet, as the probe stops)
+					m_watched_stop        = true;
+					execution.m_suspended = true;
+					return;
+				}
+				if (copied == 10u && reach > 10u && run_copy[5] == 0xc0032500u && run_copy[7] == run_copy[2] &&
+				    run_copy[8] == run_copy[3] && run_copy[9] == run_copy[4])
+					copied = copy(10u, reach);
+				draw_run_dw = copied;
+				run_words   = run_copy.data();
+			} else if (capped) {
+				// (DIAG, on a thread that reads command words freely: the packets up to and at the stop continue this run, so
+				// the cap cut it. It can fire legitimately, when the threads took a run differently; rate-limited.)
+				bool inside = to_stop % 5u == 0;
+				for (uint32_t at = 5; inside && at <= to_stop; at += 5u)
+					inside = at + 5u <= remaining_dw && packet[at] == 0xc0032500u && packet[at + 2] == packet[2] &&
+					         packet[at + 3] == packet[3] && packet[at + 4] == packet[4];
+				static std::atomic<uint32_t> inside_reports {0};
+				if (inside && inside_reports.fetch_add(1, std::memory_order_relaxed) < 16)
+					std::printf("Speculation: a stop inside a run of indirect draws (%u dwords on): the run cut there\n", to_stop);
+			}
+		}
+		// Off the GPU thread, the words two packets read after the probe, read once in a guarded copy before the packet is
+		// entered; a page without access suspends the execution before it as the probe does (nothing refused or rolled
+		// back). A WRITE_DATA's own words (its handler journals or records its payload: the GPU thread flushes the deferred
+		// read protections before a label, so a probed page may lose access before the read): the handler reads the copy; one
+		// too short to hold its address (its handler's count would wrap) stops there too. A SET_*_REG_INDIRECT's register
+		// table: the observer reads the copy, and a state pass's GuardTable takes it too (t_indirect_table_copy), one copy,
+		// not two. A speculation's GuardTable copies again after its SyncCommandMemory check, as before: a copy taken before
+		// that check could hold the bytes of a table GPU work wrote and the check then found downloaded (the check refuses
+		// and notes the clean read, so it cannot run here, before the packet is entered); bytes other than the observer's
+		// invalidate the observer's shadow (GuardTable). A state pass checks nothing
+		// (SyncCommandMemory returns at once). (WRITE_DATA packets are few a frame.) The GPU thread and mode 0 read as before.
+		// (Spec::WorkerCopy: on Linux a page a read watcher guards counts as one without access, the rest is read through the
+		// backing view, no system call.)
+		const uint32_t*           handler_words = packet;
+		std::span<const uint32_t> table_words;
+		if (off_gpu_thread) {
+			t_indirect_table_copy.packet = nullptr; // (no earlier packet's copy is taken)
+			const auto stop_before = [&] {
+				m_watched_stop        = true;
+				execution.m_suspended = true;
+			};
+			if (opcode == Pm4::IT_WRITE_DATA) {
+				static thread_local std::vector<uint32_t> write_copy;
+				const uint32_t                           dwords = KYTY_PM4_LEN(packet_header);
+				write_copy.resize(dwords);
+				if (dwords < 4u || Spec::WorkerCopy(write_copy.data(), packet, uint64_t {dwords} * 4u, false) != 0)
+					return stop_before();
+				handler_words = write_copy.data();
+			} else if ((opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT || opcode == Pm4::IT_SET_SH_REG_INDIRECT ||
+			            opcode == Pm4::IT_SET_UCONFIG_REG_INDIRECT) &&
+			           KYTY_PM4_LEN(packet_header) >= 5u) { // (as the observer reads one; its handler takes 5 only)
+				const uint64_t table = (uint64_t {packet[1]} & 0xfffffffcu) | (uint64_t {packet[2]} << 32u);
+				const uint32_t pairs = packet[4] & 0x3fffu;
+				if (table != 0 && pairs != 0) {
+					auto&          copy  = t_indirect_table_copy;
+					const uint64_t bytes = uint64_t {pairs} * 8u;
+					copy.words.resize(size_t {pairs} * 2u);
+					// (KYTY_WRITE_GUARD_SPEC: a table on a guarded page through the backing view, as GuardTable reads it.)
+					if (Spec::WorkerCopy(copy.words.data(), reinterpret_cast<const void*>(table), bytes, true) != 0)
+						return stop_before();
+					// (Shared with a state pass's GuardTable; a speculation's compares its own copy with it.)
+					copy.packet = packet, copy.table = table, copy.pairs = pairs, copy.shared = spec == nullptr;
+					table_words = {copy.words.data(), copy.words.size()};
+				}
+			}
 		}
 		// A state pass's chunk boundary (SetChunking): not within a run of indirect draws, which a translation takes
 		// together (the packet runs when the pass resumes, counted again).
@@ -2316,6 +2632,9 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			++m_chunk_work;
 		}
 		m_chunk_last_opcode = opcode;
+		if (note_words)
+			spec->NoteCommandWords(reinterpret_cast<uint64_t>(cursor.Position() + cursor.offset_dw),
+			                       uint64_t {KYTY_PM4_LEN(packet_header)} * 4u);
 		if (spec != nullptr) {
 			if (!GuestGpu::IsGpuThread()) Spec::EnterPacket();
 			spec->Mark(LocalVulkanRecording::RecordedWrites());
@@ -2344,6 +2663,12 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			case Pm4::IT_DRAW_INDEX_INDIRECT:
 			case Pm4::IT_DRAW_INDIRECT_MULTI:
 			case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+				// (Off the GPU thread, one too short to hold it is other data, its word 3 past its probed words: the execution
+				// suspends before reading it. Only a state pass meets one: a speculation takes these by their headers.)
+				if (KYTY_PM4_LEN(packet_header) < 4u && off_gpu_thread) {
+					execution.m_suspended = true;
+					return;
+				}
 				m_sh_ctx.SetStartInstanceUserSgpr(GsUserSgprAt(packet[3] & 0xffffu));
 				break;
 			case Pm4::IT_DRAW_INDEX_2:
@@ -2374,10 +2699,20 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 
 		// Only state, draws and dispatches keep the deferred read protections pending: before a label, a memory write,
 		// a wait or anything else the pages GPU work writes are protected (PageManager::DeferReadProtection).
-		if (!KeepsDeferredProtection(opcode)) PageManager::FlushDeferredProtection();
+		// spec_flush_keep (KYTY_SPECULATE=4 only): an EVENT_WRITE other than the occlusion dump (0x39, which
+		// writes guest memory) keeps them pending too. CommandProcessor::TriggerEvent: its other types record a barrier,
+		// break a compute chain or end the process; none writes guest memory, raises an interrupt or reads guest memory on
+		// the CPU, so the guest learns nothing from one (the observation epoch keeps its meaning) and the next label, write
+		// or wait still flushes first. (EVENT_WRITE asked for 45-57 % of the non-empty flushes.)
+		if (!KeepsDeferredProtection(opcode) &&
+		    !(flush_keep && opcode == Pm4::IT_EVENT_WRITE && KYTY_PM4_LEN(packet_header) >= 2u && (packet[1] & 0x3fu) != 0x39u))
+			PageManager::FlushDeferredProtection();
 		auto handler = g_cp_op_func[opcode];
 		LiveCounters::AddPm4(opcode);
-		if (DrawsOrDispatches(opcode)) PrefetchNextDraw(packet, remaining_dw);
+		// (A speculation off the GPU thread, which AddPm4 does not count: its indexed draws, which its commit counts for
+		// the presenter's 3D view, FrameGen::TakeScene. A refused packet's go with it: Rollback.)
+		if (note_words && FrameGen::IsIndexedDrawPacket(opcode)) ++spec->indexed_draws;
+		if (DrawsOrDispatches(opcode)) PrefetchNextDraw(packet, run_dw);
 		if (XprCapture::Enabled()) {
 			if (opcode == Pm4::IT_DRAW_INDEX_INDIRECT) {
 				XprCapture::ObserveDraw(m_draw_indirect_args_base_addr + packet[1]);
@@ -2397,15 +2732,21 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			}
 		} native_store_end;
 		if (const auto native = kyty_local_native_xpr_mode.load(std::memory_order_relaxed); native != 0) {
+			// (Off the GPU thread, an indirect register table from its copy above.)
 			DrawStateObserver::ObservePacket(opcode, packet, std::min(KYTY_PM4_LEN(packet_header), remaining_dw),
-			                                 false);
+			                                 false, off_gpu_thread ? &table_words : nullptr);
 			if (opcode == Pm4::IT_DRAW_INDEX_INDIRECT &&
 			    (packet_header != 0xc0032500u || GraphicsRunDebugDumpEnabled()))
 				m_renderer.GetRenderExecutor().NativeXprForgetState();
 			if (packet_header == 0xc0032500u && !GraphicsRunDebugDumpEnabled()) {
 				const auto consumed =
-				    TryNativeXprDraws({packet, remaining_dw}, DrawStateObserver::g_shadow.last_clean);
+				    TryNativeXprDraws({run_words, draw_run_dw}, DrawStateObserver::g_shadow.last_clean);
 				if (consumed) {
+					// (The run's other packets: their words noted too, after the first's.)
+					if (note_words && consumed > KYTY_PM4_LEN(packet_header))
+						spec->NoteCommandWords(
+						    reinterpret_cast<uint64_t>(cursor.Position() + cursor.offset_dw + KYTY_PM4_LEN(packet_header)),
+						    uint64_t {consumed - KYTY_PM4_LEN(packet_header)} * 4u);
 					m_draw_run_skip = 0;
 					if (Scout::Running() && !IsAsyncComputeQueue()) Scout::SkipDraws(consumed / 5u - 1u);
 					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
@@ -2491,8 +2832,13 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 #endif
 		if (opcode != Pm4::IT_DRAW_INDEX_INDIRECT) m_draw_run_skip = 0;
 		if (packet_header == 0xc0032500u && !GraphicsRunDebugDumpEnabled()) {
-			const auto consumed = TryDrawIndirectRun({packet, remaining_dw});
+			const auto consumed = TryDrawIndirectRun({run_words, draw_run_dw});
 			if (consumed) {
+				// (The run's other packets: their words noted too, after the first's.)
+				if (note_words && consumed > KYTY_PM4_LEN(packet_header))
+					spec->NoteCommandWords(
+					    reinterpret_cast<uint64_t>(cursor.Position() + cursor.offset_dw + KYTY_PM4_LEN(packet_header)),
+					    uint64_t {consumed - KYTY_PM4_LEN(packet_header)} * 4u);
 				// (KYTY_SPEC_CHUNK_IN_ORDER: the run's other draws counted as the state pass counts them, one a packet, so
 				// the in-order chunk ends where the pass cut it.)
 				if (m_chunk_every != 0) m_chunk_work += consumed / 5u - 1u;
@@ -2528,11 +2874,12 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		// (Off the GPU thread a handler's exit, a packet that cannot be, is a worker reading command memory the game
 		// reused or GPU work wrote: the speculation refuses it ("malformed packet", the spec report's stops) and a state
 		// pass ends there, as 4c1e5d95's length check does; the render thread keeps the exits. A COPY_DATA of another
-		// header ended a mode 4 run after a death, 5 Nov.)
+		// header ended a mode 4 run after a death, 5 Nov.) (Off the GPU thread a WRITE_DATA's handler reads its copy,
+		// handler_words.)
 		if (spec == nullptr && m_state_only && !GuestGpu::IsGpuThread()) {
 			try {
 				const Common::RecoverableExitScope recoverable;
-				packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+				packet_dw = handler(*this, packet_header & ~1u, handler_words + 1, remaining_dw, total_dw) + 1;
 			} catch (const Common::RecoverableExit& malformed) {
 				static std::atomic<uint32_t> reports {0};
 				if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
@@ -2547,7 +2894,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			// What would submit or wait for the GPU refuses the packet.
 			try {
 				const Common::RecoverableExitScope recoverable;
-				packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+				packet_dw = handler(*this, packet_header & ~1u, handler_words + 1, remaining_dw, total_dw) + 1;
 			} catch (const CommandScheduler::RecorderRefusal& refusal) {
 				Spec::Refuse(refusal.what);
 			} catch (const Common::RecoverableExit&) {
@@ -2729,7 +3076,7 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 	}
 	// A run: consecutive packets that differ only in the argument offset draw
 	// the same object (no register write between them).
-	constexpr uint32_t max_draws = 64;
+	constexpr uint32_t max_draws = DrawIndirectRunMax;
 	uint32_t           count     = 1;
 	while (count < max_draws && (count + 1u) * 5u <= packets.size()) {
 		const auto* next = packets.data() + count * 5u;
@@ -2970,7 +3317,7 @@ uint32_t CommandProcessor::TryNativeIndirectAutoDraw(std::span<const uint32_t> p
 }
 
 uint32_t CommandProcessor::TryDrawIndirectRun(std::span<const uint32_t> packets) {
-	constexpr uint32_t max_draws = 64;
+	constexpr uint32_t max_draws = DrawIndirectRunMax;
 	if (FrameCapture::Active()) return 0; // one record per draw while a frame is recorded
 	if (m_draw_run_skip) {
 		--m_draw_run_skip;

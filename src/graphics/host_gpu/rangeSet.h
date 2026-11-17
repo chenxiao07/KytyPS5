@@ -127,6 +127,15 @@ public:
 		m_count = 0;
 	}
 
+	// The intervals of `other`, as they are: its fast-path eligibility and lookup hints are not taken (this set's own
+	// stay; the hints go stale with the version).
+	void AssignFrom(const RangeSet& other) {
+		++m_version;
+		m_blocks = other.m_blocks;
+		m_heads  = other.m_heads;
+		m_count  = other.m_count;
+	}
+
 	template <typename Func>
 	void ForEach(Func&& func) const {
 		for (const auto& block: m_blocks) {

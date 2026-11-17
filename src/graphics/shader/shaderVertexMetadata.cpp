@@ -6,13 +6,20 @@
 namespace Libs::Graphics {
 
 bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sgprs,
-                              ShaderVertexMetadata& metadata, std::string* error) {
+                              ShaderVertexMetadata& metadata, std::string* error,
+                              bool (*read)(void* out, const void* guest, size_t bytes)) {
+	// (A speculation's lookup passes ShaderReadGuest: the guest bytes copied without a fault, or the read fails.)
+	const auto copy = [&](void* out, const void* guest, size_t bytes) {
+		if (read != nullptr) return read(out, guest, bytes);
+		std::memcpy(out, guest, bytes);
+		return true;
+	};
 	if (data.user_data == nullptr) {
 		return ShaderError::Fail(error, "missing AGC user-data header");
 	}
 
 	ShaderUserData user_data {};
-	std::memcpy(&user_data, data.user_data, sizeof(user_data));
+	if (!copy(&user_data, data.user_data, sizeof(user_data))) return ShaderError::Fail(error, "AGC metadata unread");
 
 	constexpr uint32_t DirectResourceCount =
 	    static_cast<uint32_t>(AgcDirectResourceType::Last) + 1u;
@@ -28,7 +35,8 @@ bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sg
 		if (user_data.direct_resource_offset == nullptr) {
 			return ShaderError::Fail(error, "missing AGC direct-resource offsets");
 		}
-		std::memcpy(direct_offsets.data(), user_data.direct_resource_offset, direct_size);
+		if (!copy(direct_offsets.data(), user_data.direct_resource_offset, direct_size))
+			return ShaderError::Fail(error, "AGC metadata unread");
 	}
 
 	ShaderVertexMetadata next;
@@ -73,7 +81,8 @@ bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sg
 	if (data.input_semantics == nullptr) {
 		return ShaderError::Fail(error, "missing vertex input semantics");
 	}
-	std::memcpy(next.input_semantics.data(), data.input_semantics, semantic_size);
+	if (!copy(next.input_semantics.data(), data.input_semantics, semantic_size))
+		return ShaderError::Fail(error, "AGC metadata unread");
 	next.input_semantics_count = data.num_input_semantics;
 	metadata                   = next;
 	return true;

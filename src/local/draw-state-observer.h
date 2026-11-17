@@ -15,6 +15,7 @@
 
 #include <array>
 #include <cstdint>
+#include <span>
 
 namespace Libs::Graphics::DrawStateObserver {
 
@@ -67,6 +68,14 @@ inline void WriteRegister(uint32_t space, uint32_t raw_offset, uint32_t value) {
 	}
 }
 
+// An indirect register table's (offset, value) pairs.
+inline void WriteIndirectPairs(uint32_t space, const uint32_t* block, uint32_t pairs) {
+	for (uint32_t i = 0; i < pairs; ++i) {
+		if (block[2 * i] == 0xffffffffu) continue;
+		WriteRegister(space, block[2 * i], block[2 * i + 1]);
+	}
+}
+
 inline void WriteIndirectBlock(uint32_t space, const uint32_t* packet) {
 	const auto* block = reinterpret_cast<const uint32_t*>((uint64_t(packet[1]) & 0xfffffffcu) |
 	                                                      (uint64_t(packet[2]) << 32u));
@@ -76,10 +85,7 @@ inline void WriteIndirectBlock(uint32_t space, const uint32_t* packet) {
 	// reads it: local/write-guard.h.)
 	if (const auto* backing = WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(block), uint64_t {pairs} * 8u))
 		block = static_cast<const uint32_t*>(backing);
-	for (uint32_t i = 0; i < pairs; ++i) {
-		if (block[2 * i] == 0xffffffffu) continue;
-		WriteRegister(space, block[2 * i], block[2 * i + 1]);
-	}
+	WriteIndirectPairs(space, block, pairs);
 }
 
 // The registers changed in bulk (context clear/push/pop, a register reset): nothing the
@@ -98,8 +104,11 @@ inline void Invalidate() {
 	s.key_changes = 7;
 }
 
-// Every packet the command processor is about to execute.
-inline void ObservePacket(uint32_t opcode, const uint32_t* packet, uint32_t packet_dw, bool predicated_skip) {
+// Every packet the command processor is about to execute. `table` (off the GPU thread, ProcessPm4Spec): a
+// SET_*_REG_INDIRECT's register table as its guarded copy holds it (the words GuardTable reads; empty: no table read),
+// never the table itself, whose page may have no access (a fault waits for the GPU thread); null: the table where it is.
+inline void ObservePacket(uint32_t opcode, const uint32_t* packet, uint32_t packet_dw, bool predicated_skip,
+                          const std::span<const uint32_t>* table = nullptr) {
 	auto& s = g_shadow;
 	if (predicated_skip) {
 		s.dirty       = true;
@@ -133,10 +142,16 @@ inline void ObservePacket(uint32_t opcode, const uint32_t* packet, uint32_t pack
 				s.key_changes = 7;
 				return;
 			}
-			WriteIndirectBlock(opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT ? 0u
-			                   : opcode == Pm4::IT_SET_SH_REG_INDIRECT    ? 1u
-			                                                              : 2u,
-			                   packet);
+			if (table != nullptr)
+				WriteIndirectPairs(opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT ? 0u
+				                   : opcode == Pm4::IT_SET_SH_REG_INDIRECT    ? 1u
+				                                                              : 2u,
+				                   table->data(), static_cast<uint32_t>(table->size() / 2u));
+			else
+				WriteIndirectBlock(opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT ? 0u
+				                   : opcode == Pm4::IT_SET_SH_REG_INDIRECT    ? 1u
+				                                                              : 2u,
+				                   packet);
 			return;
 		// The context registers back to their defaults (CommandProcessor::ApplyContextStateOperation): a shadow value is
 		// no longer what a register holds (one written again with it after this would not look changed).
