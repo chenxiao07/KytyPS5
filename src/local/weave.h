@@ -52,7 +52,8 @@ inline constexpr uint32_t ParcelSlots = 512, FeedEntries = 1024, FreedEntries = 
 // InitializePerformanceSwitches, after mode 4's gates: the stand-downs (each one line; the run stays in mode 0, and
 // kyty_local_weave_mode is 0 after one) and the worker count.
 void ApplyStartGates();
-// What an unset KYTY_RENDER_CORE stands for (the start line names it): null, no core kept.
+// What an unset KYTY_RENDER_CORE stands for (KeepRenderCoreAlone's fallback; the start line names it): "auto" while
+// the weave stays up after its gates (the GPU thread's core kept for it), else null.
 [[nodiscard]] const char* RenderCoreFallback() noexcept;
 // The resolved worker count (0 when stood down).
 [[nodiscard]] uint32_t Workers() noexcept;

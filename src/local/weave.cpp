@@ -442,9 +442,11 @@ void ApplyStartGates() {
 #endif
 }
 
-// No fallback: an unset KYTY_RENDER_CORE keeps no core, with the weave or without it.
+// While the weave runs, an unset KYTY_RENDER_CORE means auto: the GPU thread on a core of its own and every other
+// thread of the process kept off it (KeepRenderCoreAlone; KYTY_RENDER_CPUS set, the thread is placed and nothing is
+// chosen). Without the weave nothing changes.
 const char* RenderCoreFallback() noexcept {
-	return nullptr;
+	return Enabled() ? "auto" : nullptr;
 }
 
 uint32_t Workers() noexcept {

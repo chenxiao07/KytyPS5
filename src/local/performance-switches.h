@@ -267,7 +267,8 @@ inline void InitializePerformanceSwitches() {
 		LocalPlatform::PinThreadToCpuList(cpus);
 		enabled += std::string(enabled.empty() ? "" : " ") + "KYTY_RENDER_CPUS=" + LocalPlatform::CpuListResolved(cpus);
 	}
-	if (const int core = LocalPlatform::KeepRenderCoreAlone(); core >= 0)
+	// While the weave runs an unset KYTY_RENDER_CORE means auto (Weave::RenderCoreFallback).
+	if (const int core = LocalPlatform::KeepRenderCoreAlone(Weave::RenderCoreFallback()); core >= 0)
 		enabled += std::string(enabled.empty() ? "" : " ") + "KYTY_RENDER_CORE=" + std::to_string(core);
 	// Above the game's threads (KYTY_RENDER_PRIORITY=0: normal). Walking into a new area, the game's threads
 	// streaming it in held the render CPUs for whole time slices: frames of 35-50 ms where the render thread
