@@ -1084,6 +1084,21 @@ const char* Speculation::Changed(const Result& result, size_t index) const {
 				return "commit: memory unmapped";
 			}
 	}
+	// spec_set_cpu_dirty_stop (Spec::SetCpuDirtyStopOn): every image the segment uses is still the object it found
+	// (serial) and registered, whatever the epoch says. UnregisterImage moves the resolution epoch before it clears
+	// `registered`: a speculation that took its epochs and made an entry between the two (TableEarlyEntry read it still
+	// registered) has an epoch that includes the unregister, so the check below is skipped, and Before would restore the
+	// retired image (a barrier on a VkImage EraseRetired may destroy before it runs). Plain data on the GPU thread, one
+	// pass over the segment's images. (The null image is never registered: exempt.)
+	if (Spec::SetCpuDirtyStopOn())
+		for (const auto& use: segment.images) {
+			const auto* image = use.image;
+			if (image->serial == use.serial &&
+			    (image->registered || (image->info.data.address == 0 && image->info.data.size == 0)))
+				continue;
+			LiveCounters::Add(LiveCounters::SpecImageUnregisteredStops);
+			return "commit: an image it uses was unregistered";
+		}
 	if (textures.ResolutionEpoch() == epochs.images) return nullptr;
 	// (Live spec_exact_image_stop: the registration log's exact ranges; -1, the default: on under KYTY_SPECULATE=4; 1 on,
 	// 0 off.)
@@ -1667,6 +1682,7 @@ void Speculation::Before(Result& result, size_t index) {
 	// whose packets passed, among them maybe one the segment found already unregistered. One erased, its slot reused, or
 	// unregistered here gets no barrier (it would name a destroyed VkImage, or another image) and the segment stops before
 	// the splice (target_failed). One unregistered before Before and still alive (a parked image) gets it, as before.
+	// (With spec_set_cpu_dirty_stop on, Changed stops the segment first at an image already unregistered when it ran.)
 	// (Was an EXIT_IF on the serial alone; then registered-or-null-image too, which stopped ~0.9 segments a frame on the
 	// 1-3 walk in mode 4 for images merely unregistered before Before: 9,701 "a pending target not acquired" stops.)
 	const bool erased = textures.EraseEpoch() != erase_epoch;

@@ -1513,6 +1513,20 @@ static bool TableRefreshPending(const Image& image, const TextureCache::ImageDes
 	return TextureCache::RefreshPending(image, desc);
 }
 
+// spec_set_cpu_dirty_stop: a speculation's entry for a set's image (Image::SpeculativeEntry) made before its refresh
+// test, so that what the entry notes as found is what the test saw. Only for a registered image. Every entry joins the
+// segment's images, which its commit restores (Before: RestoreState records a barrier on the image's VkImage) and leaves
+// (After: its barrier state), and Changed's "images registered" proves only that none of them was unregistered SINCE the
+// speculation began (skipped while the resolution epoch did not move). A catalog set can still hold an image unregistered
+// before that (an area travel's unmap: DeleteImage -> RetireImage, erased once the packets in flight then passed,
+// TextureCache::EraseRetired; its VkImage destroyed with it), and TableValidateSet's proof refuses it only after this
+// entry: the entry was kept, its barrier recorded in Before, and the image could be erased before that command buffer
+// ran. The normal path never makes one: a set's unregistered image fails TableValidateSet's proof first.
+static void TableEarlyEntry(Image& image) {
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && Spec::SetCpuDirtyStopOn() && image.registered)
+		(void)image.SpeculativeEntry();
+}
+
 // A set's images are the same objects, registered and current (as NativeXprValidateResources proves a record's):
 // once a frame, and again when registrations moved. The main executor checks a use it proved again only when its
 // image's validity moved or a registration stamped the view's pages since (1-1: ~1500 sets a frame, ~0.5 ms, nearly
@@ -1575,9 +1589,9 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 			return false;
 		};
 		// The guest rewrote it (a texture streaming in), or a GPU buffer write its bytes or its stencil plane: upload it
-		// as the normal path's FindTexture does. (A speculation's entry for it first, as TableTransit's.)
-		if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && Spec::SetCpuDirtyStopOn())
-			(void)image->SpeculativeEntry();
+		// as the normal path's FindTexture does. (A speculation's entry for it first, as TableTransit's, for a registered
+		// image only: TableEarlyEntry.)
+		TableEarlyEntry(*image);
 		if (TableRefreshPending(*image, dep.desc)) {
 			if (held) (void)refuse();
 			if (Spec::Current() != nullptr) return Spec::Refuse("texture upload"), false;
@@ -2573,9 +2587,8 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 		// FindTexture leaves a storage image: it acquires it again otherwise). One written since the set was proven this
 		// frame (by the CPU, a GPU buffer write, or into its stencil plane) is uploaded by the normal path's FindTexture.
 		// (A speculation's entry for it first: the state it notes as found is the one the test saw, or a write after,
-		// which its commit then stops at: spec_set_cpu_dirty_stop.)
-		if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && Spec::SetCpuDirtyStopOn())
-			(void)image->SpeculativeEntry();
+		// which its commit then stops at: spec_set_cpu_dirty_stop. A registered image only: TableEarlyEntry.)
+		TableEarlyEntry(*image);
 		if ((dep.storage && !image->SafeToDownload()) || TableRefreshPending(*image, dep.desc)) return false;
 		if (dep.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
 			if (image->info.IsVolume()) return false;
