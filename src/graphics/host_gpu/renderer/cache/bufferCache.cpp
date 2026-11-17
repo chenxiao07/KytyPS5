@@ -3243,8 +3243,10 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 			// between ranges no GPU work wrote (speculation-state.h: work that writes them stops the commit first).
 			// spec_copy_image_refuse (Spec::CopyImageRefuseOn): not over image memory. Journaled, it lands in the
 			// segment's After, after its own work, which no binding test of the image saw coming (none asks the journal):
-			// in order the copy dirties the image first and the binding uploads it. Refused, the copy is a hole, made in
-			// order; the work after it, translated with the image clean, stops at its commit (spec_set_cpu_dirty_stop).
+			// in order the copy dirties the image first and the binding uploads it. Refused, a dispatch's linear copy
+			// (DemonsSouls TryLinearCopy) is a hole, made in order; the work after it, translated with the image clean,
+			// stops at its commit (spec_set_cpu_dirty_stop). A DMA_DATA or COPY_DATA packet is no hole (Speculation's
+			// IsHole): the speculation ends at it, and the GPU thread translates on from it in order.
 			if (Spec::CopyImageRefuseOn()) {
 				LiveCounters::Add(LiveCounters::SpecCopyJournaledN);
 				if (m_texture_cache.HasTrackedDataOverlap(dst_vaddr, size)) {

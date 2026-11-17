@@ -344,7 +344,8 @@ inline int64_t CommitVerifyEvery() {
 	return value > 0 || (value < 0 && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4);
 }
 // KYTY_SPEC_COPY_IMAGE_REFUSE (live spec_copy_image_refuse; the same rule): a speculation's copy (journaled or on the GPU)
-// or GPU fill over image memory is refused, a hole (BufferCache::CopyBuffer, FillBuffer), and so is a worker binding an
+// or GPU fill over image memory is refused (BufferCache::CopyBuffer, FillBuffer: a hole when its packet is a dispatch's
+// linear copy; at a DMA_DATA or COPY_DATA packet, which is no hole, the speculation ends), and so is a worker binding an
 // image its open segment writes (TextureCache's read-only lookups, TableTransit, NativeXprEmitTargets). Off: none of it,
 // as before.
 [[nodiscard]] inline bool CopyImageRefuseOn() {
