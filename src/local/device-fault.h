@@ -237,6 +237,157 @@ inline void Append(std::string& text, const char* format, ...) {
 	if (length > 0) text.append(line, std::min(static_cast<size_t>(length), sizeof(line) - 1));
 }
 
+// VK_EXT_device_address_binding_report (issue #314; vulkanWindow.cpp's AddressBindingReport turns it on): every GPU
+// address range the driver binds and unbinds, with its object and when. RADV reports every buffer and image bound to
+// memory, every memory object (VMA's 256 MiB blocks and dedicated allocations, all of them flagged internal), and the
+// memory of its own command buffers, descriptor pools and query pools. A fault on an address that no buffer holds now
+// then names what was bound there last. There is one record a bind and one an unbind (the debug messenger's callback,
+// on the thread that allocates or frees), nothing a draw.
+struct BindingSpan {
+	uint64_t     size = 0, object = 0, bound_ns = 0, unbound_ns = 0;
+	VkObjectType type     = VK_OBJECT_TYPE_UNKNOWN;
+	bool         internal = false;
+};
+struct Bindings {
+	std::atomic<bool>                    on {false};
+	std::mutex                           mutex;
+	std::multimap<uint64_t, BindingSpan> spans; // by GPU address (an address bound again after an unbind: both)
+	// Past `limit` records, the unbound ones a later one at the same address covers leave (NoteBinding); then, with
+	// more than MaxUnbound unbound ones left (~6 MiB), the older half of them. The limit is then twice what is left, at
+	// least History.
+	static constexpr size_t History    = size_t {1} << 14u;
+	static constexpr size_t MaxUnbound = size_t {1} << 16u;
+	size_t                  limit      = History;
+	uint64_t                binds = 0, unbinds = 0, unmatched = 0;
+};
+inline Bindings g_bindings;
+
+inline void NoteBinding(uint64_t address, uint64_t size, bool bind, VkObjectType type, uint64_t object, bool internal) {
+	const auto      now = NowNs();
+	std::lock_guard lock(g_bindings.mutex);
+	if (!bind) {
+		g_bindings.unbinds++;
+		const auto [first, last] = g_bindings.spans.equal_range(address);
+		for (auto it = first; it != last; ++it)
+			if (it->second.unbound_ns == 0 && it->second.object == object) {
+				it->second.unbound_ns = now;
+				return;
+			}
+		g_bindings.unmatched++;
+		return;
+	}
+	g_bindings.binds++;
+	auto& spans = g_bindings.spans;
+	if (spans.size() >= g_bindings.limit) {
+		// First the unbound records that a later one of the same type at the same address covers, so that every address
+		// keeps its last owner (a buffer made again and again at one address leaves one record, not hundreds).
+		std::vector<std::multimap<uint64_t, BindingSpan>::iterator> covered;
+		for (auto group = spans.begin(); group != spans.end();) {
+			const auto group_end = spans.upper_bound(group->first);
+			for (auto it = group; it != group_end; ++it) {
+				if (it->second.unbound_ns == 0) continue;
+				for (auto later = group; later != group_end; ++later)
+					if (later->second.type == it->second.type && later->second.bound_ns > it->second.bound_ns &&
+					    later->second.size >= it->second.size) {
+						covered.push_back(it);
+						break;
+					}
+			}
+			group = group_end;
+		}
+		for (const auto it: covered)
+			spans.erase(it);
+		// Then, with more than MaxUnbound unbound ones left, the older half of them (last owners too).
+		std::vector<uint64_t> unbound;
+		for (const auto& [base, span]: spans)
+			if (span.unbound_ns != 0) unbound.push_back(span.unbound_ns);
+		if (unbound.size() > Bindings::MaxUnbound) {
+			const auto middle = unbound.begin() + static_cast<std::ptrdiff_t>(unbound.size() / 2);
+			std::nth_element(unbound.begin(), middle, unbound.end());
+			const uint64_t cutoff = *middle;
+			std::erase_if(spans, [&](const auto& item) {
+				return item.second.unbound_ns != 0 && item.second.unbound_ns <= cutoff;
+			});
+		}
+		g_bindings.limit = std::max(Bindings::History, spans.size() * 2);
+	}
+	g_bindings.spans.emplace(address, BindingSpan {size, object, now, 0, type, internal});
+}
+
+// The debug messenger's callback (it asks for VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT only).
+inline VKAPI_ATTR VkBool32 VKAPI_CALL BindingCallback(VkDebugUtilsMessageSeverityFlagBitsEXT /*severity*/,
+                                                      VkDebugUtilsMessageTypeFlagsEXT             types,
+                                                      const VkDebugUtilsMessengerCallbackDataEXT* data,
+                                                      void* /*user*/) {
+	if ((types & VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT) == 0 || data == nullptr) return VK_FALSE;
+	for (const auto* next = static_cast<const VkBaseInStructure*>(data->pNext); next != nullptr; next = next->pNext) {
+		if (next->sType != VK_STRUCTURE_TYPE_DEVICE_ADDRESS_BINDING_CALLBACK_DATA_EXT) continue;
+		const auto* binding = reinterpret_cast<const VkDeviceAddressBindingCallbackDataEXT*>(next);
+		const bool  object  = data->objectCount != 0 && data->pObjects != nullptr;
+		NoteBinding(
+		    binding->baseAddress, binding->size, binding->bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT,
+		    object ? data->pObjects[0].objectType : VK_OBJECT_TYPE_UNKNOWN, object ? data->pObjects[0].objectHandle : 0,
+		    (binding->flags & VK_DEVICE_ADDRESS_BINDING_INTERNAL_OBJECT_BIT_EXT) != 0);
+		break;
+	}
+	return VK_FALSE;
+}
+
+inline const char* ObjectTypeName(VkObjectType type) {
+	switch (type) {
+		case VK_OBJECT_TYPE_DEVICE_MEMORY: return "memory";
+		case VK_OBJECT_TYPE_BUFFER: return "buffer";
+		case VK_OBJECT_TYPE_IMAGE: return "image";
+		case VK_OBJECT_TYPE_DEVICE: return "device";
+		case VK_OBJECT_TYPE_QUEUE: return "queue";
+		case VK_OBJECT_TYPE_COMMAND_BUFFER: return "command buffer";
+		case VK_OBJECT_TYPE_COMMAND_POOL: return "command pool";
+		case VK_OBJECT_TYPE_DESCRIPTOR_POOL: return "descriptor pool";
+		case VK_OBJECT_TYPE_QUERY_POOL: return "query pool";
+		case VK_OBJECT_TYPE_PIPELINE: return "pipeline";
+		case VK_OBJECT_TYPE_UNKNOWN: return "no object";
+		default: return "other object";
+	}
+}
+
+inline void AppendBinding(std::string& text, const char* what, uint64_t address, const BindingSpan& span,
+                          uint64_t now) {
+	Append(text, "    %sgpu 0x%llx size 0x%llx, %s 0x%llx%s: bound %.1f ms ago, ", what,
+	       static_cast<unsigned long long>(address), static_cast<unsigned long long>(span.size),
+	       ObjectTypeName(span.type), static_cast<unsigned long long>(span.object),
+	       span.internal ? " (flagged internal)" : "", static_cast<double>(now - span.bound_ns) / 1e6);
+	if (span.unbound_ns != 0)
+		Append(text, "unbound %.1f ms ago\n", static_cast<double>(now - span.unbound_ns) / 1e6);
+	else
+		text += "live\n";
+}
+
+// The bindings over [begin, end), the newest first (at most 8); with none, the nearest below and above.
+inline void AppendBindings(std::string& text, uint64_t begin, uint64_t end, uint64_t now) {
+	if (!g_bindings.on.load(std::memory_order_acquire)) return;
+	std::lock_guard                                      lock(g_bindings.mutex);
+	std::vector<std::pair<uint64_t, const BindingSpan*>> over;
+	for (const auto& [address, span]: g_bindings.spans) {
+		if (address >= end) break;
+		if (address + span.size > begin) over.emplace_back(address, &span);
+	}
+	std::sort(over.begin(), over.end(),
+	          [](const auto& a, const auto& b) { return a.second->bound_ns > b.second->bound_ns; });
+	Append(text,
+	       "  bound over it: %zu (address binding report: %llu binds, %llu unbinds of which %llu matched no bind, "
+	       "%zu kept)\n",
+	       over.size(), static_cast<unsigned long long>(g_bindings.binds),
+	       static_cast<unsigned long long>(g_bindings.unbinds), static_cast<unsigned long long>(g_bindings.unmatched),
+	       g_bindings.spans.size());
+	for (size_t i = 0; i < over.size() && i < 8; ++i)
+		AppendBinding(text, "", over[i].first, *over[i].second, now);
+	if (!over.empty()) return;
+	const auto above = g_bindings.spans.lower_bound(begin);
+	if (above != g_bindings.spans.begin())
+		AppendBinding(text, "nearest below: ", std::prev(above)->first, std::prev(above)->second, now);
+	if (above != g_bindings.spans.end()) AppendBinding(text, "nearest above: ", above->first, above->second, now);
+}
+
 inline void AppendFault(std::string& text, VkDevice device) {
 	VkDeviceFaultCountsEXT counts {};
 	counts.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT;
@@ -301,6 +452,7 @@ inline void AppendFault(std::string& text, VkDevice device) {
 				       static_cast<unsigned long long>(above->second.cpu),
 				       above->second.destroyed_ns != 0 ? "destroyed" : "live");
 		}
+		AppendBindings(text, begin, end, now);
 	}
 	for (uint32_t i = 0; i < counts.vendorInfoCount && i < vendors.size(); ++i)
 		Append(text, "Device fault vendor %u: %s code 0x%llx data 0x%llx\n", i, vendors[i].description,

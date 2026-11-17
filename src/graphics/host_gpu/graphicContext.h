@@ -54,6 +54,10 @@ struct GraphicContext {
 	// VK_EXT_fragment_shader_interlock's pixel interlock and storage image reads without a format enabled
 	// (PixelInterlockExtension in vulkanWindow.cpp, ShaderRecompiler::Frontend::TranslatorFeaturePixelInterlock).
 	bool                               fragment_shader_pixel_interlock       = false;
+	// VK_EXT_device_address_binding_report enabled, its debug messenger made (AddressBindingReport in vulkanWindow.cpp,
+	// DeviceFault::BindingCallback): the device fault report names the memory bound at a faulting address (issue #314).
+	bool                               address_binding_report                = false;
+	vk::DebugUtilsMessengerEXT         binding_messenger                     = nullptr;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
