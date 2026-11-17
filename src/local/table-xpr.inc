@@ -999,7 +999,6 @@ static void TableAsideDrain(uint64_t frame) {
 // segment stops; the set is never published).
 bool RenderExecutor::TableCompletePendingImages(TableImageSet& set) {
 	auto&                                textures = m_context.GetTextureCache();
-	const auto                           handle   = m_context.GetCommandScheduler().Current().Handle();
 	std::vector<vk::DescriptorImageInfo> infos(set.pending_images.size());
 	std::vector<vk::WriteDescriptorSet>  writes;
 	size_t                               done = 0;
@@ -1014,7 +1013,10 @@ bool RenderExecutor::TableCompletePendingImages(TableImageSet& set) {
 		image.usage.texture = true;
 		const ImageSubresourceRange range {desc.view_info.base_level, desc.view_info.level_count, desc.view_info.base_layer,
 		                                   desc.view_info.layer_count};
-		image.Transit(pending.layout, vk::AccessFlagBits2::eShaderRead, range, handle);
+		// (The open buffer read at each slot: a slot's FindImage / FindTexture that reclaims memory (a failed creation:
+		// ReclaimImageMemory waits for the current tick) submitted the one open before and began the next.)
+		image.Transit(pending.layout, vk::AccessFlagBits2::eShaderRead, range,
+		              m_context.GetCommandScheduler().Current().Handle());
 		infos[i] = vk::DescriptorImageInfo {nullptr, view, pending.layout};
 		vk::WriteDescriptorSet write;
 		write.dstSet          = set.set;
