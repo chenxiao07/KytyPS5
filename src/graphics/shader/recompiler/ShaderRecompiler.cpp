@@ -35,6 +35,11 @@ namespace Libs::Graphics::ShaderRecompiler {
 
 namespace {
 
+// The decoded instructions of the thread's last program, their capacity kept for its next one (up to 8 MiB,
+// TranslateProgram): a new vector of ~0.8 MiB for every program was memory the system had to zero-fill (the shader
+// prefetch's threads: 5 GB a minute). ReleaseThreadScratch gives it back.
+thread_local std::vector<Decoder::Instruction> t_instructions;
+
 const char* GetDumpLabel(const CompileOptions& options) {
 	return options.dump_label != nullptr ? options.dump_label : "ShaderRecompiler";
 }
@@ -605,9 +610,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(code.size()));
 
-	// The decoded instructions go in the thread's vector of its last program's, its capacity kept (up to 8 MiB): a new one
-	// of ~0.8 MiB for every program was memory the system had to zero-fill (the shader prefetch's threads: 5 GB a minute).
-	static thread_local std::vector<Decoder::Instruction> t_instructions;
+	// The decoded instructions go in the thread's vector of its last program's (t_instructions), its capacity kept.
 	Decoder::Program decoded;
 	decoded.instructions = std::move(t_instructions);
 	struct KeepInstructions {
@@ -844,6 +847,11 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 void RecycleSpirv(std::vector<uint32_t>&& spirv) {
 	Spirv::Builder::Recycle(std::move(spirv));
+}
+
+void ReleaseThreadScratch() {
+	std::vector<Decoder::Instruction>().swap(t_instructions);
+	Spirv::ReleaseThreadScratch();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler

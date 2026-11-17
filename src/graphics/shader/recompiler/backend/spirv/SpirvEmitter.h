@@ -18,6 +18,9 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 // translated: DPP quad_perm moves in pixel shaders read by them, or by shuffles without them.
 void SetPixelQuadOperations(bool supported);
 
+// The emitter's per-thread scratch (its last programs' definitions, the builder's pooled sections) back to the heap.
+void ReleaseThreadScratch();
+
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVEMITTER_H_ */

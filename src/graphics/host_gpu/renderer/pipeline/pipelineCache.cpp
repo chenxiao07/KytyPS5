@@ -2915,17 +2915,31 @@ public:
 
 private:
 	void Run() {
+		// A thread idle for IdleRelease after a job gives the translator's per-thread scratch back (ShaderRecompiler::
+		// ReleaseThreadScratch): kept between a burst's programs, a buffer of it is up to ~8 MiB, and every thread of these
+		// pools that once translated a big program held them for the rest of the session (at 1-1: decode vectors of 4-7
+		// MiB and SPIR-V sections of 1-3 MiB, ~35 MiB).
+		constexpr auto IdleRelease = std::chrono::seconds(5);
+		bool           worked      = false;
 		for (;;) {
 			std::function<void()> job;
 			{
 				std::unique_lock lock(m_mutex);
-				m_wake.wait(lock, [this] { return m_stop || !m_jobs.empty(); });
+				const auto       ready = [this] { return m_stop || !m_jobs.empty(); };
+				if (worked && !m_wake.wait_for(lock, IdleRelease, ready)) {
+					lock.unlock();
+					ShaderRecompiler::ReleaseThreadScratch();
+					worked = false;
+					lock.lock();
+				}
+				m_wake.wait(lock, ready);
 				// Queued jobs still run at shutdown: their pipelines are destroyed with the rest.
 				if (m_jobs.empty() || (m_stop && m_background)) return;
 				job = std::move(m_jobs.front());
 				m_jobs.pop_front();
 			}
 			job();
+			worked = true;
 		}
 	}
 

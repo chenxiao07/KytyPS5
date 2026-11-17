@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include <algorithm>
 #include <bit>
@@ -794,3 +795,12 @@ void EmitProgram(EmitterState& state) {
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
+
+namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+void ReleaseThreadScratch() {
+	std::vector<std::unordered_map<const IR::Inst*, uint32_t>>().swap(Emitter::t_definitions);
+	Builder::ReleaseThreadPool();
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv
