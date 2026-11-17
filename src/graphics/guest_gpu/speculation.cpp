@@ -384,7 +384,7 @@ void Speculation::AheadRun(Translator& translator) {
 		const bool  pinned = !cpus.empty() && LocalPlatform::TryPinThreadToCpuList(cpus.c_str());
 		std::printf("Speculation: the state pass on its own thread, %s%s (KYTY_SPEC_PASS_THREAD; the workers take only "
 		            "chunks)\n",
-		            pinned ? "CPUs " : "not pinned", pinned ? cpus.c_str() : "");
+		            pinned ? "CPUs " : "not pinned", pinned ? LocalPlatform::CpuListResolved(cpus.c_str()).c_str() : "");
 	} else {
 		PinSpeculationWorker(applied_cpus);
 	}
@@ -393,8 +393,9 @@ void Speculation::AheadRun(Translator& translator) {
 		const char* render = std::getenv("KYTY_RENDER_CPUS");
 		std::printf("Speculation: %u workers on CPUs %s (%s); render threads on CPUs %s\n",
 		            static_cast<unsigned>(m_translators.size() - (m_pass_thread ? 1u : 0u)),
-		            cpus.first.empty() ? "off the render threads' CPUs" : cpus.first.c_str(), cpus.first.empty() ? "no list" : cpus.second,
-		            render != nullptr && *render != 0 ? render : "any");
+		            cpus.first.empty() ? "off the render threads' CPUs" : LocalPlatform::CpuListResolved(cpus.first.c_str()).c_str(),
+		            cpus.first.empty() ? "no list" : cpus.second,
+		            render != nullptr && *render != 0 ? LocalPlatform::CpuListResolved(render).c_str() : "any");
 	}
 	// (Its Vulkan calls go to the driver as they are made, no recording stream: what they name is alive then.)
 	RenderContext::SetThreadExecutors(&translator.executors);
