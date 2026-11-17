@@ -2262,7 +2262,24 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				if (const auto epoch = cpu_epoch(held.address, held.size); epoch == 0 || epoch != held.cpu_epoch) {
 					LiveCensus::Scope reprove(LiveCensus::DrawPhase, 0x7ab1e, 6);
 					current = range_clean(held.address, held.size);
-					if (current) held.cpu_epoch = epoch;
+					// (Inside a speculation range_clean's BufferCache::IsRegionCpuModified answers clean for a range in the
+					// translation's current_set, its pages CPU-dirty still: noted current by a packet a Rollback took back
+					// since (Rollback cuts `current`, keeps current_set), or by a translation dropped since. The tracker's
+					// own bits decide: dirty, no epoch is kept (re-proven at each use while dirty: a later translation,
+					// whose current_set lacks the range, then resolves it afresh and notes it there) and, when no note of
+					// the translation's `current` covers the range, it is noted current, as the fresh lookup's
+					// EnsureBufferContents notes it, so the commit uploads it before the work. Before, nothing uploaded it
+					// and the work read the buffer's stale bytes. Any speculation mode.)
+					if (current) {
+						// (Behind the plain global, as BufferCache::IsRegionCpuModified's: mode 0, no thread-local read.)
+						auto* spec = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr;
+						const bool dirty = spec != nullptr && buffer_cache.IsRegionCpuDirty(held.address, held.size);
+						held.cpu_epoch   = dirty ? 0 : epoch;
+						if (dirty && std::none_of(spec->current.begin(), spec->current.end(), [&](const Spec::Range& noted) {
+							    return noted.begin <= held.address && held.address + held.size <= noted.end;
+						    }))
+							spec->NoteCurrent(held.address, held.size);
+					}
 				}
 			}
 			if (!current) {
