@@ -9,6 +9,7 @@
 #include "native-resource-state.h"
 #include "speculation-ram-gate.h"
 #include "spin-gate.h"
+#include "weave.h"
 
 #include <array>
 #include <atomic>
@@ -65,6 +66,10 @@ extern volatile std::atomic_uint32_t kyty_local_scout_mode;
 // Speculative translation of graphics command buffers (src/graphics/guest_gpu/speculation.h).
 extern volatile std::atomic_uint32_t kyty_local_speculate_mode;
 extern volatile std::atomic_uint32_t kyty_local_speculate_threads;
+// Queue 0's draws translated on worker threads and woven back in order (weave.h).
+extern volatile std::atomic_uint32_t kyty_local_weave_mode;
+extern volatile std::atomic_uint32_t kyty_local_weave_workers;
+extern volatile std::atomic_uint32_t kyty_local_weave_calls;
 }
 
 inline void InitializePerformanceSwitches() {
@@ -187,6 +192,11 @@ inline void InitializePerformanceSwitches() {
 #endif
 	    Switch {"KYTY_SPECULATE", &kyty_local_speculate_mode, 0, 4},
 	    Switch {"KYTY_SPECULATE_THREADS", &kyty_local_speculate_threads, 1, 12},
+	    // The weave (weave.h; off by default): its workers (0: as many as the performance cores spare, at most 8) and
+	    // the table calls a parcel.
+	    Switch {"KYTY_WEAVE", &kyty_local_weave_mode},
+	    Switch {"KYTY_WEAVE_WORKERS", &kyty_local_weave_workers, 0, 8},
+	    Switch {"KYTY_WEAVE_CALLS", &kyty_local_weave_calls, 16, 1024},
 	};
 	std::string enabled;
 	for (const auto& setting: switches) {
@@ -238,6 +248,9 @@ inline void InitializePerformanceSwitches() {
 			enabled += std::string(enabled.empty() ? "" : " ") + "(KYTY_SPECULATE=4 stood down: CPU)";
 		}
 	}
+	// KYTY_WEAVE=1: its stand-downs (KYTY_SPECULATE=4 on, too few performance cores, the scout or the table path off, a
+	// build without the Vulkan recording), each one line; the run then stays in mode 0.
+	Weave::ApplyStartGates();
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 	// KYTY_TABLE_TARGET_READ, unset or empty: on under KYTY_SPECULATE=4 (every mode-4 measure ran with it; mode 0 measured
 	// neutral, 1 Nov).
