@@ -335,6 +335,15 @@ inline int64_t CommitVerifyEvery() {
 	return every.load(std::memory_order_relaxed);
 }
 
+// KYTY_SPEC_SET_CPU_DIRTY_STOP (live spec_set_cpu_dirty_stop; -1, the default: on under KYTY_SPECULATE=4; 1 on, 0 off):
+// a commit stops at an image the CPU wrote since its segment found it (Speculation::CommitSegments), the entry of a set's
+// image made before its refresh test (TableTransit, TableValidateSet). Off: neither, as before.
+[[nodiscard]] inline bool SetCpuDirtyStopOn() {
+	static auto& stop  = LiveSwitch::Find("spec_set_cpu_dirty_stop", -1);
+	const auto   value = stop.load(std::memory_order_relaxed);
+	return value > 0 || (value < 0 && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4);
+}
+
 // An image's barrier state as a segment found it (the commit transitions the image there first if other work moved
 // it since) and as it left it.
 struct ImageUse {
@@ -347,6 +356,8 @@ struct ImageUse {
 	// The levels its sampled views spanned, [sample_lo, sample_hi), and whether any access was not one (redo_level_precise).
 	uint32_t                      sample_lo = UINT32_MAX, sample_hi = 0;
 	bool                          sample_other = false;
+	bool                          found_cpu_dirty = false; // (Image::IsCpuDirty, maybe-dirty too, when the segment found it)
+	uint64_t                      found_validity  = 0;     // (Image::validity then, read before it)
 };
 
 // The 64 KiB granules ranges were added over, hashed into 4096 bits, and up to BigRanges ranges over 64 granules or
@@ -453,6 +464,8 @@ struct ImageEntry {
 	// a transfer, a clear, an upload, a download).
 	uint32_t                      sample_lo = UINT32_MAX, sample_hi = 0;
 	bool                          sample_other = false;
+	bool                          found_cpu_dirty = false; // (spec_set_cpu_dirty_stop)
+	uint64_t                      found_validity  = 0;
 };
 
 // (spec_predict_dcc=3.) The fast clears speculations' holes will consume, by surface and slice, until that speculation
@@ -1271,7 +1284,7 @@ struct State {
 			segment.images.push_back({entry.image, entry.serial, entry.found, entry.state,
 			                          std::move(entry.found_subresources), entry.subresources, entry.found_group,
 			                          entry.group, entry.found_buffer_modified, entry.sample_lo, entry.sample_hi,
-			                          entry.sample_other});
+			                          entry.sample_other, entry.found_cpu_dirty, entry.found_validity});
 			entry.used = false;
 		}
 		used.clear();

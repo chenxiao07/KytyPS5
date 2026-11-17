@@ -272,6 +272,9 @@ public:
 		m_maybe_cpu_hash   = hash;
 		m_maybe_hash_valid = true;
 	}
+	// Whether the normal path's refresh of a maybe-dirty image would find it written (RefreshImage: the stored hash of its
+	// guest edges no longer theirs; one with no hash yet only takes one). Reads only (spec_set_cpu_dirty_stop).
+	[[nodiscard]] bool MaybeCpuHashMoved() const { return m_maybe_hash_valid && HashGuestEdges() != m_maybe_cpu_hash; }
 	[[nodiscard]] bool ResolveMaybeCpuHash(uint64_t hash) {
 		if (!m_maybe_cpu_dirty || !m_maybe_hash_valid || m_cpu_dirty) {
 			EXIT("image cannot resolve maybe-dirty hash\n");

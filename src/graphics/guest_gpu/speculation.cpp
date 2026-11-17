@@ -1208,6 +1208,37 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		for (const auto& use: state.closed[index].images)
 			if (!use.found_buffer_modified && use.image->IsBufferModified())
 				return ++m_stop_reasons["commit: GPU work wrote an image it uses"], Progress::Stopped;
+		// spec_set_cpu_dirty_stop (Spec::SetCpuDirtyStopOn): nor written on the CPU since (a hole's host write over its
+		// pages, or an earlier segment's guest memory writes). The work's set reuse checked it only at translation
+		// (TableTransit's and TableValidateSet's refresh tests, which make its entry first); the normal path's next
+		// acquisition uploads (a storage image: guest bytes over what the GPU wrote). CPU-dirty now and either clean when
+		// found or written since (its validity moved: every CPU write's does). A use that only sampled views above level 0
+		// (redo_level_precise's sample-only use: a texture streaming in from its small levels) passes while its sampled
+		// levels' bytes are not dirty: RefreshPending of those levels (DirtyForView), the normal path's own test for such a
+		// view. Maybe-dirty only: when its refresh would upload, the stored hash of its guest edges no longer theirs
+		// (RefreshImage's own test, read only).
+		if (Spec::SetCpuDirtyStopOn())
+			for (const auto& use: state.closed[index].images) {
+				const auto* image = use.image;
+				if (!image->IsCpuDirty() ||
+				    (use.found_cpu_dirty && image->validity.load(std::memory_order_acquire) == use.found_validity))
+					continue;
+				if (!use.sample_other && use.sample_lo != 0 && use.sample_lo < use.sample_hi && image->serial == use.serial) {
+					TextureCache::ImageDesc sampled;
+					sampled.type                  = TextureCache::BindingType::Texture;
+					sampled.view_info.base_level  = use.sample_lo;
+					sampled.view_info.level_count = use.sample_hi - use.sample_lo;
+					if (!TextureCache::RefreshPending(*image, sampled)) continue;
+				}
+				if (image->IsDefinitelyCpuDirty()) {
+					LiveCounters::Add(LiveCounters::SpecCpuDirtyStopsDefinite);
+					return ++m_stop_reasons["commit: the CPU wrote an image it uses"], Progress::Stopped;
+				}
+				if (image->MaybeCpuHashMoved()) {
+					LiveCounters::Add(LiveCounters::SpecCpuDirtyStopsMaybe);
+					return ++m_stop_reasons["commit: the CPU wrote an image it uses (maybe-dirty)"], Progress::Stopped;
+				}
+			}
 		for (const auto& left: state.left_clears)
 			if (left.segment == index && (left.image->serial != left.serial ||
 			                              left.image->validity.load(std::memory_order_relaxed) != left.validity))

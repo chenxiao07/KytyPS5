@@ -1568,7 +1568,9 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 			return false;
 		};
 		// The guest rewrote it (a texture streaming in), or a GPU buffer write its bytes or its stencil plane: upload it
-		// as the normal path's FindTexture does.
+		// as the normal path's FindTexture does. (A speculation's entry for it first, as TableTransit's.)
+		if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && Spec::SetCpuDirtyStopOn())
+			(void)image->SpeculativeEntry();
 		if (TableRefreshPending(*image, dep.desc)) {
 			if (held) (void)refuse();
 			if (Spec::Current() != nullptr) return Spec::Refuse("texture upload"), false;
@@ -2520,6 +2522,10 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 		// An image the shader writes is GPU-modified, CPU-clean and current with buffer writes (as the normal path's
 		// FindTexture leaves a storage image: it acquires it again otherwise). One written since the set was proven this
 		// frame (by the CPU, a GPU buffer write, or into its stencil plane) is uploaded by the normal path's FindTexture.
+		// (A speculation's entry for it first: the state it notes as found is the one the test saw, or a write after,
+		// which its commit then stops at: spec_set_cpu_dirty_stop.)
+		if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && Spec::SetCpuDirtyStopOn())
+			(void)image->SpeculativeEntry();
 		if ((dep.storage && !image->SafeToDownload()) || TableRefreshPending(*image, dep.desc)) return false;
 		if (dep.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
 			if (image->info.IsVolume()) return false;
