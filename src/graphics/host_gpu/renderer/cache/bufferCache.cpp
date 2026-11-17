@@ -3266,6 +3266,18 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 static constexpr uint64_t ParallelCompareBytes = uint64_t {2} << 20u;
 static constexpr uint64_t ParallelComparePages = 64; // (a chunk: 256 KiB)
 
+// An in-order copy's bytes that change: the upload jobs pending over them (work recorded before the copy, whose bytes the
+// upload worker has not taken yet) are done first, so that work reads the bytes from before the copy, as it does on the
+// PS5; as a label's write waits for them (WriteGuestMemory). Only the runs written: a page the copy leaves as it was is
+// the same for those jobs either way. (Found by CarpetHead reading mode 4's commit against the in-order path, PR #349's
+// "known, not fixed": at 1-1 such jobs were pending, ~70 us a frame of waits when drained over the whole destination.)
+// Live switch copy_drain_range (KYTY_COPY_DRAIN_RANGE=0: not waited for). (A function of its own: CopyGuestMemory keeps
+// its shape, and with it its PGO profile.)
+static void DrainCopyDestination(uint64_t vaddr, uint64_t size) {
+	static auto& drain = LiveSwitch::Find("copy_drain_range", 1);
+	if (drain.load(std::memory_order_relaxed) != 0) AsyncUpload::DrainRange(vaddr, size);
+}
+
 void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size) {
 	// The game's linear copies mostly rewrite what the destination already holds (95% of the bytes in the fixed
 	// scene): only the destination pages whose bytes differ are written, so the others stay clean (no upload of their
@@ -3277,6 +3289,7 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 		if (run_end == run) return;
 		const auto  address = dst_vaddr + run, bytes = run_end - run;
 		const auto* from    = reinterpret_cast<const void*>(src_vaddr + run);
+		DrainCopyDestination(address, bytes);
 		// (Only what changes is a write a speculation may have read: Spec::HostWriteParts. The pages were read above.)
 		Spec::HostWriteParts parts;
 		parts.Find(address, from, bytes);
