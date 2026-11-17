@@ -137,6 +137,13 @@ static void PrintUsage() {
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
 	::printf("  --hdr                                Enable HDR10 output when supported.\n");
+	::printf("  --hdr-max-nits <num>                 HDR peak luminance the game is told.\n"
+	         "                                       Default: the display's (Windows), else 1000.\n");
+	::printf("  --hdr-full-frame-nits <num>          HDR full-frame peak luminance. Default: the\n"
+	         "                                       display's (Windows), else 80.\n");
+	::printf("  --hdr-min-nits <num>                 HDR black level. Default: the display's, else 0.\n");
+	::printf("  --hdr-source-nits <num>              HDR highlights up to this peak are fitted to the\n"
+	         "                                       display's (BT.2390); 0: shown as they are. Default: 10000.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
@@ -334,6 +341,20 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--gpu") {
 			options.config.gpu_index = Common::ToInt32(value);
+		} else if (arg == "--hdr-max-nits" || arg == "--hdr-full-frame-nits" || arg == "--hdr-min-nits" ||
+		           arg == "--hdr-source-nits") {
+			char*       end  = nullptr;
+			const float nits = std::strtof(value.c_str(), &end);
+			// (Only the black level may be 0, and the source peak: 0 turns the tone mapping off.)
+			const bool  zero = arg == "--hdr-min-nits" || arg == "--hdr-source-nits";
+			if (end == value.c_str() || *end != '\0' || !((zero ? nits >= 0.0f : nits > 0.0f) && nits <= 10000.0f)) {
+				::printf("invalid %s (nits, 0-10000): %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+			(arg == "--hdr-max-nits"          ? options.config.hdr_max_nits
+			 : arg == "--hdr-full-frame-nits" ? options.config.hdr_max_full_frame_nits
+			 : arg == "--hdr-min-nits"        ? options.config.hdr_min_nits
+			                                  : options.config.hdr_source_nits) = nits;
 		} else if (arg == "--vblank-frequency") {
 			const int32_t vblank_frequency = Common::ToInt32(value);
 			options.config.vblank_frequency =

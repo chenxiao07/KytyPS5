@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/present_dither_spv.h"
+#include "gpu_blit_shaders/present_hdr_tonemap_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -375,7 +376,9 @@ private:
 	void                 Destroy();
 	vk::SurfaceFormatKHR SelectFormat();
 	// `source` (a 10-bit frame) drawn into the 8-bit `dst_image` at m_present_region with an ordered dither, where the blit
-	// rounded each pixel (issue #234: the loading screens' fog banded); false (nothing recorded) where it does not apply.
+	// rounded each pixel (issue #234: the loading screens' fog banded); on the HDR10 swapchain a PQ frame drawn with its
+	// highlights fitted to the display's peak (present_hdr_tonemap.frag, HdrPresentTonemap); false (nothing recorded)
+	// where neither applies.
 	bool RecordDitheredCopy(vk::CommandBuffer command, VulkanImage& source, vk::ImageView source_view,
 	                        vk::Image dst_image, vk::ImageView dst_view, uint32_t src_x, uint32_t src_w);
 
@@ -395,12 +398,14 @@ private:
 	uint32_t                    m_image_index = static_cast<uint32_t>(-1);
 	uint32_t                    m_frame_index = 0;
 	vk::Rect2D                  m_present_region {};
-	// RecordDitheredCopy's: made on its first use and kept (a pipeline for each 8-bit format: B8G8R8A8, R8G8B8A8).
+	// RecordDitheredCopy's: made on its first use and kept (a pipeline for each 8-bit format, B8G8R8A8 and R8G8B8A8, and
+	// for each HDR10 one, A2B10G10R10 and A2R10G10B10, the tone mapping's).
 	vk::Sampler                 m_dither_sampler    = nullptr;
 	vk::DescriptorSetLayout     m_dither_set_layout = nullptr;
 	vk::PipelineLayout          m_dither_layout     = nullptr;
-	std::array<vk::Pipeline, 2> m_dither_pipelines {};
-	bool                        m_dither_failed = false;
+	std::array<vk::Pipeline, 4> m_dither_pipelines {};
+	bool                        m_dither_failed  = false;
+	bool                        m_tonemap_failed = false;
 };
 
 struct Presenter::Impl {
@@ -1021,9 +1026,110 @@ struct Presenter::Impl {
 #endif
 };
 
+namespace {
+// HdrOutputLuminance: the display's range as last read (UpdateHdrLuminance), --hdr-*-nits over it.
+struct HdrLuminanceState {
+	std::mutex   mutex;
+	bool         resolved = false;
+	bool         logged   = false;
+	HdrLuminance value;
+};
+HdrLuminanceState g_hdr_luminance;
+
+bool HdrLuminanceOverridden() {
+	return Config::GetHdrMaxNits() >= 0.0f || Config::GetHdrMaxFullFrameNits() >= 0.0f || Config::GetHdrMinNits() >= 0.0f;
+}
+
+// `display`: the range Windows reports for the display (max, full-frame max, min), or null. A display without HDR
+// luminance in its EDID reports zeros: such values keep the defaults.
+HdrLuminance ResolveHdrLuminance(const float* display) {
+	HdrLuminance luminance {};
+	if (display != nullptr && display[0] >= 100.0f && display[0] <= 10000.0f) {
+		luminance.max_nits            = display[0];
+		luminance.max_full_frame_nits = display[1] >= 50.0f && display[1] <= display[0] ? display[1] : display[0];
+		if (display[2] >= 0.0f && display[2] < 10.0f) luminance.min_nits = display[2];
+		luminance.peak_known = true;
+	}
+	if (Config::GetHdrMaxNits() >= 0.0f) {
+		luminance.max_nits   = Config::GetHdrMaxNits();
+		luminance.peak_known = true;
+	}
+	if (Config::GetHdrMaxFullFrameNits() >= 0.0f) luminance.max_full_frame_nits = Config::GetHdrMaxFullFrameNits();
+	if (Config::GetHdrMinNits() >= 0.0f) luminance.min_nits = Config::GetHdrMinNits();
+	luminance.max_full_frame_nits = std::min(luminance.max_full_frame_nits, luminance.max_nits);
+	luminance.min_nits            = std::min(luminance.min_nits, luminance.max_nits);
+	return luminance;
+}
+
+// The luminance of the display the window is on, read again as the swapchain is made (the window may have moved).
+void UpdateHdrLuminance([[maybe_unused]] SDL_Window* window) {
+	float display[3] {};
+	bool  read = false;
+#if defined(_WIN32)
+	SDL_SysWMinfo info {};
+	SDL_VERSION(&info.version);
+	read = window != nullptr && SDL_GetWindowWMInfo(window, &info) == SDL_TRUE && info.subsystem == SDL_SYSWM_WINDOWS &&
+	       LocalPlatform::DisplayHdrLuminance(info.info.win.window, &display[0], &display[1], &display[2]);
+#endif
+	const HdrLuminance  luminance = ResolveHdrLuminance(read ? display : nullptr);
+	std::lock_guard     lock(g_hdr_luminance.mutex);
+	const HdrLuminance& last      = g_hdr_luminance.value;
+	if (g_hdr_luminance.logged && last.max_nits == luminance.max_nits &&
+	    last.max_full_frame_nits == luminance.max_full_frame_nits && last.min_nits == luminance.min_nits) {
+		return;
+	}
+	g_hdr_luminance.value    = luminance;
+	g_hdr_luminance.resolved = true;
+	g_hdr_luminance.logged   = true;
+	if (read) {
+		std::printf("HDR10 display (Windows): peak %.0f, full-frame %.0f, black %.4f nits\n", display[0], display[1],
+		            display[2]);
+	}
+	std::printf("HDR10 luminance for the game: peak %.0f, full-frame %.0f, black %.4f nits (%s%s)\n", luminance.max_nits,
+	            luminance.max_full_frame_nits, luminance.min_nits,
+	            read && display[0] >= 100.0f ? "the display's" : "defaults: no luminance reported for the display",
+	            HdrLuminanceOverridden() ? ", --hdr-*-nits over it" : "");
+	std::fflush(stdout);
+}
+} // namespace
+
+HdrLuminance HdrOutputLuminance() {
+	std::lock_guard lock(g_hdr_luminance.mutex);
+	if (!g_hdr_luminance.resolved) {
+		g_hdr_luminance.value    = ResolveHdrLuminance(nullptr);
+		g_hdr_luminance.resolved = true;
+	}
+	return g_hdr_luminance.value;
+}
+
+namespace {
+// Nits (0-10,000) as an ST 2084 PQ signal (0-1).
+float NitsToPq(float nits) {
+	const double y = std::pow(std::clamp(static_cast<double>(nits), 0.0, 10000.0) / 10000.0, 2610.0 / 16384.0);
+	return static_cast<float>(std::pow((3424.0 / 4096.0 + 2413.0 / 128.0 * y) / (1.0 + 2392.0 / 128.0 * y), 2523.0 / 32.0));
+}
+
+// present_hdr_tonemap.frag's range: the game's HDR frames from --hdr-source-nits (default 10,000, all PQ can hold) to the
+// display's peak. Off with --hdr-source-nits 0, when the display's peak is not known (no luminance reported, no
+// --hdr-max-nits), or when the display is as bright as the frames.
+struct HdrPresentTonemap {
+	bool  on          = false;
+	float source_nits = 0.0f;
+	float target_nits = 0.0f;
+};
+
+HdrPresentTonemap PresentTonemap() {
+	const float source = Config::GetHdrSourceNits();
+	const auto  output = HdrOutputLuminance();
+	if (source <= 0.0f || !output.peak_known || output.max_nits >= source) return {};
+	return {true, source, output.max_nits};
+}
+} // namespace
+
 // --hdr: an HDR10 (ST 2084 PQ) surface format the presentation blit can write. The swapchain uses it
 // while the guest's frames are PQ; SDR frames (and before the first PQ frame) keep an SDR swapchain.
 vk::SurfaceFormatKHR Swapchain::SelectFormat() {
+	if (Config::HdrEnabled()) UpdateHdrLuminance(m_window.window);
 	const auto& formats    = m_window.surface_capabilities.formats;
 	auto&       graphics   = m_window.graphic_ctx;
 	const auto  hdr_format = std::find_if(formats.begin(), formats.end(), [&](const vk::SurfaceFormatKHR& candidate) {
@@ -1342,15 +1448,26 @@ bool Swapchain::RecordDitheredCopy(vk::CommandBuffer command, VulkanImage& sourc
 	const bool deep = source.format == vk::Format::eA2B10G10R10UnormPack32 ||
 	                  source.format == vk::Format::eA2R10G10B10UnormPack32 ||
 	                  source.format == vk::Format::eR16G16B16A16Sfloat;
-	if (!deep || (m_format != vk::Format::eB8G8R8A8Unorm && m_format != vk::Format::eR8G8B8A8Unorm) ||
-	    source_view == nullptr || dst_view == nullptr || m_dither_failed || !PresentDither()) {
+	// A PQ frame on the HDR10 swapchain (it is one only while the frames are PQ): its highlights fitted to the display.
+	const auto tonemap = m_hdr_active && IsHdrSwapchainFormat(m_format) && IsHdrSwapchainFormat(source.format)
+	                         ? PresentTonemap()
+	                         : HdrPresentTonemap {};
+	if (source_view == nullptr || dst_view == nullptr) return false;
+	if (tonemap.on ? m_tonemap_failed
+	               : !deep || (m_format != vk::Format::eB8G8R8A8Unorm && m_format != vk::Format::eR8G8B8A8Unorm) ||
+	                     m_dither_failed || !PresentDither()) {
 		return false;
 	}
 	auto& device = m_window.graphic_ctx.device;
-	auto  fail   = [this](const char* what) {
-		std::printf("Presenter: no dithered copy (%s failed): frames blitted, each pixel rounded\n", what);
+	auto  fail   = [this, &tonemap](const char* what) {
+		if (tonemap.on) {
+			std::printf("Presenter: no HDR tone mapping (%s failed): HDR frames shown as they are\n", what);
+			m_tonemap_failed = true;
+		} else {
+			std::printf("Presenter: no dithered copy (%s failed): frames blitted, each pixel rounded\n", what);
+			m_dither_failed = true;
+		}
 		std::fflush(stdout);
-		m_dither_failed = true;
 		return false;
 	};
 	if (m_dither_layout == nullptr) {
@@ -1375,7 +1492,7 @@ bool Swapchain::RecordDitheredCopy(vk::CommandBuffer command, VulkanImage& sourc
 			return fail("descriptor set layout");
 		vk::PushConstantRange range {};
 		range.stageFlags = vk::ShaderStageFlagBits::eFragment;
-		range.size       = 4 * sizeof(float);
+		range.size       = 8 * sizeof(float); // (present_dither.frag takes the first 4)
 		vk::PipelineLayoutCreateInfo layout {};
 		layout.setLayoutCount         = 1;
 		layout.pSetLayouts            = &m_dither_set_layout;
@@ -1384,12 +1501,14 @@ bool Swapchain::RecordDitheredCopy(vk::CommandBuffer command, VulkanImage& sourc
 		if (device.createPipelineLayout(&layout, nullptr, &m_dither_layout) != vk::Result::eSuccess)
 			return fail("pipeline layout");
 	}
-	auto& pipeline = m_dither_pipelines[m_format == vk::Format::eR8G8B8A8Unorm ? 1 : 0];
+	auto& pipeline = m_dither_pipelines[tonemap.on ? (m_format == vk::Format::eA2R10G10B10UnormPack32 ? 3 : 2)
+	                                               : (m_format == vk::Format::eR8G8B8A8Unorm ? 1 : 0)];
 	if (pipeline == nullptr) {
 		std::array<vk::ShaderModule, 2> modules {};
 		const std::array<std::pair<const uint32_t*, size_t>, 2> code {
 		    std::pair {GPU_BLIT_FS_TRIANGLE_SPV, std::size(GPU_BLIT_FS_TRIANGLE_SPV)},
-		    std::pair {PRESENT_DITHER_SPV, std::size(PRESENT_DITHER_SPV)}};
+		    tonemap.on ? std::pair {PRESENT_HDR_TONEMAP_SPV, std::size(PRESENT_HDR_TONEMAP_SPV)}
+		               : std::pair {PRESENT_DITHER_SPV, std::size(PRESENT_DITHER_SPV)}};
 		bool made = true;
 		for (size_t i = 0; i < modules.size() && made; ++i) {
 			vk::ShaderModuleCreateInfo create {};
@@ -1449,7 +1568,13 @@ bool Swapchain::RecordDitheredCopy(vk::CommandBuffer command, VulkanImage& sourc
 			pipeline = nullptr;
 			return fail("pipeline");
 		}
-		std::printf("Presenter: 10-bit frames dithered into the 8-bit swapchain image (KYTY_PRESENT_DITHER=0: rounded)\n");
+		if (tonemap.on) {
+			std::printf("Presenter: HDR highlights up to %.0f nits fitted to the display's %.0f (BT.2390; --hdr-source-nits 0: "
+			            "shown as they are)\n",
+			            tonemap.source_nits, tonemap.target_nits);
+		} else {
+			std::printf("Presenter: 10-bit frames dithered into the 8-bit swapchain image (KYTY_PRESENT_DITHER=0: rounded)\n");
+		}
 		std::fflush(stdout);
 	}
 
@@ -1505,10 +1630,15 @@ bool Swapchain::RecordDitheredCopy(vk::CommandBuffer command, VulkanImage& sourc
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_dither_layout, 0, 1, &write);
 	// present_dither.frag: the region's top left, and the frame's texture coordinates per pixel (its `src_w` columns);
 	// the frame's columns from `src_x` on: the region's left edge as if src_x of them came before it.
-	const std::array<float, 4> constants {viewport.x - static_cast<float>(src_x) * viewport.width / static_cast<float>(src_w),
+	// present_hdr_tonemap.frag: those, then the frames' and the display's peaks as PQ signals.
+	const std::array<float, 8> constants {viewport.x - static_cast<float>(src_x) * viewport.width / static_cast<float>(src_w),
 	                                      viewport.y,
 	                                      static_cast<float>(src_w) / static_cast<float>(source.extent.width) / viewport.width,
-	                                      1.0f / viewport.height};
+	                                      1.0f / viewport.height,
+	                                      NitsToPq(tonemap.source_nits),
+	                                      NitsToPq(tonemap.target_nits),
+	                                      0.0f,
+	                                      0.0f};
 	command.pushConstants(m_dither_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(constants), constants.data());
 	command.draw(3, 1, 0, 0);
 	command.endRendering();

@@ -60,6 +60,22 @@ bool HdrEnabled() {
 	return g_config->hdr_enabled;
 }
 
+float GetHdrMaxNits() {
+	return g_config->hdr_max_nits;
+}
+
+float GetHdrMaxFullFrameNits() {
+	return g_config->hdr_max_full_frame_nits;
+}
+
+float GetHdrMinNits() {
+	return g_config->hdr_min_nits;
+}
+
+float GetHdrSourceNits() {
+	return g_config->hdr_source_nits;
+}
+
 uint32_t GetVblankFrequency() {
 	return std::clamp(g_config->vblank_frequency, 30u, 360u);
 }

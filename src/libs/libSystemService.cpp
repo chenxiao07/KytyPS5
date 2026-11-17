@@ -4,11 +4,14 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "graphics/presentation/presenter.h"
 #include "libs/dialog.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <atomic>
+#include <cstdio>
 #include <cstring>
 
 namespace Libs {
@@ -190,9 +193,18 @@ SystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLuminance* luminance)
 		return SYSTEM_SERVICE_ERROR_PARAMETER;
 	}
 
-	luminance->max_full_frame_tone_map_luminance = 80.0f;
-	luminance->max_tone_map_luminance            = 1000.0f;
-	luminance->min_tone_map_luminance            = 0.0f;
+	// The system's HDR calibration on a PS5: here the display's range (Windows), --hdr-*-nits over it.
+	const auto output                            = Graphics::HdrOutputLuminance();
+	luminance->max_full_frame_tone_map_luminance = output.max_full_frame_nits;
+	luminance->max_tone_map_luminance            = output.max_nits;
+	luminance->min_tone_map_luminance            = output.min_nits;
+
+	static std::atomic_flag logged;
+	if (!logged.test_and_set(std::memory_order_relaxed)) {
+		std::printf("sceSystemServiceGetHdrToneMapLuminance: the game takes peak %.0f, full-frame %.0f, black %.4f nits\n",
+		            output.max_nits, output.max_full_frame_nits, output.min_nits);
+		std::fflush(stdout);
+	}
 
 	return OK;
 }

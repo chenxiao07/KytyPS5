@@ -9,6 +9,10 @@
 #   .\run-windows.ps1 -Fullscreen -AspectFit keep the game's 16:9 (black bars) instead of stretching
 #   .\run-windows.ps1 -Hdr                   HDR10 output when Windows HDR is on for the display (the game is
 #                                            told the TV takes HDR and outputs it; SDR otherwise)
+#   .\run-windows.ps1 -Hdr -HdrMaxNits 800   the HDR range the game tones to (also -HdrFullFrameNits, -HdrMinNits;
+#                                            default: what Windows reports for the display, else 1000/80/0)
+#   .\run-windows.ps1 -Hdr -HdrSourceNits 4000 the game's highlights taken to reach 4000 nits, fitted to the display's
+#                                            peak (default 10000; 0: shown as they are, the display clipping them)
 #   .\run-windows.ps1 -Language 11           the console language (0-29 as the PS5 numbers them: 1 English (US),
 #                                            11 Chinese (Simplified); default: the config's)
 #   .\run-windows.ps1 -Set KEY=VALUE         an emulator switch (KYTY_*; the defaults are the emulator's own,
@@ -74,6 +78,10 @@ param(
 	[int]$Height = 0,
 	[switch]$Fullscreen,
 	[switch]$Hdr,
+	[double]$HdrMaxNits = -1,
+	[double]$HdrFullFrameNits = -1,
+	[double]$HdrMinNits = -1,
+	[double]$HdrSourceNits = -1,
 	[switch]$Precompile,
 	[int]$Threads = 0,
 	[switch]$NoRedZone,
@@ -266,6 +274,10 @@ if ($Width -gt 0) { Set-Option '--screen-width' "$Width" }
 if ($Height -gt 0) { Set-Option '--screen-height' "$Height" }
 if ($Fullscreen) { $options.Add('--fullscreen') }
 if ($Hdr) { $options.Add('--hdr') }
+if ($HdrMaxNits -ge 0) { Set-Option '--hdr-max-nits' "$HdrMaxNits" }
+if ($HdrFullFrameNits -ge 0) { Set-Option '--hdr-full-frame-nits' "$HdrFullFrameNits" }
+if ($HdrMinNits -ge 0) { Set-Option '--hdr-min-nits' "$HdrMinNits" }
+if ($HdrSourceNits -ge 0) { Set-Option '--hdr-source-nits' "$HdrSourceNits" }
 if ($PresentMode) { Set-Option '--present-mode' $PresentMode }
 if ($Language -ge 0) { Set-Option '--console-language' "$Language" }
 # The flip queue, one flip per vblank, is what caps the game's frame rate: it never waits for a
