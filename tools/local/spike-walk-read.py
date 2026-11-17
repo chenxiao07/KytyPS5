@@ -11,6 +11,9 @@ last=, LIVE_COUNTERS):
   2nd window       the same around the longest frame from 11 frames after the crossing to the run's end (18 s)
   write faults     the mean write_faults a frame over the walk's measure windows: over 100 a STORM boot, 40-100 MILD
 Boots flagged STORM are listed but left out of the means (their window rows measure the storm, not the crossing).
+Each walk's end position (its last LIVE_WHERE before the flipsx reply) is checked against the bridge's (z 390.3, SPIKE-WALK.md):
+a walk that ends elsewhere gets a WARNING line (a save without the Tower Knight beaten, a stuck run); no reply, or ok=0,
+"where failed".
 Labels are spike-walk.ps1's -Label; each walk of a boot is LABEL-wN. Means and standard errors over the labels given.
 """
 import math
@@ -18,6 +21,8 @@ import re
 import statistics as S
 import sys
 from pathlib import Path
+
+END_Z, END_Z_TOLERANCE = 390.3, 1.5  # the run's end on the bridge: z 390.0-390.6, within 0.1 m walk to walk
 
 
 def walk_rows(d, label, walk):
@@ -30,6 +35,15 @@ def walk_rows(d, label, walk):
     tag = f'{walk}c00'
     start = next(i for i, l in enumerate(live) if f'label={tag}' in l or f' {tag}' in l)
     end = next(i for i in range(start, len(live)) if live[i].startswith('LIVE_FLIPSX'))
+    wheres = [l for l in live[start:end] if l.startswith('LIVE_WHERE')]
+    z = re.search(r' z=(-?[0-9.]+)', wheres[-1]) if wheres else None
+    if not wheres:
+        print(f'WARNING {label} {walk}: where failed (no LIVE_WHERE reply before the flipsx one)')
+    elif ' ok=1 ' not in wheres[-1] or z is None:
+        print(f'WARNING {label} {walk}: where failed at the run\'s end (no end position read)')
+    elif abs(float(z.group(1)) - END_Z) > END_Z_TOLERANCE:
+        print(f'WARNING {label} {walk}: the run ended at z={float(z.group(1)):.1f}, not on the bridge (z {END_Z}); '
+              f'the save may lack the Tower Knight beaten (SPIKE-WALK.md)')
     last = int(re.search(r'last=(\d+)', live[end]).group(1))
     pad_line = max(i for i in range(start) if live[i].startswith('LIVE_PAD'))
     pad_flip = int(re.search(r'flip=(\d+)', live[pad_line]).group(1))
