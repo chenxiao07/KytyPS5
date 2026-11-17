@@ -312,6 +312,19 @@ private:
 	void                  WeaveYieldEnd();
 	static bool WeaveSameOf(const void* processor, const Weave::Registers& start, const Weave::RegisterLog& log,
 	                        uint32_t first, uint32_t index);
+	// The linear-copy records (weave-copies.inc): made as the weave starts, and how many so far; the reader's record of
+	// a queue-0 top-level DISPATCH_DIRECT; a worker's list of those its parcel reads through; the GPU thread's pass of
+	// the records it is past (`here`: true when the next is this dispatch's), its test of a DISPATCH_DIRECT's record
+	// (before its handler: false, no records; after it), and what they say of a parcel at its open (true: every copy it
+	// read through matched; `passed`, the matched copies' write-clock windows).
+	static void                   WeaveCopiesStart();
+	[[nodiscard]] static uint64_t WeaveCopiesMade();
+	[[nodiscard]] bool WeaveNoteCopy(uint64_t sequence, const uint32_t* guest, uint32_t at, const uint32_t* packet);
+	void               WeaveCopiesList(const Weave::Parcel& parcel);
+	bool               WeaveCopiesPass(const uint32_t* base, uint32_t at, bool here);
+	[[nodiscard]] bool WeaveCopyBefore(const Pm4Execution& execution);
+	void               WeaveCopyAfter();
+	[[nodiscard]] bool WeaveCopiesOf(const Weave::Parcel& parcel, std::vector<std::pair<uint64_t, uint64_t>>& passed);
 	// Weave: end of the reader and the GPU thread's order
 	void SuspendPm4();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }

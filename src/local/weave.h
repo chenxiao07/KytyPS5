@@ -214,4 +214,15 @@ struct Worker {
 	static constexpr bool worker = true;
 };
 
+// --- Linear copies ---
+
+// The GPU thread's last linear copy (BufferCache::CopyBuffer writes it while Active(): path 1 the CPU copy, 2 the GPU
+// path; cleared before each top-level DISPATCH_DIRECT the weave's loop checks, read after it), compared with the
+// reader's record of that copy.
+struct CopyDone {
+	uint64_t dst = 0, src = 0, bytes = 0;
+	uint8_t  path = 0;
+};
+inline thread_local CopyDone t_copy_done;
+
 } // namespace Weave

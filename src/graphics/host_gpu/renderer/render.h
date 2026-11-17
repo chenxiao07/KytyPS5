@@ -697,12 +697,23 @@ private:
 	[[nodiscard]] auto& TableEmit();
 	template <typename P>
 	[[nodiscard]] bool TableTargetsCurrent(const NativeXprDrawState& draw_state);
+	// The worker's thread, before its parcel's first draw: the linear copies listed before the parcel and not yet run
+	// as it began (`run`: the records the GPU thread has run), one WeaveCopy each, which its reads go through.
+	static void WeaveCopiesBegin(const std::atomic<uint64_t>* run);
+	static void WeaveCopy(uint64_t index, uint64_t dst, uint64_t src, uint64_t bytes, bool decoded);
+	static void WeaveCopiesEnd();
 	// The weave (weave.h). A worker's table draw (weave-draw.inc), from the command processor's walk of a parcel on
 	// `view`, the worker's view of the GPU thread's command buffer: the table path's worker instantiation,
 	// TableContinue<Weave::Worker> when `clean`, else TableTry<Weave::Worker>.
 	TableResult WeaveTableDraw(CommandBuffer& view, std::span<const uint64_t> commands, uint64_t index_base,
 	                           uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct,
 	                           bool clean);
+	// The linear copy shader's address (0: none found yet) and the shader map generation it was found at, for the
+	// weave's reader (its records of the game's linear copies).
+	[[nodiscard]] uint64_t LinearCopyShader(uint64_t& generation) const {
+		generation = m_linear_copy_generation.load(std::memory_order_acquire);
+		return m_linear_copy_shader.load(std::memory_order_acquire);
+	}
 	// Weave: the worker and the turn
 	// A worker's side (weave-worker.inc), from the command processor's walk of a parcel on worker `worker`'s thread, in
 	// this order. WeaveParcelBegin, once the processor holds the parcel's start registers: the worker's view bound to
@@ -743,15 +754,19 @@ private:
 	// buffer aimed at the apart marker, and its ring (direct calls); `same` compares the processor's registers with the
 	// worker's before a strand's draw (its start image, and the register log past its first draw). WeaveOpen at a
 	// parcel's first draw packet, its worker done and its start registers the GPU thread's: nothing it read moved since
-	// (each refusal counted); true: open. WeaveTurnAt at each draw packet of the open parcel: true when a part of a
-	// strand was spliced there (`until` the packet after it); false: the GPU thread makes the draw. WeaveSkip after a
-	// splice: the part's made draws, when its packets may be skipped by the parcel's register log. WeaveClose: the open
-	// parcel closed. WeaveRelease: a parcel's slab released once (`used`: by the GPU thread, with the tick of now).
-	// WeaveReclaim: the slabs whose tick is done freed.
+	// (each refusal counted); true: open. What the command processor's records of the game's linear copies say of the
+	// parcel: every copy it read through ran as recorded (`copies_matched`), and the write-clock windows of those
+	// copies, (begin, end] and sorted, which the write ring's test passes over
+	// (`copies_passed`). WeaveTurnAt at each draw packet of the open parcel: true when a part of a strand was spliced
+	// there (`until` the packet after it); false: the GPU thread makes the draw. WeaveSkip after a splice: the part's
+	// made draws, when its packets may be skipped by the parcel's register log. WeaveClose: the open parcel closed.
+	// WeaveRelease: a parcel's slab released once (`used`: by the GPU thread, with the tick of now). WeaveReclaim: the
+	// slabs whose tick is done freed.
 	[[nodiscard]] bool WeaveStart(uint32_t workers, const void* processor,
 	                              bool (*same)(const void* processor, const Weave::Registers& start,
 	                                           const Weave::RegisterLog& log, uint32_t first, uint32_t index));
-	[[nodiscard]] bool WeaveOpen(Weave::Parcel& parcel);
+	[[nodiscard]] bool WeaveOpen(Weave::Parcel& parcel, bool copies_matched,
+	                             std::span<const std::pair<uint64_t, uint64_t>> copies_passed);
 	[[nodiscard]] bool WeaveTurnAt(const uint32_t* packet, const uint32_t*& until);
 	[[nodiscard]] bool WeaveSkip(uint32_t& begin, uint32_t& end) noexcept;
 	void               WeaveClose() noexcept;

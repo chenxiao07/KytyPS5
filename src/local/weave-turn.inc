@@ -122,7 +122,8 @@ bool RenderExecutor::WeaveStartsHit(const Weave::Parcel& parcel) {
 	return false;
 }
 
-bool RenderExecutor::WeaveOpen(Weave::Parcel& parcel) {
+bool RenderExecutor::WeaveOpen(Weave::Parcel& parcel, bool copies_matched,
+                               std::span<const std::pair<uint64_t, uint64_t>> copies_passed) {
 	if (!g_weave_turn || !parcel.result) return false;
 	auto&       t     = *g_weave_turn;
 	auto&       r     = *parcel.result;
@@ -141,8 +142,9 @@ bool RenderExecutor::WeaveOpen(Weave::Parcel& parcel) {
 	auto& textures  = m_context.GetTextureCache();
 	// Each test asks only where its epoch moved since the worker began, and only over what the parcel read: the mapping
 	// over its pages; shader registrations at its draws' programs; image starts inside the ranges it bound; the
-	// device-address table; the free log over its objects (turned over since: no object of it can be proven alive);
-	// the scout's write ring over its pages (a host write, a write-back or a GPU-written mark since).
+	// device-address table; the linear copies it read through (each ran as the reader decoded it); the free log over
+	// its objects (turned over since: no object of it can be proven alive); the scout's write ring over its pages (a
+	// host write, a write-back or a GPU-written mark since; a matched copy's is passed over: it was read through).
 	if (resources.MappingEpoch() != begun.mapping && resources.MappingMovedSince(begun.mapping, r.pages))
 		return refuse(LiveCounters::WeaveParcelsRefusedMapping);
 	if (ShaderMapGeneration() != r.shader_generation) {
@@ -159,13 +161,15 @@ bool RenderExecutor::WeaveOpen(Weave::Parcel& parcel) {
 	if (textures.StartEpoch() != r.image_start_epoch && WeaveStartsHit(parcel))
 		return refuse(LiveCounters::WeaveParcelsRefusedImageStart);
 	if (BufferCache::BdaTableGeneration() != r.bda_generation) return refuse(LiveCounters::WeaveParcelsRefusedBda);
+	if (!copies_matched) return refuse(LiveCounters::WeaveParcelsRefusedCopies);
 	// (The free log read from the parcel's begin clock here, on in each later test: each entry once.)
 	auto& o         = t.open;
 	o.freed_scanned = r.freed_clock;
 	o.freed_hits.clear();
 	o.freed_lost = Weave::FreedHits(o.freed_scanned, r.objects, o.freed_hits) == 2;
 	if (o.freed_lost) return refuse(LiveCounters::WeaveParcelsRefusedFreed);
-	if (Scout::RangesWrittenSince(r.write_clock, r.pages) != 0) return refuse(LiveCounters::WeaveParcelsRefusedRing);
+	if (Scout::RangesWrittenSince(r.write_clock, r.pages, copies_passed) != 0)
+		return refuse(LiveCounters::WeaveParcelsRefusedRing);
 	o.parcel          = &parcel;
 	o.result          = &r;
 	o.begun           = &begun;

@@ -302,6 +302,7 @@ bool CommandProcessor::WeaveReadFrom(uint64_t sequence, const uint32_t* guest,
 		if (parcel == nullptr) return false; // (paused, or stopping)
 		parcel->generation = g_weave->generation.load(std::memory_order_relaxed);
 		parcel->sequence   = sequence;
+		parcel->copies_end = WeaveCopiesMade();
 		parcel->guest      = guest;
 		parcel->first      = guest + at;
 		parcel->end        = guest + at;
@@ -413,10 +414,12 @@ bool CommandProcessor::WeaveReadFrom(uint64_t sequence, const uint32_t* guest,
 			case Pm4::IT_CLEAR_STATE: stop = !run(at, header, length); break;
 			case Pm4::IT_DISPATCH_DIRECT:
 				// (Its handler sets the compute wave size, DispatchDirect.)
-				if (length == 5)
+				if (length == 5) {
 					m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(packet[4]));
-				else
+					stop = !WeaveNoteCopy(sequence, guest, at, packet);
+				} else {
 					stop = true;
+				}
 				break;
 			case Pm4::IT_DISPATCH_INDIRECT:
 				if (header == 0xc0011600u)
@@ -484,6 +487,7 @@ void CommandProcessor::WeaveWalk(uint32_t worker, Weave::Parcel& parcel) {
 	WeaveRestore(parcel.start);
 	// (Its registers were replaced: nothing the observer holds is known, and its first draw is not clean.)
 	DrawStateObserver::Invalidate();
+	WeaveCopiesList(parcel);
 	if (!executor.WeaveParcelBegin(worker, parcel, m_ctx, m_ucfg, m_sh_ctx)) {
 		if (parcel.result) parcel.result->spoiled = true; // (nothing of it made: never opened)
 		return;

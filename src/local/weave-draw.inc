@@ -84,6 +84,25 @@ struct RenderExecutor::WeaveScratch {
 	// the parcel's end sorts and merges. (Cleared at the parcel's first note: its pages start empty.)
 	std::array<std::pair<uint64_t, uint64_t>, 64> pages_seen {};
 
+	// The linear copies listed before the worker's parcel and not yet run as it began (the reader's records): a range
+	// one writes is read from the copy's source instead (RenderExecutor::WeaveCopiesBegin, WeaveCopy, WeaveCopiesEnd
+	// list them). Sorted by destination; `copies_covered` is their destinations' union.
+	struct Copy {
+		uint64_t dst = 0, end = 0, src = 0, index = 0, max_end = 0; // (max_end: the largest end up to this entry)
+		bool     decoded = true;
+	};
+	std::vector<Copy>                          copies;
+	std::vector<std::pair<uint64_t, uint64_t>> copies_covered;
+	const std::atomic<uint64_t>*               copies_run = nullptr; // the records the GPU thread has run
+	[[nodiscard]] bool                         CopiesMeet(uint64_t begin, uint64_t end) const;
+	template <typename Read>
+	[[nodiscard]] bool CopiesResolve(uint64_t run, uint64_t begin, uint64_t end, uint64_t limit, uint8_t* out,
+	                                 Read& read);
+	// [address, address + bytes) into `out` through the listed copies, when one is listed over it (false: none is, the
+	// caller reads it as ever); `ok` false when a read failed or met a copy the reader could not decode.
+	template <typename Read>
+	[[nodiscard]] bool CopiesThrough(uint64_t address, uint64_t bytes, void* out, bool& ok, Read&& read);
+
 	// What the strand's buffer bound is not assumed bound any more: its emission, its last draw and state, and the key.
 	void ForgetDraws() noexcept {
 		emit               = {};
@@ -112,7 +131,7 @@ struct RenderExecutor::WeaveScratch {
 		table.store      = nullptr;
 	}
 	// The parcel's notes as a draw began: a continuation that failed leaves none of its own before the draw is tried in
-	// full (its pages stay: what it read).
+	// full (its pages and copies stay: what it read).
 	struct Mark {
 		size_t held_uses = 0, held_words = 0, held_buffers = 0, ring_uses = 0, touched = 0, placed = 0, proofs = 0,
 		       needs = 0;
@@ -142,7 +161,7 @@ struct RenderExecutor::WeaveScratch {
 	// set's transit under a draw state), once a stretch.
 	static void NoteNeed(Weave::NeedKind kind, const NativeXprDrawState* state, const TableImageSet* set,
 	                     uint64_t capture);
-	// The guest's bytes for a ring copy, the range noted (a failed read is a hole).
+	// The guest's bytes for a ring copy, through the listed copies, the ranges noted (a failed read is a hole).
 	[[nodiscard]] bool ReadBacking(uint64_t address, void* out, uint64_t size);
 
 	// Whether an image the set or the draw state names by its id is retiring (Weave::ImageRetiring): its erase may come
@@ -167,8 +186,8 @@ struct RenderExecutor::WeaveScratch {
 	// thread). A page a pending guest write guards (KYTY_WRITE_GUARD) comes from its backing view, as the GPU thread
 	// reads it. A watched page comes from the backing where the GPU thread's own proof holds for it (no GPU-dirty byte,
 	// no GPU-modified image: Memory::TryReadGpuCleanBackingToHost); otherwise the read fails (the GPU thread's reader
-	// may read back from the GPU, a worker may not). Each range read is noted in the parcel's
-	// pages.
+	// may read back from the GPU, a worker may not). A range a listed copy writes is read from its source. Each range
+	// read is noted in the parcel's pages.
 	class Reader {
 	public:
 		explicit Reader(GpuResourceManager& resources)
@@ -270,14 +289,104 @@ void RenderExecutor::WeaveScratch::NoteNeed(Weave::NeedKind kind, const NativeXp
 	                        .first_made = static_cast<uint32_t>(result.made.size() - 1)});
 }
 
+bool RenderExecutor::WeaveScratch::CopiesMeet(uint64_t begin, uint64_t end) const {
+	if (copies_covered.empty() || end <= copies_covered.front().first || begin >= copies_covered.back().second)
+		return false;
+	const auto after = std::upper_bound(copies_covered.begin(), copies_covered.end(), end - 1,
+	                                    [](uint64_t value, const auto& range) { return value < range.first; });
+	return after != copies_covered.begin() && std::prev(after)->second > begin;
+}
+
+// [begin, end) through the copies below `limit` the GPU thread has not run (`run` and on), the latest first: what such
+// a copy writes is read from its source at the same offset (split at its edges; through chains of copies), the rest by
+// `read`. False: a read failed, or the range is under a copy the reader could not decode.
+template <typename Read>
+bool RenderExecutor::WeaveScratch::CopiesResolve(uint64_t run, uint64_t begin, uint64_t end, uint64_t limit,
+                                                 uint8_t* out, Read& read) {
+	const Copy* best  = nullptr;
+	auto        after = std::upper_bound(copies.begin(), copies.end(), end - 1,
+	                                     [](uint64_t value, const Copy& copy) { return value < copy.dst; });
+	while (after != copies.begin()) {
+		--after;
+		if (after->max_end <= begin) break;
+		if (after->end > begin && after->index < limit && after->index >= run &&
+		    (best == nullptr || after->index > best->index))
+			best = &*after;
+	}
+	if (best == nullptr) return read(begin, end - begin, out);
+	if (!best->decoded) return false;
+	auto& used = WeaveParcel().result->copies_used;
+	if (used.empty() || used.back() != best->index) used.push_back(best->index);
+	const auto from = std::max(begin, best->dst), to = std::min(end, best->end);
+	const auto here = best->index, source = best->src + (from - best->dst);
+	if (begin < from && !CopiesResolve(run, begin, from, here, out, read)) return false;
+	if (!CopiesResolve(run, source, source + (to - from), here, out + (from - begin), read)) return false;
+	return to >= end || CopiesResolve(run, to, end, here, out + (to - begin), read);
+}
+
+template <typename Read>
+bool RenderExecutor::WeaveScratch::CopiesThrough(uint64_t address, uint64_t bytes, void* out, bool& ok, Read&& read) {
+	if (bytes == 0 || copies_run == nullptr || !CopiesMeet(address, address + bytes)) return false;
+	const auto run = copies_run->load(std::memory_order_acquire);
+	ok             = CopiesResolve(run, address, address + bytes, UINT64_MAX, static_cast<uint8_t*>(out), read);
+	return true;
+}
+
+void RenderExecutor::WeaveCopiesBegin(const std::atomic<uint64_t>* run) {
+	auto& scratch = WeaveHere();
+	scratch.copies.clear();
+	scratch.copies_covered.clear();
+	scratch.copies_run = run;
+}
+
+void RenderExecutor::WeaveCopy(uint64_t index, uint64_t dst, uint64_t src, uint64_t bytes, bool decoded) {
+	if (bytes != 0)
+		WeaveHere().copies.push_back({.dst = dst, .end = dst + bytes, .src = src, .index = index, .decoded = decoded});
+}
+
+void RenderExecutor::WeaveCopiesEnd() {
+	auto& scratch = WeaveHere();
+	auto& copies  = scratch.copies;
+	std::ranges::sort(copies, {}, &WeaveScratch::Copy::dst);
+	uint64_t most = 0;
+	for (auto& copy: copies) {
+		most          = std::max(most, copy.end);
+		copy.max_end  = most;
+		auto& covered = scratch.copies_covered;
+		if (!covered.empty() && copy.dst <= covered.back().second)
+			covered.back().second = std::max(covered.back().second, copy.end);
+		else
+			covered.emplace_back(copy.dst, copy.end);
+	}
+	if (copies.empty()) scratch.copies_run = nullptr;
+}
+
 bool RenderExecutor::WeaveScratch::ReadBacking(uint64_t address, void* out, uint64_t size) {
-	NoteRange(*WeaveParcel().result, address, size);
-	return Libs::LibKernel::Memory::TryReadBackingToHost(address, out, size);
+	auto&      result = *WeaveParcel().result;
+	const auto piece  = [&](uint64_t at, uint64_t bytes, uint8_t* to) {
+        NoteRange(result, at, bytes);
+        return Libs::LibKernel::Memory::TryReadBackingToHost(at, to, bytes);
+	};
+	if (bool ok = true; CopiesThrough(address, size, out, ok, piece)) return ok;
+	return piece(address, size, static_cast<uint8_t*>(out));
 }
 
 void RenderExecutor::WeaveScratch::Reader::Read(uint64_t address, uint32_t count, uint32_t* out) {
-	const uint64_t bytes = uint64_t {count} * 4u;
-	m_scratch.NoteRange(*WeaveParcel().result, address, bytes);
+	const uint64_t bytes  = uint64_t {count} * 4u;
+	auto&          result = *WeaveParcel().result;
+	m_scratch.NoteRange(result, address, bytes);
+	bool       ok    = true;
+	const auto piece = [&](uint64_t at, uint64_t size, uint8_t* to) {
+		if (at != address) m_scratch.NoteRange(result, at, size);
+		return ReadBytes(at, size, to);
+	};
+	if (m_scratch.CopiesThrough(address, bytes, out, ok, piece)) {
+		if (!ok) {
+			std::memset(out, 0, bytes);
+			m_failed = true;
+		}
+		return;
+	}
 	if (!ReadBytes(address, bytes, reinterpret_cast<uint8_t*>(out))) m_failed = true;
 }
 

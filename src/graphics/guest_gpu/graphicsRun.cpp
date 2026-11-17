@@ -44,6 +44,7 @@
 #include "speculation-state.h"
 #include "xpr-capture.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "vulkan-recording.h"
 #include "weave-parcel.h"
 #endif
@@ -2321,6 +2322,7 @@ static int32_t GsUserSgprAt(uint32_t location) {
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "weave-reader.inc"
 #include "weave-order.inc"
+#include "weave-copies.inc"
 #endif
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
@@ -2577,6 +2579,12 @@ void CommandProcessor::ProcessPm4Loop(Pm4Execution& execution, size_t stop_depth
 			     total_dw - remaining_dw, packet_header);
 		}
 
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		// KYTY_WEAVE: a queue-0 top-level DISPATCH_DIRECT tested against the reader's record of it (weave-copies.inc).
+		bool weave_copy = false;
+		if constexpr (kWeave)
+			weave_copy = buffer_index == 0 && opcode == Pm4::IT_DISPATCH_DIRECT && WeaveCopyBefore(execution);
+#endif
 		const uint32_t packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
@@ -2586,6 +2594,10 @@ void CommandProcessor::ProcessPm4Loop(Pm4Execution& execution, size_t stop_depth
 			return;
 		}
 		EXIT_IF(execution.m_buffer_stack.size() != buffer_index + 1);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		if constexpr (kWeave)
+			if (weave_copy) WeaveCopyAfter();
+#endif
 		execution.m_buffer_stack[buffer_index].offset_dw += packet_dw;
 		execution.m_made_progress = true;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING

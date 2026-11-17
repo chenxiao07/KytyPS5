@@ -17,22 +17,27 @@ namespace {
 // step, the reader's generation then, at or below which every parcel is passed unused; whether a parcel is open, and
 // the open parcel (its serial, submission, buffer and packets); the packet a spliced part's draws are passed one by one
 // up to (the register log off); a handler's draw in it that may have changed the registers, one being made (watched:
-// WeaveYieldBegin), and the registers before that draw; the weave started, or stood down at its start; the submission
-// queue 0's processor is in (the scout's numbering, WeaveSubmission), and that processor while the weave runs on it
-// (null: none; ProcessPm4 tests it, one load). All of it the GPU thread's: there is one weave, on queue 0's one
-// processor.
+// WeaveYieldBegin), and the registers before that draw; a queue-0 DISPATCH_DIRECT's place and the write clock before
+// it, the records' cursor, and the matched copies' write-clock windows an open passes over (the linear-copy records);
+// the weave started, or stood down at its start; the submission queue 0's processor is in (the scout's numbering,
+// WeaveSubmission), and that processor while the weave runs on it (null: none; ProcessPm4 tests it, one load). All of
+// it the GPU thread's: there is one weave, on queue 0's one processor.
 struct WeaveOrder {
-	uint64_t                cursor = 0, distrust = 0, sequence = 0;
-	bool                    distrusting = false, open = false;
-	uint64_t                open_serial = 0, open_sequence = 0;
-	const uint32_t*         open_base  = nullptr;
-	const uint32_t*         open_first = nullptr;
-	const uint32_t*         open_end   = nullptr;
-	const uint32_t*         skip_until = nullptr;
-	bool                    changed = false, yield = false;
-	Weave::Registers        before;
-	bool                    started = false, failed = false;
-	const CommandProcessor* turns = nullptr;
+	uint64_t                                   cursor = 0, distrust = 0, sequence = 0;
+	bool                                       distrusting = false, open = false;
+	uint64_t                                   open_serial = 0, open_sequence = 0;
+	const uint32_t*                            open_base  = nullptr;
+	const uint32_t*                            open_first = nullptr;
+	const uint32_t*                            open_end   = nullptr;
+	const uint32_t*                            skip_until = nullptr;
+	bool                                       changed = false, yield = false;
+	Weave::Registers                           before;
+	const uint32_t*                            copy_base  = nullptr;
+	uint32_t                                   copy_at    = 0;
+	uint64_t                                   copy_clock = 0, copies_cursor = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> copies_passed;
+	bool                                       started = false, failed = false;
+	const CommandProcessor*                    turns = nullptr;
 };
 WeaveOrder g_weave_order;
 
@@ -220,8 +225,8 @@ bool CommandProcessor::WeaveSameOf(const void* processor, const Weave::Registers
 }
 
 // The GPU thread, at queue 0's first top-level draw packet woven: the reader's and the workers' processors, the
-// executor's state for them, and the threads. Once; false: the weave stood down (each reason says so in one line,
-// Weave::Start).
+// executor's state for them, the linear-copy records, and the threads. Once; false: the weave stood down (each reason
+// says so in one line, Weave::Start).
 bool CommandProcessor::WeaveStart() {
 	auto& order = g_weave_order;
 	if (order.started || order.failed) return order.started;
@@ -240,6 +245,7 @@ bool CommandProcessor::WeaveStart() {
 		weave->workers[i] = std::make_unique<CommandProcessor>(m_renderer, m_interrupt_event_id);
 	weave->gpu_sequence.store(g_weave_order.sequence, std::memory_order_relaxed);
 	g_weave = weave;
+	WeaveCopiesStart(); // (before the reader and the workers start)
 	if (!Weave::Start({.read    = &CommandProcessor::WeaveRead,
 	                   .make    = &CommandProcessor::WeaveMake,
 	                   .release = &CommandProcessor::WeaveRelease}))
@@ -349,8 +355,11 @@ bool CommandProcessor::WeaveAt(Pm4Execution& execution) {
 		Weave::PassParcel(parcel);
 		return false;
 	}
+	// (What the linear-copy records say of it: every copy it read through ran as recorded; the windows of the matched
+	// copies listed before it, which the write ring's test passes over.)
+	const bool copies_matched = WeaveCopiesOf(parcel, order.copies_passed);
 	CheckBuffer();
-	if (!g_weave->executor->WeaveOpen(parcel)) {
+	if (!g_weave->executor->WeaveOpen(parcel, copies_matched, order.copies_passed)) {
 		Weave::PassParcel(parcel);
 		return false;
 	}
@@ -366,13 +375,15 @@ bool CommandProcessor::WeaveAt(Pm4Execution& execution) {
 }
 
 // At a draw packet of queue 0's top level outside an open parcel (the cursor on it): the slabs whose tick is done
-// reclaimed and the parcels the GPU thread is past passed; the serial of the parcel that starts here (-1: none). With
-// none here, the GPU thread's registers posted when the reader asked for them at or before this packet.
+// reclaimed, the linear-copy records and the parcels the GPU thread is past passed; the serial of the parcel that
+// starts here (-1: none). With none here, the GPU thread's registers posted when the reader asked for them at or before
+// this packet.
 int64_t CommandProcessor::WeaveFind(const Pm4Execution::BufferCursor& cursor) {
 	auto&       order  = g_weave_order;
 	const auto* base   = cursor.Position();
 	const auto* packet = base + cursor.offset_dw;
 	g_weave->executor->WeaveReclaim();
+	(void)WeaveCopiesPass(base, cursor.offset_dw, false);
 	const auto published = Weave::Published();
 	for (; order.cursor < published; ++order.cursor) {
 		auto& parcel = Weave::ParcelAt(order.cursor);
