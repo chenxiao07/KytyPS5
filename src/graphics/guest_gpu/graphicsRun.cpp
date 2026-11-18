@@ -55,6 +55,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -2533,8 +2534,39 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 	const bool note_words = spec != nullptr && !GuestGpu::IsGpuThread();
 	// (spec_flush_keep: read once a call; mode 4 only.)
 	const bool flush_keep = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+	// (Mode 4, a speculation's thread off the GPU thread: packet_light.) A register packet (SET_CONTEXT_REG, SET_SH_REG,
+	// SET_UCONFIG_REG(_INDEX); not the INDIRECT forms, which read memory) takes no Spec::EnterPacket and no Mark at its
+	// start. Its handlers (pm4Handlers.cpp CpOpSetContextReg / CpOpSetShaderReg / CpOpSetUconfigReg and the HwCtx / HwSh /
+	// HwUc register functions they call) set the processor's registers only: no note of the state (Spec::State's lists,
+	// bda_all), no recorded Vulkan work, no buffer, image or catalog lookup. So:
+	// - Mark: what it would take at the packet's start (Sizes, bda_all, RecordedWrites) is what it takes at any point of
+	//   the packet. Such a packet can still be refused (an offset past its bank, "register packet of other data"; an exit
+	//   in a register function, "malformed packet"; the AA sample look-ahead's copy) or cancelled at the poll; every such
+	//   return goes through `refuse` or the cancel stop below, which take the Mark first (State::light_unmarked, on the
+	//   state so that a refusal any call level meets takes it: an exit thrown out of a nested call (INDIRECT_BUFFER) is
+	//   refused by the outer level's `refuse`; Translate takes it too before its Rollback), so Translate's Rollback and its
+	//   partial-work check see the checkpoint they see without. It is cleared at each loop turn and when a call returns
+	//   (not when an exception leaves it), so no later packet's or outer packet's refusal takes it.
+	// - EnterPacket: only while the thread's packet slot holds an earlier packet of this translation (not 0, as
+	//   LeavePackets leaves it between translations: a translation's first packets enter as before). A release
+	//   (PacketNow) during such a packet waits for that earlier packet to be passed, which happens at the next packet
+	//   that enters, the same one as without or a later one (a register packet references nothing released): frees
+	//   only come later, never earlier.
+	const bool packet_light = note_words && flush_keep;
+	// (packet_light: a return clears the pending Mark; an exception leaving the call keeps it for the level that catches
+	// it. Armed only then: nothing to do on the other paths.)
+	struct LightMarkEnd {
+		Spec::State* spec       = nullptr;
+		int          exceptions = 0;
+		~LightMarkEnd() {
+			if (spec != nullptr && std::uncaught_exceptions() == exceptions) spec->light_unmarked = false;
+		}
+	} light_mark_end;
+	if (packet_light) light_mark_end.spec = spec, light_mark_end.exceptions = std::uncaught_exceptions();
 	// A speculation's refused packet suspends the execution there (speculation.cpp goes on past it, or stops).
 	const auto refuse = [&](const char* why) {
+		if (spec != nullptr && spec->light_unmarked) // (packet_light)
+			spec->Mark(LocalVulkanRecording::RecordedWrites()), spec->light_unmarked = false;
 		Spec::Refuse(why);
 		execution.m_suspended = true;
 	};
@@ -2582,6 +2614,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		return false;
 	};
 	while (execution.m_buffer_stack.size() > stop_depth) {
+		if (packet_light) spec->light_unmarked = false; // (a packet before this one is done with its Mark)
 		if (spec != nullptr && spec->refused != nullptr) return refuse(spec->refused);
 		if (g_gpu_state != nullptr && spec == nullptr) { // (a speculation's thread runs no guest commands)
 			g_gpu_state->ProcessCommands();
@@ -2835,11 +2868,19 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			spec->NoteCommandWords(reinterpret_cast<uint64_t>(cursor.Position() + cursor.offset_dw),
 			                       uint64_t {KYTY_PM4_LEN(packet_header)} * 4u);
 		if (spec != nullptr) {
-			if (!GuestGpu::IsGpuThread()) Spec::EnterPacket();
-			spec->Mark(LocalVulkanRecording::RecordedWrites());
+			// (packet_light: a register packet's EnterPacket and Mark left out; see `packet_light`.)
+			const bool light = packet_light &&
+			                   (opcode == Pm4::IT_SET_CONTEXT_REG || opcode == Pm4::IT_SET_SH_REG ||
+			                    opcode == Pm4::IT_SET_UCONFIG_REG || opcode == Pm4::IT_SET_UCONFIG_REG_INDEX) &&
+			                   Spec::g_packet[Spec::t_packet_slot].value.load(std::memory_order_relaxed) != 0;
+			if (!GuestGpu::IsGpuThread() && !light) Spec::EnterPacket();
+			if (light) spec->light_unmarked = true;
+			else spec->Mark(LocalVulkanRecording::RecordedWrites());
 			// (Between packets, nothing of this one recorded: what is translated so far is committed, the rest is taken the
 			// normal way.)
 			if (spec->cancel != nullptr && spec->cancel->load(std::memory_order_relaxed)) {
+				if (spec->light_unmarked) // (packet_light)
+					spec->Mark(LocalVulkanRecording::RecordedWrites()), spec->light_unmarked = false;
 				Spec::Stop("cancelled: the GPU thread came for it");
 				execution.m_suspended = true;
 				return;

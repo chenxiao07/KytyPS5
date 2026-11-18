@@ -961,6 +961,8 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 			}
 			uint32_t   dwords  = 0;
 			const auto packet  = CommandProcessor::SuspendedPacket(spec, dwords);
+			if (r.state.light_unmarked) // (mode 4: a refused register packet's Mark, if no level of ProcessPm4Spec took it)
+				r.state.Mark(LocalVulkanRecording::RecordedWrites()), r.state.light_unmarked = false;
 			const bool partial = LocalVulkanRecording::RecordedWrites() != r.state.checkpoint_work;
 			r.state.Rollback();
 			if (partial) { // (its recorded work cannot be taken back)

@@ -719,6 +719,10 @@ struct State {
 	std::vector<ImageEntry>                  overlay;
 	std::unordered_map<const Image*, size_t> overlay_index;
 	std::vector<size_t>                      used; // overlay entries the open segment transitioned
+	// (Mode 4) moved by every overlay entry taken (Image::SpeculativeEntry: every transition, first touch, read of an
+	// entry) and by every write the open segment notes (NoteWritten, Journal): a worker's table draw in place while
+	// neither moved since its last one (TableDraw, TableXpr::spec_place). Never reset: they only grow.
+	uint64_t overlay_gen = 0, open_gen = 0;
 	// The upload rings its work reads (BufferCache::GetTableUploadBuffer, GetShaderUploadBuffer): its own, what they
 	// fence gets the commit's tick.
 	StreamBuffer* table_upload  = nullptr;
@@ -770,6 +774,9 @@ struct State {
 	Counts   checkpoint;
 	bool     checkpoint_bda_all = false;
 	uint64_t checkpoint_work    = 0; // LocalVulkanRecording::RecordedWrites()
+	uint64_t rollbacks          = 0; // (mode 4: Rollbacks so far, it only grows: TableBlocks' shared ring copies)
+	// (Mode 4: the current register packet's Mark not taken yet; ProcessPm4Spec.)
+	bool light_unmarked = false;
 	// (NoteCommandWords: the run of command words not noted yet.)
 	uint64_t command_begin = 0, command_end = 0;
 	// What the GPU thread notes for the presenter as it runs the packets (FrameGen), noted here off it and noted by the
@@ -983,6 +990,7 @@ struct State {
 		if (NoteOnce(1, current, Sealed().current, address, size)) current_set.Add(address, size);
 	}
 	void NoteWritten(uint64_t address, uint64_t size) {
+		++open_gen;
 		if (NoteOnce(0, written, Sealed().written, address, size)) {
 			written_set.Add(address, size);
 			pending.Add(address, size);
@@ -1131,6 +1139,7 @@ struct State {
 		if (one_set) pending_set.Add(address, size);
 		open_journal_set.Add(address, size);
 		if (copy) open_copy_sources.Add(value, size);
+		++open_gen;
 	}
 	// The words at `address` as the translation reads them: as the processor's pending writes leave them (in order it
 	// writes before the commands after it; a copy's word is its source's), its own, then a previous speculation's;
@@ -1385,6 +1394,7 @@ struct State {
 	}
 	// (The cumulative sets keep what the packet noted: they only make later decisions more careful.)
 	void Rollback() {
+		++rollbacks;
 		note_seen.clear(); // (before_merge)
 		current.resize(std::min(current.size(), checkpoint.current));
 		written.resize(std::min(written.size(), checkpoint.written));
@@ -1461,6 +1471,7 @@ struct State {
 		draw_verifies.clear();
 		indexed_draws = 0;
 		scenes        = 0;
+		light_unmarked = false;
 		used_pairs.clear();
 		reloc_refs.clear();
 		reloc_unrel.clear();

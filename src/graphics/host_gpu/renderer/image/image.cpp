@@ -152,6 +152,7 @@ void Image::LockStateContended() const noexcept {
 Spec::ImageEntry* Image::SpeculativeEntry() {
 	auto* spec = Spec::Current();
 	if (spec == nullptr) return nullptr;
+	++spec->overlay_gen; // (any entry taken: a worker's table draw in place, TableDraw)
 	const auto [found, inserted] = spec->overlay_index.try_emplace(this, spec->overlay.size());
 	Spec::ImageEntry* entry      = nullptr;
 	if (inserted) {

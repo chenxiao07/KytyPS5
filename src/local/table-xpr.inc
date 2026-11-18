@@ -391,6 +391,14 @@ struct RenderExecutor::TableXpr {
 		return memo[((reinterpret_cast<uintptr_t>(pair) * 0x9e3779b97f4a7c15ull) ^ (key * 0xc2b2ae3d27d4eb4full)) >> 52u];
 	}
 	uint64_t                  images_epoch = 0;       // TextureCache::ImagesEpoch after it
+	// (Mode 4) a speculation's last table draw here, by its translation (Spec::State::id), segment, chain head, draw
+	// state's capture (a state re-captured in place keeps its address), the images epoch read before its checks, and its
+	// overlay and open-write generations after it (id 0: none to match). TableDraw's spec_in_place.
+	struct SpecPlace {
+		uint64_t           id = 0, images = 0, overlay = 0, open = 0, capture = 0;
+		size_t             segment = 0;
+		const Spec::State* chain   = nullptr;
+	} spec_place;
 	// The game buffer the last arguments came from, and the indices' by their address (each mesh has its own): used
 	// again while no registration changed and the guest wrote none of its region (ObtainBuffer then returns the same
 	// buffer; it streams CPU-dirty ranges).
@@ -433,6 +441,15 @@ struct RenderExecutor::TableXpr {
 	};
 	static constexpr size_t           RingCopies = 4096;
 	std::unique_ptr<RingCopy[]>       ring_copies = std::make_unique<RingCopy[]>(RingCopies);
+	// (Mode 4) a speculation's copies, shared on the same terms within one translation (Spec::State::id), segment and
+	// wait count (State::waits and covered_waits: every wait it passes moves it) while no Rollback took notes back since
+	// (State::rollbacks). TableBlocks.
+	struct SpecRingCopy {
+		RingCopy copy;
+		uint64_t id = 0, rollbacks = 0, waits = 0;
+		size_t   segment = 0;
+	};
+	std::unique_ptr<SpecRingCopy[]> spec_ring_copies; // (made at a speculation's first copy)
 	uint32_t                          special_generation = 1; // moves with the image starts and the mappings
 	// Addresses no image starts at, each with the TextureCache::StartEpoch it was proven at (only an address gaining
 	// its first image moves that epoch): TableBlocks asks the texture cache (a lock and a map lookup) again only then.
@@ -2678,11 +2695,37 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						const auto tick        = m_context.GetCommandScheduler().CurrentTick();
 						const auto cpu         = buffer_cache.CpuModificationEpoch(address, size); // (before the copy)
 						vk::DeviceAddress device = 0;
+						// (Mode 4: a speculation's copy used again within its translation, on the GPU thread's RingCopy
+						// terms (the same range, observation epoch, tick and tracker regions' CPU epoch, none 0; the checks
+						// above, CPU-dirty, not GPU-modified, no journaled write over it, made as before), in the same
+						// segment and wait count, with no Rollback since. What keeps the bytes is what keeps the GPU
+						// thread's share: the observation epoch, this thread's, which ProcessPm4Spec steps before every
+						// packet that is not a draw, dispatch or register packet (FlushDeferredProtection), so a share
+						// never crosses a label, write, wait or DMA. The use's note is the copy's (NoteCleanRead of the
+						// same range: the commit's checks see the same lists); the shader reads the copy's bytes at its
+						// address, in the same ring, fenced for the same commit.)
+						TableXpr::SpecRingCopy* spec_shared = nullptr;
+						if (spec != nullptr && cpu != 0 && ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+							if (!table.spec_ring_copies)
+								table.spec_ring_copies = std::make_unique<TableXpr::SpecRingCopy[]>(TableXpr::RingCopies);
+							spec_shared = &table.spec_ring_copies[((address ^ (size << 40u)) * 0x9e3779b97f4a7c15ull) >> 52u];
+						}
+						const auto spec_waits = [&] { return uint64_t {spec->waits.size()} + spec->covered_waits; };
+						const auto spec_own   = [&] {
+							const auto& own = spec_shared->copy;
+							return own.address == address && own.size == size && own.observation == observation &&
+							       own.tick == tick && own.cpu_epoch == cpu && own.device != 0 && spec_shared->id == spec->id &&
+							       spec_shared->segment == spec->closed.size() && spec_shared->rollbacks == spec->rollbacks &&
+							       spec_shared->waits == spec_waits();
+						};
 						if (shared != nullptr && cpu != 0 && shared->address == address && shared->size == size &&
 						    shared->observation == observation && shared->tick == tick && shared->cpu_epoch == cpu) {
 							device = shared->device;
 							LiveCounters::Add(LiveCounters::TableRingShared);
 							LiveCounters::Add(LiveCounters::TableRingSharedBytes, size);
+						} else if (spec_shared != nullptr && spec_own()) {
+							device = spec_shared->copy.device;
+							spec->NoteCleanRead(address, size);
 						} else if (auto [mapped, offset] = upload.Map(size, 16, false);
 						           mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(address, mapped, size)) {
 							upload.Commit();
@@ -2690,6 +2733,17 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 							device = upload.BufferDeviceAddress() + offset;
 							LiveCounters::Add(LiveCounters::TableRingCopies);
 							LiveCounters::Add(LiveCounters::TableRingBytes, size);
+							if (spec_shared != nullptr) // (after its note)
+								*spec_shared = {.copy      = {.address     = address,
+								                              .size        = size,
+								                              .observation = observation,
+								                              .tick        = tick,
+								                              .cpu_epoch   = cpu,
+								                              .device      = device},
+								                .id        = spec->id,
+								                .rollbacks = spec->rollbacks,
+								                .waits     = spec_waits(),
+								                .segment   = spec->closed.size()};
 							if (shared != nullptr && cpu != 0)
 								*shared = {.address     = address,
 								           .size        = size,
@@ -3555,9 +3609,36 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	    set->read_after_write && kyty_local_draw_read_after_write.load(std::memory_order_relaxed) != 0;
 	const bool in_place      = same_command && emit.state == &draw_state && table.last_set == set &&
 	                      table.images_epoch == images_epoch && own && !read_after_write;
+	// (Mode 4) A speculation's draw in place too (spec_in_place: NativeXprEmitTargets and TableTransit skipped) when its
+	// executor's last table draw (TableXpr::spec_place, taken at that draw's end) drew the same draw state (and capture)
+	// and set into the same command buffer, as the GPU thread's in_place, in the same translation, segment and chain
+	// before it, and since then:
+	// - TextureCache::ImagesEpoch has not moved from its value before that draw's checks (image states, registration,
+	//   metadata, CPU-written bytes: what the GPU thread's own in_place trusts for the cache's side);
+	// - no overlay entry was taken (State::overlay_gen: Image::SpeculativeEntry, through which every transition and every
+	//   read of the speculation's image states goes, its first touch in the segment included);
+	// - the open segment noted no write (State::open_gen: NoteWritten, Journal; OpenSegmentWrites* read only those).
+	// Then the two calls would read what they read for that draw and decide the same: no refusal (it passed), no
+	// transition (the overlay holds the layouts it left), and their notes are already the segment's: the entries' found
+	// states and used marks (per segment), the sampled levels (min / max of the same ranges), pending targets (in the
+	// segment already). A draw whose emission noted a meta answer, a left clear or a consumed clear leaves no key (those
+	// answers came from the cache, whose bits some changes move without moving ImagesEpoch), nor does a worker-captured
+	// draw state (its depth access follows its target's uniformity, which a partial transit splits).
+	const bool spec_emit     = !own && speculate_mode == 4;
+	const bool spec_in_place = spec_emit && same_command && emit.state == &draw_state && table.last_set == set &&
+	                           !read_after_write && table.spec_place.id == spec_state->id &&
+	                           table.spec_place.segment == spec_state->closed.size() &&
+	                           table.spec_place.chain == spec_state->previous.load(std::memory_order_acquire) &&
+	                           table.spec_place.images == images_epoch && table.spec_place.overlay == spec_state->overlay_gen &&
+	                           table.spec_place.open == spec_state->open_gen &&
+	                           table.spec_place.capture == draw_state.capture_id;
+	const auto spec_facts = [&] {
+		return spec_state->meta_facts.size() + spec_state->left_clears.size() + spec_state->consume_pending.size();
+	};
+	const size_t spec_facts_before = spec_emit ? spec_facts() : 0;
 	// KYTY_TABLE_SERIALS: the checks again only when a serial sum moved (1), or as before with the sums counted (2).
 	const auto serials = own ? TableSerialsMode() : 0u;
-	if (!in_place) {
+	if (!in_place && !spec_in_place) {
 		// The same for the targets apart, as this draw state's last emission left them, and the set's images, as its
 		// last transit under this state did (the passes alternate materials: another set or state in between).
 		const bool epoch_targets = !own || draw_state.emitted_epoch != images_epoch;
@@ -3698,6 +3779,20 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	table.last_state   = &draw_state;
 	table.last_set     = set;
 	table.images_epoch = texture_cache.ImagesEpoch();
+	// (Mode 4: this draw's key for spec_in_place, its own transits and writes taken; none after an emission that noted a
+	// cache answer, or for a worker-captured state.)
+	if (spec_emit) {
+		if (spec_facts() == spec_facts_before && !draw_state.worker_captured)
+			table.spec_place = {.id      = spec_state->id,
+			                    .images  = images_epoch,
+			                    .overlay = spec_state->overlay_gen,
+			                    .open    = spec_state->open_gen,
+			                    .capture = draw_state.capture_id,
+			                    .segment = spec_state->closed.size(),
+			                    .chain   = spec_state->previous.load(std::memory_order_acquire)};
+		else
+			table.spec_place.id = 0;
+	}
 	if (vertex_arguments && groups != 0) { // (KYTY_SPEC_DRAW_INDIRECT_VERIFY: what it read)
 		auto&       noted  = m_table_args_emit;
 		const auto* source = arguments[0].first;
