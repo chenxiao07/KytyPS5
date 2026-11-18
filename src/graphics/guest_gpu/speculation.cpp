@@ -1508,9 +1508,12 @@ void Speculation::Before(Result& result, size_t index) {
 		// the range's live game buffer is left unobtained: the patch step then stops the segment.)
 		auto& entry   = state.pending_buffers[i];
 		// (spec_reloc_refs: a found buffer's entry still over a live game buffer needs nothing here: a join copied its
-		// bytes; the patch step decides whether its address moved. None any more: obtained as a pending one.)
+		// bytes; the patch step decides whether its address moved. None any more: obtained as a pending one. Over
+		// CPU-dirty memory (a collector's retire copies no bytes; read only, no region manager made) obtained too: its
+		// bytes uploaded to the live buffer.)
 		if (!entry.pending && (entry.since >= registration_now ||
-		                       buffers.GetBufferIfLive(buffers.RegisteredBuffer(entry.address, entry.size)) != nullptr)) {
+		                       (buffers.GetBufferIfLive(buffers.RegisteredBuffer(entry.address, entry.size)) != nullptr &&
+		                        !buffers.IsRegionCpuDirtyNoCreate(entry.address, entry.size)))) {
 			entry.obtained = true;
 			continue;
 		}

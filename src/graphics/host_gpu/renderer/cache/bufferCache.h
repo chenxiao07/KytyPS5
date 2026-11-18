@@ -176,6 +176,10 @@ public:
 	[[nodiscard]] bool IsRegionCpuDirty(uint64_t vaddr, uint64_t size) {
 		return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 	}
+	// The same, read only: no region manager made (an untracked region answers CPU-dirty, as a made one would).
+	[[nodiscard]] bool IsRegionCpuDirtyNoCreate(uint64_t vaddr, uint64_t size) const {
+		return m_memory_tracker.IsRegionCpuModifiedNoCreate(vaddr, size);
+	}
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);

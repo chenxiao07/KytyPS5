@@ -43,6 +43,9 @@ public:
 		return manager != nullptr && manager->DeferredProtectionPending();
 	}
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
+	// The same answer with no region manager made (IsRegionCpuModified makes the missing ones, whose pages start
+	// CPU-dirty): a region with none was never tracked and answers CPU-dirty.
+	[[nodiscard]] bool IsRegionCpuModifiedNoCreate(uint64_t vaddr, uint64_t size) const;
 	// Every page CPU-dirty (untracked memory is): none is write-protected for the tracker.
 	[[nodiscard]] bool IsRegionFullyCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionFullyGpuModified(uint64_t vaddr, uint64_t size);
