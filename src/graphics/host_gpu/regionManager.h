@@ -288,6 +288,18 @@ public:
 		m_cpu_epoch.fetch_add(count, std::memory_order_acq_rel);
 		m_deferred_protects.fetch_sub(count, std::memory_order_acq_rel);
 	}
+	// KYTY_SPEC_PROTECT_ASYNC: the two above for an upload of a buffer GPU work writes (PageManager::
+	// ReapplyWrittenProtection: a page whose no access is still pending on the GPU thread gets read-only, not it early).
+	void ApplyDeferredWrittenProtection(uint64_t vaddr, uint64_t size) {
+		m_page_manager.ReapplyWrittenProtection(vaddr, size, 1);
+		m_cpu_epoch.fetch_add(1, std::memory_order_acq_rel);
+		m_deferred_protects.fetch_sub(1, std::memory_order_acq_rel);
+	}
+	void ApplyDeferredWrittenProtections(uint64_t vaddr, uint64_t size, uint32_t count) {
+		m_page_manager.ReapplyWrittenProtection(vaddr, size, count);
+		m_cpu_epoch.fetch_add(count, std::memory_order_acq_rel);
+		m_deferred_protects.fetch_sub(count, std::memory_order_acq_rel);
+	}
 
 	template <DirtySource source, bool all = false>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {

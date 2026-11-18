@@ -762,8 +762,15 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 }
 
 uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, SubmitInfo submit) {
-	// The work may run once submitted: the pages it writes are read-protected first.
-	PageManager::FlushDeferredProtection();
+	// The work may run once submitted: the pages it writes are read-protected first. KYTY_SPEC_PROTECT_ASYNC (mode 4): by
+	// the upload worker, ahead of the upload sequence taken below, which the work waits for
+	// (PageManager::FlushDeferredProtectionAtSubmit).
+	PageManager::HandPush push = nullptr;
+	if (AsyncUpload::Enabled())
+		push = [](void (*call)(void*, uint64_t, uint64_t), void* context, uint64_t vaddr, uint64_t size) {
+			AsyncUpload::Get().PushProtection(call, context, vaddr, size, vaddr, size);
+		};
+	if (PageManager::FlushDeferredProtectionAtSubmit(push)) AsyncUpload::Get().Kick();
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 	EXIT_IF(m_graphics.queue == nullptr || entries.empty() || entries.size() > MaxSubmitEntries);

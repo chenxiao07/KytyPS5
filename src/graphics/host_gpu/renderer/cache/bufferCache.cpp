@@ -2725,7 +2725,22 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		for (const auto& copy: copies)
 			queued = queued && LibKernel::Memory::TryGetBackingPointer(buffer.CpuAddress() + copy.dstOffset, copy.size);
 		for (const auto& item: deferred) {
-			if (queued) {
+			if (queued && item.written) {
+				// KYTY_SPEC_PROTECT_ASYNC: a written buffer's arm, ahead of its copies as the others; its job leaves a no
+				// access still pending on the GPU thread to that flush (RegionManager::ApplyDeferredWrittenProtection).
+				LiveCounters::Add(LiveCounters::Wa1Queued);
+				PageManager::NoteWrittenArmQueued(); // (the GPU thread keeps the pages' marks until the job ran)
+				AsyncUpload::Get().PushProtection(
+				    [](void* manager, uint64_t address, uint64_t size) {
+					    static_cast<RegionManager*>(manager)->ApplyDeferredWrittenProtection(address, size);
+				    },
+				    item.manager, item.address, item.size, item.address, item.size,
+				    // (KYTY_SPEC_UPLOAD_PIPE: `count` of them over adjacent ranges as one; never with a read-only buffer's.)
+				    [](void* manager, uint64_t address, uint64_t size, uint64_t count) {
+					    static_cast<RegionManager*>(manager)->ApplyDeferredWrittenProtections(address, size,
+					                                                                          static_cast<uint32_t>(count));
+				    });
+			} else if (queued) {
 				AsyncUpload::Get().PushProtection(
 				    [](void* manager, uint64_t address, uint64_t size) {
 					    static_cast<RegionManager*>(manager)->ApplyDeferredProtection(address, size);

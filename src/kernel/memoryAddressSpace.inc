@@ -2118,7 +2118,7 @@ public:
 			LiveCounters::Add(LiveCounters::AddressSpaceWaitKt, waited);
 			if (LiveCensus::g_render) LiveCounters::Add(LiveCounters::AddressSpaceWaitKtRender, waited);
 		}
-		WaitNotBusy(lock, vaddr, size);
+		WaitNotBusy(lock, vaddr, size, /*count_stale=*/true); // (as_serial_broad_stale: SerialBroad's staleness fallback)
 		return ProtectMappedUnlocked(vaddr, size, mode, true);
 	}
 
@@ -2654,19 +2654,24 @@ private:
 		return on;
 #endif
 	}
-	[[nodiscard]] bool SerialBroad() const {
+	// `count_stale` (a protection's first test, ProtectTransient): the staleness watchdog's broad wait counted
+	// (as_serial_broad_stale), only where it decides.
+	[[nodiscard]] bool SerialBroad(bool count_stale = false) const {
 		if (const int forced = ProtectSerialEnv(); forced >= 0) return forced == 1;
 		if (!SerialPressureGateOn() || ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return true;
 		if (m_serial_pressure.load(std::memory_order_acquire)) return true;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		// (Staleness watchdog: a sample older than 300 ms, e.g. Kyty.MemPressure starved among busy threads, counts as short:
 		// the broad wait until the sampler runs again. GetTickCount64 reads shared user data, no system call.)
-		if (GetTickCount64() - m_serial_stamp.load(std::memory_order_acquire) > 300) return true;
+		if (GetTickCount64() - m_serial_stamp.load(std::memory_order_acquire) > 300) {
+			if (count_stale) LiveCounters::Add(LiveCounters::AsSerialBroadStale);
+			return true;
+		}
 #endif
 		return false;
 	}
-	[[nodiscard]] bool BusyUnlocked(uint64_t vaddr, uint64_t size) const {
-		const bool serial = SerialBroad();
+	[[nodiscard]] bool BusyUnlocked(uint64_t vaddr, uint64_t size, bool count_stale = false) const {
+		const bool serial = SerialBroad(count_stale);
 		if (serial && !m_busy.empty()) return true;
 		constexpr uint64_t PageTablePage = uint64_t {2} << 20u;
 		for (const auto& [begin, end]: m_busy) {
@@ -2728,8 +2733,9 @@ private:
 #endif
 
 	// (With m_mutex held shared.) Returns once no map or unmap is changing [vaddr, vaddr + size).
-	void WaitNotBusy(std::shared_lock<std::shared_mutex>& lock, uint64_t vaddr, uint64_t size) {
-		if (t_batch_section || !BusyUnlocked(vaddr, size)) return; // (batch_busy_once: its own section)
+	// `count_stale`: SerialBroad's, for the first test only (the waits' re-tests are not protections).
+	void WaitNotBusy(std::shared_lock<std::shared_mutex>& lock, uint64_t vaddr, uint64_t size, bool count_stale = false) {
+		if (t_batch_section || !BusyUnlocked(vaddr, size, count_stale)) return; // (batch_busy_once: its own section)
 		LiveCounters::Add(LiveCounters::AddressSpaceBusyWaits);
 		const auto start = __rdtsc();
 		m_busy_waiters.fetch_add(1, std::memory_order_acq_rel); // (trim_idle: a thread waits on a busy range)
