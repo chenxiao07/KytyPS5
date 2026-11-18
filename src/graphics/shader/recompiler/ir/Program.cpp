@@ -78,8 +78,14 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
 	if (IsRuntimeRead(lhs->GetOpcode())) {
 		const auto li = lhs->Flags<MemoryFlags>().index;
 		const auto ri = rhs->Flags<MemoryFlags>().index;
-		if (li >= program.memory_info.size() || ri >= program.memory_info.size() ||
-		    program.memory_info[li] != program.memory_info[ri]) {
+		// (An extracted plan keeps a runtime read's kind and offset alone: PlanMemory.)
+		if (program.UsesPlanMemory()) {
+			if (li >= program.plan_memory.size() || ri >= program.plan_memory.size() ||
+			    program.plan_memory[li] != program.plan_memory[ri]) {
+				return false;
+			}
+		} else if (li >= program.memory_info.size() || ri >= program.memory_info.size() ||
+		           program.memory_info[li] != program.memory_info[ri]) {
 			return false;
 		}
 	} else if (lhs->Flags<uint64_t>() != rhs->Flags<uint64_t>()) {

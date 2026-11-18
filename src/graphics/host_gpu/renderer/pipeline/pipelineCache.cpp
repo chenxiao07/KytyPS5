@@ -948,7 +948,7 @@ struct PipelineCache::ProgramCache {
 			for (const auto& inst: plan.value_storage)
 				n[MemPlanValues] += sizeof(inst) + 2 * sizeof(void*) + inst.NumArgs() * sizeof(ShaderRecompiler::IR::Value) +
 				                    inst.NumPhiBlocks() * sizeof(void*) + inst.Uses().capacity() * sizeof(ShaderRecompiler::IR::Use);
-			n[MemPlanMemoryInfo] = Capacity(plan.memory_info);
+			n[MemPlanMemoryInfo] = Capacity(plan.memory_info) + Capacity(plan.plan_memory);
 			n[MemPlanOther]      = Capacity(plan.descriptor_sources) + Capacity(plan.control_flow) +
 			                       Capacity(plan.materialization_sources) + Capacity(plan.srt_reads) + Capacity(plan.clean_flat_slots);
 			for (const auto& block: plan.control_flow) n[MemPlanOther] += Capacity(block.successors) + Capacity(block.sources);

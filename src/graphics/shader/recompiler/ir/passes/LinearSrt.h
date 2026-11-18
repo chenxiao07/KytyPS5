@@ -414,16 +414,15 @@ private:
 					break;
 				case ValueOpcode::LoadAddressU32:
 				case ValueOpcode::ReadConstBuffer: {
-					const auto  memory = inst->Flags<MemoryFlags>().index;
+					PlanMemory  memory;
 					const auto* handle = inst->Arg(0).ResolveInstruction();
 					const bool  buffer = node.op == ValueOpcode::ReadConstBuffer;
-					if (memory >= source.memory_info.size() || !handle ||
+					if (!source.RuntimeMemory(inst->Flags<MemoryFlags>().index, memory) || !handle ||
 					    handle->NumArgs() != (buffer ? 4u : 2u) ||
-					    source.memory_info[memory].kind !=
-					        (buffer ? ResourceKind::ScalarBuffer : ResourceKind::ScalarAddress))
+					    memory.kind != (buffer ? ResourceKind::ScalarBuffer : ResourceKind::ScalarAddress))
 						return Fail("memory handle", node.op);
 					node.kind      = Kind::Read;
-					node.immediate = source.memory_info[memory].offset;
+					node.immediate = memory.offset;
 					node.args[0]   = Add(handle->Arg(0), clean, depth + 1);
 					node.args[1]   = Add(handle->Arg(1), clean, depth + 1);
 					node.args[2]   = arg(1);

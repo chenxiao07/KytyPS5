@@ -43,11 +43,11 @@ struct ResourceSpecialization {
 // (BuildLinearSrtPlan, made from the plan alone: the caller makes it when the plan is used).
 ResourcePlan ExtractResourcePlan(const Program& program, bool linear = true);
 
-// Keeps only the plan's memory infos its values read: a plan is evaluated with the entries of its runtime reads alone
-// (ReadConstBuffer and the address reads: SrtWalker's raw reads, LinearSrt, EquivalentValue), where the program's vector
-// holds one for each of its memory instructions (~16 KB a plan). Those values' indices are moved to the kept entries;
-// nothing in a plan reads the others. ExtractResourcePlan and ResourcePlanSerial::Load call it (plans of earlier builds
-// too).
+// Keeps only what the plan's values read of its memory infos: a plan is evaluated with the kind and offset of its runtime
+// reads alone (ReadConstBuffer and the address reads: SrtWalker's raw reads, LinearSrt, EquivalentValue), where the
+// program's memory_info holds a ~128-byte entry for each of its memory instructions (~16 KB a plan). Those reads' kind
+// and offset go to plan_memory (8 bytes each), their indices moved there, and memory_info is emptied; nothing in a plan
+// reads the others. ExtractResourcePlan and ResourcePlanSerial::Load call it (plans of earlier builds too).
 void CompactPlanMemoryInfo(ResourcePlan& plan);
 
 // Resolves and specializes the immutable resource plan in one transaction. On failure both

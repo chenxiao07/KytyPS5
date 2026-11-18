@@ -69,11 +69,11 @@ bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
 	if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer) {
 		return false;
 	}
-	const auto index = inst.Flags<MemoryFlags>().index;
-	if (index >= values.memory_info.size()) {
+	PlanMemory memory;
+	if (!values.RuntimeMemory(inst.Flags<MemoryFlags>().index, memory)) {
 		return false;
 	}
-	const auto kind = values.memory_info[index].kind;
+	const auto kind = memory.kind;
 	return (op == ValueOpcode::LoadAddressU32 && kind == ResourceKind::ScalarAddress) ||
 	       (op == ValueOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer);
 }
@@ -187,8 +187,8 @@ private:
 		if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer) {
 			const auto flags = inst->Flags<MemoryFlags>();
 			text += fmt::format(" pc=0x{:08x}", flags.pc);
-			if (flags.index < m_program.memory_info.size()) {
-				text += fmt::format(" offset=0x{:x}", m_program.memory_info[flags.index].offset);
+			if (PlanMemory memory; m_program.RuntimeMemory(flags.index, memory)) {
+				text += fmt::format(" offset=0x{:x}", memory.offset);
 			}
 			return text;
 		}
@@ -759,11 +759,10 @@ private:
 	}
 
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result) {
-		const auto flags = inst.Flags<MemoryFlags>();
-		if (flags.index >= m_program.memory_info.size()) {
+		PlanMemory mem;
+		if (!m_program.RuntimeMemory(inst.Flags<MemoryFlags>().index, mem)) {
 			return false;
 		}
-		const auto& mem    = m_program.memory_info[flags.index];
 		const auto* handle = inst.Arg(0).ResolveInstruction();
 		if (handle == nullptr) {
 			return false;

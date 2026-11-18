@@ -14,12 +14,15 @@ namespace IR = Libs::Graphics::ShaderRecompiler::IR;
 
 namespace {
 
-constexpr uint32_t Magic = 0x4e4c5052u; // "RPLN"
+// RPL2: the plan's PlanMemory entries after its memory infos (empty for an extracted plan). An RPLN plan (no
+// plan_memory) still loads: its memory infos are compacted as it loads.
+constexpr uint32_t MagicV1 = 0x4e4c5052u; // "RPLN"
+constexpr uint32_t Magic   = 0x324c5052u; // "RPL2"
 
 // A field added to one of these types must be added here too (Save, Load and Same). The sizes are the 64-bit Windows
 // build's (Microsoft's STL; libstdc++'s containers have other sizes: the Linux build checks nothing here).
 #if defined(_MSC_VER) || defined(_WIN32)
-static_assert(sizeof(void*) != 8 || sizeof(IR::ResourcePlan) == 496, "ResourcePlan changed: update resource-plan-serial");
+static_assert(sizeof(void*) != 8 || sizeof(IR::ResourcePlan) == 520, "ResourcePlan changed: update resource-plan-serial");
 static_assert(sizeof(void*) != 8 || sizeof(IR::ShaderInfo) == 192, "ShaderInfo changed: update resource-plan-serial");
 static_assert(sizeof(void*) != 8 || sizeof(IR::ImageResource) == 88, "ImageResource changed: update resource-plan-serial");
 static_assert(sizeof(void*) != 8 || sizeof(IR::StageInput) == 56, "StageInput changed: update resource-plan-serial");
@@ -29,6 +32,7 @@ static_assert(sizeof(void*) != 8 || sizeof(IR::ResourceBlock) == 64, "ResourceBl
 static_assert(sizeof(void*) != 8 || sizeof(IR::UniformFillPlan) == 96, "UniformFillPlan changed: update resource-plan-serial");
 #endif
 static_assert(std::is_trivially_copyable_v<IR::MemoryInfo>);
+static_assert(std::is_trivially_copyable_v<IR::PlanMemory>);
 static_assert(std::is_trivially_copyable_v<IR::BufferResource>);
 static_assert(std::is_trivially_copyable_v<IR::SamplerResource>);
 static_assert(std::is_trivially_copyable_v<IR::SampledResourcePair>);
@@ -256,6 +260,7 @@ bool Save(const IR::ResourcePlan& plan, std::vector<uint8_t>& out) {
 		}
 	}
 	w.PutVector(plan.memory_info);
+	w.PutVector(plan.plan_memory);
 	w.Put(static_cast<uint32_t>(plan.descriptor_sources.size()));
 	for (const auto& source: plan.descriptor_sources) {
 		w.Put(source.dword_count);
@@ -293,7 +298,7 @@ bool Load(std::span<const uint8_t> bytes, IR::ResourcePlan& plan, bool* defer_li
 	plan = IR::ResourcePlan {};
 	Reader   r(bytes);
 	uint32_t magic = 0, count = 0;
-	if (!r.Get(magic) || magic != Magic || !r.Get(plan.stage) || !r.Get(plan.shader_hash) || !r.Get(plan.user_data_base) ||
+	if (!r.Get(magic) || (magic != Magic && magic != MagicV1) || !r.Get(plan.stage) || !r.Get(plan.shader_hash) || !r.Get(plan.user_data_base) ||
 	    !r.Get(plan.user_data_count) || !r.Get(count))
 		return false;
 	std::vector<IR::Inst*> insts;
@@ -316,7 +321,8 @@ bool Load(std::span<const uint8_t> bytes, IR::ResourcePlan& plan, bool* defer_li
 			else inst->SetArg(i, value);
 		}
 	}
-	if (!r.GetVector(plan.memory_info) || !r.Get(count)) return plan = {}, false;
+	if (!r.GetVector(plan.memory_info) || (magic == Magic && !r.GetVector(plan.plan_memory)) || !r.Get(count))
+		return plan = {}, false;
 	plan.descriptor_sources.resize(count);
 	for (auto& source: plan.descriptor_sources) {
 		uint8_t indirect = 0;

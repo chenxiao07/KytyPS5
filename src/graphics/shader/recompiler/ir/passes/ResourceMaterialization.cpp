@@ -1910,8 +1910,9 @@ ResourcePlan ExtractResourcePlan(const Program& program, bool linear) {
 }
 
 void CompactPlanMemoryInfo(ResourcePlan& plan) {
+	if (plan.memory_info.empty() || !plan.plan_memory.empty()) return; // (compact already, or no memory infos at all)
 	std::vector<uint32_t>   kept_at(plan.memory_info.size(), UINT32_MAX);
-	std::vector<MemoryInfo> kept;
+	std::vector<PlanMemory> kept;
 	for (auto& inst: plan.value_storage) {
 		// (The runtime reads, as Program.cpp's IsRuntimeRead: all EquivalentValue compares by their memory infos.)
 		const auto op = inst.GetOpcode();
@@ -1921,14 +1922,14 @@ void CompactPlanMemoryInfo(ResourcePlan& plan) {
 		auto& at = kept_at[flags.index];
 		if (at == UINT32_MAX) {
 			at = static_cast<uint32_t>(kept.size());
-			kept.push_back(plan.memory_info[flags.index]);
+			kept.push_back({plan.memory_info[flags.index].kind, plan.memory_info[flags.index].offset});
 		}
 		flags.index = at;
 		inst.SetFlags(flags);
 	}
-	// (Always the kept order: the values now index it, also where every entry is kept.)
 	kept.shrink_to_fit();
-	plan.memory_info = std::move(kept);
+	plan.plan_memory = std::move(kept);
+	std::vector<MemoryInfo>().swap(plan.memory_info);
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,

@@ -653,6 +653,14 @@ struct UniformFillPlan {
 	std::array<Value, 4> values;
 };
 
+// A runtime read's memory info as an extracted plan keeps it (CompactPlanMemoryInfo): its kind and immediate offset, all
+// that evaluating the plan reads of it (8 bytes, where a MemoryInfo is ~128).
+struct PlanMemory {
+	ResourceKind kind   = ResourceKind::None;
+	uint32_t     offset = 0;
+	bool         operator==(const PlanMemory&) const = default;
+};
+
 // Immutable runtime resource analysis retained by the shader cache. It owns descriptor/SRT,
 // uniform condition and fill values without retaining translated blocks.
 struct LinearSrtPlan;
@@ -672,6 +680,9 @@ struct ResourcePlan {
 	std::list<Inst>                     value_storage;
 	std::shared_ptr<const LinearSrtPlan> linear_srt;
 	std::vector<MemoryInfo>             memory_info;
+	// An extracted plan's runtime reads (ReadConstBuffer and the address reads) by their MemoryFlags index, in place of
+	// memory_info, which it leaves empty (CompactPlanMemoryInfo). A translated program has memory_info alone.
+	std::vector<PlanMemory>             plan_memory;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<uint32_t>               materialization_sources;
@@ -682,6 +693,20 @@ struct ResourcePlan {
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
+
+	// Whether the runtime reads' infos are plan_memory's (an extracted plan) rather than memory_info's (a program).
+	[[nodiscard]] bool UsesPlanMemory() const { return !plan_memory.empty() || memory_info.empty(); }
+	// A runtime read's kind and offset by its MemoryFlags index, from whichever holds them; false past their end.
+	[[nodiscard]] bool RuntimeMemory(uint32_t index, PlanMemory& out) const {
+		if (UsesPlanMemory()) {
+			if (index >= plan_memory.size()) return false;
+			out = plan_memory[index];
+			return true;
+		}
+		if (index >= memory_info.size()) return false;
+		out = {memory_info[index].kind, memory_info[index].offset};
+		return true;
+	}
 };
 
 struct Program: ResourcePlan {
