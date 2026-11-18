@@ -57,11 +57,10 @@ struct SubmissionState {
 };
 
 struct ResolvedPathInfo {
-	int         result    = OK;
-	uint32_t    file_id   = 0xffffffffu;
-	uint64_t    file_size = 0;
-	bool        is_dir    = false;
-	std::string host_path;
+	int      result    = OK;
+	uint32_t file_id   = 0xffffffffu;
+	uint64_t file_size = 0;
+	bool     is_dir    = false;
 };
 
 static std::mutex                                        g_mutex;
@@ -69,10 +68,16 @@ static uint32_t                                          g_next_submission_id = 
 static uint32_t                                          g_next_file_id       = 1;
 static std::unordered_map<uint32_t, SubmissionState>     g_submissions;
 static std::unordered_map<std::string, ResolvedPathInfo> g_resolved_paths;
-// The files by id (at file_id - 1: ids are handed out in order from 1, under g_mutex): their g_resolved_paths entries,
-// which never move or go (a node map; a path is resolved once and kept). Two maps by id held a second copy of each
-// host path and its size before: the game resolves its ~250K paths at start-up, so the copies were tens of MiB of heap.
-static std::vector<const ResolvedPathInfo*> g_files_by_id;
+// The files by id (at file_id - 1: ids are handed out in order from 1, under g_mutex): their g_resolved_paths entries
+// (the guest path and its info), which never move or go (a node map; a path is resolved once and kept). Two maps by id
+// held a second copy of each host path and its size before: the game resolves its ~250K paths at start-up, so the copies
+// were tens of MiB of heap.
+using ResolvedPath = std::pair<const std::string, ResolvedPathInfo>;
+static std::vector<const ResolvedPath*> g_files_by_id;
+// The host paths of the files read so far, by id: made from the guest path at a file's first read as resolving it makes
+// them (GetRealFilename: the mount point's directory or archive and the rest of the path). The game resolves ~224K paths
+// at start-up and reads a few thousand: a host path kept with each was ~140 bytes of heap apiece (~35 MiB).
+static std::unordered_map<uint32_t, std::string> g_host_paths;
 
 static bool IsValidGuestRange(uint64_t addr, uint64_t size, bool write = false) {
 	(void)write;
@@ -127,34 +132,45 @@ static int ReadGuestCString(uint64_t addr, char* out, size_t out_size) {
 	return LibKernel::KERNEL_ERROR_ENAMETOOLONG;
 }
 
-static void RegisterHostPathLocked(uint32_t file_id, const ResolvedPathInfo* info) {
+static void RegisterHostPathLocked(uint32_t file_id, const ResolvedPath* entry) {
 	if (g_files_by_id.size() < file_id) {
 		g_files_by_id.resize(file_id, nullptr);
 	}
-	g_files_by_id[file_id - 1] = info;
+	g_files_by_id[file_id - 1] = entry;
 }
 
-static const ResolvedPathInfo* FindFileLocked(uint32_t file_id) {
+static const ResolvedPath* FindFileLocked(uint32_t file_id) {
 	return file_id != 0 && file_id <= g_files_by_id.size() ? g_files_by_id[file_id - 1] : nullptr;
 }
 
 static bool TryGetHostPath(uint32_t file_id, std::string* out) {
-	std::scoped_lock lock(g_mutex);
-	const auto*      info = FindFileLocked(file_id);
-	if (info == nullptr) {
-		return false;
+	std::string guest_path;
+	{
+		std::scoped_lock lock(g_mutex);
+		const auto*      entry = FindFileLocked(file_id);
+		if (entry == nullptr) {
+			return false;
+		}
+		if (const auto kept = g_host_paths.find(file_id); kept != g_host_paths.end()) {
+			*out = kept->second;
+			return true;
+		}
+		guest_path = entry->first;
 	}
-	*out = info->host_path;
+	// (Outside g_mutex, as ResolveOnePath: the mount points take a lock of their own.)
+	auto             host_path = Common::PathToString(LibKernel::FileSystem::GetRealFilename(guest_path));
+	std::scoped_lock lock(g_mutex);
+	*out = g_host_paths.try_emplace(file_id, std::move(host_path)).first->second;
 	return true;
 }
 
 static bool TryGetHostFileSize(uint32_t file_id, uint64_t* out) {
 	std::scoped_lock lock(g_mutex);
-	const auto*      info = FindFileLocked(file_id);
-	if (info == nullptr) {
+	const auto*      entry = FindFileLocked(file_id);
+	if (entry == nullptr) {
 		return false;
 	}
-	*out = info->is_dir ? 0 : info->file_size;
+	*out = entry->second.is_dir ? 0 : entry->second.file_size;
 	return true;
 }
 
@@ -220,7 +236,6 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 
 	if (!found) {
 		const auto real_path = LibKernel::FileSystem::GetRealFilename(path);
-		info.host_path       = Common::PathToString(real_path);
 
 		// (One query for the kind and the size: the game resolves its ~250K paths at start-up.)
 		if (const auto found_info = Common::File::GetInfo(real_path); !found_info) {
@@ -242,13 +257,13 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 				// One id per path. Ids hashed from the path collided (13 pairs among Demon's Souls' 250K
 				// files, which the game resolves at start-up): one file of a pair read the other's bytes.
 				info.file_id = it->second.file_id = g_next_file_id++;
-				RegisterHostPathLocked(info.file_id, &it->second);
+				RegisterHostPathLocked(info.file_id, &*it);
 			} else if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
 				log_missing = true;
 			}
 		}
 		if (log_missing) {
-			LOGF("\tAPR resolve missing path: %s -> %s\n", guest_path, info.host_path.c_str());
+			LOGF("\tAPR resolve missing path: %s -> %s\n", guest_path, Common::PathToString(real_path).c_str());
 		}
 	}
 
