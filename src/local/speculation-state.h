@@ -779,7 +779,8 @@ struct State {
 	// past flips; a segment not committed is translated again the normal way, which notes them itself.
 	size_t indexed_draws = 0, scenes = 0;
 	// The satisfied waits it pushed no WaitCheck for, every word of them given by pending writes (its own or a previous
-	// speculation's): a segment with one is not run as a hole, as one with a WaitCheck is not (Speculation::SegmentAsHole).
+	// speculation's): a segment with one runs as a hole through its waits, as one with a WaitCheck does, blocking where the
+	// in-order path blocks (Speculation::SegmentAsHole).
 	size_t covered_waits = 0;
 	// The catalog's table pairs its table draws and dispatches looked up (TableTry, TableDispatch): their used_frame,
 	// which only the GPU thread writes, stamped by the commit of the segment they are in (Speculation::After) as the GPU

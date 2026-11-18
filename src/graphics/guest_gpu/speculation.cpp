@@ -912,6 +912,8 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	r.last_tick      = 0;
 	r.next           = 0;
 	r.blocked        = SIZE_MAX;
+	r.blocked_segment = SIZE_MAX;
+	r.resume_at.reset();
 	r.start_ns       = NowNs();
 	r.start_at       = execution;
 	Pm4Execution spec = execution;
@@ -1463,12 +1465,38 @@ static bool SrtVerifyHolds(const Spec::State& state, size_t from, size_t to) {
 	return true;
 }
 
+// The waits of State::waits [from, to) as memory holds them now (through the backing view where a guest write is
+// pending): the commit's test of a segment's waits, and SegmentAsHole's re-test of a segment it runs through them.
+static bool SegmentWaitsHold(const Spec::State& state, size_t from, size_t to) {
+	for (size_t i = from; i < to; ++i) {
+		const auto& wait  = state.waits[i];
+		uint64_t    value = 0;
+		const void* at    = reinterpret_cast<const void*>(wait.address);
+		if (WriteGuard::g_count.load(std::memory_order_relaxed) != 0)
+			if (const auto* backing = WriteGuard::GuardedBacking(wait.address, wait.bytes)) at = backing;
+		std::memcpy(&value, at, wait.bytes);
+		if (!TestWaitRegMemValue(value, wait.reference, wait.mask, wait.function)) return false;
+	}
+	return true;
+}
+
 Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcessor& cp) {
 	m_renderer.GetBufferCache().ServeAhead(); // (spec_buffer_ahead: the ranges speculations found no buffer over)
 	auto&       scheduler = m_renderer.GetCommandScheduler();
 	const auto& state     = result.state;
 	const auto  segments  = state.closed.size();
 	EXIT_IF(result.holes.size() + 1 != segments);
+	// (Mode 4: blocked at a wait inside a segment run as a hole: on from that wait, `cp` in the run's state there,
+	// result.resume_at its execution. Reached after a block, the commit stops at the hole's packet (resume_at) and the
+	// rest goes in order, as before: the wait may have been on a word the CPU released after guest writes the later
+	// segments' reads were made before, which the effects log does not hold.)
+	if (const auto segment = std::exchange(result.blocked_segment, SIZE_MAX); segment != SIZE_MAX) {
+		const auto as_hole = SegmentAsHole(result, cp, segment, true);
+		if (as_hole == AsHole::Blocked) return result.blocked_segment = segment, Progress::Blocked;
+		if (as_hole == AsHole::NotReached)
+			return ++m_stop_reasons["commit: a segment run as a hole did not reach its hole"], Progress::Stopped;
+		return ++m_stop_reasons["commit: a segment run as a hole blocked at a wait"], Progress::Stopped;
+	}
 	// (Blocked at a wait hole: from there.)
 	// (After its segment ran as a hole, `cp` is already in the state the hole runs from: not the worker's copied.)
 	if (const auto hole = std::exchange(result.blocked, SIZE_MAX); hole != SIZE_MAX) {
@@ -1772,16 +1800,7 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 				if (state.journal_reads_on && to.journal_reads > from.journal_reads)
 					if (const char* moved = JournalReadsMoved(result, index))
 						return moved;
-				for (size_t i = from.waits; i < to.waits; ++i) {
-					const auto& wait  = state.waits[i];
-					uint64_t    value = 0;
-					const void* from  = reinterpret_cast<const void*>(wait.address);
-					if (WriteGuard::g_count.load(std::memory_order_relaxed) != 0)
-						if (const auto* backing = WriteGuard::GuardedBacking(wait.address, wait.bytes)) from = backing;
-					std::memcpy(&value, from, wait.bytes);
-					if (!TestWaitRegMemValue(value, wait.reference, wait.mask, wait.function))
-						return "commit: a wait not satisfied";
-				}
+				if (!SegmentWaitsHold(state, from.waits, to.waits)) return "commit: a wait not satisfied";
 			}
 			// A completion uploads its images' bytes, metadata and stencil plane in Before, before the segment's own writes
 			// over them execute (the replay, After), and leaves them clean: in order a write before the bind is uploaded
@@ -1830,6 +1849,8 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 			const auto as_hole = SegmentAsHole(result, cp, index);
 			if (as_hole == AsHole::NotTaken) return ++m_stop_reasons[why], Progress::Stopped;
 			result.next = index + 1;
+			// (Blocked at a wait inside it, the execution kept (resume_at): Resume goes on from there.)
+			if (as_hole == AsHole::Blocked) return result.blocked_segment = index, Progress::Blocked;
 			// (The GPU thread ran it: on the normal way from where it stopped, on its own state, when its run did not reach
 			// the hole (the packets changed under the walk), or reached it in another state than the work after it assumed
 			// (the worker's at the hole, which nothing checked: what Changed found moved may have moved a register).)
@@ -2625,24 +2646,40 @@ Speculation::HoleRun Speculation::RunHole(Result& result, CommandProcessor& cp, 
 	return HoleRun::Done;
 }
 
-Speculation::AsHole Speculation::SegmentAsHole(Result& result, CommandProcessor& cp, size_t index) {
-	// (Under KYTY_SPECULATE=4 only; otherwise the stop stands.)
-	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4 || index >= result.holes.size())
-		return AsHole::NotTaken;
-	const auto& state = result.state;
-	const auto  from  = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
-	const auto& to    = state.closed[index].end;
-	// (A wait inside it: the GPU thread could block there, before the hole it must stop at. Also one its own pending
-	// writes or a previous speculation's gave whole, which pushed no WaitCheck: State::covered_waits.)
-	if (to.waits != from.waits || to.covered_waits != from.covered_waits) return AsHole::NotTaken;
-	// From the segment's start (the chunk's, or past the hole before it: `cp` is in that state, the commit checked the
-	// chunk's start state and ran the hole) up to its hole's packet.
-	Pm4Execution execution = index == 0 ? result.start_at : result.holes[index - 1].after;
-	if (!execution.Started() || !result.holes[index].at.Started()) return AsHole::NotTaken;
-	// Its recorded work dropped, never submitted: the GPU thread records it again.
-	m_renderer.GetCommandScheduler().DiscardFirst(*result.recorder, state.closed[index].recorded - result.submitted);
-	result.submitted = state.closed[index].recorded;
-	RelocCellsRelease(result.state, index); // (its chunks discarded)
+Speculation::AsHole Speculation::SegmentAsHole(Result& result, CommandProcessor& cp, size_t index, bool resume) {
+	Pm4Execution execution;
+	bool         through = resume; // (it runs through the waits inside it)
+	if (resume) {
+		// (Blocked at a wait inside it: on from there.)
+		execution = std::move(*result.resume_at);
+		result.resume_at.reset();
+	} else {
+		// (Under KYTY_SPECULATE=4 only; otherwise the stop stands.)
+		if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4 || index >= result.holes.size())
+			return AsHole::NotTaken;
+		const auto& state = result.state;
+		const auto  from  = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
+		const auto& to    = state.closed[index].end;
+		// A wait inside it (also one its own pending writes or a previous speculation's gave whole, which pushed no
+		// WaitCheck: State::covered_waits): the waits it found satisfied re-tested now; one that does not hold keeps the
+		// stop (in order the GPU thread blocks there too). Else the run goes through them, each passing or blocking where
+		// the in-order path's does: the same WaitRegMem reading the same memory at the same place in the queue, nothing of
+		// the segment's translation used. A block yields the submission as an in-order block does (Progress::Blocked),
+		// `cp` untouched until Resume goes on from that wait (its queue's front is blocked: nothing else runs its
+		// processor), as RunHole's blocked wait after a segment run as a hole already relies on (blocked_as_hole).
+		if (to.waits != from.waits || to.covered_waits != from.covered_waits) {
+			if (!SegmentWaitsHold(state, from.waits, to.waits)) return AsHole::NotTaken;
+			through = true;
+		}
+		// From the segment's start (the chunk's, or past the hole before it: `cp` is in that state, the commit checked
+		// the chunk's start state and ran the hole) up to its hole's packet.
+		execution = index == 0 ? result.start_at : result.holes[index - 1].after;
+		if (!execution.Started() || !result.holes[index].at.Started()) return AsHole::NotTaken;
+		// Its recorded work dropped, never submitted: the GPU thread records it again.
+		m_renderer.GetCommandScheduler().DiscardFirst(*result.recorder, state.closed[index].recorded - result.submitted);
+		result.submitted = state.closed[index].recorded;
+		RelocCellsRelease(result.state, index); // (its chunks discarded)
+	}
 	const Spec::EffectSourceScope source(Spec::EffectSource::Hole);
 	auto&                         executor = m_renderer.GetRenderExecutor();
 	DrawStateObserver::Invalidate();
@@ -2657,6 +2694,10 @@ Speculation::AsHole Speculation::SegmentAsHole(Result& result, CommandProcessor&
 	DrawStateObserver::Invalidate();
 	executor.NativeXprForgetState();
 	result.resume_at = std::move(execution); // (at the hole's packet, or where the run ended)
+	// (At a wait not satisfied inside it, as the in-order path blocks there: the commit blocks, resume_at kept for
+	// Resume.)
+	if (!reached && through && processed != Pm4ProcessResult::Complete && CommandProcessor::AtWait(*result.resume_at))
+		return AsHole::Blocked;
 	if (!reached) {
 		// (The packets changed under the walk: the commit stops, the GPU thread goes on from where its run ended.)
 		const auto& hole = result.holes[index];

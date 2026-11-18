@@ -136,8 +136,9 @@ private:
 	};
 	enum class Progress { Complete, Stopped, Blocked };
 	enum class HoleRun { Done, Changed, Blocked };
-	// SegmentAsHole: not taken (nothing run), or run by the GPU thread up to its hole's packet, or past it without reaching it.
-	enum class AsHole { NotTaken, Reached, NotReached };
+	// SegmentAsHole: not taken (nothing run), or run by the GPU thread up to its hole's packet, or past it without reaching it,
+	// or (mode 4) stopped at a wait inside it not satisfied yet (result.resume_at there).
+	enum class AsHole { NotTaken, Reached, NotReached, Blocked };
 	// What the speculation's work assumed of the caches: no buffer or image registered or released, no mapping changed
 	// since (and the surface metadata it found not cleared still not: Spec::State::meta_facts).
 	struct Epochs {
@@ -174,7 +175,10 @@ private:
 		uint64_t     last_tick = 0;           // the last of them's tick (0: none; batched / spliced: not yet submitted)
 		size_t       blocked   = SIZE_MAX;    // the wait hole the commit waits at
 		bool         blocked_as_hole = false; // (... after its segment ran as a hole: `cp` holds the hole's state)
-		uint64_t     retired   = 0;           // when Finish kept it for reuse (m_clock; 0: in use)
+		// (Mode 4) the segment run as a hole the commit waits in, at a wait inside it (resume_at; `cp` holds the run's
+		// state there).
+		size_t       blocked_segment = SIZE_MAX;
+		uint64_t     retired   = 0;          // when Finish kept it for reuse (m_clock; 0: in use)
 		// When its translation started and ended, when each segment's ended.
 		uint64_t              start_ns = 0, end_ns = 0;
 		std::vector<uint64_t> segment_ends;
@@ -259,8 +263,9 @@ private:
 	[[nodiscard]] HoleRun RunHole(Result& result, CommandProcessor& cp, size_t index, bool copy_state = true);
 	// Under KYTY_SPECULATE=4: segment `index`, which Changed stopped, run by `cp` the normal way
 	// as a hole (its recorded work dropped), so the commit can go on; NotTaken: the stop stands, nothing run. Reached or
-	// NotReached: result.resume_at is where `cp` stopped.
-	[[nodiscard]] AsHole SegmentAsHole(Result& result, CommandProcessor& cp, size_t index);
+	// NotReached: result.resume_at is where `cp` stopped. Blocked: stopped at a wait inside it not satisfied yet
+	// (result.resume_at there); `resume` goes on from there.
+	[[nodiscard]] AsHole SegmentAsHole(Result& result, CommandProcessor& cp, size_t index, bool resume = false);
 	// At segment `index`'s commit (KYTY_SPECULATE=4): why a word it read from the journal that an earlier segment's
 	// write gave no longer holds (null: all hold).
 	[[nodiscard]] const char* JournalReadsMoved(const Result& result, size_t index) const;
