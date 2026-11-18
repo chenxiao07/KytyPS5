@@ -1432,6 +1432,12 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		set->refused = true;
 		return publish();
 	};
+	// (Mode 4: a speculation's program lookup runs with the catalog's read lock dropped, below: taken back here, through
+	// the writer-first gate, as the worker entry's lookups and capture take it.)
+	const auto relock = [this] {
+		CatalogGate(Catalog().m_catalog_writer_waiting, CatalogWriterFirst());
+		t_catalog_read->lock();
+	};
 	ShaderVertexInputInfo  vertex_info;
 	ShaderPixelInputInfo   pixel_info;
 	ShaderComputeInputInfo compute_info;
@@ -1451,7 +1457,18 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		// it: nothing releases it here), which the GPU thread's CatalogWrite waits for: its guest reads (PrepareProgramInto's
 		// hash, AGC metadata and vertex tables, Get's code and SRT words) are made without a fault, the set refused when
 		// one cannot be (PipelineCache: "worker set: code unread", "GPU-written shader code"; t_no_fault_failed). The
-		// epoch and variant checks after it hold for the lock; they stay for a lookup made without it.)
+		// epoch and variant checks after it hold for the lock; they stay for a lookup made without it: mode 4 drops it
+		// around the lookup, and proves the rest of what the draw holds as well, below.)
+		// (Mode 4: the lock dropped around the lookup, so the GPU thread's catalog writes (TableStore in holes) do not wait
+		// for it. EXACT: the lookup reads nothing of the catalog (the variant's mapping and the pair's portable masks are
+		// the copies held below, the rest is the draw's registers, guest memory and the pipeline cache under its own lock).
+		// Once the lock is back, everything the draw holds of the catalog and reads after it is proven as it was: the epoch
+		// (TableReset, a set replaced or retired; the sweeps of pairs and states run only between translations), the
+		// variant found again at the same address (the vector did not grow) with its pipeline, mapping and fetch_embedded
+		// (TableStore's in-place update), the pair's portable masks (TableLearnPortable's in-place update), the draw state's
+		// capture (NativeXprCaptureState replaces a state in place: capture_id moves). The pair's programs are compared
+		// after, as before. Anything moved: the set refused ("worker set: catalog changed", the draw a hole), never built
+		// over a mix; the draw's references may be stale then, so no retry in the hold.)
 		// (Copies held by a speculation only. Mode 0 reads them in place.)
 		struct Held {
 			std::remove_cvref_t<decltype(variant->mapping)> mapping;
@@ -1465,9 +1482,14 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		const auto* portable = held ? &held->portable : &pair.portable;
 		const auto  since    = spec != nullptr && CatalogTable() != nullptr ? CatalogTable()->epoch : 0;
 		const bool  unlocked = spec != nullptr && t_catalog_read != nullptr && t_catalog_read->owns_lock();
+		const bool     outside      = unlocked && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+		const bool     fetch_held   = outside && variant->fetch_embedded;
+		const uint64_t capture_held = outside && draw_state != nullptr ? draw_state->capture_id : 0;
+		if (outside) t_catalog_read->unlock();
 		(void)m_context.GetPipelineCache().GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx,
 		                                                       buffer.GetUserConfig(), *mapping, stages == 2,
 		                                                       vertex_info, pixel_info, true, *portable);
+		if (outside) relock();
 		PipelineCache::t_no_fault_reads = false;
 		if (spec != nullptr && PipelineCache::t_no_fault_failed) return worker_refuse("worker set: program read");
 		if (unlocked) {
@@ -1482,6 +1504,14 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			// the vector: its pipeline swapped, or null while TryCreateGraphicsPipeline is pending, or the variant refused.
 			// The set's layout and TableDraw's bind read that pipeline: refused unless it is the one held before the unlock.)
 			if (variant != t_entry_variant && (again->pipeline != held->pipeline || again->pipeline == nullptr || again->refused))
+				return worker_refuse("worker set: catalog changed");
+			// (Mode 4, the lock dropped for the lookup: the rest of what the draw read before the drop and reads after it, as
+			// it was: the variant's other in-place fields (TableStore), the pair's portable masks (the lookup's input), the
+			// draw state's capture (NativeXprCaptureState replaces a state in place, at its address).)
+			if (outside && variant != t_entry_variant && (again->mapping != held->mapping || again->fetch_embedded != fetch_held))
+				return worker_refuse("worker set: catalog changed");
+			if (outside && pair.portable != held->portable) return worker_refuse("worker set: catalog changed");
+			if (outside && draw_state != nullptr && draw_state->capture_id != capture_held)
 				return worker_refuse("worker set: catalog changed");
 		}
 		if (m_context.GetPipelineCache().TablePending())
@@ -1531,12 +1561,18 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		const auto* portable0 = held_portable ? &*held_portable : &pair.portable[0];
 		const auto since     = spec != nullptr && CatalogTable() != nullptr ? CatalogTable()->epoch : 0;
 		const bool unlocked  = spec != nullptr && t_catalog_read != nullptr && t_catalog_read->owns_lock();
+		// (Mode 4: the lock dropped around the lookup, as above. A dispatch's pair changes in place only its portable
+		// masks; its compute input, programs and pipeline with a TableReset, which moves the epoch.)
+		const bool outside   = unlocked && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+		if (outside) t_catalog_read->unlock();
 		const auto handle    = pipelines.GetComputeProgram(sh.GetCs(), ctx.GetShaderRegisters(), compute_info, nullptr, true,
 		                                                   *portable0);
+		if (outside) relock();
 		PipelineCache::t_no_fault_reads = false;
 		if (spec != nullptr && PipelineCache::t_no_fault_failed) return worker_refuse("worker set: program read");
 		if (unlocked && (CatalogTable() == nullptr || CatalogTable()->epoch != since))
 			return worker_refuse("worker set: catalog changed");
+		if (outside && pair.portable[0] != *held_portable) return worker_refuse("worker set: catalog changed");
 		if (pipelines.TablePending()) return spec != nullptr ? worker_refuse("worker set: program pending") : nullptr;
 		if (compute_info.stage.program != pair.programs[0]) {
 			if (spec != nullptr) return worker_refuse("worker set: other specialization");
@@ -2220,7 +2256,8 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 				// (A retry that came back pending: the refused set is still the slot's.) (The GPU thread's only: workers
 				// would write the shared_ptr under the shared lock while others read it. A speculation's TableResolveSet keeps
 				// the catalog's read across its program lookup, its guest reads made without a fault; were it ever released
-				// there, the owner could destroy `retried` meanwhile (TableReset, the set collection, a publish).)
+				// there, the owner could destroy `retried` meanwhile (TableReset, the set collection, a publish). Mode 4
+				// does: `retried` is read below by the GPU thread's own call only.)
 				if (Spec::Current() == nullptr && retried != nullptr && set == nullptr && TableLearnPortable() == 2 &&
 				    m_context.GetPipelineCache().TablePending()) {
 					// (Under the catalog's write lock: workers read retry_wait under the shared one, and this assignment can drop
