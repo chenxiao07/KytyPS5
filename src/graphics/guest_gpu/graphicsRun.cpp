@@ -84,6 +84,13 @@ static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_mutex_owned   = false;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
+// KYTY_SPECULATE=4: the WAIT_REG_MEM the GPU thread's last unsatisfied wait suspended at (size 0: none); taken when its
+// submission is requeued (GuestGpu::ThreadRun).
+struct FailedWaitWords {
+	uint64_t serial = 0, address = 0, reference = 0, mask = 0;
+	uint32_t function = 0, size = 0;
+};
+static thread_local FailedWaitWords g_failed_wait;
 static thread_local BufferCache*      g_gpu_buffers       = nullptr; // (the GPU thread's: spec_label_cpu_backing)
 
 struct DrawIndirectArgs {
@@ -1153,6 +1160,10 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		LiveTrace::Event(LiveTrace::FrontSuspend, reinterpret_cast<uint64_t>(addr),
 		                 (static_cast<uint64_t>(value) << 32u) | static_cast<uint32_t>(ref));
 		SuspendPm4();
+		// (KYTY_SPECULATE=4: kept for the queue selection's re-test, GuestGpu::RetestBlockedFronts.)
+		if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) [[unlikely]]
+			g_failed_wait = {0, reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(ref), static_cast<uint64_t>(mask), func,
+			                 static_cast<uint32_t>(sizeof(T))};
 	} else if (Spec::Current() == nullptr) { // (a speculation's commit publishes them)
 		BdaDirtyRegions::Publish();
 		// KYTY_SCOUT=2: a wait the scout passes, on a word another writer changed (Scout::CheckWait).
@@ -1319,6 +1330,105 @@ void GuestGpu::WaitForIdle() {
 	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
 		m_idle.Wait(&m_queue_mutex);
 	}
+}
+
+// KYTY_SPECULATE=4: a blocked front's stored wait re-tested where the selector and ReadyFrontElsewhere trusted
+// `blocked` (cleared otherwise only when a submission completes or after the selector's idle wait). The word is read as
+// the GPU thread's WAIT_REG_MEM reads it (no speculation): through the backing view on a page a pending guarded write
+// guards, else the guest's word. Where that read would fault into the fault handler (a read-watched page: its read-back,
+// the handler's locks and waits), or the page has no access (GuardedCopy stops at a fault before the guest-memory
+// handler), it is not read: kept blocked, as before. Only a hint: the packet itself runs the wait again when the queue
+// runs, so a pass stale by then blocks again (one more slice); a fail or an unread word keeps today's behaviour.
+static bool RetestWait(uint64_t address, uint64_t reference, uint64_t mask, uint32_t function, uint32_t size) {
+	uint64_t value = 0;
+	if (const auto* backing = WriteGuard::GuardedBacking(address, size)) {
+		std::memcpy(&value, backing, size);
+	} else if (Libs::LibKernel::Memory::ReadFaults(address, size) ||
+	           Common::GuardedCopy(&value, reinterpret_cast<const void*>(address), size) != 0) {
+		return false;
+	}
+	return TestWaitRegMemValue(value, reference, mask, function);
+}
+
+uint32_t GuestGpu::RetestBlockedFronts() {
+	// (Caller holds m_queue_mutex. The fronts copied under it; the words read without it, as the wait's handler reads
+	// them, so no lock of the read's is taken under it. Only this thread pops or requeues a front, so the fronts are the
+	// same ones when it is taken again.)
+	struct Front {
+		uint32_t   id = 0;
+		FailedWait wait;
+		bool       pass = false;
+	};
+	std::array<Front, QueueCount> fronts;
+	uint32_t                      count = 0;
+	for (uint32_t id = 0; id < QueueCount; ++id) {
+		auto& wait = m_failed_waits[id];
+		if (wait.size == 0) continue;
+		const auto& queue = m_queues[id];
+		// (Its front gone, taken or unblocked meanwhile: the wait is not that front's any more.)
+		if (queue.empty() || queue.front().serial != wait.serial || !queue.front().blocked) {
+			wait = {};
+			--m_failed_waits_n;
+			continue;
+		}
+		fronts[count++] = {id, wait, false};
+	}
+	if (count == 0) return 0;
+	m_queue_mutex.Unlock();
+	for (uint32_t i = 0; i < count; ++i)
+		fronts[i].pass = RetestWait(fronts[i].wait.address, fronts[i].wait.reference, fronts[i].wait.mask,
+		                            fronts[i].wait.function, fronts[i].wait.size);
+	m_queue_mutex.Lock();
+	uint32_t unblocked = 0;
+	for (uint32_t i = 0; i < count; ++i) {
+		if (!fronts[i].pass) continue;
+		auto& queue = m_queues[fronts[i].id];
+		if (queue.empty() || queue.front().serial != fronts[i].wait.serial || !queue.front().blocked) continue;
+		queue.front().blocked = false;
+		if (m_failed_waits[fronts[i].id].size != 0) {
+			m_failed_waits[fronts[i].id] = {};
+			--m_failed_waits_n;
+		}
+		++unblocked;
+	}
+	return unblocked;
+}
+
+// Under the queue mutex the runnable fronts of the other queues are looked at (the async speculation's: its serial and
+// chunk taken); the async speculation's own lock is taken after the queue mutex is released (FrontReady), so no two
+// locks are held at once. A front gone meanwhile only costs a wasted yield: the selector takes what is runnable. None
+// runnable: the blocked fronts' stored waits re-tested; one that passes is unblocked, and the fronts looked at again.
+int GuestGpu::ReadyFrontElsewhere() noexcept {
+	auto* gpu = g_gpu_state;
+	if (gpu == nullptr || !IsGpuThread()) return 0;
+	const auto look = [gpu] {
+		bool     async_front = false, compute_front = false;
+		uint64_t async_serial = 0;
+		uint32_t async_chunk  = 0;
+		{
+			Common::LockGuard lock(gpu->m_queue_mutex);
+			for (uint32_t id = 1; id < QueueCount; ++id) {
+				const auto& queue = gpu->m_queues[id];
+				if (queue.empty()) continue;
+				const auto& front = queue.front();
+				if (front.blocked || front.type != SubmissionType::Compute || !gpu->CanProcessSubmission(front)) continue;
+				if (gpu->m_speculation_async && id == gpu->m_async_queue && front.constant_commands.empty()) {
+					if (!async_front) async_front = true, async_serial = front.serial, async_chunk = front.spec_chunk;
+				} else {
+					compute_front = true;
+				}
+			}
+		}
+		if (async_front && gpu->m_speculation_async && gpu->m_speculation_async->FrontReady(async_serial, async_chunk))
+			return 1;
+		return compute_front ? 2 : 0;
+	};
+	if (const int target = look(); target != 0) return target;
+	{
+		Common::LockGuard lock(gpu->m_queue_mutex);
+		if (gpu->m_failed_waits_n == 0 || gpu->RetestBlockedFronts() == 0) return 0;
+	}
+	return look();
 }
 
 bool GuestGpu::CanProcessSubmission(const Submission& submission) const {
@@ -1516,15 +1626,23 @@ void GuestGpu::ThreadRun(void* data) {
 				EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 				gpu->m_processing = true;
 			} else {
+				// (KYTY_SPECULATE=4: a front blocked at a wait that passes now is runnable; the mutex was released for the
+				// reads, so what came meanwhile is looked at again: a pass, or a command whose Signal found no waiter then.)
+				if (gpu->m_failed_waits_n != 0) [[unlikely]]
+					if (gpu->RetestBlockedFronts() != 0 || !gpu->m_commands.empty()) continue;
 				int selected_queue = -1;
-				for (uint32_t offset = 0; offset < QueueCount; offset++) {
-					const auto id = (gpu->m_next_queue + offset) % QueueCount;
-					if (!gpu->m_queues[id].empty() && !gpu->m_queues[id].front().blocked &&
-					    gpu->CanProcessSubmission(gpu->m_queues[id].front())) {
-						selected_queue = static_cast<int>(id);
-						break;
+				// (KYTY_SPECULATE=4: a front requeued by a yield is passed over in the first look, taken in the second when
+				// no other front is runnable. With none marked, one look.)
+				for (int look = gpu->m_yields != 0 ? 0 : 1; look < 2 && selected_queue < 0; ++look)
+					for (uint32_t offset = 0; offset < QueueCount; offset++) {
+						const auto id = (gpu->m_next_queue + offset) % QueueCount;
+						if (!gpu->m_queues[id].empty() && !gpu->m_queues[id].front().blocked &&
+						    (look != 0 || !gpu->m_queues[id].front().yielded) &&
+						    gpu->CanProcessSubmission(gpu->m_queues[id].front())) {
+							selected_queue = static_cast<int>(id);
+							break;
+						}
 					}
-				}
 				if (selected_queue < 0) {
 					if (gpu->m_renderer.GetCommandScheduler().FlushPending()) {
 						gpu->m_queue_mutex.Unlock();
@@ -1551,6 +1669,12 @@ void GuestGpu::ThreadRun(void* data) {
 				auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
 				submission  = std::move(queue.front());
 				queue.pop_front();
+				// (A yield's mark is the run that set it; taken, it is cleared, so a requeue after this run carries only
+				// this run's yield.)
+				if (submission.yielded) [[unlikely]] {
+					submission.yielded = false;
+					--gpu->m_yields;
+				}
 				gpu->m_submission_count--;
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
 				gpu->m_processing = true;
@@ -1596,9 +1720,31 @@ void GuestGpu::ThreadRun(void* data) {
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		LiveCounters::Add(LiveCounters::Submissions);
+		// (KYTY_SPECULATE=4: a yield's mark lasts until the next submission returns.)
+		if (gpu->m_yields != 0) [[unlikely]]
+			for (auto& queue: gpu->m_queues)
+				if (!queue.empty() && queue.front().yielded) {
+					queue.front().yielded = false;
+					--gpu->m_yields;
+				}
+		// (KYTY_SPECULATE=4: the wait this run suspended at, taken; a compute submission requeued blocked keeps it for
+		// the re-test, any other run none.)
+		if (g_failed_wait.size != 0) [[unlikely]] {
+			const auto wait   = std::exchange(g_failed_wait, {});
+			auto&      stored = gpu->m_failed_waits[submission.queue_id];
+			if (stored.size != 0) stored = {}, --gpu->m_failed_waits_n;
+			if (!complete && !submission.yielded && submission.type == SubmissionType::Compute) {
+				stored = {submission.serial, wait.address, wait.reference, wait.mask, wait.function, wait.size};
+				++gpu->m_failed_waits_n;
+			}
+		}
 		if (!complete) {
 			LiveCounters::Add(LiveCounters::SubmissionRequeues);
-			submission.blocked = true;
+			// (KYTY_SPECULATE=4: requeued by a yield, not blocked.)
+			if (submission.yielded) [[unlikely]]
+				++gpu->m_yields;
+			else
+				submission.blocked = true;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
 		} else {
@@ -1689,6 +1835,11 @@ bool GuestGpu::Process(Submission& submission) {
 						                         ? m_speculation->Resume(cp, submission.command_execution)
 						                         : m_speculation->CommitReady(cp, job, submission.spec_chunk,
 						                                                      submission.command_execution, submission.spec_end);
+						// (Nothing committed: requeued at this chunk, another queue's front first.)
+						if (outcome == Speculation::Outcome::Yield) {
+							submission.yielded = true;
+							break;
+						}
 						progressed |= outcome != Speculation::Outcome::None;
 						if (outcome == Speculation::Outcome::Blocked) break;
 						if (outcome == Speculation::Outcome::Whole) {

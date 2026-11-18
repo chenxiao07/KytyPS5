@@ -648,6 +648,29 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 				});
 			};
 			if (translating()) {
+				// Mode 4, the graphics instance: before the cancel, another queue's compute front that is runnable and ready
+				// (the async speculation's front has its chunk translated, or an unspeculated one: in-order work this thread
+				// does anyway) runs first: Yield, the submission requeued at this chunk, whose worker goes on meanwhile; on
+				// the return the chunk is committed if ready, else cancelled as before. One check, so one yield, a chunk.
+				// Lock order: this speculation's m_mutex is released for the check (GuestGpu's queue mutex, then the other
+				// instance's own m_mutex in FrontReady, one at a time), then retaken and the translation looked at again.
+				// Exact: between queues the guest sees order only through labels and WAIT_REG_MEM (each queue's waits are
+				// evaluated when it runs) and the frame epoch (CanProcessSubmission); on the console the queues run
+				// concurrently, so any interleaving at packet boundaries that keeps these is a legal schedule, as the
+				// Blocked requeue already makes. A yielded-to queue's write over what a later graphics chunk read is caught
+				// by that chunk's commit checks (the effects log): a stop, never a wrong frame.
+				if (m_interrupt_id == 0 && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 &&
+				    !(m_ready_checked_serial == job.serial && m_ready_checked_chunk == chunk)) {
+					m_ready_checked_serial = job.serial, m_ready_checked_chunk = chunk;
+					lock.unlock();
+					const int target = GuestGpu::ReadyFrontElsewhere();
+					lock.lock();
+					if (target != 0) {
+						if (!translating()) continue; // (done or stopped meanwhile: looked at again)
+						end.reset();
+						return Outcome::Yield;
+					}
+				}
 				// KYTY_SPECULATE_CANCEL_US (live speculate_cancel_us, 0: never): a translation begun less than that long ago
 				// has more left than this thread takes for the whole chunk (a speculation's thread is several times slower
 				// per draw): it stops at its next packet, what it did is committed, the rest is translated here.
@@ -704,6 +727,13 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 		chunk_end();
 	}
 	return Commit(std::move(result), cp, execution);
+}
+
+bool Speculation::FrontReady(uint64_t serial, uint32_t chunk) {
+	std::lock_guard lock(m_mutex);
+	return std::ranges::any_of(m_ahead, [&](const auto& ahead) {
+		return ahead->serial == serial && ahead->chunk == chunk && ahead->pass == m_pass;
+	});
 }
 
 Speculation::Outcome Speculation::CommitAhead(CommandProcessor& cp, const Job& job, std::span<const Job> queued,

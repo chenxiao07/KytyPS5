@@ -64,8 +64,10 @@ public:
 	void Stop();
 
 	// Blocked: committed up to a wait hole not satisfied yet (the submission waits; Resume goes on from there). Chunk:
-	// committed up to the end of its chunk (mode 4: the execution is where the next begins).
-	enum class Outcome { Whole, Partly, None, Blocked, Chunk };
+	// committed up to the end of its chunk (mode 4: the execution is where the next begins). Yield (mode 4): nothing
+	// committed, the chunk still being translated and another queue's front ready: the submission is requeued at this
+	// chunk (as at a wait), that front runs first.
+	enum class Outcome { Whole, Partly, None, Blocked, Chunk, Yield };
 	// The command buffer translated speculatively from `cp`'s state, from where `execution` is (its start, or a wait the
 	// normal translation stopped at), and committed: whole (`cp` then has its state after it), partly or not at all
 	// (the rest is translated the normal way from `execution`, where `cp` has the state; nothing committed: as it was).
@@ -102,6 +104,9 @@ public:
 	[[nodiscard]] Outcome CommitReady(CommandProcessor& cp, const Job& job, uint32_t chunk, Pm4Execution& execution,
 	                                  std::optional<Pm4Execution>& end);
 	void                  Done(uint64_t serial, const CommandProcessor& cp);
+	// Mode 4: a translated chunk of the submission with that serial is waiting to be committed (the speculation's own
+	// lock, taken and released here; the caller holds no other instance's).
+	[[nodiscard]] bool    FrontReady(uint64_t serial, uint32_t chunk);
 	static constexpr uint32_t ChunkWork = 128;
 	// KYTY_SPEC_CHUNK_IN_ORDER (live spec_chunk_in_order, default off): a chunk the state pass has not cut when the GPU
 	// thread comes for it ("not passed yet") is translated in order up to where the pass will end it (ChunkWork draws
@@ -325,6 +330,10 @@ private:
 	bool                              m_state_busy = false, m_broken = false;
 	uint64_t                          m_taken = 0, m_done_serial = 0; // (taken: with m_taken_chunk)
 	uint32_t                          m_taken_chunk = 0;
+	// Mode 4, the graphics instance: the chunk last checked for a ready front elsewhere (one check, so one yield, a
+	// chunk; under m_mutex).
+	uint64_t                          m_ready_checked_serial = 0;
+	uint32_t                          m_ready_checked_chunk  = UINT32_MAX;
 	std::unique_ptr<CommandProcessor> m_done_state;
 	Spec::State*                      m_pass_record = nullptr; // the record the state pass fills
 	std::vector<std::pair<uint64_t, std::unique_ptr<Spec::State>>> m_retired_records; // (when: m_clock)
