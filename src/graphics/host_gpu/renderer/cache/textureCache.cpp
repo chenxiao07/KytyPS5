@@ -4301,6 +4301,14 @@ bool TextureCache::AcquireTargetAtCommit(ImageId id, uint64_t serial, uint32_t b
 	return image->SafeToDownload();
 }
 
+bool TextureCache::RefreshAtCommit(Image& image, uint64_t serial) {
+	std::scoped_lock lock {m_lock};
+	const auto       id = m_slot_images.live_id(image.serial_slot, &image);
+	if (!id || image.serial != serial || !image.registered) return false;
+	RefreshImage(id);
+	return !image.IsBufferModified();
+}
+
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.type != BindingType::RenderTarget) {
 		EXIT("TextureCache: invalid color-target binding\n");

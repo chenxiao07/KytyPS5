@@ -1461,9 +1461,56 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 			// copy over its memory, or an earlier segment's, replayed in its Before). The normal path's binding uploads such an
 			// image from those bytes before the work; this work was recorded without the upload and would read it as it was
 			// (the game's probe input, 0x27ce00000 at the tester's spot, written per face by a refused dispatch: the dark).
+			// Under KYTY_SPECULATE=4 such an image is refreshed in the segment's Before instead, as the normal path's binding
+			// refreshes it (TextureCache::RefreshAtCommit -> RefreshImage: the buffer-written bytes uploaded, or the fill's
+			// clear), after the texel syncs, invalidations and pending targets, before the restore loop. Exact:
+			// - the work read the image's identity (the VkImage its descriptors name; RefreshImage keeps it) and its contents
+			//   at execution; the writes that made it buffer-modified were made before the segment (holes, earlier segments'
+			//   Befores, in-order work), the ones the in-order binding sees. Nothing between Before and the segment's uses
+			//   writes that memory again: refused (the stop as before) when the segment's own work writes over the image (its
+			//   invalidated ranges, the GPU writes replayed in its Before; its written ranges; its journal's writes). Every use
+			//   of the image in the segment is at or after its first binding, where in order the refresh is made;
+			// - the same image: serial and registration (here, and RefreshAtCommit again under the cache's lock, by its
+			//   slot); not CPU-dirty or maybe-dirty, not stencil-modified (their stops stay), uncompressed, single-sampled
+			//   (RefreshImage uploads neither);
+			// - the layout: the restore loop puts it back in ImageUse::found, the state the recorded barriers start from,
+			//   from whatever the refresh left. A use found Undefined (or at any subresource) is refused: that barrier would
+			//   discard the upload. (An image a set of the segment completed in this Before: the restore loop's no-barrier
+			//   keep requires it still in its completion's layout and access, which the refresh's upload moves: the segment
+			//   stops there.)
+			// - a refresh that fails in Before (not that image any more, or still buffer-modified) fails the segment as a
+			//   target not acquired does (target_failed: stopped before the splice); what it uploaded is the in-order path's
+			//   own upload of those bytes.
+			bool image_refresh = false;
 			for (const auto& use: state.closed[index].images)
-				if (!use.found_buffer_modified && use.image->IsBufferModified())
-					return "commit: GPU work wrote an image it uses";
+				if (!use.found_buffer_modified && use.image->IsBufferModified()) {
+					if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4)
+						return "commit: GPU work wrote an image it uses";
+					const auto  from_c = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
+					const auto& to_c   = state.closed[index].end;
+					const auto& image  = *use.image;
+					const auto  begin = image.info.data.address, end = image.info.data.End();
+					const auto  over  = [&](const std::vector<Spec::Range>& list, size_t a, size_t b) {
+						for (size_t k = a; k < b; ++k)
+							if (list[k].begin < end && begin < list[k].end) return true;
+						return false;
+					};
+					bool journal_over = false;
+					for (size_t k = from_c.writes; k < to_c.writes && !journal_over; ++k)
+						journal_over = state.writes[k].address < end && begin < state.writes[k].address + state.writes[k].size;
+					const auto undefined       = [](const VulkanImageState& s) { return s.layout == vk::ImageLayout::eUndefined; };
+					const bool found_undefined = use.found_subresources.empty() ? undefined(use.found)
+					                                                            : std::ranges::any_of(use.found_subresources, undefined);
+					if (image.serial != use.serial || !image.registered || image.IsCpuDirty() || image.IsStencilModified() ||
+					    image.info.metadata.compression != VideoOutCompression::Uncompressed || image.info.samples > 1 ||
+					    found_undefined || over(state.invalidated, from_c.invalidated, to_c.invalidated) ||
+					    over(state.written, from_c.written, to_c.written) || journal_over)
+						return "commit: GPU work wrote an image it uses";
+					image_refresh = true;
+				}
+			if (image_refresh)
+				for (auto& use: result.state.closed[index].images)
+					use.refresh = !use.found_buffer_modified && use.image->IsBufferModified();
 			// spec_copy_image_refuse (Spec::CopyImageRefuseOn): nor its stencil plane (MarkStencilModified: a buffer write over
 			// it), which the normal path's refresh uploads (RefreshImage) and this work was recorded without.
 			if (Spec::CopyImageRefuseOn())
@@ -1610,20 +1657,79 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 						}
 					}
 				}
-				if (effects.stamped) {
-					if (any_since)
-						for (size_t i = from.cpu_copies; i < to.cpu_copies; ++i) {
-							const auto& copy = state.cpu_copies[i];
-							if (m_log.stamps.MaybeSince(copy.begin, copy.end - copy.begin, result.effects_from) &&
-							    m_log.FirstGpuWriteOver(result.effects_from, copy.begin, copy.end - copy.begin) != nullptr)
-								return "commit: GPU work wrote what it copies";
+				// The sources and destinations of the copies it makes on the CPU at its commit: no GPU work wrote them since.
+				// (A GPU write logged since it began over a range: the copies' test.)
+				const auto copy_written = [&](uint64_t begin, uint64_t size) {
+					if (effects.stamped)
+						return any_since && m_log.stamps.MaybeSince(begin, size, result.effects_from) &&
+						       m_log.FirstGpuWriteOver(result.effects_from, begin, size) != nullptr;
+					return !effects.gpu_writes.Empty() && effects.gpu_writes.Intersects(begin, size);
+				};
+				bool copies_written = false;
+				for (size_t i = from.cpu_copies; i < to.cpu_copies && !copies_written; ++i)
+					copies_written = copy_written(state.cpu_copies[i].begin, state.cpu_copies[i].end - state.cpu_copies[i].begin);
+				if (copies_written) {
+					// Under KYTY_SPECULATE=4 each such copy is made in After as the in-order path makes it now
+					// (BufferCache::CopyBuffer on the GPU thread, in the journal's place: WriteLabels), instead of the stop.
+					// Exact:
+					// - the translation read none of the copy's bytes: it decided the CPU path from the tracker. At the commit,
+					//   on the GPU thread in queue order, CopyBuffer re-decides as in order: a range GPU-modified (or an image
+					//   over the source) takes the GPU copy, which reads the bytes at execution, after the write. One whose
+					//   ranges the tracker no longer holds GPU-modified is made as the processor copy, as before;
+					// - its place: recorded after the segment's work (WriteLabels flushes it first), in the journal's order.
+					//   Refused (the stop as before) when the segment's own work reads or writes the source or destination
+					//   (its current, written, buffer, table or texel ranges: that work would then run before the copy
+					//   instead of after it), or the destination is image memory (HasTrackedDataOverlap);
+					// - in the journal's order, a later copy over a GPU copy's source or destination is made as the GPU copy
+					//   too (in order CopyBuffer would see the range GPU-modified), and a processor write (a label) over one
+					//   stops the segment (it would land before the GPU copy's execution, not after it);
+					// - later segments of the chunk: the GPU path's own marking (InvalidateMemoryFromGPU, ObtainBuffer
+					//   written: the tracker's GPU-modified range, the copy feedback invalidated, Spec::NoteGpuWrite into the
+					//   effects log) makes a later CPU-side read of the destination stop on "GPU work wrote what it read";
+					//   the destination's guest memory stays as in order (stale until the copy feedback).
+					if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4)
+						return "commit: GPU work wrote what it copies";
+					const auto own = [&](uint64_t begin, uint64_t end) {
+						const auto over = [&](const std::vector<Spec::Range>& list, size_t a, size_t b) {
+							for (size_t k = a; k < b; ++k)
+								if (list[k].begin < end && begin < list[k].end) return true;
+							return false;
+						};
+						return over(state.current, from.current, to.current) || over(state.written, from.written, to.written) ||
+						       over(state.buffer_ranges, from.buffer_ranges, to.buffer_ranges) ||
+						       over(state.table_ranges, from.table_ranges, to.table_ranges) ||
+						       over(state.texel_syncs, from.texel_syncs, to.texel_syncs);
+					};
+					// (A journaled copy GPU work wrote: its source or destination written since. Every cpu_copies range is a
+					// journaled copy's source or destination, noted with it.)
+					const auto noted = [&](const Spec::MemoryWrite& write) {
+						return write.copy && (copy_written(write.address, write.size) || copy_written(write.value, write.size));
+					};
+					auto&                                      textures = m_renderer.GetTextureCache();
+					std::vector<std::pair<uint64_t, uint64_t>> touched; // (the GPU copies' sources and destinations, [begin, end))
+					std::vector<size_t>                        marked;
+					const auto over_touched = [&](uint64_t begin, uint64_t size) {
+						for (const auto& [b, e]: touched)
+							if (b < begin + size && begin < e) return true;
+						return false;
+					};
+					for (size_t i = from.writes; i < to.writes; ++i) {
+						const auto& write   = state.writes[i];
+						const bool  follows = over_touched(write.address, write.size) || (write.copy && over_touched(write.value, write.size));
+						if (!write.copy) {
+							if (follows) return "commit: GPU work wrote what it copies";
+							continue;
 						}
-				} else if (!effects.gpu_writes.Empty())
-					for (size_t i = from.cpu_copies; i < to.cpu_copies; ++i) {
-						const auto& copy = state.cpu_copies[i];
-						if (effects.gpu_writes.Intersects(copy.begin, copy.end - copy.begin))
+						if (!follows && !noted(write)) continue;
+						if (own(write.address, write.address + write.size) || own(write.value, write.value + write.size) ||
+						    textures.HasTrackedDataOverlap(write.address, write.size))
 							return "commit: GPU work wrote what it copies";
+						marked.push_back(i);
+						touched.emplace_back(write.address, write.address + write.size);
+						touched.emplace_back(write.value, write.value + write.size);
 					}
+					for (const auto i: marked) result.state.writes[i].gpu = true;
+				}
 				for (size_t i = from.chain_reads; i < to.chain_reads; ++i) {
 					const auto& read = state.chain_reads[i];
 					// (KYTY_WRITE_GUARD_SPEC: a page a pending guest write guards, through the backing view: wg2's census had this
@@ -2071,6 +2177,11 @@ void Speculation::Before(Result& result, size_t index) {
 		                                               pending.base_layer, pending.layer_count, pending.clear);
 		if (!ok) state.target_failed = true;
 	}
+	// (Mode 4: the images GPU work wrote through a buffer since the translation found them, refreshed as the normal path's
+	// binding refreshes them (the commit's checks marked them: ImageUse::refresh), before the restore loop puts them back
+	// in the states the segment's barriers start from. One not refreshed fails the segment.)
+	for (const auto& use: segment.images)
+		if (use.refresh && !textures.RefreshAtCommit(*use.image, use.serial)) state.target_failed = true;
 	// The images back in the states the segment's barriers start from. This Before may have released one: a creation it
 	// made failed for memory (ReclaimImageMemory unregisters its victims, among them maybe the segment's own, and erases
 	// them after a wait), and any EraseRetired here (that one, a deferred RetireImage a Finish ran) erases retired images
@@ -2102,7 +2213,7 @@ void Speculation::Before(Result& result, size_t index) {
 	//   Undefined form above; exact, the state the completion left is the in-order one. Only while the image is still
 	//   whole in the layout of every completion of it (two in different layouts: never kept) with the completion's access
 	//   (shader read): anything of this Before after the completion that moved it (a pending target's acquisition of the
-	//   same image) stops the segment instead;
+	//   same image, the refresh above: its upload ends in General) stops the segment instead;
 	// - any other: the replay binds the completed set's descriptor (written in Lc) wherever the segment's own barriers
 	//   have the image then (its draw made no transition: its TableTransit ran before the completion added it), where in
 	//   order the set's build puts it in Lc. Restored (no stop) only when the image is in Lc at every point of the replay
@@ -2387,6 +2498,16 @@ void Speculation::After(Result& result, size_t index) {
 				i = end - 1;
 				continue;
 			}
+		}
+		// (Mode 4: a copy GPU work wrote since the translation, made here as the in-order path makes it now, where
+		// BufferCache::CopyBuffer takes its GPU path: either range GPU-modified in the tracker, or an image over the source.
+		// Else the processor copy below, as before: CopyBuffer's processor path is that copy. Recorded after the segment's
+		// work, flushed above.)
+		if (write.copy && write.gpu &&
+		    (buffers.IsRegionGpuModified(write.address, write.size) || buffers.IsRegionGpuModified(write.value, write.size) ||
+		     textures.FindImageFromRange(write.value, write.size))) {
+			buffers.CopyBuffer(write.address, write.value, write.size, false, false);
+			continue;
 		}
 		if (write.copy) {
 			// (Under KYTY_SPECULATE=4, the guard on and no full drain yet: the copy made as guarded writes of its

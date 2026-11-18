@@ -78,6 +78,7 @@ struct MemoryWrite {
 	uint64_t value   = 0; // a copy's source address
 	uint32_t size    = 0; // 4 or 8; a copy's bytes
 	bool     copy    = false;
+	bool     gpu     = false; // (a copy its commit makes as the in-order GPU copy, BufferCache::CopyBuffer: mode 4)
 };
 
 // A word read from the pending guest memory writes of a speculation before it (State::previous), and a wait
@@ -414,6 +415,9 @@ struct ImageUse {
 	// Any access of the segment's not a shader read in the shader-read-only layout (Image::GetBarriers): an image a set of
 	// the segment completed in its Before is restored only when the replay keeps it in that layout.
 	bool                          not_sampled = false;
+	// GPU work wrote it through a buffer since the segment found it: its commit's Before refreshes it as the normal path's
+	// binding does (Speculation::Before, mode 4).
+	bool                          refresh = false;
 };
 
 // The 64 KiB granules ranges were added over, hashed into 4096 bits, and up to BigRanges ranges over 64 granules or

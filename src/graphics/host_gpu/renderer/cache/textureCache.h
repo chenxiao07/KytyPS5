@@ -63,6 +63,10 @@ public:
 	// (the color DCC clear over the view's layers when `clear`); false: not that image any more, or not safe after.
 	[[nodiscard]] bool AcquireTargetAtCommit(ImageId id, uint64_t serial, uint32_t base_level, uint32_t level_count,
 	                                         uint32_t base_layer, uint32_t layer_count, bool clear);
+	// A speculation's image GPU work wrote through a buffer since its translation found it, refreshed at its commit's
+	// Before as the normal path's binding refreshes it (RefreshImage); false: not that image any more (its slot's, serial,
+	// registered), or still buffer-modified after.
+	[[nodiscard]] bool RefreshAtCommit(Image& image, uint64_t serial);
 	// An image of exactly this guest texture is registered (what FindImage takes first; no lookup side effects).
 	[[nodiscard]] bool          HoldsImage(const ImageInfo& info);
 	// The layers of a one-level array a sampled view reads, `info` (slices one after another: descriptors.cpp
