@@ -1378,9 +1378,18 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 					auto&      textures  = owner->m_context.GetTextureCache();
 					auto&      completed = spec->proposed_sets[index].completed;
 					const auto handle    = reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(raw->set));
+					const bool snapshot  = Spec::CompletedSnapshotOn();
 					for (size_t i = first; i < raw->images.size(); ++i)
-						if (const auto* image = textures.TryGetImage(raw->images[i].id))
+						if (const auto* image = textures.TryGetImage(raw->images[i].id)) {
 							completed.push_back({image, raw->images[i].serial, handle, raw->images[i].layout});
+							// (spec_completed_snapshot: its state as this completion left it, every slot of the set done.)
+							if (snapshot) {
+								const Image::StateLock lock(*image);
+								completed.back().snapshot     = true;
+								completed.back().state        = image->backing.state;
+								completed.back().subresources = image->backing.subresource_states;
+							}
+						}
 					return ok;
 				};
 				// (The memory its completion uploads from, for the commit's test before it against the committing segment's

@@ -375,6 +375,15 @@ inline int64_t CommitVerifyEvery() {
 	return every.load(std::memory_order_relaxed);
 }
 
+// KYTY_SPEC_COMPLETED_SNAPSHOT (live spec_completed_snapshot; on under KYTY_SPECULATE=4, off in mode 0): a completion
+// (ProposedSet::complete) keeps a snapshot of each image it completed (ProposedSet::Completed::state, subresources), and
+// Before's K1 test keeps the state of a no-barrier use of a completed-now image while its state equals that snapshot,
+// part-transited too (Speculation::Before). Off: only while whole in the completion's layout with shader read, as before.
+[[nodiscard]] inline bool CompletedSnapshotOn() {
+	static auto& on = LiveSwitch::Find("spec_completed_snapshot", ModeToggle::Default("spec_completed_snapshot"));
+	return on.load(std::memory_order_relaxed) != 0;
+}
+
 // KYTY_SPEC_SET_CPU_DIRTY_STOP (live spec_set_cpu_dirty_stop; -1, the default: on under KYTY_SPECULATE=4; 1 on, 0 off):
 // a commit stops at an image the CPU wrote since its segment found it (Speculation::CommitSegments), the entry of a set's
 // image made before its refresh test (TableTransit, TableValidateSet). Off: neither, as before.
@@ -691,6 +700,12 @@ struct State {
 			uint64_t        serial = 0;
 			uint64_t        set    = 0;
 			vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+			// (spec_completed_snapshot: the image's barrier state as `complete` left it, read under its StateLock once the
+			// set's TableCompletePendingImages returned: the whole state and the per-subresource vector. Before's K1 keep
+			// test compares the state then with it.)
+			bool                          snapshot = false;
+			VulkanImageState              state;
+			std::vector<VulkanImageState> subresources;
 		};
 		std::vector<Completed> completed;
 		std::function<bool()>     check; // (spec_proposed_check: still current at its segment's commit)

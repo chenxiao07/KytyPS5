@@ -2407,15 +2407,27 @@ void Speculation::Before(Result& result, size_t index) {
 	//   not a depth one's), `found` in that layout (whole, or at every found subresource; RestoreState makes it `found`
 	//   whatever the state now) and every access of the segment a shader read in it (not_sampled clear); else the segment
 	//   stops before the splice (target_failed), its restore not made.
+	// KYTY_SPEC_COMPLETED_SNAPSHOT (spec_completed_snapshot, mode 4): the first form's test is instead the image's state
+	// now equal to the snapshot its completion took (ProposedSet::Completed::state and subresources: layout, access,
+	// stages and guest, the whole state and every subresource), so a completion that transited only the slot's
+	// subresources (a part-transited image) keeps too. Exact as the whole form: TableCompletePendingImages made the
+	// transit the set's in-order build makes at its draw, from the state the image had in order before it (its earlier
+	// segments committed, their holes run); a state equal to the snapshot is one nothing after the completion moved, so it
+	// is the in-order state after the set's build, and the segment's commands do nothing to it (no barrier recorded on the
+	// use; the refused draw a hole run after the commit). After (its keep_state branch) leaves it; no restore. A stop
+	// still where it differs (spec_completed_stop_differs_n), where two completions of the image in this segment left
+	// different snapshots, where two completions' layouts differ (the test above), and for a barrier-recorded use (the
+	// second form, unchanged).
 	struct CompletedNow {
-		const Image*    image  = nullptr;
-		uint64_t        serial = 0;
-		vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+		const Image*                               image  = nullptr;
+		uint64_t                                   serial = 0;
+		vk::ImageLayout                            layout = vk::ImageLayout::eUndefined;
+		const Spec::State::ProposedSet::Completed* entry  = nullptr;
 	};
 	std::vector<CompletedNow> completed_now;
 	for (const auto& proposed: state.proposed_sets)
 		if (proposed.segment == index)
-			for (const auto& slot: proposed.completed) completed_now.push_back({slot.image, slot.serial, slot.layout});
+			for (const auto& slot: proposed.completed) completed_now.push_back({slot.image, slot.serial, slot.layout, &slot});
 	// Two completions of one image (the same object and serial) in different layouts: one barrier state cannot hold both
 	// (two sets of this segment completing it, a colour slot's ShaderReadOnly and a depth slot's DepthStencilReadOnly:
 	// TableCompletePendingImages transits it once for each, and the replay binds both descriptors with it in the last
@@ -2481,13 +2493,45 @@ void Speculation::Before(Result& result, size_t index) {
 		const auto this_image = [&](const CompletedNow& c) { return c.image == use.image && c.serial == use.serial; };
 		if (!completed_now.empty() && std::ranges::any_of(completed_now, this_image)) {
 			if (use.sample_lo == UINT32_MAX && !use.sample_other) {
-				bool kept = false; // (still whole in the layout of every completion of it, with the completion's access)
+				bool kept = false; // (still whole in the layout of every completion of it, with the completion's access; or
+				                   // spec_completed_snapshot: its state the completions' one snapshot)
 				{
 					const Image::StateLock lock(*use.image);
 					const auto&            now = use.image->backing.state;
 					kept = use.image->backing.subresource_states.empty() &&
 					       now.access_mask == vk::AccessFlags2 {vk::AccessFlagBits2::eShaderRead} &&
 					       std::ranges::all_of(completed_now, [&](const CompletedNow& c) { return !this_image(c) || c.layout == now.layout; });
+					if (kept) {
+						LiveCounters::Add(LiveCounters::SpecCompletedKeptWholeN);
+					} else if (Spec::CompletedSnapshotOn()) {
+						// (spec_completed_snapshot: every completion of it in this segment took a snapshot, all of them equal, and its
+						// state now equal to it: layout, access, stages and guest, whole and at every subresource.)
+						const auto same = [](const VulkanImageState& a, const VulkanImageState& b) {
+							return a.layout == b.layout && a.access_mask == b.access_mask && a.pl_stage == b.pl_stage && a.guest == b.guest;
+						};
+						const auto same_all = [&](const VulkanImageState& a, const std::vector<VulkanImageState>& a_sub,
+						                          const VulkanImageState& b, const std::vector<VulkanImageState>& b_sub) {
+							return same(a, b) && std::ranges::equal(a_sub, b_sub, same);
+						};
+						const Spec::State::ProposedSet::Completed* first = nullptr;
+						bool                                       equal = true;
+						for (const auto& c: completed_now) {
+							if (!this_image(c)) continue;
+							if (c.entry == nullptr || !c.entry->snapshot) {
+								equal = false;
+								break;
+							}
+							if (first == nullptr) {
+								first = c.entry;
+							} else if (!same_all(first->state, first->subresources, c.entry->state, c.entry->subresources)) {
+								equal = false;
+								break;
+							}
+						}
+						kept = equal && first != nullptr &&
+						       same_all(now, use.image->backing.subresource_states, first->state, first->subresources);
+						LiveCounters::Add(kept ? LiveCounters::SpecCompletedKeptSnapshotN : LiveCounters::SpecCompletedStopDiffersN);
+					}
 				}
 				if (kept) use.keep_state = true;
 				else state.target_failed = true;
