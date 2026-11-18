@@ -35,7 +35,7 @@ sealed class KeyboardControlsWindow : Window {
 		FontSize = 14;
 		var dock = new DockPanel { Margin = new Thickness(24) };
 		Content = dock;
-		var intro = new TextBlock { Text = T("Click an action, then press a key or mouse button. Assigning an input already used by another action swaps the two. F7 captures/releases the mouse in-game; F7, F8, F11 and Pause cannot be rebound. Hold one input and press another to bind both at once, such as Left Shift + Mouse:Left.", "点击动作后按键或鼠标按钮。若输入已用于其他动作，则交换两个动作的键位。游戏内按 F7 捕获/释放鼠标；F7、F8、F11 和 Pause 不可重新绑定。按住一个输入再按下另一个，即可将两者一起绑定，例如 Left Shift + Mouse:Left。"), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 12) };
+		var intro = new TextBlock { Text = T("Click an action, then press a key or mouse button. Assigning a single input that another action already uses swaps the two; a clash involving a combo is refused. F7 captures/releases the mouse in-game; F7, F8, F11 and Pause cannot be rebound. Hold one input and press another to bind both at once, such as Left Alt + Mouse:Left.", "点击动作后按键或鼠标按钮。若单个输入已用于其他动作，则交换两个动作的键位；涉及组合键的冲突会被拒绝。游戏内按 F7 捕获/释放鼠标；F7、F8、F11 和 Pause 不可重新绑定。按住一个输入再按下另一个，即可将两者一起绑定，例如 Left Alt + Mouse:Left。"), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 12) };
 		DockPanel.SetDock(intro, Dock.Top);
 		dock.Children.Add(intro);
 		var footer = new StackPanel();

@@ -78,6 +78,24 @@ sealed class KeyboardLayout {
 		first = second = null;
 		return false;
 	}
+	// Why another control's binding keeps this control from taking the input, or null: the input a combo holds is not
+	// bound on its own too, and two combos never have the same two inputs, in either order.
+	string Conflict(string control, string input) {
+		string first, second, otherFirst, otherSecond;
+		var combo = SplitCombo(input, out first, out second);
+		foreach (var other in Controls) {
+			if (other == control)
+				continue;
+			if (!SplitCombo(Bindings[other], out otherFirst, out otherSecond)) {
+				if (combo && Bindings[other] == first)
+					return first + " is bound to " + other + " on its own, so it cannot be held for a combo.";
+			} else if (!combo && input == otherFirst)
+				return input + " is held for " + other + "'s combo, so it cannot be bound on its own.";
+			else if (combo && ((first == otherFirst && second == otherSecond) || (first == otherSecond && second == otherFirst)))
+				return other + " already has " + first + " and " + second + " as a combo.";
+		}
+		return null;
+	}
 	public void Validate() {
 		var used = new HashSet<string>();
 		foreach (var control in Controls) {
@@ -86,6 +104,9 @@ sealed class KeyboardLayout {
 				throw new IOException("Unsupported binding for " + control + ". Edit keyboard controls to choose a supported key.");
 			if (!used.Add(input))
 				throw new IOException("Duplicate binding: " + input + ". Edit keyboard controls to give each action its own input.");
+			var conflict = Conflict(control, input);
+			if (conflict != null)
+				throw new IOException(control + ": " + conflict + " Edit keyboard controls to change one of them.");
 		}
 		double value;
 		if (Sensitivity.Length != 0 && (!double.TryParse(Sensitivity, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out value) || value < 0.1 || value > 5))
@@ -94,6 +115,9 @@ sealed class KeyboardLayout {
 	public string Assign(string control, string input) {
 		if (!Bindings.ContainsKey(control) || !Supported(input))
 			throw new IOException("Unsupported key. F7, F8, F11, Pause, Alt+Enter and Alt+F4 are reserved for the emulator.");
+		var conflict = Conflict(control, input);
+		if (conflict != null)
+			throw new IOException(conflict);
 		var other = Bindings.FirstOrDefault(p => p.Key != control && p.Value == input).Key;
 		if (other != null)
 			Bindings[other] = Bindings[control];
