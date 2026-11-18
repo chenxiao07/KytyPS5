@@ -1904,8 +1904,31 @@ ResourcePlan ExtractResourcePlan(const Program& program, bool linear) {
 			                   plan.clean_flat_slots);
 		}
 	}
+	CompactPlanMemoryInfo(plan);
 	if (linear) BuildLinearSrtPlan(plan);
 	return plan;
+}
+
+void CompactPlanMemoryInfo(ResourcePlan& plan) {
+	std::vector<uint32_t>   kept_at(plan.memory_info.size(), UINT32_MAX);
+	std::vector<MemoryInfo> kept;
+	for (auto& inst: plan.value_storage) {
+		// (The runtime reads, as Program.cpp's IsRuntimeRead: all EquivalentValue compares by their memory infos.)
+		const auto op = inst.GetOpcode();
+		if (op != ValueOpcode::ReadConstBuffer && AddressOpcodeInfoOf(op).access != AddressAccess::Read) continue;
+		auto flags = inst.Flags<MemoryFlags>();
+		if (flags.index >= kept_at.size()) continue; // (refused by its readers as before: past any kept entry too)
+		auto& at = kept_at[flags.index];
+		if (at == UINT32_MAX) {
+			at = static_cast<uint32_t>(kept.size());
+			kept.push_back(plan.memory_info[flags.index]);
+		}
+		flags.index = at;
+		inst.SetFlags(flags);
+	}
+	// (Always the kept order: the values now index it, also where every entry is kept.)
+	kept.shrink_to_fit();
+	plan.memory_info = std::move(kept);
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,

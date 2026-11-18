@@ -348,6 +348,8 @@ bool Load(std::span<const uint8_t> bytes, IR::ResourcePlan& plan, bool* defer_li
 	plan.requires_specialization_memory = (bits & 1u) != 0;
 	plan.srt_plan_complete              = (bits & 2u) != 0;
 	plan.resource_tracking_complete     = (bits & 4u) != 0;
+	// (A plan an earlier build wrote holds its program's every memory info: only its values' are kept.)
+	IR::CompactPlanMemoryInfo(plan);
 	const bool linear = (bits & 8u) != 0;
 	if (defer_linear != nullptr) {
 		*defer_linear = linear;
