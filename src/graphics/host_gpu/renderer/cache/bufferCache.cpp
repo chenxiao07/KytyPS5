@@ -2802,6 +2802,17 @@ void BufferCache::EnsureBdaReadable(std::span<const GuestRange> ranges) {
 	}
 }
 
+bool BufferCache::BdaHeadHeld(const GuestRange& range) const {
+	constexpr uint64_t HeadBytes = uint64_t {64} << 10u; // (EnsureBdaReadable's)
+	if (range.size == 0) return true;
+	const auto last = (range.address + std::min(range.size, HeadBytes) - 1) >> PageTable::kPageBits;
+	for (auto page = range.address >> PageTable::kPageBits; page <= last; ++page) {
+		const BufferId owner = LoadOwner(m_page_table.Find(page)); // (one read: LoadOwner)
+		if (!owner) return false;
+	}
+	return true;
+}
+
 void BufferCache::EnsureBufferContents(uint64_t vaddr, uint64_t size) {
 	if (auto* spec = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr) {
 		// Made current when the speculative translation is committed (an earlier segment's guest memory writes

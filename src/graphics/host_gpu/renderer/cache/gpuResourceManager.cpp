@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
+#include <unordered_set>
 #include <utility>
 #include <x86intrin.h>
 
@@ -532,11 +533,18 @@ bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges
 		// Prepared when it is committed (and its guest memory writes made after its work).
 		if (std::ranges::any_of(ranges, [&](const auto& range) { return spec->open_journal_set.Intersects(range.address, range.size); }))
 			Spec::Refuse("memory the processor writes");
-		spec->bda.insert(spec->bda.end(), ranges.begin(), ranges.end());
+		for (const auto& range: ranges) spec->NoteBda(range); // (KYTY_SPECULATE=4: a repeat in its segment not again)
 		return true;
 	}
 	// (Before the lock: making buffers asks for it.)
-	m_buffer_cache.EnsureBdaReadable(ranges);
+	// KYTY_SPECULATE=4: a range whose head pages this thread found all held by registered buffers at the registration
+	// epoch that still stands is not walked again (EnsureBdaReadableMemo): EnsureBdaReadable acts only on pages no buffer
+	// holds, and a page's owner changes only in BufferCache::ChangeRegister, which moves the epoch (the page table's one
+	// writer). The dirty-region syncs below run as before.
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) [[unlikely]]
+		EnsureBdaReadableMemo(ranges);
+	else
+		m_buffer_cache.EnsureBdaReadable(ranges);
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	RefreshBdaRanges();
 	LiveCounters::Add(LiveCounters::BdaRangeCalls);
@@ -558,6 +566,41 @@ bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges
 	m_fault_process_pending = true;
 	m_bda_used              = true;
 	return true;
+}
+
+// KYTY_SPECULATE=4: EnsureBdaReadable for the ranges not known all held at the current registration epoch; those found
+// all held after it, at an epoch read before and after the look, remembered (this thread's, cleared when the epoch
+// moves).
+void GpuResourceManager::EnsureBdaReadableMemo(std::span<const GuestRange> ranges) {
+	struct Key {
+		uint64_t address = 0, size = 0;
+		bool     operator==(const Key&) const = default;
+	};
+	struct Hash {
+		size_t operator()(const Key& key) const noexcept {
+			const uint64_t h = key.address * 0x9E3779B97F4A7C15ull ^ (key.size + 0x632BE59BD9B4E019ull);
+			return static_cast<size_t>(h ^ (h >> 29u));
+		}
+	};
+	thread_local uint64_t                      memo_epoch = 0;
+	thread_local std::unordered_set<Key, Hash> held;
+	thread_local std::vector<GuestRange>       todo;
+	if (const auto epoch = m_buffer_cache.RegistrationEpoch(); epoch != memo_epoch) {
+		held.clear();
+		memo_epoch = epoch;
+	}
+	todo.clear();
+	for (const auto& range: ranges)
+		if (!held.contains({range.address, range.size})) todo.push_back(range);
+	if (todo.empty()) return;
+	m_buffer_cache.EnsureBdaReadable(todo);
+	const auto before = m_buffer_cache.RegistrationEpoch();
+	if (before != memo_epoch) {
+		held.clear();
+		memo_epoch = before;
+	}
+	for (const auto& range: todo)
+		if (m_buffer_cache.BdaHeadHeld(range) && m_buffer_cache.RegistrationEpoch() == before) held.insert({range.address, range.size});
 }
 
 void GpuResourceManager::SynchronizeDirtyBdaRegions(GuestRange range) {

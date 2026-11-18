@@ -87,6 +87,8 @@ public:
 	[[nodiscard]] bool UnmappedSince(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept;
 
 	bool PrepareBdaReadRanges(std::span<const GuestRange> ranges);
+	// (KYTY_SPECULATE=4: EnsureBdaReadable for the ranges not known held at the registration epoch that stands.)
+	void EnsureBdaReadableMemo(std::span<const GuestRange> ranges);
 	// After each completed submission: its shaders' fault records and the image downloads.
 	void               EndSubmission();
 	// A flip the GPU makes (an end-of-pipe flip, all of Demon's Souls' frames): the collectors run at the end of its

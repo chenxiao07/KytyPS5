@@ -83,6 +83,8 @@ public:
 	void                   EnsureTexelContents(uint64_t vaddr, uint64_t size);
 	// The start of each range shaders read through pointers held by a buffer with the guest's bytes (see the definition).
 	void                   EnsureBdaReadable(std::span<const GuestRange> ranges);
+	// Every page EnsureBdaReadable looks at for `range` (its head) held by a buffer now.
+	[[nodiscard]] bool     BdaHeadHeld(const GuestRange& range) const;
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,

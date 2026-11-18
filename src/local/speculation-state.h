@@ -310,6 +310,20 @@ inline bool ReadOneSetOn() {
 	static auto& on = LiveSwitch::Find("spec_read_one_set", ModeToggle::Default("spec_read_one_set"));
 	return on.load(std::memory_order_relaxed) != 0;
 }
+// (KYTY_SPECULATE=4, State::before_merge: a noted range's key, by list, for the open segment's ranges noted once.)
+struct NoteSeenKey {
+	uint64_t begin = 0, end = 0;
+	uint32_t list  = 0;
+	bool     operator==(const NoteSeenKey&) const = default;
+};
+struct NoteSeenHash {
+	size_t operator()(const NoteSeenKey& key) const noexcept {
+		uint64_t h = key.begin * 0x9E3779B97F4A7C15ull;
+		h ^= (key.end + 0x632BE59BD9B4E019ull) + (h << 6u) + (h >> 2u);
+		h ^= key.list * 0xD6E8FEB86659FD93ull;
+		return static_cast<size_t>(h ^ (h >> 31u));
+	}
+};
 // spec_inherit_lazy (under KYTY_SPECULATE=4 only, the mode read at each Inherit): State::Inherit
 // takes the chain's union from the state before it (its own chain union and its own sets) when the chain beyond that state
 // is still the one it inherited, in place of merging every state of the chain (~20 at a spike: ~0.6 us a worker table
@@ -691,6 +705,13 @@ struct State {
 	// speculation (the switch as it began).
 	RangeSet pending_set;
 	bool     one_set = false;
+	// KYTY_SPECULATE=4 (taken with one_set, when a speculation begins or its state is cleared): a range the open segment
+	// already noted in the same list (the same bytes, anywhere in the segment, not only its last few) is not noted again,
+	// for the lists the commit's Before walks one call a range (written: ObtainBuffer; current: EnsureBufferContents;
+	// texel syncs; BDA read ranges). The open segment's noted ranges by list: cleared when it closes and on a rollback
+	// (a truncated note must not hide its repeat).
+	bool                                          before_merge = false;
+	std::unordered_set<NoteSeenKey, NoteSeenHash> note_seen;
 	uint32_t one_set_verify_n = 0, one_set_verified = 0; // (KYTY_SPEC_READ_ONE_SET_VERIFY; added 64 at a time)
 	// The notes as the packet being translated found them (Mark): a refused packet leaves none (Rollback). (Its image
 	// transitions stay: they are recorded, the overlay holds where they leave the images.)
@@ -754,6 +775,8 @@ struct State {
 		chain.clear();
 		for (const State* state = previous.load(); state != nullptr; state = state->previous.load()) chain.push_back(state);
 		one_set = ReadOneSetOn();
+		before_merge = ModeFour();
+		note_seen.clear();
 		const State* before = chain.empty() ? nullptr : chain.front();
 		// (The chain beyond the state before it still the one that state inherited: compared only for a switch that uses it.)
 		const bool   beyond_same = (InheritLazyOn() || OwnerIndexOn()) && before != nullptr && before->chain_ready &&
@@ -900,10 +923,10 @@ struct State {
 	}
 
 	void NoteCurrent(uint64_t address, uint64_t size) {
-		if (Note(current, Sealed().current, address, size)) current_set.Add(address, size);
+		if (NoteOnce(1, current, Sealed().current, address, size)) current_set.Add(address, size);
 	}
 	void NoteWritten(uint64_t address, uint64_t size) {
-		if (Note(written, Sealed().written, address, size)) {
+		if (NoteOnce(0, written, Sealed().written, address, size)) {
 			written_set.Add(address, size);
 			pending.Add(address, size);
 			if (one_set) pending_set.Add(address, size);
@@ -930,7 +953,13 @@ struct State {
 	}
 	void NoteTableRange(uint64_t address, uint64_t size) { (void)Note(table_ranges, Sealed().table_ranges, address, size); }
 	void NoteCpuCopy(uint64_t address, uint64_t size) { (void)Note(cpu_copies, Sealed().cpu_copies, address, size); }
-	void NoteTexelSync(uint64_t address, uint64_t size) { (void)Note(texel_syncs, Sealed().texel_syncs, address, size); }
+	void NoteTexelSync(uint64_t address, uint64_t size) { (void)NoteOnce(2, texel_syncs, Sealed().texel_syncs, address, size); }
+	// A BDA read range for the commit's preparation (GpuResourceManager::PrepareBdaReadRanges under a speculation); under
+	// before_merge not again when the open segment noted the same range.
+	void NoteBda(const GuestRange& range) {
+		if (before_merge && !note_seen.insert({range.address, range.address + range.size, 3}).second) return;
+		bda.push_back(range);
+	}
 	void NoteLateRead(uint64_t address, uint64_t size, uint64_t since) {
 		if (late_reads.size() > Sealed().late_reads && late_reads.back().end == address && late_reads.back().since == since)
 			late_reads.back().end = address + size;
@@ -1261,6 +1290,7 @@ struct State {
 	}
 	// (The cumulative sets keep what the packet noted: they only make later decisions more careful.)
 	void Rollback() {
+		note_seen.clear(); // (before_merge)
 		current.resize(std::min(current.size(), checkpoint.current));
 		written.resize(std::min(written.size(), checkpoint.written));
 		bda.resize(std::min(bda.size(), checkpoint.bda));
@@ -1360,6 +1390,8 @@ struct State {
 		pending.Clear();
 		pending_set.Clear();
 		one_set = ReadOneSetOn();
+		before_merge = ModeFour();
+		note_seen.clear();
 		if (one_set_verified != 0)
 			LiveCounters::Add(LiveCounters::SpecOneSetVerified, std::exchange(one_set_verified, 0));
 	}
@@ -1382,11 +1414,23 @@ struct State {
 		}
 		used.clear();
 		bda_all = false;
+		note_seen.clear(); // (before_merge: the next segment's own)
 		open_journal_set.Clear();
 		open_copy_sources.Clear();
 	}
 
 private:
+	// Under before_merge: Note, and a range the open segment already noted in that list (list 0 written, 1 current, 2
+	// texel syncs) is a repeat (false, as Note's own repeat: the sets beside the list already hold it). The key is the
+	// range as noted; the list entry that holds it only grows (Note's extension) until the segment closes or a rollback
+	// clears it. Exact: Before walks each list in order, and every call it makes (an obtain written, an ensure, a texel
+	// sync, a BDA preparation) is idempotent for the same range when only the same list's other entries run between the
+	// two calls (an obtain or ensure of another range may make or join a buffer, which copies the bytes it covers).
+	bool NoteOnce(uint32_t list, std::vector<Range>& ranges, size_t sealed, uint64_t address, uint64_t size) {
+		if (!before_merge || size == 0) return Note(ranges, sealed, address, size);
+		if (!note_seen.insert({address, address + size, list}).second) return false;
+		return Note(ranges, sealed, address, size);
+	}
 	// A range noted, merged into the open segment's last one when it extends it (draws mostly read consecutive
 	// ranges); false when one of the open segment's last few covers it (a repeat only costs the commit a lookup).
 	static bool Note(std::vector<Range>& ranges, size_t sealed, uint64_t address, uint64_t size) {
