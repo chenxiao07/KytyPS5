@@ -3230,6 +3230,54 @@ bool TextureCache::RefreshDepthLayers(ImageId id, const ImageViewInfo& view) {
 	return true;
 }
 
+TextureCache::DepthLayers TextureCache::DepthLayersClean(const Image& image, uint32_t first, uint32_t last, ReadPath* path) {
+	// (Read under a hold of m_lock and never a wait, in either mode: every write to what it reads (the image's dirty flags
+	// and ranges, its tracked range, its backing) is made under the exclusive flag.
+	// - This thread holding it already, exclusive (an UploadWindow open or not: the readers it admits only read, as this
+	//   does) or shared: read directly, no new take (Held).
+	// - Holding nothing, the shared mode on: one shared take that never waits (TextureCacheLock::try_lock_shared: the flag
+	//   held by anyone, who may be draining the workers' readers, and no window open: refused), released after the read
+	//   (Shared).
+	// - Holding nothing, the shared mode off (a worker's query takes the exclusive flag too): the flag taken only if free
+	//   (TextureCacheLock::try_lock: no spin, no wait), released after the read (Tried).
+	// A try refused: Busy, nothing read (the stop stands).)
+	const bool held = m_lock.OwnedByCurrentThread() || TextureCacheLock::HeldSharedHere();
+	const auto how  = held ? ReadPath::Held : m_lock.SharedMode() ? ReadPath::Shared : ReadPath::Tried;
+	if (how == ReadPath::Tried && !m_lock.try_lock()) return DepthLayers::Busy;
+	if (how == ReadPath::Shared && !m_lock.try_lock_shared()) return DepthLayers::Busy;
+	if (path != nullptr) *path = how;
+	struct Hold {
+		Hold(TextureCacheLock& taken, ReadPath kind) noexcept: lock(taken), how(kind) {}
+		~Hold() {
+			if (how == ReadPath::Shared) lock.unlock_shared();
+			else if (how == ReadPath::Tried) lock.unlock();
+		}
+		Hold(const Hold&)            = delete;
+		Hold& operator=(const Hold&) = delete;
+		TextureCacheLock& lock;
+		ReadPath          how;
+	} hold {m_lock, how};
+	const auto& info   = image.info;
+	const auto  layers = info.resources.layers;
+	// (UploadDepthPartial's own kind tests: a later refresh of any layers of it, in order or after this commit, is the
+	// partial upload of the dirty layers it covers, never a whole one over the span's.)
+	if (info.samples != 1 || image.backing.samples != 1 || info.HasStencil() || info.IsVolume() || info.resources.levels != 1 ||
+	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block ||
+	    DepthAspectTransferBytes(info.pixel_format) != info.bytes_per_block)
+		return DepthLayers::RefusedKind;
+	// (RefreshDepthLayers' own tests, for the view [first, last); then its slice arithmetic.)
+	if (!image.IsPartiallyCpuDirty() || image.IsBufferModified() || image.IsStencilModified() || image.IsMaybeCpuDirty() ||
+	    image.track_addr != info.data.address || image.track_addr_end != info.data.End() || layers < 2 || first >= last ||
+	    last > layers || last - first == layers || info.data.size % layers != 0 ||
+	    (info.data.size / layers) % TRACKER_PAGE_SIZE != 0 || info.data.address % TRACKER_PAGE_SIZE != 0 ||
+	    info.metadata.compression != VideoOutCompression::Uncompressed || UploadBinding(image) != BindingType::DepthTarget)
+		return DepthLayers::Dirty;
+	const uint64_t slice = info.data.size / layers;
+	return IntersectsRanges(image.CpuDirtyRanges(), info.data.address + slice * first, info.data.address + slice * last)
+	           ? DepthLayers::Dirty
+	           : DepthLayers::Clean;
+}
+
 bool TextureCache::LevelRefreshCandidate(const Image& image) {
 	// Textures the CPU writes and the GPU only samples (one written as a target or storage keeps whole refreshes),
 	// without layers (a level is one range of bytes), on whole pages.

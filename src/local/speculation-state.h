@@ -442,6 +442,22 @@ struct ImageUse {
 	// GPU work wrote it through a buffer since the segment found it: its commit's Before refreshes it as the normal path's
 	// binding does (Speculation::Before, mode 4).
 	bool                          refresh = false;
+	// (spec_pool_layers) The layers its accesses spanned, [layer_lo, layer_hi), and whether any access named no range
+	// (ImageEntry's, from Image::GetBarriers); layer_nontarget: the first access not as a depth attachment, by kind
+	// (LayerNontarget; 0: none): a binding the normal path refreshes through FindTexture / RefreshImage.
+	uint32_t                      layer_lo = UINT32_MAX, layer_hi = 0;
+	bool                          layer_other = false;
+	uint8_t                       layer_nontarget = 0;
+	// (spec_pool_layers' refusal counters: this use counted already, at most once per use whatever the calls.)
+	mutable bool                  pool_counted = false;
+	enum LayerNontarget : uint8_t {
+		NontargetSampled = 1, // a shader read (sampled) access
+		NontargetStorage,     // a shader write or storage access
+		NontargetTransfer,    // a transfer access or layout
+		NontargetGeneral,     // the General layout
+		NontargetFolded,      // a depth attachment access with a shader read folded in
+		NontargetOther,       // any other (a non-depth layout, no access)
+	};
 };
 
 // The 64 KiB granules ranges were added over, hashed into 4096 bits, and up to BigRanges ranges over 64 granules or
@@ -553,6 +569,11 @@ struct ImageEntry {
 	bool                          found_stencil_modified = false; // (spec_copy_image_refuse)
 	uint8_t                       writes = 0; // (the open segment's write accesses: ImageUse::writes)
 	bool                          not_sampled = false; // (ImageUse::not_sampled)
+	// (spec_pool_layers) The open segment's accesses' layer span, [layer_lo, layer_hi); layer_other: one with no range (the
+	// whole image). Recorded whatever the switch, as sample_lo / sample_hi.)
+	uint32_t                      layer_lo = UINT32_MAX, layer_hi = 0;
+	bool                          layer_other = false;
+	uint8_t                       layer_nontarget = 0; // (ImageUse::layer_nontarget: the first such access's kind)
 };
 
 // (spec_predict_dcc=3.) The fast clears speculations' holes will consume, by surface and slice, until that speculation
@@ -692,6 +713,9 @@ struct State {
 		// completion uploads from: each pending slot's own desc range (data, metadata range, stencil plane) and every
 		// image over the slot's bytes as FindImage would meet them (TextureCache::ImagesOverWritten).)
 		std::function<bool(const std::function<bool(uint64_t, uint64_t)>&)> pending_written;
+		// (With `complete`, spec_pool_layers, read only, the GPU thread: whether any pending slot's own data range meets
+		// [address, address + size): the only images its completion's FindTexture can resolve to are over those bytes.)
+		std::function<bool(uint64_t, uint64_t)> pending_over;
 		// (The images `complete` made its pending slots', each as it was then (its serial), the set's descriptor set handle
 		// as State::sets notes it and the layout it transited each to: its segment's Before restores them only as the
 		// replay binds them; the commits of later segments that bind the set test them, spec_set_cpu_dirty_stop off.)
@@ -1554,7 +1578,8 @@ struct State {
 			                          std::move(entry.found_subresources), entry.subresources, entry.found_group,
 			                          entry.group, entry.found_buffer_modified, entry.sample_lo, entry.sample_hi,
 			                          entry.sample_other, entry.found_cpu_dirty, entry.found_validity,
-			                          entry.found_stencil_modified, entry.writes, false, entry.not_sampled});
+			                          entry.found_stencil_modified, entry.writes, false, entry.not_sampled, false,
+			                          entry.layer_lo, entry.layer_hi, entry.layer_other, entry.layer_nontarget});
 			entry.used = false;
 		}
 		used.clear();

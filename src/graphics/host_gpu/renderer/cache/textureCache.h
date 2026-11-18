@@ -302,6 +302,15 @@ public:
 	// thread holding no lock, after the performance switches, before the speculation threads; once on, never off), and
 	// the lab's line when it turns on.
 	void ApplySharedMode(bool four);
+	// spec_pool_layers (the GPU thread, a commit's checks; read only, under a shared hold of m_lock): Clean when a depth
+	// target binding of layers [first, last) would upload nothing now (RefreshDepthLayers' preconditions for a scoped
+	// refresh hold and none of those layers' bytes is CPU-dirty) and a later refresh of the other layers is itself the
+	// partial one (UploadDepthPartial's kind tests: RefusedKind); Busy: m_lock held by another thread, so its try (the
+	// shared one in the shared mode, the exclusive one otherwise) refused (nothing read; a try never waits). `path`: the
+	// hold it read under (this thread's own, a shared take by try_lock_shared, or the exclusive flag taken by try_lock).
+	enum class DepthLayers : uint8_t { Clean, Dirty, RefusedKind, Busy };
+	enum class ReadPath : uint8_t { Held, Shared, Tried };
+	[[nodiscard]] DepthLayers DepthLayersClean(const Image& image, uint32_t first, uint32_t last, ReadPath* path = nullptr);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);

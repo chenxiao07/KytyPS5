@@ -189,6 +189,10 @@ Spec::ImageEntry* Image::SpeculativeEntry() {
 		entry->sample_lo             = UINT32_MAX; // (redo_level_precise: the segment's accesses, from its first)
 		entry->sample_hi             = 0;
 		entry->sample_other          = false;
+		entry->layer_lo              = UINT32_MAX; // (spec_pool_layers: the segment's accesses' layers, from its first)
+		entry->layer_hi              = 0;
+		entry->layer_other           = false;
+		entry->layer_nontarget       = 0;
 		entry->writes                = 0;
 		entry->not_sampled           = false;
 		spec->used.push_back(found->second);
@@ -220,6 +224,43 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 		if (destination_layout != vk::ImageLayout::eShaderReadOnlyOptimal ||
 		    destination_access != vk::AccessFlags2 {vk::AccessFlagBits2::eShaderRead})
 			entry->not_sampled = true; // (Spec::ImageUse::not_sampled)
+		// (spec_pool_layers: every access's layers, whatever the switch; no range, or none counted: the whole image.)
+		if (range && range->layer_count != 0) {
+			entry->layer_lo = std::min(entry->layer_lo, range->base_layer);
+			entry->layer_hi = std::max(entry->layer_hi, range->base_layer + range->layer_count);
+		} else {
+			entry->layer_other = true;
+		}
+		// (spec_pool_layers: an access not as a depth attachment: a depth layout with attachment access only, else not; the
+		// first such access's kind kept.)
+		if (entry->layer_nontarget == 0) {
+			using Layout             = vk::ImageLayout;
+			using Access             = vk::AccessFlagBits2;
+			using Use                = Spec::ImageUse;
+			constexpr auto attach    = Access::eDepthStencilAttachmentRead | Access::eDepthStencilAttachmentWrite;
+			const auto     has       = [&](vk::AccessFlags2 bits) { return static_cast<bool>(destination_access & bits); };
+			const bool     depth_lay = destination_layout == Layout::eDepthStencilAttachmentOptimal ||
+			                       destination_layout == Layout::eDepthAttachmentOptimal ||
+			                       destination_layout == Layout::eDepthStencilReadOnlyOptimal ||
+			                       destination_layout == Layout::eDepthReadOnlyOptimal ||
+			                       destination_layout == Layout::eDepthAttachmentStencilReadOnlyOptimal ||
+			                       destination_layout == Layout::eDepthReadOnlyStencilAttachmentOptimal;
+			if (!depth_lay || !static_cast<bool>(destination_access) || has(~vk::AccessFlags2 {attach})) {
+				if (destination_layout == Layout::eGeneral)
+					entry->layer_nontarget = Use::NontargetGeneral;
+				else if (has(Access::eShaderWrite | Access::eShaderStorageWrite | Access::eShaderStorageRead))
+					entry->layer_nontarget = Use::NontargetStorage;
+				else if (has(Access::eTransferRead | Access::eTransferWrite) || destination_layout == Layout::eTransferSrcOptimal ||
+				         destination_layout == Layout::eTransferDstOptimal)
+					entry->layer_nontarget = Use::NontargetTransfer;
+				else if (depth_lay && has(attach) && has(Access::eShaderRead | Access::eShaderSampledRead))
+					entry->layer_nontarget = Use::NontargetFolded;
+				else if (has(Access::eShaderRead | Access::eShaderSampledRead))
+					entry->layer_nontarget = Use::NontargetSampled;
+				else
+					entry->layer_nontarget = Use::NontargetOther;
+			}
+		}
 		// (Its write accesses, by kind: Spec::ImageUse::writes.)
 		using Access = vk::AccessFlagBits2;
 		if (static_cast<bool>(destination_access & (Access::eColorAttachmentWrite | Access::eDepthStencilAttachmentWrite)))

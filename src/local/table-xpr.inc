@@ -1395,6 +1395,13 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				// (The memory its completion uploads from, for the commit's test before it against the committing segment's
 				// writes (Speculation::Before): each pending slot's own desc range, metadata and stencil plane, and the images
 				// over the slot's bytes as FindImage would meet them. Read only, the GPU thread.)
+				spec->proposed_sets.back().pending_over = [raw](uint64_t address, uint64_t size) {
+					for (const auto& pending: raw->pending_images) {
+						const auto& data = pending.desc.info.data;
+						if (data.address < address + size && address < data.address + data.size) return true;
+					}
+					return false;
+				};
 				spec->proposed_sets.back().pending_written =
 				    [owner, raw](const std::function<bool(uint64_t, uint64_t)>& written) {
 					    auto& textures = owner->m_context.GetTextureCache();

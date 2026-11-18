@@ -1174,6 +1174,101 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 	return outcome;
 }
 
+// spec_pool_layers (live; on under KYTY_SPECULATE=4, off otherwise: mode-toggle.h; acts under mode 4 only).
+[[nodiscard]] static bool PoolLayersOn() {
+	static auto& on = LiveSwitch::Find("spec_pool_layers", ModeToggle::Default("spec_pool_layers"));
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && on.load(std::memory_order_relaxed) != 0;
+}
+// spec_pool_layers: a depth-array use's layer span, [first, last), when every access of the segment to it named a range
+// (ImageUse::layer_other clear), the span is a part of the layers, the image is the object the segment used (serial) and
+// registered, and its bytes divide into equal layers. Not a depth array: false, uncounted; a depth array without such a
+// span: false, counted (spec_pool_layers_span_unknown_n). And only where the depth-target binding is the one refresh the
+// in-order path makes of it in this segment (spec_pool_layers_refused_<cause>_n else): every access of the segment to it as a
+// depth attachment (layer_nontarget clear: a sampled, storage or other access is a binding the normal path refreshes
+// through FindTexture -> RefreshImage, a whole InitializeImage); no pending target of the segment on it but a layers2 one
+// (AcquireTargetAtCommit refreshes through RefreshImage); no pending slot of the segment's sets over its bytes, nor one
+// its Before completed to it (TableCompletePendingImages -> FindTexture).
+[[nodiscard]] static bool PoolLayerSpan(const Spec::State& state, size_t index, const Spec::ImageUse& use, uint32_t& first,
+                                        uint32_t& last) {
+	const auto* image  = use.image;
+	const auto& info   = image->info;
+	const auto  layers = info.resources.layers;
+	if (!info.IsDepth() || info.IsVolume() || layers < 2) return false;
+	// (Each use's refusal counted once, by the first: PoolLayerSpan runs at both stops and Changed up to twice.)
+	const auto refused = [&](LiveCounters::Id cause) {
+		if (!use.pool_counted) {
+			use.pool_counted = true;
+			LiveCounters::Add(cause);
+		}
+		return false;
+	};
+	if (use.layer_other || use.layer_lo >= use.layer_hi || use.layer_hi > layers || use.layer_hi - use.layer_lo == layers ||
+	    image->serial != use.serial || !image->registered || info.data.size % layers != 0)
+		return refused(LiveCounters::SpecPoolLayersSpanUnknownN);
+	if (use.layer_nontarget != 0) {
+		using Use = Spec::ImageUse;
+		if (!use.pool_counted && !image->IsCpuDirty()) LiveCounters::Add(LiveCounters::SpecPoolLayersNontargetCleanN);
+		switch (use.layer_nontarget) {
+			case Use::NontargetSampled: return refused(LiveCounters::SpecPoolLayersRefusedSampledN);
+			case Use::NontargetStorage: return refused(LiveCounters::SpecPoolLayersRefusedStorageN);
+			case Use::NontargetTransfer: return refused(LiveCounters::SpecPoolLayersRefusedTransferN);
+			case Use::NontargetGeneral: return refused(LiveCounters::SpecPoolLayersRefusedGeneralN);
+			case Use::NontargetFolded: return refused(LiveCounters::SpecPoolLayersRefusedFoldedN);
+			default: return refused(LiveCounters::SpecPoolLayersRefusedOtherAccessN);
+		}
+	}
+	const auto  from = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
+	const auto& to   = state.closed[index].end;
+	for (size_t i = from.pending_targets; i < to.pending_targets; ++i)
+		if (state.pending_targets[i].image == image && !state.pending_targets[i].depth_layers2)
+			return refused(LiveCounters::SpecPoolLayersRefusedPendingTargetN);
+	for (const auto& proposed: state.proposed_sets) {
+		if (proposed.segment != index) continue;
+		if (proposed.complete && proposed.pending_over && proposed.pending_over(info.data.address, info.data.size))
+			return refused(LiveCounters::SpecPoolLayersRefusedPendingSlotN);
+		if (std::ranges::any_of(proposed.completed, [&](const auto& c) { return c.image == image; }))
+			return refused(LiveCounters::SpecPoolLayersRefusedCompletedN);
+	}
+	first = use.layer_lo;
+	last  = use.layer_hi;
+	return true;
+}
+// spec_pool_layers (a): the CPU-dirty stop's test for a depth-array use: its image dirty only outside the span (and a
+// scoped refresh's preconditions held: TextureCache::DepthLayersClean, RefreshDepthLayers' own tests and slices, and
+// UploadDepthPartial's kind; read under a shared hold of the cache's lock).
+[[nodiscard]] static bool PoolLayersClean(TextureCache& textures, const Spec::State& state, size_t index, const Spec::ImageUse& use) {
+	uint32_t first = 0, last = 0;
+	if (!PoolLayersOn() || !PoolLayerSpan(state, index, use, first, last)) return false;
+	auto       path  = TextureCache::ReadPath::Shared;
+	const auto clean = textures.DepthLayersClean(*use.image, first, last, &path);
+	if (clean == TextureCache::DepthLayers::RefusedKind || clean == TextureCache::DepthLayers::Busy) {
+		if (!use.pool_counted) {
+			use.pool_counted = true;
+			LiveCounters::Add(clean == TextureCache::DepthLayers::RefusedKind ? LiveCounters::SpecPoolLayersRefusedKindN
+			                                                                  : LiveCounters::SpecPoolLayersRefusedBusyN);
+		}
+		return false;
+	}
+	if (path == TextureCache::ReadPath::Held) LiveCounters::Add(LiveCounters::SpecPoolLayersHeldReadN);
+	if (path == TextureCache::ReadPath::Tried) LiveCounters::Add(LiveCounters::SpecPoolLayersTryReadN);
+	if (path == TextureCache::ReadPath::Shared) LiveCounters::Add(LiveCounters::SpecPoolLayersHeldSharedN);
+	const bool pass = clean == TextureCache::DepthLayers::Clean;
+	LiveCounters::Add(pass ? LiveCounters::SpecPoolLayersPassDirtyN : LiveCounters::SpecPoolLayersStopDirtyN);
+	return pass;
+}
+// spec_pool_layers (b): the unmap stop's test for a depth-array use: no unmap since the speculation began over the span's
+// bytes (the layers' equal slices of the data range).
+[[nodiscard]] static bool PoolLayersMapped(GpuResourceManager& resources, const Spec::State& state, size_t index,
+                                           const Spec::ImageUse& use, uint64_t mapping) {
+	uint32_t first = 0, last = 0;
+	if (!PoolLayersOn() || !PoolLayerSpan(state, index, use, first, last)) return false;
+	const auto& info   = use.image->info;
+	const auto  slice  = info.data.size / info.resources.layers;
+	const bool  mapped = !resources.UnmappedSince(mapping, info.data.address + slice * first, slice * (last - first));
+	LiveCounters::Add(mapped ? LiveCounters::SpecPoolLayersPassUnmappedN : LiveCounters::SpecPoolLayersStopUnmappedN);
+	return mapped;
+}
+
 const char* Speculation::Changed(const Result& result, size_t index, bool skip_registered, const Epochs* since) const {
 	extern thread_local bool t_unmap_list_site; // (spec_unmap_list: its checks share one `since`)
 	struct ListSite {
@@ -1251,6 +1346,8 @@ const char* Speculation::Changed(const Result& result, size_t index, bool skip_r
 			if (resources.UnmappedSince(epochs.mapping, use.image->info.data.address, use.image->info.data.size)) {
 				// redo_level_precise: not over the bytes of the levels the segment sampled, when it only sampled it.
 				if (Spec::RedoLevelPreciseOn() && SampledLevelsMapped(use, epochs.mapping)) continue;
+				// spec_pool_layers: not over the bytes of the layers the segment's accesses spanned (a depth array).
+				if (PoolLayersMapped(resources, state, index, use, epochs.mapping)) continue;
 				return "commit: memory unmapped";
 			}
 	}
@@ -1681,6 +1778,8 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 						sampled.view_info.level_count = use.sample_hi - use.sample_lo;
 						if (!TextureCache::RefreshPending(*image, sampled)) continue;
 					}
+					// spec_pool_layers: a depth array dirty only outside the layers the segment's accesses spanned.
+					if (PoolLayersClean(m_renderer.GetTextureCache(), state, index, use)) continue;
 					if (image->IsDefinitelyCpuDirty()) {
 						LiveCounters::Add(LiveCounters::SpecCpuDirtyStopsDefinite);
 						return "commit: the CPU wrote an image it uses";

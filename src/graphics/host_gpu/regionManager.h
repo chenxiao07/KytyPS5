@@ -61,6 +61,15 @@ public:
 		m_seq.store(m_seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 		std::atomic_thread_fence(std::memory_order_release);
 	}
+	// A take that never waits (spec_pool_layers): false while anyone holds it, this thread too (no recursion check, no
+	// spin); else lock()'s acquisition (the owner, the sequence odd), released by unlock().
+	[[nodiscard]] bool try_lock() noexcept {
+		if (m_lock.test(std::memory_order_relaxed) || m_lock.test_and_set(std::memory_order_acquire)) return false;
+		m_owner.store(CurrentThread(), std::memory_order_relaxed);
+		m_seq.store(m_seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
+		return true;
+	}
 	void unlock() noexcept {
 		if (m_owner.load(std::memory_order_relaxed) != CurrentThread()) {
 			EXIT("region tracking lock released by non-owner\n");
@@ -150,6 +159,20 @@ public:
 			EXIT("texture cache lock released with readers let in\n");
 		m_exclusive.unlock();
 	}
+	// (spec_pool_layers) The exclusive take that never waits: the flag only if free, then the mode read under it (as
+	// lock()); in the shared mode, readers inside (lock()'s fence, then the count): released, false, where lock() would
+	// wait them out. Released by unlock().
+	[[nodiscard]] bool try_lock() noexcept {
+		if (!m_exclusive.try_lock()) return false;
+		if (m_shared.load(std::memory_order_relaxed)) {
+			std::atomic_thread_fence(std::memory_order_seq_cst);
+			if (m_readers.load(std::memory_order_acquire) != 0) {
+				m_exclusive.unlock();
+				return false;
+			}
+		}
+		return true;
+	}
 	void lock_shared() noexcept {
 		if (m_exclusive.OwnedByCurrentThread() || t_shared_depth != 0) EXIT("texture cache lock taken shared while held\n");
 		uint32_t spins = 0;
@@ -163,6 +186,19 @@ public:
 			}
 		}
 		++t_shared_depth;
+	}
+	// (spec_pool_layers) One shared take that never waits: the count raised, then the flag tested as lock_shared does
+	// (both sequentially consistent); held by anyone (who may be draining the readers) and no window open: the count
+	// lowered again, false. Released by unlock_shared().
+	[[nodiscard]] bool try_lock_shared() noexcept {
+		if (m_exclusive.OwnedByCurrentThread() || t_shared_depth != 0) EXIT("texture cache lock taken shared while held\n");
+		m_readers.fetch_add(1, std::memory_order_seq_cst);
+		if (m_exclusive.Held() && !m_admit.load(std::memory_order_seq_cst)) {
+			m_readers.fetch_sub(1, std::memory_order_release);
+			return false;
+		}
+		++t_shared_depth;
+		return true;
 	}
 	void unlock_shared() noexcept {
 		--t_shared_depth;
