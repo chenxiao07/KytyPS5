@@ -1228,6 +1228,80 @@ bool Speculation::SampledLevelsMapped(const Spec::ImageUse& use, uint64_t mappin
 	return !m_renderer.GetGpuResources().UnmappedSince(mapping, info.data.address + first, last - first);
 }
 
+static bool ReadGuestNow(void* out, uint64_t address, uint64_t bytes); // (below)
+
+// Whether a clean read of segment `index` that a write was logged over since the speculation began still gives the
+// translation's bytes. Only when: no GPU write is logged over it (a GPU write is logged as its work is recorded, before
+// it reaches memory: memory cannot tell); none of its bytes was read without keeping them (unvalued_reads: command
+// words, the buffer cache's, the kernel's, the table path's readers, a copy's source, reads over MaxBytes); every byte of
+// it is in a kept read of the segment; and memory now (as the translation read it: the write guard's backing view where
+// a guest write is pending; on Linux a read-watched page refused, the rest through the backing view; else a guarded
+// copy, a fault refusing) holds every kept read's bytes. Then the translation, which depended only on those bytes, is
+// the one the GPU thread would make now: the write wrote what was there, or changed it back. Late reads keep their
+// rule.
+bool Speculation::ReadValuesHold(const Result& result, size_t index, const Spec::Range& read) const {
+	const auto& state = result.state;
+	if (!state.read_values_on) return false;
+	const auto  from = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
+	const auto& to   = state.closed[index].end;
+	const auto  size = read.end - read.begin;
+	if (m_log.FirstGpuWriteOver(result.effects_from, read.begin, size) != nullptr) return false;
+	// (The segment's kept reads sorted by address and its unvalued reads sorted and merged, once, at its first read
+	// checked; the thread that commits alone.)
+	thread_local struct {
+		uint64_t                            id = 0, index = 0, count = 0, unvalued_count = 0;
+		std::vector<const Spec::ReadValue*> sorted;
+		std::vector<Spec::Range>            unvalued;
+	} kept;
+	if (kept.id != state.id || kept.index != index || kept.count != to.read_values - from.read_values ||
+	    kept.unvalued_count != to.unvalued_reads - from.unvalued_reads) {
+		kept.id             = state.id;
+		kept.index          = index;
+		kept.count          = to.read_values - from.read_values;
+		kept.unvalued_count = to.unvalued_reads - from.unvalued_reads;
+		kept.sorted.clear();
+		for (size_t i = from.read_values; i < to.read_values; ++i) kept.sorted.push_back(&state.read_values[i]);
+		std::sort(kept.sorted.begin(), kept.sorted.end(),
+		          [](const Spec::ReadValue* a, const Spec::ReadValue* b) { return a->address < b->address; });
+		kept.unvalued.assign(state.unvalued_reads.begin() + static_cast<ptrdiff_t>(from.unvalued_reads),
+		                     state.unvalued_reads.begin() + static_cast<ptrdiff_t>(to.unvalued_reads));
+		std::sort(kept.unvalued.begin(), kept.unvalued.end(),
+		          [](const Spec::Range& a, const Spec::Range& b) { return a.begin < b.begin; });
+		size_t merged = 0;
+		for (const auto& range: kept.unvalued) {
+			if (merged != 0 && range.begin <= kept.unvalued[merged - 1].end)
+				kept.unvalued[merged - 1].end = std::max(kept.unvalued[merged - 1].end, range.end);
+			else
+				kept.unvalued[merged++] = range;
+		}
+		kept.unvalued.resize(merged);
+	}
+	// (No unvalued read over it: the first merged range ending past its start begins past its end.)
+	const auto ends_after = [](uint64_t at, const Spec::Range& range) { return at < range.end; };
+	if (const auto unvalued = std::upper_bound(kept.unvalued.begin(), kept.unvalued.end(), read.begin, ends_after);
+	    unvalued != kept.unvalued.end() && unvalued->begin < read.end)
+		return false;
+	// (Every byte of the read in a kept read: the kept reads over it, by address, without a gap; those begin at most
+	// MaxBytes before it.)
+	thread_local std::vector<const Spec::ReadValue*> over;
+	over.clear();
+	const uint64_t lowest = read.begin > Spec::ReadValue::MaxBytes ? read.begin - Spec::ReadValue::MaxBytes : 0;
+	for (auto it = std::lower_bound(kept.sorted.begin(), kept.sorted.end(), lowest,
+	                                [](const Spec::ReadValue* value, uint64_t at) { return value->address < at; });
+	     it != kept.sorted.end() && (*it)->address < read.end; ++it)
+		if (read.begin < (*it)->address + (*it)->size) over.push_back(*it);
+	uint64_t covered = read.begin;
+	for (const auto* value: over)
+		if (value->address <= covered) covered = std::max(covered, value->address + value->size);
+	if (covered < read.end) return false;
+	for (const auto* value: over) {
+		std::array<uint8_t, Spec::ReadValue::MaxBytes> now;
+		if (!ReadGuestNow(now.data(), value->address, value->size)) return false;
+		if (std::memcmp(now.data(), value->bytes.data(), value->size) != 0) return false;
+	}
+	return true;
+}
+
 // KYTY_SPEC_COMMIT_VERIFY: whether this one is the Nth (the thread that commits).
 static bool CommitVerifyDue() {
 	static uint64_t count = 0;
@@ -1339,14 +1413,235 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 	const auto  segments  = state.closed.size();
 	EXIT_IF(result.holes.size() + 1 != segments);
 	// (Blocked at a wait hole: from there.)
+	// (After its segment ran as a hole, `cp` is already in the state the hole runs from: not the worker's copied.)
 	if (const auto hole = std::exchange(result.blocked, SIZE_MAX); hole != SIZE_MAX) {
-		const auto run = RunHole(result, cp, hole);
-		if (run == HoleRun::Blocked) return result.blocked = hole, Progress::Blocked;
+		const bool as_hole = std::exchange(result.blocked_as_hole, false);
+		const auto run     = RunHole(result, cp, hole, !as_hole);
+		if (run == HoleRun::Blocked) return result.blocked = hole, result.blocked_as_hole = as_hole, Progress::Blocked;
 		if (run == HoleRun::Changed) return Progress::Stopped;
 	}
 	while (result.next < segments) {
 		const auto index = result.next;
 		m_effects.Take(m_log);
+		// The checks after Changed(): the stop's reason, or null when they all hold. (Under KYTY_SPECULATE=4 a stop here
+		// runs the segment as a hole, as Changed()'s do: nothing of its preparation ran, so the run is the in-order
+		// path's from the true state.)
+		const auto post_checks = [&]() -> const char* {
+			// The images it uses as it found them: none written through a buffer since (a hole's storage-buffer write, fill or
+			// copy over its memory, or an earlier segment's, replayed in its Before). The normal path's binding uploads such an
+			// image from those bytes before the work; this work was recorded without the upload and would read it as it was
+			// (the game's probe input, 0x27ce00000 at the tester's spot, written per face by a refused dispatch: the dark).
+			for (const auto& use: state.closed[index].images)
+				if (!use.found_buffer_modified && use.image->IsBufferModified())
+					return "commit: GPU work wrote an image it uses";
+			// spec_copy_image_refuse (Spec::CopyImageRefuseOn): nor its stencil plane (MarkStencilModified: a buffer write over
+			// it), which the normal path's refresh uploads (RefreshImage) and this work was recorded without.
+			if (Spec::CopyImageRefuseOn())
+				for (const auto& use: state.closed[index].images)
+					if (!use.found_stencil_modified && use.image->IsStencilModified()) {
+						LiveCounters::Add(LiveCounters::SpecStencilModifiedStops);
+						return "commit: GPU work wrote a stencil it uses";
+					}
+			// spec_set_cpu_dirty_stop (Spec::SetCpuDirtyStopOn): nor written on the CPU since (a hole's host write over its
+			// pages, or an earlier segment's guest memory writes). The work's set reuse checked it only at translation
+			// (TableTransit's and TableValidateSet's refresh tests, which make its entry first); the normal path's next
+			// acquisition uploads (a storage image: guest bytes over what the GPU wrote). CPU-dirty now and either clean when
+			// found or written since (its validity moved: every CPU write's does). A use that only sampled views above level 0
+			// (redo_level_precise's sample-only use: a texture streaming in from its small levels) passes while its sampled
+			// levels' bytes are not dirty: RefreshPending of those levels (DirtyForView), the normal path's own test for such a
+			// view. Maybe-dirty only: when its refresh would upload, the stored hash of its guest edges no longer theirs
+			// (RefreshImage's own test, read only).
+			if (Spec::SetCpuDirtyStopOn())
+				for (const auto& use: state.closed[index].images) {
+					const auto* image = use.image;
+					if (!image->IsCpuDirty() ||
+					    (use.found_cpu_dirty && image->validity.load(std::memory_order_acquire) == use.found_validity))
+						continue;
+					if (!use.sample_other && use.sample_lo != 0 && use.sample_lo < use.sample_hi && image->serial == use.serial) {
+						TextureCache::ImageDesc sampled;
+						sampled.type                  = TextureCache::BindingType::Texture;
+						sampled.view_info.base_level  = use.sample_lo;
+						sampled.view_info.level_count = use.sample_hi - use.sample_lo;
+						if (!TextureCache::RefreshPending(*image, sampled)) continue;
+					}
+					if (image->IsDefinitelyCpuDirty()) {
+						LiveCounters::Add(LiveCounters::SpecCpuDirtyStopsDefinite);
+						return "commit: the CPU wrote an image it uses";
+					}
+					if (image->MaybeCpuHashMoved()) {
+						LiveCounters::Add(LiveCounters::SpecCpuDirtyStopsMaybe);
+						return "commit: the CPU wrote an image it uses (maybe-dirty)";
+					}
+				}
+			for (const auto& left: state.left_clears)
+				if (left.segment == index && (left.image->serial != left.serial ||
+				                              left.image->validity.load(std::memory_order_relaxed) != left.validity))
+					return "commit: a left clear's image moved";
+			for (const auto& fact: state.meta_facts)
+				if (!fact.cleared && fact.first <= index && index <= fact.last &&
+				    m_renderer.GetTextureCache().IsMetaCleared(fact.address, fact.slice))
+					return "commit: a surface cleared";
+			{
+				const auto  from    = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
+				const auto& to      = state.closed[index].end;
+				const auto& effects = m_effects;
+				// The guest memory it read on the CPU as no GPU work wrote it (and as it was): not written since.
+				// (Stamped: a page written since is a candidate, the log's entries since over the read decide.)
+				const bool any_since = m_log.End() > result.effects_from;
+				if (effects.stamped) {
+					// (KYTY_SPEC_WALK_FROM_STAMP: the walk tries the entry the read's latest stamp names first;
+					// KYTY_SPEC_COMMIT_VERIFY: every Nth such walk, the walk from the speculation's start as well.)
+					if (any_since) {
+						const bool from_stamp = Spec::WalkFromStampOn();
+						for (size_t i = from.clean_reads; i < to.clean_reads; ++i) {
+							const auto& read = state.clean_reads[i];
+							const auto  size = read.end - read.begin;
+							if (!m_log.stamps.MaybeSince(read.begin, size, result.effects_from)) continue;
+							const Spec::EffectsLog::Entry* write = nullptr;
+							if (from_stamp) {
+								bool direct = false;
+								write       = m_log.WriteOverFromStamp(result.effects_from, read.begin, size, direct);
+								if (direct) LiveCounters::Add(LiveCounters::SpecWalkDirect);
+								if (CommitVerifyDue()) {
+									const bool first = m_log.FirstWriteOver(result.effects_from, read.begin, size) != nullptr;
+									LiveCounters::Add(LiveCounters::SpecCommitVerified);
+									if (first != (write != nullptr)) LiveCounters::Add(LiveCounters::SpecCommitMismatch);
+								}
+							} else {
+								write = m_log.FirstWriteOver(result.effects_from, read.begin, size);
+							}
+							if (write != nullptr && !ReadValuesHold(result, index, read))
+								return WroteWhatItRead(write);
+						}
+					}
+					// (KYTY_SPEC_LATE_READS: a late read, by the processor's writes logged after it was read, and GPU work's since
+					// the speculation began: a GPU write is logged as its work is recorded, before it reaches memory, and its
+					// page's read protection may be deferred, PageManager::DeferReadProtection.)
+					if (any_since)
+						for (size_t i = from.late_reads; i < to.late_reads; ++i) {
+							const auto& read  = state.late_reads[i];
+							const auto  bytes = read.end - read.begin;
+							if (!m_log.stamps.MaybeSince(read.begin, bytes, result.effects_from)) continue;
+							if (const auto* gpu = m_log.FirstGpuWriteOver(result.effects_from, read.begin, bytes))
+								return WroteWhatItRead(gpu);
+							const auto since = std::max(result.effects_from, read.since);
+							if (m_log.End() <= since || !m_log.stamps.MaybeSince(read.begin, bytes, since)) continue;
+							if (const auto* write = m_log.FirstWriteOver(since, read.begin, bytes))
+								return WroteWhatItRead(write);
+						}
+				} else if (!effects.gpu_writes.Empty() || !effects.host_writes.Empty()) {
+					for (size_t i = from.clean_reads; i < to.clean_reads; ++i) {
+						const auto& read = state.clean_reads[i];
+						if (effects.gpu_writes.Intersects(read.begin, read.end - read.begin) ||
+						    (effects.host_writes.Intersects(read.begin, read.end - read.begin) &&
+						     !ReadValuesHold(result, index, read)))
+							return WroteWhatItRead(m_log.FirstWriteOver(result.effects_from, read.begin, read.end - read.begin));
+					}
+					// (Late reads as clean ones here: every write since it began.)
+					for (size_t i = from.late_reads; i < to.late_reads; ++i) {
+						const auto& read = state.late_reads[i];
+						if (effects.gpu_writes.Intersects(read.begin, read.end - read.begin) ||
+						    effects.host_writes.Intersects(read.begin, read.end - read.begin))
+							return WroteWhatItRead(m_log.FirstWriteOver(result.effects_from, read.begin, read.end - read.begin));
+					}
+				}
+				// The descriptor sets it binds: none retired since (one may be reused under it).
+				for (const auto retired: effects.retired_sets)
+					if (std::find(state.sets.begin() + static_cast<ptrdiff_t>(from.sets),
+					              state.sets.begin() + static_cast<ptrdiff_t>(to.sets), retired) !=
+					    state.sets.begin() + static_cast<ptrdiff_t>(to.sets))
+						return "commit: a hole retired a set";
+				// spec_set_cpu_dirty_stop off: the guards that keep a set with pending slots an earlier segment proposed from
+				// being bound again (TableResolveSet, TableTransit, TableValidateSet) are off, so this segment may bind a set an
+				// earlier segment's commit completed (its Before, before this segment's writes). Each completed slot's image
+				// (its data, metadata range, stencil plane) is tested against this segment's writes, the whole segment
+				// (SegmentWritesRange: its Before applies them after these checks, its replay and After after that): one written
+				// stops it, as one no longer the image completed (erased, or its serial moved: its memory unknown). Only the sets
+				// it binds (State::sets; ProposedSet::completed, recorded with the switch off).
+				if (!Spec::SetCpuDirtyStopOn() && to.sets > from.sets) {
+					auto&      textures    = m_renderer.GetTextureCache();
+					const auto bound_begin = state.sets.begin() + static_cast<ptrdiff_t>(from.sets);
+					const auto bound_end   = state.sets.begin() + static_cast<ptrdiff_t>(to.sets);
+					const auto written     = [&](uint64_t address, uint64_t size) {
+						return SegmentWritesRange(state, index, from, to, address, size);
+					};
+					for (const auto& proposed: state.proposed_sets) {
+						if (proposed.segment >= index || proposed.completed.empty() ||
+						    std::find(bound_begin, bound_end, proposed.completed.front().set) == bound_end)
+							continue;
+						for (const auto& slot: proposed.completed) {
+							if (!textures.LiveImageId(*slot.image) || slot.image->serial != slot.serial)
+								return "commit: a completed pending image moved";
+							const auto& info = slot.image->info;
+							if (written(info.data.address, info.data.size) ||
+							    (info.HasMetadata() && written(info.metadata.range.address, info.metadata.range.size)) ||
+							    (info.HasStencil() && written(info.stencil.address, info.stencil.size)))
+								return "commit: a completed pending image's memory written by its segment";
+						}
+					}
+				}
+				if (effects.stamped) {
+					if (any_since)
+						for (size_t i = from.cpu_copies; i < to.cpu_copies; ++i) {
+							const auto& copy = state.cpu_copies[i];
+							if (m_log.stamps.MaybeSince(copy.begin, copy.end - copy.begin, result.effects_from) &&
+							    m_log.FirstGpuWriteOver(result.effects_from, copy.begin, copy.end - copy.begin) != nullptr)
+								return "commit: GPU work wrote what it copies";
+						}
+				} else if (!effects.gpu_writes.Empty())
+					for (size_t i = from.cpu_copies; i < to.cpu_copies; ++i) {
+						const auto& copy = state.cpu_copies[i];
+						if (effects.gpu_writes.Intersects(copy.begin, copy.end - copy.begin))
+							return "commit: GPU work wrote what it copies";
+					}
+				for (size_t i = from.chain_reads; i < to.chain_reads; ++i) {
+					const auto& read = state.chain_reads[i];
+					// (KYTY_WRITE_GUARD_SPEC: a page a pending guest write guards, through the backing view: wg2's census had this
+					// read fault ~1 a frame.)
+					const void* word = reinterpret_cast<const void*>(read.address);
+					if (WriteGuard::g_count.load(std::memory_order_relaxed) != 0)
+						if (const auto* backing = WriteGuard::GuardedBacking(read.address, 4u)) word = backing;
+					if (*static_cast<const uint32_t*>(word) != read.value)
+						return "commit: a command buffer before wrote otherwise";
+				}
+				// The words it read from its own speculation's journal that an earlier segment's write gave, as the chain
+				// reads (KYTY_SPECULATE=4: JournalReadsMoved).
+				if (state.journal_reads_on && to.journal_reads > from.journal_reads)
+					if (const char* moved = JournalReadsMoved(result, index))
+						return moved;
+				for (size_t i = from.waits; i < to.waits; ++i) {
+					const auto& wait  = state.waits[i];
+					uint64_t    value = 0;
+					const void* from  = reinterpret_cast<const void*>(wait.address);
+					if (WriteGuard::g_count.load(std::memory_order_relaxed) != 0)
+						if (const auto* backing = WriteGuard::GuardedBacking(wait.address, wait.bytes)) from = backing;
+					std::memcpy(&value, from, wait.bytes);
+					if (!TestWaitRegMemValue(value, wait.reference, wait.mask, wait.function))
+						return "commit: a wait not satisfied";
+				}
+			}
+			// A completion uploads its images' bytes, metadata and stencil plane in Before, before the segment's own writes
+			// over them execute (the replay, After), and leaves them clean: in order a write before the bind is uploaded
+			// after it, and one after the bind marks the image again. So a set its Before would complete whose pending
+			// slots' memory the segment writes (the whole segment: SegmentWritesRange) stops it here, before anything of
+			// its Before ran: run as a hole under KYTY_SPECULATE=4, as the other stops here. (Under the render lock, as
+			// Before reads the sets and images.)
+			if (std::ranges::any_of(state.proposed_sets, [&](const auto& proposed) {
+				    return proposed.segment == index && proposed.complete && proposed.pending_written;
+			    })) {
+				const RenderLockGuard lock(m_renderer.GetMutex());
+				const auto            from           = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
+				const auto&           to             = state.closed[index].end;
+				const auto            segment_writes = [&](uint64_t address, uint64_t size) {
+					return SegmentWritesRange(state, index, from, to, address, size);
+				};
+				for (const auto& proposed: state.proposed_sets)
+					if (proposed.segment == index && proposed.complete && proposed.pending_written &&
+					    proposed.pending_written(segment_writes))
+						return "commit: a pending image's memory written by its segment";
+			}
+			return nullptr;
+		};
 		// What the work assumed: nothing registered or released since; the surface metadata it found not cleared not
 		// cleared since; the guest memory it read as no GPU work had written it not written since (the effects
 		// logged since it began); the words it read from a speculation before it in memory now; the waits it found
@@ -1359,9 +1654,16 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 			changed_why = Changed(result, index, true);
 			reloc       = changed_why == nullptr;
 		}
-		if (const char* why = changed_why) {
+		const char* why  = changed_why;
+		const bool  post = why == nullptr && (why = post_checks()) != nullptr; // (a stop after Changed())
+		if (why != nullptr) {
 			// (spec_stop_as_hole: the segment run the normal way as a hole, its recorded work dropped; the hole after it as
-			// after any segment.)
+			// after any segment. Under KYTY_SPECULATE=4 (journal_reads_on, as the state was made) the stops after Changed()
+			// too, before Before: nothing of the segment's preparation ran, so the run is the in-order path's from the
+			// true state, as for Changed()'s kinds; the segments after it are still checked against the effects log, which
+			// holds the run's effects, and their journal words. A stop then costs its own packets, not the rest of the
+			// chunk.)
+			if (post && !state.journal_reads_on) return ++m_stop_reasons[why], Progress::Stopped;
 			const auto as_hole = SegmentAsHole(result, cp, index);
 			if (as_hole == AsHole::NotTaken) return ++m_stop_reasons[why], Progress::Stopped;
 			result.next = index + 1;
@@ -1373,8 +1675,8 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 			if (!cp.SameState(*result.hole_states[index]))
 				return ++m_stop_reasons["commit: a segment run as a hole ended in another state"], Progress::Stopped;
 			// (Its hole's header as translated: RunHole reads the packet's words as they are now but runs it with the
-			// translation's length, which the header holds. Nothing after Changed() checked the segment's command
-			// words, the hole's among them, and the run itself may have written them. Read as the chain reads are,
+			// translation's length, which the header holds. A write over what the segment read, or the run itself, may
+			// have written the hole's words (a Changed() stop checked none of them). Read as the chain reads are,
 			// through the backing view where a guest write is pending. A stop leaves the GPU thread at the hole's
 			// packet, Result::resume_at.)
 			{
@@ -1394,206 +1696,9 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 			for (auto& proposed: result.state.proposed_sets)
 				if (proposed.segment == index) proposed.segment = index + 1;
 			const auto run = RunHole(result, cp, index, false);
-			if (run == HoleRun::Blocked) return result.blocked = index, Progress::Blocked;
+			if (run == HoleRun::Blocked) return result.blocked = index, result.blocked_as_hole = true, Progress::Blocked;
 			if (run == HoleRun::Changed) return Progress::Stopped;
 			continue;
-		}
-		// The images it uses as it found them: none written through a buffer since (a hole's storage-buffer write, fill or
-		// copy over its memory, or an earlier segment's, replayed in its Before). The normal path's binding uploads such an
-		// image from those bytes before the work; this work was recorded without the upload and would read it as it was
-		// (the game's probe input, 0x27ce00000 at the tester's spot, written per face by a refused dispatch: the dark).
-		for (const auto& use: state.closed[index].images)
-			if (!use.found_buffer_modified && use.image->IsBufferModified())
-				return ++m_stop_reasons["commit: GPU work wrote an image it uses"], Progress::Stopped;
-		// spec_copy_image_refuse (Spec::CopyImageRefuseOn): nor its stencil plane (MarkStencilModified: a buffer write over
-		// it), which the normal path's refresh uploads (RefreshImage) and this work was recorded without.
-		if (Spec::CopyImageRefuseOn())
-			for (const auto& use: state.closed[index].images)
-				if (!use.found_stencil_modified && use.image->IsStencilModified()) {
-					LiveCounters::Add(LiveCounters::SpecStencilModifiedStops);
-					return ++m_stop_reasons["commit: GPU work wrote a stencil it uses"], Progress::Stopped;
-				}
-		// spec_set_cpu_dirty_stop (Spec::SetCpuDirtyStopOn): nor written on the CPU since (a hole's host write over its
-		// pages, or an earlier segment's guest memory writes). The work's set reuse checked it only at translation
-		// (TableTransit's and TableValidateSet's refresh tests, which make its entry first); the normal path's next
-		// acquisition uploads (a storage image: guest bytes over what the GPU wrote). CPU-dirty now and either clean when
-		// found or written since (its validity moved: every CPU write's does). A use that only sampled views above level 0
-		// (redo_level_precise's sample-only use: a texture streaming in from its small levels) passes while its sampled
-		// levels' bytes are not dirty: RefreshPending of those levels (DirtyForView), the normal path's own test for such a
-		// view. Maybe-dirty only: when its refresh would upload, the stored hash of its guest edges no longer theirs
-		// (RefreshImage's own test, read only).
-		if (Spec::SetCpuDirtyStopOn())
-			for (const auto& use: state.closed[index].images) {
-				const auto* image = use.image;
-				if (!image->IsCpuDirty() ||
-				    (use.found_cpu_dirty && image->validity.load(std::memory_order_acquire) == use.found_validity))
-					continue;
-				if (!use.sample_other && use.sample_lo != 0 && use.sample_lo < use.sample_hi && image->serial == use.serial) {
-					TextureCache::ImageDesc sampled;
-					sampled.type                  = TextureCache::BindingType::Texture;
-					sampled.view_info.base_level  = use.sample_lo;
-					sampled.view_info.level_count = use.sample_hi - use.sample_lo;
-					if (!TextureCache::RefreshPending(*image, sampled)) continue;
-				}
-				if (image->IsDefinitelyCpuDirty()) {
-					LiveCounters::Add(LiveCounters::SpecCpuDirtyStopsDefinite);
-					return ++m_stop_reasons["commit: the CPU wrote an image it uses"], Progress::Stopped;
-				}
-				if (image->MaybeCpuHashMoved()) {
-					LiveCounters::Add(LiveCounters::SpecCpuDirtyStopsMaybe);
-					return ++m_stop_reasons["commit: the CPU wrote an image it uses (maybe-dirty)"], Progress::Stopped;
-				}
-			}
-		for (const auto& left: state.left_clears)
-			if (left.segment == index && (left.image->serial != left.serial ||
-			                              left.image->validity.load(std::memory_order_relaxed) != left.validity))
-				return ++m_stop_reasons["commit: a left clear's image moved"], Progress::Stopped;
-		for (const auto& fact: state.meta_facts)
-			if (!fact.cleared && fact.first <= index && index <= fact.last &&
-			    m_renderer.GetTextureCache().IsMetaCleared(fact.address, fact.slice))
-				return ++m_stop_reasons["commit: a surface cleared"], Progress::Stopped;
-		{
-			const auto  from    = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
-			const auto& to      = state.closed[index].end;
-			const auto& effects = m_effects;
-			// The guest memory it read on the CPU as no GPU work wrote it (and as it was): not written since.
-			// (Stamped: a page written since is a candidate, the log's entries since over the read decide.)
-			const bool any_since = m_log.End() > result.effects_from;
-			if (effects.stamped) {
-				// (KYTY_SPEC_WALK_FROM_STAMP: the walk tries the entry the read's latest stamp names first;
-				// KYTY_SPEC_COMMIT_VERIFY: every Nth such walk, the walk from the speculation's start as well.)
-				if (any_since) {
-					const bool from_stamp = Spec::WalkFromStampOn();
-					for (size_t i = from.clean_reads; i < to.clean_reads; ++i) {
-						const auto& read = state.clean_reads[i];
-						const auto  size = read.end - read.begin;
-						if (!m_log.stamps.MaybeSince(read.begin, size, result.effects_from)) continue;
-						const Spec::EffectsLog::Entry* write = nullptr;
-						if (from_stamp) {
-							bool direct = false;
-							write       = m_log.WriteOverFromStamp(result.effects_from, read.begin, size, direct);
-							if (direct) LiveCounters::Add(LiveCounters::SpecWalkDirect);
-							if (CommitVerifyDue()) {
-								const bool first = m_log.FirstWriteOver(result.effects_from, read.begin, size) != nullptr;
-								LiveCounters::Add(LiveCounters::SpecCommitVerified);
-								if (first != (write != nullptr)) LiveCounters::Add(LiveCounters::SpecCommitMismatch);
-							}
-						} else {
-							write = m_log.FirstWriteOver(result.effects_from, read.begin, size);
-						}
-						if (write != nullptr)
-							return ++m_stop_reasons[WroteWhatItRead(write)], Progress::Stopped;
-					}
-				}
-				// (KYTY_SPEC_LATE_READS: a late read, by the processor's writes logged after it was read, and GPU work's since
-				// the speculation began: a GPU write is logged as its work is recorded, before it reaches memory, and its
-				// page's read protection may be deferred, PageManager::DeferReadProtection.)
-				if (any_since)
-					for (size_t i = from.late_reads; i < to.late_reads; ++i) {
-						const auto& read  = state.late_reads[i];
-						const auto  bytes = read.end - read.begin;
-						if (!m_log.stamps.MaybeSince(read.begin, bytes, result.effects_from)) continue;
-						if (const auto* gpu = m_log.FirstGpuWriteOver(result.effects_from, read.begin, bytes))
-							return ++m_stop_reasons[WroteWhatItRead(gpu)], Progress::Stopped;
-						const auto since = std::max(result.effects_from, read.since);
-						if (m_log.End() <= since || !m_log.stamps.MaybeSince(read.begin, bytes, since)) continue;
-						if (const auto* write = m_log.FirstWriteOver(since, read.begin, bytes))
-							return ++m_stop_reasons[WroteWhatItRead(write)], Progress::Stopped;
-					}
-			} else if (!effects.gpu_writes.Empty() || !effects.host_writes.Empty()) {
-				for (size_t i = from.clean_reads; i < to.clean_reads; ++i) {
-					const auto& read = state.clean_reads[i];
-					if (effects.gpu_writes.Intersects(read.begin, read.end - read.begin) ||
-					    effects.host_writes.Intersects(read.begin, read.end - read.begin))
-						return ++m_stop_reasons[WroteWhatItRead(m_log.FirstWriteOver(result.effects_from, read.begin,
-						                                                             read.end - read.begin))],
-						       Progress::Stopped;
-				}
-				// (Late reads as clean ones here: every write since it began.)
-				for (size_t i = from.late_reads; i < to.late_reads; ++i) {
-					const auto& read = state.late_reads[i];
-					if (effects.gpu_writes.Intersects(read.begin, read.end - read.begin) ||
-					    effects.host_writes.Intersects(read.begin, read.end - read.begin))
-						return ++m_stop_reasons[WroteWhatItRead(m_log.FirstWriteOver(result.effects_from, read.begin,
-						                                                             read.end - read.begin))],
-						       Progress::Stopped;
-				}
-			}
-			// The descriptor sets it binds: none retired since (one may be reused under it).
-			for (const auto retired: effects.retired_sets)
-				if (std::find(state.sets.begin() + static_cast<ptrdiff_t>(from.sets),
-				              state.sets.begin() + static_cast<ptrdiff_t>(to.sets), retired) !=
-				    state.sets.begin() + static_cast<ptrdiff_t>(to.sets))
-					return ++m_stop_reasons["commit: a hole retired a set"], Progress::Stopped;
-			// spec_set_cpu_dirty_stop off: the guards that keep a set with pending slots an earlier segment proposed from
-			// being bound again (TableResolveSet, TableTransit, TableValidateSet) are off, so this segment may bind a set an
-			// earlier segment's commit completed (its Before, before this segment's writes). Each completed slot's image
-			// (its data, metadata range, stencil plane) is tested against this segment's writes, the whole segment
-			// (SegmentWritesRange: its Before applies them after these checks, its replay and After after that): one written
-			// stops it, as one no longer the image completed (erased, or its serial moved: its memory unknown). Only the sets
-			// it binds (State::sets; ProposedSet::completed, recorded with the switch off).
-			if (!Spec::SetCpuDirtyStopOn() && to.sets > from.sets) {
-				auto&      textures    = m_renderer.GetTextureCache();
-				const auto bound_begin = state.sets.begin() + static_cast<ptrdiff_t>(from.sets);
-				const auto bound_end   = state.sets.begin() + static_cast<ptrdiff_t>(to.sets);
-				const auto written     = [&](uint64_t address, uint64_t size) {
-					return SegmentWritesRange(state, index, from, to, address, size);
-				};
-				for (const auto& proposed: state.proposed_sets) {
-					if (proposed.segment >= index || proposed.completed.empty() ||
-					    std::find(bound_begin, bound_end, proposed.completed.front().set) == bound_end)
-						continue;
-					for (const auto& slot: proposed.completed) {
-						if (!textures.LiveImageId(*slot.image) || slot.image->serial != slot.serial)
-							return ++m_stop_reasons["commit: a completed pending image moved"], Progress::Stopped;
-						const auto& info = slot.image->info;
-						if (written(info.data.address, info.data.size) ||
-						    (info.HasMetadata() && written(info.metadata.range.address, info.metadata.range.size)) ||
-						    (info.HasStencil() && written(info.stencil.address, info.stencil.size)))
-							return ++m_stop_reasons["commit: a completed pending image's memory written by its segment"],
-							       Progress::Stopped;
-					}
-				}
-			}
-			if (effects.stamped) {
-				if (any_since)
-					for (size_t i = from.cpu_copies; i < to.cpu_copies; ++i) {
-						const auto& copy = state.cpu_copies[i];
-						if (m_log.stamps.MaybeSince(copy.begin, copy.end - copy.begin, result.effects_from) &&
-						    m_log.FirstGpuWriteOver(result.effects_from, copy.begin, copy.end - copy.begin) != nullptr)
-							return ++m_stop_reasons["commit: GPU work wrote what it copies"], Progress::Stopped;
-					}
-			} else if (!effects.gpu_writes.Empty())
-				for (size_t i = from.cpu_copies; i < to.cpu_copies; ++i) {
-					const auto& copy = state.cpu_copies[i];
-					if (effects.gpu_writes.Intersects(copy.begin, copy.end - copy.begin))
-						return ++m_stop_reasons["commit: GPU work wrote what it copies"], Progress::Stopped;
-				}
-			for (size_t i = from.chain_reads; i < to.chain_reads; ++i) {
-				const auto& read = state.chain_reads[i];
-				// (KYTY_WRITE_GUARD_SPEC: a page a pending guest write guards, through the backing view: wg2's census had this
-				// read fault ~1 a frame.)
-				const void* word = reinterpret_cast<const void*>(read.address);
-				if (WriteGuard::g_count.load(std::memory_order_relaxed) != 0)
-					if (const auto* backing = WriteGuard::GuardedBacking(read.address, 4u)) word = backing;
-				if (*static_cast<const uint32_t*>(word) != read.value)
-					return ++m_stop_reasons["commit: a command buffer before wrote otherwise"], Progress::Stopped;
-			}
-			// The words it read from its own speculation's journal that an earlier segment's write gave, as the chain
-			// reads (KYTY_SPECULATE=4: JournalReadsMoved).
-			if (state.journal_reads_on && to.journal_reads > from.journal_reads)
-				if (const char* moved = JournalReadsMoved(result, index))
-					return ++m_stop_reasons[moved], Progress::Stopped;
-			for (size_t i = from.waits; i < to.waits; ++i) {
-				const auto& wait  = state.waits[i];
-				uint64_t    value = 0;
-				const void* from  = reinterpret_cast<const void*>(wait.address);
-				if (WriteGuard::g_count.load(std::memory_order_relaxed) != 0)
-					if (const auto* backing = WriteGuard::GuardedBacking(wait.address, wait.bytes)) from = backing;
-				std::memcpy(&value, from, wait.bytes);
-				if (!TestWaitRegMemValue(value, wait.reference, wait.mask, wait.function))
-					return ++m_stop_reasons["commit: a wait not satisfied"], Progress::Stopped;
-			}
 		}
 		const auto prepared = CurrentEpochs();
 		Before(result, index);
@@ -1843,17 +1948,10 @@ void Speculation::Before(Result& result, size_t index) {
 			if (proposed.segment == index && proposed.check) {
 				if (!proposed.check()) state.images_failed = true;
 			}
-	// A completion uploads its images' bytes, metadata and stencil plane now, before the segment's own writes over them
-	// execute (the replay, After), and leaves them clean: in order a write before the bind is uploaded after it, and one
-	// after the bind marks the image again. So a set whose pending slots' memory the segment writes (the whole segment:
-	// SegmentWritesRange) is not completed, and the segment stops.
-	const auto segment_writes = [&](uint64_t address, uint64_t size) {
-		return SegmentWritesRange(state, index, from, to, address, size);
-	};
+	// (A set whose pending slots' memory the segment writes stopped it before this: the commit's checks before Before.)
 	for (auto& proposed: state.proposed_sets)
 		if (proposed.segment == index && proposed.complete) {
-			if ((proposed.pending_written && proposed.pending_written(segment_writes)) || !proposed.complete())
-				state.images_failed = true;
+			if (!proposed.complete()) state.images_failed = true;
 			proposed.complete = nullptr;
 		}
 	// spec_commit_targets: the targets it left to its commit, acquired as the normal path does at the draw, before their
@@ -2302,8 +2400,9 @@ Speculation::AsHole Speculation::SegmentAsHole(Result& result, CommandProcessor&
 	const auto& state = result.state;
 	const auto  from  = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
 	const auto& to    = state.closed[index].end;
-	// (A wait inside it: the GPU thread could block there, before the hole it must stop at.)
-	if (to.waits != from.waits) return AsHole::NotTaken;
+	// (A wait inside it: the GPU thread could block there, before the hole it must stop at. Also one its own pending
+	// writes or a previous speculation's gave whole, which pushed no WaitCheck: State::covered_waits.)
+	if (to.waits != from.waits || to.covered_waits != from.covered_waits) return AsHole::NotTaken;
 	// From the segment's start (the chunk's, or past the hole before it: `cp` is in that state, the commit checked the
 	// chunk's start state and ran the hole) up to its hole's packet.
 	Pm4Execution execution = index == 0 ? result.start_at : result.holes[index - 1].after;

@@ -62,6 +62,14 @@ namespace Libs::Graphics::Spec {
 struct Range {
 	uint64_t begin = 0, end = 0;
 };
+// (KYTY_SPECULATE=4, State::read_values_on) The bytes a clean read of at most MaxBytes gave the translation, at their
+// guest address.
+struct ReadValue {
+	static constexpr uint32_t     MaxBytes = 64;
+	uint64_t                      address  = 0;
+	uint32_t                      size     = 0;
+	std::array<uint8_t, MaxBytes> bytes {};
+};
 
 // A guest memory write of the command processor (a label) or a copy made on the CPU (a linear copy:
 // BufferCache::CopyBuffer), applied at commit in order.
@@ -96,7 +104,8 @@ struct Counts {
 	size_t current = 0, written = 0, bda = 0, invalidated = 0, writes = 0, touched_images = 0, touched_buffers = 0,
 	       clean_reads = 0, feedbacks = 0, buffer_ranges = 0, sets = 0, chain_reads = 0, waits = 0, cpu_copies = 0,
 	       late_reads = 0, texel_syncs = 0, pending_buffers = 0, table_ranges = 0, pending_targets = 0, indexed_draws = 0,
-	       scenes = 0, used_pairs = 0, left_clears = 0, journal_reads = 0, journal_words = 0, reloc_refs = 0, reloc_unrel = 0;
+	       scenes = 0, used_pairs = 0, left_clears = 0, journal_reads = 0, journal_words = 0, reloc_refs = 0, reloc_unrel = 0,
+	       covered_waits = 0, read_values = 0, unvalued_reads = 0;
 };
 
 // spec_pending_buffers (under KYTY_SPECULATE=4 only): a table V#'s range with no
@@ -592,6 +601,14 @@ struct State {
 	std::vector<JournalRead> journal_reads;
 	std::vector<uint32_t>    journal_words;
 	bool                     journal_reads_on = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+	// - under KYTY_SPECULATE=4 (read_values_on, as the state is made or cleared): the bytes of its small clean reads made
+	//   through ReadJournaled (ReadValue), and the clean reads it made any other way (command words, the buffer cache's
+	//   reads, the kernel's plain one, the table path's, a copy's source read through its destination, and those over
+	//   ReadValue::MaxBytes), which keep no bytes: a range one of those touched is never passed by value at the commit
+	//   (Speculation::ReadValuesHold).
+	std::vector<ReadValue> read_values;
+	std::vector<Range>     unvalued_reads;
+	bool                   read_values_on = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 	// - the sources and destinations of the copies it makes on the CPU at its commit (in order: what the guest or the
 	//   processor writes there before is copied, or copied over): no GPU work may have written them since.
 	std::vector<Range> cpu_copies;
@@ -726,6 +743,9 @@ struct State {
 	// (FrameGen::NoteScene: the game's 3D view). Noted at the commit only: a speculation's thread translates ahead,
 	// past flips; a segment not committed is translated again the normal way, which notes them itself.
 	size_t indexed_draws = 0, scenes = 0;
+	// The satisfied waits it pushed no WaitCheck for, every word of them given by pending writes (its own or a previous
+	// speculation's): a segment with one is not run as a hole, as one with a WaitCheck is not (Speculation::SegmentAsHole).
+	size_t covered_waits = 0;
 	// The catalog's table pairs its table draws and dispatches looked up (TableTry, TableDispatch): their used_frame,
 	// which only the GPU thread writes, stamped by the commit of the segment they are in (Speculation::After) as the GPU
 	// thread's own lookup stamps it. Unstamped, a pair only speculations' threads used was swept as unused past
@@ -746,7 +766,8 @@ struct State {
 		        sets.size(),           chain_reads.size(),     waits.size(),       cpu_copies.size(),
 		        late_reads.size(),     texel_syncs.size(),     pending_buffers.size(), table_ranges.size(), pending_targets.size(),
 		        indexed_draws,         scenes,                 used_pairs.size(),      left_clears.size(),
-		        journal_reads.size(),  journal_words.size(),   reloc_refs.size(),  reloc_unrel.size()};
+		        journal_reads.size(),  journal_words.size(),   reloc_refs.size(),  reloc_unrel.size(),
+		        covered_waits,         read_values.size(),     unvalued_reads.size()};
 	}
 	// Its pending guest memory writes or a previous speculation's over the range; the ranges its work or a previous
 	// one's writes.
@@ -933,7 +954,24 @@ struct State {
 		}
 	}
 	void NoteInvalidated(uint64_t address, uint64_t size) { (void)Note(invalidated, Sealed().invalidated, address, size); }
-	void NoteCleanRead(uint64_t address, uint64_t size) { (void)Note(clean_reads, Sealed().clean_reads, address, size); }
+	void NoteCleanRead(uint64_t address, uint64_t size) {
+		(void)Note(clean_reads, Sealed().clean_reads, address, size);
+		if (read_values_on) (void)Note(unvalued_reads, Sealed().unvalued_reads, address, size);
+	}
+	// A clean read made through ReadJournaled, `data` the bytes it gave the translation (read_values_on: kept).
+	void NoteCleanReadValue(uint64_t address, uint64_t size, const void* data) {
+		if (!read_values_on || size == 0 || size > ReadValue::MaxBytes) return NoteCleanRead(address, size);
+		(void)Note(clean_reads, Sealed().clean_reads, address, size);
+		// (The same bytes read again in the open segment: one record.)
+		if (read_values.size() > Sealed().read_values && read_values.back().address == address &&
+		    read_values.back().size == size && std::memcmp(read_values.back().bytes.data(), data, size) == 0)
+			return;
+		ReadValue value;
+		value.address = address;
+		value.size    = static_cast<uint32_t>(size);
+		std::memcpy(value.bytes.data(), data, size);
+		read_values.push_back(value);
+	}
 	void NoteBufferRange(uint64_t address, uint64_t size) { (void)Note(buffer_ranges, Sealed().buffer_ranges, address, size); }
 	// The command words a speculation's thread translated (ProcessPm4Spec, at their guest addresses): clean reads of
 	// the segment they are in, a range for each run of consecutive packets (no command word was in any read set, so a
@@ -1068,7 +1106,7 @@ struct State {
 		const uint64_t bytes = uint64_t {4} * count;
 		if (bytes != 0 && !pending.MayHold(address, bytes)) {
 			if (!CopyGuest(out, address, bytes)) return false;
-			if (clean) NoteCleanRead(address, bytes);
+			if (clean) NoteCleanReadValue(address, bytes, out);
 			return true;
 		}
 		// (KYTY_SPEC_READ_ONE_SET: none of the four sets over it, one search; one of them over it, the chain unlinked
@@ -1087,7 +1125,7 @@ struct State {
 			const uint64_t since = read_late ? log_end->load(std::memory_order_acquire) : 0;
 			if (!CopyGuest(out, address, bytes)) return false;
 			if (read_late) NoteLateRead(address, bytes, since);
-			else if (clean) NoteCleanRead(address, bytes);
+			else if (clean) NoteCleanReadValue(address, bytes, out);
 			return true;
 		}
 		// (KYTY_SPECULATE_COPY_RUNS, live speculate_copy_runs 0: word by word, as before.)
@@ -1099,7 +1137,7 @@ struct State {
 			const State*   by = nullptr;
 			if (!ReadWord(at, out[i], by)) return false;
 			if (by == nullptr && clean && std::exchange(late, false)) NoteLateRead(at, 4, late_since);
-			else if (by == nullptr && clean) NoteCleanRead(at, 4);
+			else if (by == nullptr && clean) NoteCleanReadValue(at, 4, &out[i]);
 			else if (by != nullptr && by != this) chain_reads.push_back({at, out[i]});
 		}
 		return true;
@@ -1226,6 +1264,9 @@ struct State {
 		const auto source = latest->value + (address - latest->address);
 		if (owner->JournalIntersects(source, bytes) || owner->WrittenIntersects(source, bytes)) return Run::Refused;
 		if (!CopyGuest(out, source, bytes)) return Run::Refused;
+		// (Unvalued: the copy may be an earlier segment's; in order the reader gets the source's bytes as that segment's
+		// commit copies them, not as the reading segment's commit finds them, where a by-value check would compare; any
+		// write logged over the source since the speculation began stops it.)
 		if (owner == this) {
 			NoteCleanRead(source, bytes);
 			const auto entry = static_cast<size_t>(latest.base() - writes.cbegin()) - 1;
@@ -1318,6 +1359,9 @@ struct State {
 		journal_words.resize(std::min(journal_words.size(), checkpoint.journal_words));
 		reloc_refs.resize(std::min(reloc_refs.size(), checkpoint.reloc_refs));
 		reloc_unrel.resize(std::min(reloc_unrel.size(), checkpoint.reloc_unrel));
+		covered_waits = std::min(covered_waits, checkpoint.covered_waits);
+		read_values.resize(std::min(read_values.size(), checkpoint.read_values));
+		unvalued_reads.resize(std::min(unvalued_reads.size(), checkpoint.unvalued_reads));
 		bda_all = checkpoint_bda_all;
 	}
 
@@ -1344,6 +1388,10 @@ struct State {
 		journal_reads.clear();
 		journal_words.clear();
 		journal_reads_on = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+		read_values.clear();
+		unvalued_reads.clear();
+		read_values_on = journal_reads_on;
+		covered_waits  = 0;
 		cpu_copies.clear();
 		late_reads.clear();
 		texel_syncs.clear();

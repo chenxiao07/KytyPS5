@@ -168,6 +168,7 @@ private:
 		size_t       submitted = 0, next = 0; // recorded command buffers submitted, segments committed
 		uint64_t     last_tick = 0;           // the last of them's tick (0: none; batched / spliced: not yet submitted)
 		size_t       blocked   = SIZE_MAX;    // the wait hole the commit waits at
+		bool         blocked_as_hole = false; // (... after its segment ran as a hole: `cp` holds the hole's state)
 		uint64_t     retired   = 0;           // when Finish kept it for reuse (m_clock; 0: in use)
 		// When its translation started and ended, when each segment's ended.
 		uint64_t              start_ns = 0, end_ns = 0;
@@ -241,6 +242,9 @@ private:
 	[[nodiscard]] bool SampledLevelsMapped(const Spec::ImageUse& use, uint64_t mapping) const;
 	// The segments committed, the holes after them run: all, or up to what the work after it no longer holds
 	// (Result::next: the segments committed).
+	// Under KYTY_SPECULATE=4 (Spec::State::read_values_on): whether a clean read of segment `index` that a processor
+	// write was logged over since the speculation began still gives the translation's bytes.
+	[[nodiscard]] bool     ReadValuesHold(const Result& result, size_t index, const Spec::Range& read) const;
 	[[nodiscard]] Progress CommitSegments(Result& result, CommandProcessor& cp);
 	// The segment before its work and after it.
 	void Before(Result& result, size_t index);

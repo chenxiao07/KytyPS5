@@ -1135,6 +1135,8 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		}
 		if (from_memory == count)
 			spec->waits.push_back({at, ref, mask, func, static_cast<uint32_t>(sizeof(T))});
+		else if (from_memory == 0)
+			++spec->covered_waits; // (no WaitCheck: a segment holding it is not run as a hole, SegmentAsHole)
 		else
 			for (uint32_t i = 0; i < count; ++i)
 				if (memory[i]) spec->waits.push_back({at + 4ull * i, words[i], 0xffffffffu, 3u, 4u});
