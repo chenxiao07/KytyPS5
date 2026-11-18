@@ -5243,6 +5243,13 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	return false;
 }
 
+bool TextureCache::IsRegionImageBacked(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) return false;
+	if (!m_lock.ReadShared([&] { return MayHaveImagesRead(address, size); })) return false;
+	std::scoped_lock lock {m_lock};
+	return !FindImagesInRegion(address, size, false).empty();
+}
+
 namespace {
 
 // KYTY_SLOW_LOG_MS: a large image a CPU write or a map made dirty whole, or a partial unmap deleted, and why it took no

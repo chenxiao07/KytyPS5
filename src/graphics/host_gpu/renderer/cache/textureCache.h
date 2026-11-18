@@ -208,6 +208,9 @@ public:
 	enum class ReadOnlyBufferOverlap { None, CpuSampled, Unsafe };
 	[[nodiscard]] ReadOnlyBufferOverlap ClassifyReadOnlyBufferOverlap(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
+	// Any image over the range's bytes, registered, GPU-modified or not (spec_nofault_journal: Memory::TryReadGuestNoFault),
+	// from one look under the image lock.
+	[[nodiscard]] bool IsRegionImageBacked(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	// Bumped on every insertion, erasure or type change of a surface-metadata

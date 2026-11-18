@@ -1565,15 +1565,22 @@ bool TryReadGuestNoFault(uint64_t vaddr, void* data, uint64_t size) {
 	// copy, a fault refused. A read-watched one only through its clean backing.)
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
 	    (!g_gpu_resources->HasReadWatchers(vaddr, size) && SpeculationReadsClean(vaddr, size)))
+		// (No image test on a page no read watcher guards: images put no read watcher on their pages and a read fault
+		// reads back buffers only (GpuResourceManager's fault: BufferCache::ReadMemory), so the in-order read there is a
+		// plain load whatever image the open segment renders into or stores to: the same bytes as this copy.)
 		return CopyUnwatched(vaddr, data, size);
 	if (TryReadGpuCleanBackingToHost(vaddr, data, size)) return true;
 	// spec_nofault_journal: refused only for the speculations' pending processor writes over it (none of their GPU work's,
-	// no GPU-dirty bytes): the words as ReadJournaled gives them, over the clean backing.
+	// no GPU-dirty bytes): the words as ReadJournaled gives them, over the clean backing. No image over the words either,
+	// GPU-modified or not: an earlier draw or dispatch of the open segment may render into or store to one there, noted
+	// only at its commit, where the in-order read faults and downloads the image. (The journal does not record whether
+	// that image write came before or after the processor write: any image refuses. Tested last: only on words the
+	// journal would otherwise serve.)
 	if (auto* spec = Graphics::Spec::Current(); spec != nullptr && Graphics::Spec::NoFaultJournalOn() && vaddr % 4 == 0 &&
 	                                            size % 4 == 0 && size <= 64 &&
 	                                            !GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) &&
-	                                            !GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size) &&
-	                                            spec->JournalIntersects(vaddr, size) && !spec->WrittenIntersects(vaddr, size)) {
+	                                            spec->JournalIntersects(vaddr, size) && !spec->WrittenIntersects(vaddr, size) &&
+	                                            !GetGpuResources().GetTextureCache().IsRegionImageBacked(vaddr, size)) {
 		Graphics::Spec::t_backing_copy = [](void* out, uint64_t address, uint64_t bytes) {
 			return TryReadBackingToHost(address, out, bytes);
 		};
