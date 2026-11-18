@@ -1701,6 +1701,9 @@ struct EffectsLog {
 	std::unordered_map<uint64_t, std::vector<uint64_t>> index;
 	std::vector<uint64_t>                               index_wide;
 	uint64_t                                            index_from = UINT64_MAX, index_pruned = 0;
+	// (Under KYTY_SPECULATE=4, kept with `index`:) the indices of the RetiredSet entries, ascending, from index_from on, so
+	// that a stamped Effects::Take visits those alone.
+	std::vector<uint64_t> retired;
 	[[nodiscard]] static int64_t IndexSwitch() {
 		return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 1 : 0;
 	}
@@ -1708,6 +1711,7 @@ struct EffectsLog {
 		                  if (IndexSwitch() != 0) {
 			                  const uint64_t at = base + entries.size();
 			                  if (index_from == UINT64_MAX) index_from = at;
+			                  if (kind == Kind::RetiredSet) retired.push_back(at);
 			                  if (kind != Kind::RetiredSet && size != 0) {
 				                  const uint64_t g0 = address >> IndexGranuleBits, g1 = (address + size - 1) >> IndexGranuleBits;
 				                  if (g1 - g0 >= IndexWideGranules) index_wide.push_back(at);
@@ -1715,7 +1719,7 @@ struct EffectsLog {
 					                  for (uint64_t g = g0; g <= g1; ++g) index[g].push_back(at);
 			                  }
 		                  } else if (index_from != UINT64_MAX) {
-			                  index_from = UINT64_MAX, index.clear(), index_wide.clear(); // (off: the next on starts afresh)
+			                  index_from = UINT64_MAX, index.clear(), index_wide.clear(), retired.clear(); // (off: the next on starts afresh)
 		                  }
 		                  if (kind != Kind::RetiredSet) stamps.Stamp(address, size, base + entries.size() + 1);
 		                  if (kind == Kind::HostWrite) host_stamps.Stamp(address, size, base + entries.size() + 1);
@@ -1808,6 +1812,9 @@ struct EffectsLog {
 			entries.pop_front();
 			++base;
 		}
+		// (The dropped entries' RetiredSet indices out.)
+		if (!retired.empty() && retired.front() < base)
+			retired.erase(retired.begin(), std::lower_bound(retired.begin(), retired.end(), base));
 		// (spec_log_index: the dropped indices out of the granules' lists, now and then.)
 		if (index_from != UINT64_MAX && base >= index_pruned + 4096) {
 			index_pruned = base;
@@ -1836,6 +1843,16 @@ struct Effects {
 		next = from;
 	}
 	void Take(const EffectsLog& log) {
+		// (Under KYTY_SPECULATE=4) Stamped, a Take keeps only the RetiredSet entries (the writes are looked up in the stamps):
+		// when the log's index covers where this walk starts (every Add from index_from on appended its RetiredSet index),
+		// those entries alone, through it, in log order: the same list the walk below makes, and `next` where it ends.
+		if (const uint64_t from = std::max(next, log.base), end = log.base + log.entries.size();
+		    stamped && log.index_from != UINT64_MAX && from >= log.index_from) {
+			for (auto it = std::lower_bound(log.retired.begin(), log.retired.end(), from); it != log.retired.end() && *it < end; ++it)
+				retired_sets.push_back(log.entries[*it - log.base].address);
+			next = std::max(from, end);
+			return;
+		}
 		for (next = std::max(next, log.base); next < log.base + log.entries.size(); ++next) {
 			const auto& entry = log.entries[next - log.base];
 			switch (entry.kind) {
