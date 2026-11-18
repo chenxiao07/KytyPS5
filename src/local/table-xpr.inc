@@ -168,6 +168,9 @@ struct RenderExecutor::TableImageSet {
 	// KYTY_DRAW_READ_AFTER_WRITE=1 a draw with the set transits it every time (TableTransit), never in place, ordered
 	// after the last draw's write (Image::GetBarriers, issue #315).
 	bool                      read_after_write = false;
+	// (Mode 4) The targets of every draw state its translation bound it under while it had pending slots (TableDraw; that
+	// translation's thread only, until its commit reads them: TableCompletePendingImages).
+	std::vector<ImageId>      pending_targets;
 	// (Mode 4) A worker built it with a storage image resolved read only (its commit's check notes the GPU write the owner's
 	// FindTexture would have, once each such image is still as the worker found it).
 	bool                      worker_storage = false;
@@ -1115,6 +1118,11 @@ bool RenderExecutor::TableCompletePendingImages(TableImageSet& set) {
 		auto       desc    = pending.desc;
 		const auto id      = textures.FindImage(desc, false, true); // (may fail: no memory for it, a refusal)
 		if (!id) continue;
+		// An image a draw that bound the set renders to: the slot would hold it read-only as a texture (the dep below, not
+		// a target) while that draw's attachment holds it, where the owner's build lays it out as the target
+		// (TableResolveSet). The segment stops: in order, the owner's build. (The rest of the set's slots are left: it is
+		// retired unpublished.)
+		if (std::ranges::find(set.pending_targets, id) != set.pending_targets.end()) break;
 		// (Its view with metadata: FindTexture's metadata step still a no-op here, the in-order point before the work,
 		// else the slot fails and the segment stops.)
 		if (pending.metadata && !textures.MetadataBindNoop(id, desc)) continue;
@@ -1156,7 +1164,7 @@ bool RenderExecutor::TableCompletePendingImages(TableImageSet& set) {
 		);
 	bool ok = done == set.pending_images.size();
 	set.span_begin = set.span_end = 0; // (its span grew: found again at its next proof)
-	if (ok) set.pending_images.clear();
+	if (ok) set.pending_images.clear(), std::vector<ImageId>().swap(set.pending_targets);
 	return ok;
 }
 
@@ -2741,6 +2749,37 @@ static bool TableSetApart(const Set& set, const State& draw_state) {
 		if (std::ranges::find(draw_state.target_ids, id) != draw_state.target_ids.end()) return false;
 	return true;
 }
+// (Mode 4) Whether TableTransit's target tests refuse the set under a draw state: an image the set holds as a target the
+// draw does not target, the reverse, or another attachment layout or access. (Those tests only: TableTransit may refuse
+// for another cause too.) A set's deps are laid out for the draw state it was resolved under (TableResolveSet: a target
+// in its attachment layout and access, any other image as a texture or storage), and its descriptors carry those
+// layouts; the pair's sets are keyed by the words alone.
+template<typename Set, typename State> // (RenderExecutor::TableImageSet, RenderExecutor::NativeXprDrawState)
+static bool TableTargetsDiffer(const Set& set, const State& draw_state) {
+	for (const auto& dep: set.images) {
+		const auto target    = std::ranges::find(draw_state.targets, dep.id, &State::Target::id);
+		const bool is_target = target != draw_state.targets.end();
+		if (dep.target != is_target ||
+		    (is_target && (target->layout != dep.layout || (target->access | dep.target_read) != dep.access)))
+			return true;
+	}
+	return false;
+}
+// (Mode 4) The draw state's targets (each one's image, attachment layout and access: what TableResolveSet lays a target
+// dep out from), the words' tag for the set resolved under them. All of them, not only those among the set's image_ids:
+// a set's pending slots are not there until its commit completes them.
+inline constexpr uint32_t TableTargetsTag = 0x7a4e5170u;
+template<typename State>
+static uint64_t TableTargetsKey(const State& draw_state) {
+	uint64_t key = TableTargetsTag;
+	for (const auto& target: draw_state.targets) {
+		const std::array<uint64_t, 3> part {uint64_t {target.id.index} | uint64_t {target.id.generation} << 32u,
+		                                    static_cast<uint64_t>(target.layout),
+		                                    static_cast<uint64_t>(static_cast<VkAccessFlags2>(target.access))};
+		key = XXH3_64bits_withSeed(part.data(), sizeof(part), key);
+	}
+	return key;
+}
 
 // A set's images in their layouts (other work may have moved them since the set was last bound), a DCC image's
 // pending fast clear applied first, as the normal path's FindTexture does (a speculation's refuses: its packet is a
@@ -3183,9 +3222,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
                                                       const NativeXprDirectDraw* direct) {
 	auto&       table  = OwnTable();
 	// (A speculative translation's state, read once behind a plain global: KYTY_SPECULATE unset, no thread-local
-	// reads in the draw.)
-	Spec::State* const spec_state =
-	    ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr;
+	// reads in the draw. The mode kept for the set's target test below.)
+	const auto         speculate_mode = ::kyty_local_speculate_mode.load(std::memory_order_relaxed);
+	Spec::State* const spec_state     = speculate_mode != 0 ? Spec::Current() : nullptr;
 	// (A speculation's relocatable index buffer and draw arguments, TableRelocRecord: nothing of it runs without one.)
 	const bool reloc = spec_state != nullptr && spec_state->reloc_on;
 	auto&       cache  = *m_native_xpr;
@@ -3216,6 +3255,53 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 2);
 	auto* set = TableSet(buffer, pair, &variant, &draw_state);
+	// (Mode 4) A set resolved under another draw state, whose deps TableTransit's target tests refuse for this one's targets,
+	// is not the draw's: the words tagged with the draw state's targets (TableTargetsKey, three words more than any words
+	// TableEvaluate makes, so no untagged lookup compares equal) find, or resolve, the set made for them, in a slot of its
+	// own (TableSet: the same lookups, proofs and publication, the tagged words the set's key); the untagged words back
+	// right after. The set found is tested again by TableTransit as any. The memo's set is not offered to the second call: a
+	// first call that took the role's last set may have run the collection, which can have destroyed it.
+	if (set != nullptr && speculate_mode == 4) {
+		if (TableTargetsDiffer(*set, draw_state)) {
+			const auto key  = TableTargetsKey(draw_state);
+			const auto size = table.words.size();
+			table.memo_set    = nullptr;
+			table.memo_verify = false;
+			table.words.push_back(TableTargetsTag);
+			table.words.push_back(static_cast<uint32_t>(key));
+			table.words.push_back(static_cast<uint32_t>(key >> 32u));
+			set = TableSet(buffer, pair, &variant, &draw_state);
+			// The tagged slot's set made for these targets and still not laid out for them (a worker's, published before
+			// its commit's completion refused such a slot, below): the owner retires it, as its own path retires a set
+			// found invalid, and resolves the slot's set afresh under this draw state. A speculation leaves it to the owner
+			// (its draw a hole). (A worker's only: the owner's own build is laid out for the draw state it ran under, and one
+			// that differed would be retired at every draw.)
+			if (set != nullptr && spec_state == nullptr && Role() == 0 && set->proposer != 0 &&
+			    TableTargetsDiffer(*set, draw_state)) {
+				bool retired = false;
+				{
+					const auto write = CatalogWrite();
+					const auto found = pair.sets.find(XXH3_64bits(set->words.data(), set->words.size() * sizeof(uint32_t)));
+					if (found != pair.sets.end() && found->second.get() == set) {
+						if (table.last_set == set) table.last_set = nullptr;
+						pair.ClearSets();
+						++table.epoch;
+						NativeXprRetireSet(set->pool, set->set);
+						pair.sets.erase(found);
+						retired = true;
+					}
+				}
+				if (retired) set = TableSet(buffer, pair, &variant, &draw_state);
+			}
+			table.words.resize(size);
+		}
+		// A set this translation proposed with pending slots notes the draw's targets, which its commit's completion must
+		// not hold as textures (TableCompletePendingImages).
+		if (spec_state != nullptr && set != nullptr && !set->pending_images.empty() && set->proposer == spec_state->id)
+			for (const auto& target: draw_state.targets)
+				if (std::ranges::find(set->pending_targets, target.id) == set->pending_targets.end())
+					set->pending_targets.push_back(target.id);
+	}
 	if (spec_state != nullptr && set != nullptr)
 		spec_state->NoteSet(reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(set->set)));
 	if (set == nullptr) return LiveCounters::Add(LiveCounters::TableNoSet), Spec::Refuse("table: no set"), TableResult::Native;
