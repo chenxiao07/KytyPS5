@@ -3594,6 +3594,7 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 		programs.warming = false;
 		programs.ReleaseRetired();
 		programs.warm_phase.store(0, std::memory_order_release);
+		programs.warmup.ReleaseLoaded(); // (the recording's words: read from its file from now on)
 		PipelineCacheLog("Shader warmup: done beside the game in {} ms; meanwhile the game translated {} programs itself "
 		                 "({:.0f} ms) and made {} pipelines ({:.0f} ms)",
 		                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count(),
@@ -3610,6 +3611,10 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 		    mib(memory_after.working_set, memory_shaders.working_set),
 		    mib(m_graphics.GetDeviceMemoryUsage(), video_before));
 		m_graphics.LogVideoMemory("warmup");
+		{
+			Common::LockGuard lock(m_mutex);
+			programs.warmup.ReleaseLoaded(); // (the recording's words: read from its file from now on)
+		}
 		programs.warmup.StartWriter();
 		if (const char* only = std::getenv("KYTY_SHADER_WARMUP_ONLY"); only && std::string_view(only) == "1") {
 			if (!Save()) {
