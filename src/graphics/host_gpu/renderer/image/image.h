@@ -457,6 +457,9 @@ public:
 	mutable std::atomic<uint32_t> state_busy {0};
 	// RegisterImage calls on this object: a proof names one registration.
 	uint32_t         registrations      = 0;
+	// (Mode 4) Its upload is running with the texture cache's shared readers let in (TextureCache::UploadWindow); they take
+	// it as not current. Written by the GPU thread with no reader inside.
+	bool             refreshing         = false;
 	// TextureCache::ViewLevelBytes's last answer: the view's levels (base | count << 8; UINT32_MAX: none yet) and their
 	// bytes [level_begin, level_end) (level_end 0: the view needs the whole image).
 	mutable uint32_t level_view         = UINT32_MAX;

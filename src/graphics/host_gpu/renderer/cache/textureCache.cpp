@@ -41,6 +41,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <thread>
 #include <tuple>
@@ -678,6 +679,108 @@ size_t TextureCache::ReclaimImageMemory(uint64_t bytes, bool all) {
 	return victims.size() - held;
 }
 
+// KYTY_SPEC_TEXCACHE_SHARED (live spec_texcache_shared; mode-toggle row {1, 0}: on under KYTY_SPECULATE=4, off in
+// mode 0): m_lock's shared mode (ApplySharedMode) and the readers' shared takes (ReadLock). Off live: they take the
+// exclusive flag again (the mode, once on, stays on: an exclusive take drains).
+[[nodiscard]] static bool TexcacheSharedOn() {
+	static auto& on = LiveSwitch::Find("spec_texcache_shared", ModeToggle::Default("spec_texcache_shared"));
+	return on.load(std::memory_order_relaxed) != 0;
+}
+// KYTY_SPEC_TEXCACHE_UPLOAD_UNLOCKED (live spec_texcache_upload_unlocked; mode-toggle row {0, 0}: off in both modes, as
+// the lab's): the upload window (UploadWindow), which needs the shared mode too.
+[[nodiscard]] static bool TexcacheUploadUnlockedOn() {
+	static auto& on = LiveSwitch::Find("spec_texcache_upload_unlocked", ModeToggle::Default("spec_texcache_upload_unlocked"));
+	return on.load(std::memory_order_relaxed) != 0;
+}
+
+// The GPU thread, once the performance switches are set (GuestGpu::ThreadRun after InitializePerformanceSwitches, and a
+// live `mode 4` before it takes m_queue_mutex), before the speculation threads are made, holding no lock: for mode 4
+// (`four`), m_lock's shared mode on when the switch is on in mode 4 (its variable when set, else the mode table's mode-4
+// value: a live `mode 4` asks before ApplyTable(4) sets the switch) (TextureCacheLock::EnableShared: under the flag, so
+// whatever took the lock before is out, and every take after drains). The lab's line when it turns on; none otherwise.
+void TextureCache::ApplySharedMode(bool four) {
+	if (!four || m_lock.SharedMode()) return;
+	int64_t     on  = 0;
+	const char* env = std::getenv("KYTY_SPEC_TEXCACHE_SHARED");
+	if (env != nullptr && *env != '\0') {
+		on = std::atoll(env);
+	} else {
+		for (const auto& row: ModeToggle::Table)
+			if (std::strcmp(row.name, "spec_texcache_shared") == 0) on = row.on4;
+	}
+	if (on == 0) return;
+	m_lock.EnableShared();
+	std::printf("TextureCache: m_lock in its shared mode (KYTY_SPEC_TEXCACHE_SHARED)\n");
+	std::fflush(stdout);
+}
+
+// (Mode 4, m_lock in its shared mode: KYTY_SPEC_TEXCACHE_SHARED) A speculation's thread takes m_lock shared for the
+// read-only queries. Under a shared hold each of them writes nothing the cache shares: its speculation's own lists,
+// thread-locals and counters only (TouchImage's speculation branch; frame_accessed_last is the GPU thread's;
+// FindImagesInRegion and ViewLevelBytes leave their caches unwritten under it; MayHaveImagesRead rebuilds no granules).
+// Every write to what they read is made under the exclusive take, which waits for them to leave. Else (the GPU thread, no
+// speculation, the mode not 4 now, or no shared mode): the exclusive take, as before.
+class TextureCache::ReadLock {
+public:
+	explicit ReadLock(TextureCacheLock& lock) noexcept
+	    : m_lock(lock), m_shared(lock.SharedMode() && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 &&
+	                             Spec::Current() != nullptr && !GuestGpu::IsGpuThread() && TexcacheSharedOn()) {
+		if (m_shared) m_lock.lock_shared();
+		else m_lock.lock();
+	}
+	~ReadLock() {
+		if (m_shared) m_lock.unlock_shared();
+		else m_lock.unlock();
+	}
+	ReadLock(const ReadLock&)            = delete;
+	ReadLock& operator=(const ReadLock&) = delete;
+
+private:
+	TextureCacheLock& m_lock;
+	bool              m_shared;
+};
+
+// (Mode 4, m_lock in its shared mode, KYTY_SPEC_TEXCACHE_UPLOAD_UNLOCKED) The GPU-side work of a whole upload (InitializeImage: the chunked upload, or the
+// staging buffer's fill and the detile) runs with the shared readers let in, the GPU thread keeping the lock's flag:
+// - Only m_lock's readers come in. Every other taker (guest threads' faults, unmaps and maps; the offload, upload and
+//   priority threads' takes) still waits for the flag, as for the whole hold before: the image stays registered and
+//   alive, its dirty state unchanged by anyone else, its memory mapped, until the upload is done and the window shut.
+// - Inside, the GPU thread writes nothing a reader reads: the buffer cache (its own state), the tiler and the command
+//   buffer, the image's barrier state (its own StateLock), its staged_* fields and m_partial_plans (GPU thread only). A
+//   texture-cache take nested in it would end the emulator as before (the GPU thread holds the flag), and the one owned
+//   path, RestoreOffloaded, shuts the window first (CloseWindow: the readers waited out) before it writes.
+// - What the readers find is the cache as it stood when the window opened: complete for every image but the one being
+//   refreshed, and that one is `refreshing`: each query taking an image refuses it (not current, a refusal or a hole the
+//   normal path decides), each region query meeting it answers as when unsure (written by the GPU: true / Unsafe).
+// - Shut (CloseWindow: readers barred, those inside waited out) before the upload's results are written (its dirty and
+//   buffer-written state cleared) and before the lock is released.
+// - Opened only from RefreshImage as FindTexture, FindRenderTarget, FindDepthTarget and UpdateImage call it (each with
+//   the image found and the cache otherwise at rest), on the GPU thread holding m_lock.
+class TextureCache::UploadWindow {
+public:
+	UploadWindow(TextureCache& cache, Image& image, bool window) noexcept
+	    : m_cache(cache), m_image(image),
+	      m_open(window && cache.m_lock.SharedMode() && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 &&
+	             cache.m_lock.OwnedByCurrentThread() && !cache.m_lock.WindowOpen() && GuestGpu::IsGpuThread() &&
+	             TexcacheUploadUnlockedOn()) {
+		if (!m_open) return;
+		m_image.refreshing = true; // (no reader inside: written before they are let in)
+		m_cache.m_lock.OpenWindow();
+	}
+	~UploadWindow() {
+		if (!m_open) return;
+		m_cache.m_lock.CloseWindow();
+		m_image.refreshing = false; // (the readers out)
+	}
+	UploadWindow(const UploadWindow&)            = delete;
+	UploadWindow& operator=(const UploadWindow&) = delete;
+
+private:
+	TextureCache& m_cache;
+	Image&        m_image;
+	bool          m_open;
+};
+
 bool TextureCache::RecentlyFailed(const ImageInfo& info) const {
 	return std::ranges::any_of(m_failed_images, [&](const FailedImage& failed) {
 		return failed.address == info.data.address && info.data.size >= failed.size &&
@@ -697,9 +800,9 @@ bool TextureCache::RegistrationsOverlapSince(uint64_t address, uint64_t size, ui
 	// (A speculation's thread holds m_lock for the read: the GPU thread's registrations erase from the log and
 	// append to it under m_lock, which moves or frees its storage; a worker read it unlocked and faulted (8 Nov). The
 	// GPU thread, the log's only other user, reads it as before. Not m_lock.ReadShared: its first try reads unlocked.)
-	auto&                              guard = const_cast<TrackingSpinLock&>(m_lock);
-	std::unique_lock<TrackingSpinLock> lock(guard, std::defer_lock);
-	if (Spec::Current() != nullptr && !guard.OwnedByCurrentThread()) lock.lock();
+	auto&                   guard = const_cast<TextureCacheLock&>(m_lock);
+	std::optional<ReadLock> lock; // (mode 4: shared; the log is written under the exclusive take)
+	if (Spec::Current() != nullptr && !guard.OwnedByCurrentThread()) lock.emplace(guard);
 	const auto& log = m_registration_log;
 	known           = log.empty() || log.front().epoch <= epoch + 1;
 	if (!known) return true;
@@ -1369,6 +1472,25 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
 		return {};
+	}
+	// (Mode 4: a shared holder writes neither the query epochs nor the granules (MayHaveImagesRead: no rebuild, true while
+	// one is due): the same ids in the same order (each at its first page), duplicates dropped by a search of the result
+	// instead of the epoch (an image's overlap is the same from every page).)
+	if (m_lock.SharedMode() && TextureCacheLock::HeldSharedHere()) {
+		if (!MayHaveImagesRead(address, size)) return {};
+		ImageIds result;
+		for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+			const auto* owners = m_image_page_table.Find(page);
+			if (owners == nullptr) continue;
+			owners->ForEach([&](ImageId id) {
+				const auto* image = m_slot_images.try_get(id);
+				if (image == nullptr) return;
+				for (const ImageId seen: result)
+					if (seen == id) return;
+				if (image->Overlaps(address, size, page_overlap)) result.push_back(id);
+			});
+		}
+		return result;
 	}
 	if (!MayHaveImages(address, size)) {
 		return {};
@@ -2269,7 +2391,7 @@ bool TextureCache::RefillUpload(Image& image) {
 	return true;
 }
 
-void TextureCache::InitializeImage(ImageId id) {
+void TextureCache::InitializeImage(ImageId id, bool window) {
 	using Clock = std::chrono::steady_clock;
 	auto&             image = m_slot_images[id];
 	Clock::time_point marks[3] {Clock::now()};
@@ -2391,11 +2513,17 @@ void TextureCache::InitializeImage(ImageId id) {
 			                                                      : UploadImageSubresources(image, ranges);
 			if (uploaded) image.staged_ring = nullptr;
 		}
-		if (!uploaded && UploadImageChunked(image)) {
+		bool chunked = false;
+		if (!uploaded) {
+			const UploadWindow open {*this, image, window}; // (mode 4)
+			chunked = UploadImageChunked(image);
+		}
+		if (chunked) {
 			uploaded            = true;
 			image.staged_ring   = nullptr;
 		}
 		if (!uploaded) {
+			const UploadWindow open {*this, image, window}; // (mode 4: to its end)
 			bool refillable = false;
 			const auto [source, source_offset] =
 			    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size, &refillable);
@@ -3011,7 +3139,7 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 	}
 }
 
-void TextureCache::RefreshImage(ImageId id) {
+void TextureCache::RefreshImage(ImageId id, bool window) {
 	DeferredImageProtects protects {m_buffer_cache, m_page_manager};
 	protects.Track([&] { TrackImage(id); });
 	auto& image = m_slot_images[id];
@@ -3043,7 +3171,7 @@ void TextureCache::RefreshImage(ImageId id) {
 	if (!cpu_dirty) {
 		return;
 	}
-	InitializeImage(id);
+	InitializeImage(id, window);
 }
 
 // A depth target binding writes only the layers its view covers. Of a depth array that is also dirty in other layers,
@@ -3095,44 +3223,53 @@ bool TextureCache::LevelRefreshCandidate(const Image& image) {
 	       info.data.address % TRACKER_PAGE_SIZE == 0 && info.data.End() % TRACKER_PAGE_SIZE == 0;
 }
 
-bool TextureCache::ViewLevelBytes(const Image& image, const ImageViewInfo& view, uint64_t& begin, uint64_t& end) {
-	const auto key = view.base_level | view.level_count << 8u;
-	if (image.level_view != key) {
-		image.level_view  = key;
-		image.level_begin = 0;
-		image.level_end   = 0;
-		const auto& info   = image.info;
-		const auto  levels = info.resources.levels;
-		if (view.base_level != 0 && levels <= info.mip_layout.size() && view.base_level < levels &&
-		    view.level_count != 0 && view.level_count <= levels - view.base_level) {
-			uint64_t first = UINT64_MAX, last = 0;
-			for (uint32_t level = view.base_level; level < view.base_level + view.level_count; ++level) {
-				first = std::min(first, info.mip_layout[level].offset);
-				last  = std::max(last, info.mip_layout[level].offset + info.mip_layout[level].size);
-			}
-			// Every level whose bytes the range touches is in it whole (the levels of the mip tail share one block).
-			for (bool grew = true; grew;) {
-				grew = false;
-				for (uint32_t level = 0; level < levels; ++level) {
-					const auto& mip = info.mip_layout[level];
-					if (mip.size == 0 || mip.offset >= last || mip.offset + mip.size <= first) continue;
-					if (mip.offset < first || mip.offset + mip.size > last) {
-						first = std::min(first, mip.offset);
-						last  = std::max(last, mip.offset + mip.size);
-						grew  = true;
-					}
+// (ViewLevelBytes' range, worked out: [begin, end), end 0 when none.)
+void TextureCache::LevelBytesFor(const ImageInfo& info, const ImageViewInfo& view, uint64_t& begin, uint64_t& end) {
+	begin = 0, end = 0;
+	const auto levels = info.resources.levels;
+	if (view.base_level != 0 && levels <= info.mip_layout.size() && view.base_level < levels &&
+	    view.level_count != 0 && view.level_count <= levels - view.base_level) {
+		uint64_t first = UINT64_MAX, last = 0;
+		for (uint32_t level = view.base_level; level < view.base_level + view.level_count; ++level) {
+			first = std::min(first, info.mip_layout[level].offset);
+			last  = std::max(last, info.mip_layout[level].offset + info.mip_layout[level].size);
+		}
+		// Every level whose bytes the range touches is in it whole (the levels of the mip tail share one block).
+		for (bool grew = true; grew;) {
+			grew = false;
+			for (uint32_t level = 0; level < levels; ++level) {
+				const auto& mip = info.mip_layout[level];
+				if (mip.size == 0 || mip.offset >= last || mip.offset + mip.size <= first) continue;
+				if (mip.offset < first || mip.offset + mip.size > last) {
+					first = std::min(first, mip.offset);
+					last  = std::max(last, mip.offset + mip.size);
+					grew  = true;
 				}
 			}
-			// Levels left out (the range is not the whole image), on pages of their own: the range ends on page
-			// boundaries.
-			const auto from = info.data.address + first;
-			const auto to   = info.data.address + std::min(last, info.data.size);
-			if (first < last && from < to && (first != 0 || last < info.data.size) && from % TRACKER_PAGE_SIZE == 0 &&
-			    to % TRACKER_PAGE_SIZE == 0) {
-				image.level_begin = from;
-				image.level_end   = to;
-			}
 		}
+		// Levels left out (the range is not the whole image), on pages of their own: the range ends on page
+		// boundaries.
+		const auto from = info.data.address + first;
+		const auto to   = info.data.address + std::min(last, info.data.size);
+		if (first < last && from < to && (first != 0 || last < info.data.size) && from % TRACKER_PAGE_SIZE == 0 &&
+		    to % TRACKER_PAGE_SIZE == 0) {
+			begin = from;
+			end   = to;
+		}
+	}
+}
+
+bool TextureCache::ViewLevelBytes(const Image& image, const ImageViewInfo& view, uint64_t& begin, uint64_t& end) {
+	const auto key = view.base_level | view.level_count << 8u;
+	// (Mode 4: a shared holder writes no cache of the image (another holder may read it meanwhile): another view's range
+	// is worked out here, the image's cache left as it is (the same answer).)
+	if (image.level_view != key && Spec::On() && TextureCacheLock::HeldSharedHere()) {
+		LevelBytesFor(image.info, view, begin, end);
+		return end != 0;
+	}
+	if (image.level_view != key) {
+		image.level_view = key;
+		LevelBytesFor(image.info, view, image.level_begin, image.level_end);
 	}
 	begin = image.level_begin;
 	end   = image.level_end;
@@ -3526,7 +3663,7 @@ ImageId TextureCache::FindImageReadOnly(ImageDesc& desc, bool exact_format) {
 	const bool mode4   = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 	const bool storage = desc.type == BindingType::Storage && mode4;
 	if (desc.type != BindingType::Texture && !storage) return ReadOnlyFail("worker set: not a texture"), ImageId {};
-	std::scoped_lock lock {m_lock};
+	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
 	if (desc.info.data.Empty()) {
 		const auto type = desc.info.type == Prospero::ImageType::kColor1D || desc.info.type == Prospero::ImageType::kColor3D
 		                      ? desc.info.type
@@ -3547,8 +3684,9 @@ ImageId TextureCache::FindImageReadOnly(ImageDesc& desc, bool exact_format) {
 			}
 		}
 	}
+	ImageIds candidates;
 	if (!result) {
-		const auto candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 		for (const auto id: candidates)
 			if (SameBacking(m_slot_images[id].info, desc.info, exact_format)) result = id;
 		if (!result && mode4) result = ResolveOverlapReadOnly(desc, exact_format, candidates);
@@ -3560,6 +3698,14 @@ ImageId TextureCache::FindImageReadOnly(ImageDesc& desc, bool exact_format) {
 		return ReadOnlyFail("worker set: no image"), ImageId {};
 	}
 	auto& image = m_slot_images[result];
+	// (Mode 4: an image being uploaded with the readers let in (UploadWindow), found or among those the pick looked at: not
+	// current.)
+	if (m_lock.SharedMode()) {
+		bool refreshing = image.refreshing;
+		for (const ImageId id: candidates)
+			if (const auto* other = m_slot_images.try_get(id); other != nullptr && other->refreshing) refreshing = true;
+		if (refreshing) return ReadOnlyFail("worker set: image refreshing"), ImageId {};
+	}
 	if (OpenSegmentWrote(image.info) || OpenSegmentWrote(desc.info)) return ImageId {};
 	if (storage) {
 		if (exact_format && image.info.pixel_format != desc.info.pixel_format)
@@ -3594,9 +3740,11 @@ ImageId TextureCache::FindImageReadOnly(ImageDesc& desc, bool exact_format) {
 // spec_worker_sets: FindTexture on a set-building speculation's thread (ReadOnlyScope): the view of a current image that
 // needs no upload, no metadata clear and no new view, which the normal path already acquired for sampling.
 vk::ImageView TextureCache::FindTextureReadOnly(ImageId id, const ImageDesc& desc) {
-	std::scoped_lock lock {m_lock};
-	auto*            image = m_slot_images.try_get(id);
+	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
+	auto*          image = m_slot_images.try_get(id);
 	if (image == nullptr) return ReadOnlyFail("worker set: image gone"), vk::ImageView {};
+	if (m_lock.SharedMode() && image->refreshing) // (mode 4, UploadWindow: not current)
+		return ReadOnlyFail("worker set: image refreshing"), vk::ImageView {};
 	if (OpenSegmentWrote(image->info) || OpenSegmentWrote(desc.info)) return vk::ImageView {};
 	if (desc.type != BindingType::Texture) {
 		if (desc.type != BindingType::Storage || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4)
@@ -3846,7 +3994,7 @@ bool TextureCache::SameDccSurface(const Image& image, const ImageMetadataInfo& m
 }
 
 bool TextureCache::IsSampledImageCurrent(ImageId id, const ImageDesc& desc, bool storage_dcc) {
-	std::scoped_lock lock {m_lock};
+	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
 	// A DCC image keeps the surface FindTexture gave it (its user checks for a pending clear): sampled, or written as
 	// storage by a caller that checks at every use too.
 	const bool dcc = (desc.type == BindingType::Texture || (storage_dcc && desc.type == BindingType::Storage)) &&
@@ -3857,7 +4005,7 @@ bool TextureCache::IsSampledImageCurrent(ImageId id, const ImageDesc& desc, bool
 		return false;
 	}
 	auto* image = m_slot_images.try_get(id);
-	if (image == nullptr || !image->registered || image->depth_id ||
+	if (image == nullptr || !image->registered || image->depth_id || (m_lock.SharedMode() && image->refreshing) ||
 	    image->binding.needs_rebind || image->info.IsDepth() || (image->info.HasMetadata() && !dcc) ||
 	    (dcc && !SameDccSurface(*image, desc.info.metadata)) ||
 	    image->info.HasStencil() || !SameBacking(image->info, desc.info, true) ||
@@ -3916,8 +4064,10 @@ bool TextureCache::IsSampledDepthCurrent(ImageId id, const ImageDesc& desc, uint
 }
 
 bool TextureCache::IsTargetCurrent(ImageId id, const ImageInfo& requested, uint64_t& epoch) {
-	std::scoped_lock lock {m_lock};
-	const auto current = m_resolution_epoch.load(std::memory_order_relaxed);
+	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
+	const auto     current = m_resolution_epoch.load(std::memory_order_relaxed);
+	if (m_lock.SharedMode()) // (mode 4, UploadWindow: a target being uploaded is not current)
+		if (const auto* target = m_slot_images.try_get(id); target != nullptr && target->refreshing) return false;
 	// FindImage takes the last owner with the requested backing (on the first page or in the region);
 	// only without one does it resolve an overlap (a target found as part of another image).
 	if (epoch != current && RegistrationsSince(requested.data.address, 1, epoch)) {
@@ -3976,7 +4126,7 @@ void TextureCache::UpdateImage(ImageId id) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
-	RefreshImage(id);
+	RefreshImage(id, true);
 }
 
 bool TextureCache::HasImageStartingAt(uint64_t address) {
@@ -4099,7 +4249,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	if (!image.info.data.Empty()) {
 		PrepareDccClear(id, desc);
 		if (desc.type != BindingType::Texture || !RefreshTextureLevels(id, desc.view_info)) {
-			RefreshImage(id);
+			RefreshImage(id, true);
 		}
 	}
 	switch (desc.type) {
@@ -4165,7 +4315,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	if (!image.usage.render_target) ++image.validity;
 	image.usage.render_target = true;
 	PrepareDccClear(id, desc);
-	RefreshImage(id);
+	RefreshImage(id, true);
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);
 	const auto view = image.FindView(desc.view_info);
@@ -4220,7 +4370,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.usage.depth_target = true;
 	const bool scoped = RefreshDepthLayers(id, desc.view_info);
 	if (!scoped) {
-		RefreshImage(id);
+		RefreshImage(id, true);
 	}
 	if (desc.info.HasMetadata()) {
 		// The epoch moves only when metadata state changes: every depth target
@@ -5048,8 +5198,9 @@ void TextureCache::RestoreOffloaded(uint64_t vaddr, uint64_t size, uint8_t touch
 	auto       ranges = TextureOffload::BeginRestore(vaddr, size, touch, touch == TextureOffload::Touch::Count, async);
 	if (ranges.empty()) return;
 	const auto                         start = std::chrono::steady_clock::now();
-	std::unique_lock<TrackingSpinLock> lock(m_lock, std::defer_lock);
+	std::unique_lock<TextureCacheLock> lock(m_lock, std::defer_lock);
 	if (!m_lock.OwnedByCurrentThread()) lock.lock();
+	else m_lock.CloseWindow(); // (mode 4: a restore inside an upload's window writes: the readers out first)
 	struct Job {
 		size_t       range  = 0;
 		Image*       image  = nullptr;
@@ -5270,10 +5421,11 @@ bool TextureCache::HasTrackedDataOverlap(uint64_t address, uint64_t size) {
 
 bool TextureCache::HasGpuWrittenImageOverlap(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) return true;
-	std::scoped_lock lock {m_lock};
+	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		const auto& image = m_slot_images[id];
 		if (image.IsGpuModified() || image.IsStencilModified()) return true;
+		if (m_lock.SharedMode() && image.refreshing) return true; // (mode 4, UploadWindow: as when unsure)
 	}
 	return false;
 }
@@ -5281,12 +5433,13 @@ bool TextureCache::HasGpuWrittenImageOverlap(uint64_t address, uint64_t size) {
 bool TextureCache::SpeculationUsesGpuWrittenImage(uint64_t address, uint64_t size) {
 	const auto* spec = Spec::Current();
 	if (spec == nullptr || !GuestRange {address, size}.Valid()) return true;
-	std::scoped_lock lock {m_lock};
+	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		const auto& image = m_slot_images[id];
 		// (Any use of its own, conservatively: its work may write it before the texel read. A speculation before it is
 		// committed before it: what that one writes lands first, as in order.)
 		if ((image.IsGpuModified() || image.IsStencilModified()) && spec->overlay_index.contains(&image)) return true;
+		if (m_lock.SharedMode() && image.refreshing) return true; // (mode 4, UploadWindow: as when unsure)
 	}
 	return false;
 }
@@ -5294,8 +5447,8 @@ bool TextureCache::SpeculationUsesGpuWrittenImage(uint64_t address, uint64_t siz
 TextureCache::ReadOnlyBufferOverlap TextureCache::ClassifyReadOnlyBufferOverlap(
     uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) return ReadOnlyBufferOverlap::Unsafe;
-	std::scoped_lock lock {m_lock};
-	const auto images = FindImagesInRegion(address, size, false);
+	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
+	const auto     images = FindImagesInRegion(address, size, false);
 	for (const auto id : images) {
 		const auto& image = m_slot_images[id];
 		// Only ordinary sampled images whose contents still come from the CPU.
@@ -5305,7 +5458,8 @@ TextureCache::ReadOnlyBufferOverlap TextureCache::ClassifyReadOnlyBufferOverlap(
 		    image.usage.depth_target || image.usage.video_out || image.depth_id ||
 		    image.info.IsDepth() || image.info.HasStencil() ||
 		    image.info.metadata.kind != ImageMetadataKind::None ||
-		    image.IsGpuModified() || image.IsStencilModified() || image.IsBufferModified())
+		    image.IsGpuModified() || image.IsStencilModified() || image.IsBufferModified() ||
+		    (m_lock.SharedMode() && image.refreshing)) // (mode 4, UploadWindow: as when unsure)
 			return ReadOnlyBufferOverlap::Unsafe;
 	}
 	return images.empty() ? ReadOnlyBufferOverlap::None : ReadOnlyBufferOverlap::CpuSampled;
@@ -5421,7 +5575,7 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 bool TextureCache::IsRegionImageBacked(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) return false;
 	if (!m_lock.ReadShared([&] { return MayHaveImagesRead(address, size); })) return false;
-	std::scoped_lock lock {m_lock};
+	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
 	return !FindImagesInRegion(address, size, false).empty();
 }
 
@@ -5502,8 +5656,8 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 		return false;
 	};
 	if (!MetaFilterMayHold(address)) return not_cleared();
-	std::scoped_lock lock {m_lock};
-	const auto       found = m_surface_metas.find(address);
+	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
+	const auto     found = m_surface_metas.find(address);
 	// KYTY_SPEC_PREDICT_DCC (live spec_predict_dcc): a surface DCC fills clear (every frame, in the game) is read by a
 	// speculation as cleared when it finds it not: a fill in work not committed yet, of its command buffer or an earlier
 	// one it is not chained to, may clear it before its commit ("commit: a surface cleared"). The draw that would consume
@@ -5622,10 +5776,11 @@ bool TextureCache::DccClearSticks(uint64_t address) {
 // (registered, no depth_id, no rebind).
 bool TextureCache::DccClearLeftPending(ImageId id, const ImageDesc& desc, uint64_t& serial, uint64_t& validity) {
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc) return false;
-	std::scoped_lock lock {m_lock};
-	const auto*      image = m_slot_images.try_get(id);
+	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
+	const auto*    image = m_slot_images.try_get(id);
 	if (image == nullptr || image->info.data.Empty() || !image->registered || image->depth_id ||
-	    image->binding.needs_rebind || !(image->info.metadata == desc.info.metadata))
+	    image->binding.needs_rebind || !(image->info.metadata == desc.info.metadata) ||
+	    (m_lock.SharedMode() && image->refreshing)) // (mode 4, UploadWindow: the hole, as when unsure)
 		return false;
 	const auto found = m_surface_metas.find(desc.info.metadata.range.address);
 	if (found == m_surface_metas.end() || found->second.type != MetaDataInfo::Type::Dcc) return false;

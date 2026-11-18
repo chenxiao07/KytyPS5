@@ -197,6 +197,10 @@ public:
 		bool          fill_known   = false;
 	};
 	[[nodiscard]] bool AcquireDepthDrawAtCommit(ImageId id, uint64_t serial, const ImageDesc& desc, DepthDrawState* out);
+	// KYTY_SPEC_TEXCACHE_SHARED: for mode 4 (`four`), m_lock's shared mode on with the switch on in mode 4 (the GPU
+	// thread holding no lock, after the performance switches, before the speculation threads; once on, never off), and
+	// the lab's line when it turns on.
+	void ApplySharedMode(bool four);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);
@@ -436,6 +440,7 @@ private:
 	[[nodiscard]] static bool LevelRefreshCandidate(const Image& image);
 	// The guest bytes [begin, end) of the view's levels and every level sharing them, when that leaves levels out whose
 	// pages are theirs alone; false: the view needs the whole image.
+	static void               LevelBytesFor(const ImageInfo& info, const ImageViewInfo& view, uint64_t& begin, uint64_t& end);
 	[[nodiscard]] static bool ViewLevelBytes(const Image& image, const ImageViewInfo& view, uint64_t& begin,
 	                                         uint64_t& end);
 	// A sampled view's refresh of its levels (the others stay dirty); false: RefreshImage's.
@@ -458,9 +463,10 @@ private:
 	// (Mode 4, FindImageReadOnly) ResolveOverlap's pick over the candidates, read only; caller holds m_lock.
 	[[nodiscard]] ImageId       ResolveOverlapReadOnly(ImageDesc& desc, bool exact_format, const ImageIds& candidates);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
-	void                        RefreshImage(ImageId id);
+	// (`window`: mode 4's UploadWindow may open: FindTexture's, FindRenderTarget's, FindDepthTarget's, UpdateImage's.)
+	void                        RefreshImage(ImageId id, bool window = false);
 	void                        PrepareDccClear(ImageId id, const ImageDesc& desc);
-	void                        InitializeImage(ImageId id);
+	void                        InitializeImage(ImageId id, bool window = false);
 	[[nodiscard]] bool          RefillUpload(Image& image);
 	[[nodiscard]] TextureTransferPlan
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
@@ -488,7 +494,11 @@ private:
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
-	TrackingSpinLock                                  m_lock;
+	TextureCacheLock                                  m_lock;
+	// (Mode 4) A read-only query's hold (ReadLock: shared on a speculation's thread, off the GPU thread, in the shared mode;
+	// else exclusive, as before), and a whole upload's GPU-side work with the readers let in (UploadWindow).
+	class ReadLock;
+	class UploadWindow;
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;

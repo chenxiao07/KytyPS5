@@ -125,7 +125,7 @@ bool MemoryTracker::IsRegionFullyGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool MemoryTracker::TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size,
-                                                std::unique_lock<TrackingSpinLock>* handoff) noexcept {
+                                                std::unique_lock<TextureCacheLock>* handoff) noexcept {
 	CheckNotInUploadCallback();
 	if (!GuestRange {begin, size}.Valid() || size <= TRACKER_PAGE_SIZE ||
 	    begin % TRACKER_PAGE_SIZE || size % TRACKER_PAGE_SIZE || fault < begin ||

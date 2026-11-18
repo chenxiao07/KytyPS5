@@ -52,7 +52,7 @@ public:
 	// `handoff` (a held caller lock) is released once the region lock is held, so the
 	// protection change does not extend the caller's critical section.
 	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size,
-	                                               std::unique_lock<TrackingSpinLock>* handoff = nullptr) noexcept;
+	                                               std::unique_lock<TextureCacheLock>* handoff = nullptr) noexcept;
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	// CPU-dirty, the write protection kept (RegionManager::MarkCpuDirtyKeepProtection): for a write through the

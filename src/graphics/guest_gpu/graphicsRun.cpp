@@ -1517,6 +1517,9 @@ void GuestGpu::ThreadRun(void* data) {
 	};
 	// (A KYTY_SPECULATE=4 boot: the mode table's values set before the first packet, as a live `mode 4` sets them; the
 	// switches whose Find keeps main's default, the four levers, take mode 4's here.)
+	// (KYTY_SPEC_TEXCACHE_SHARED: the texture cache lock's shared mode, after the switches above, before the speculation
+	// threads that take it shared exist.)
+	gpu->m_renderer.GetTextureCache().ApplySharedMode(kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4);
 	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
 		ModeToggle::ApplyTable(4);
 		start_speculation();
@@ -1527,6 +1530,11 @@ void GuestGpu::ThreadRun(void* data) {
 	const auto apply_mode = [gpu, &start_speculation] {
 		const int want = ModeToggle::g_request.load(std::memory_order_acquire);
 		if (want < 0) return;
+		// (KYTY_SPEC_TEXCACHE_SHARED: the texture cache lock's shared mode for mode 4, before m_queue_mutex (its take
+		// waits for the lock's exclusive holder: no new lock order) and before start_speculation makes the threads that
+		// take it shared. Turned on even if the switch to mode 4 below waits for a later call: until then mode 0's takes
+		// only find no readers to drain.)
+		if (want == 4) gpu->m_renderer.GetTextureCache().ApplySharedMode(true);
 		std::unique_ptr<Speculation> old, old_async;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
