@@ -4041,24 +4041,51 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 3);
 	std::array<vk::DeviceAddress, 2> blocks {};
-	bool                             storage_writes = false;
-	auto&                            cache          = m_context.GetBufferCache();
-	TablePrepareBda(pair, user_data); // (as TableDraw's: before the blocks)
-	const auto                       registration   = cache.RegistrationEpoch(); // (as TableDraw's)
-	if (!TableBlocks(pair, user_data, blocks, &storage_writes)) return m_dispatch_declined = "table: blocks", false;
-	vk::Buffer indirect_buffer = nullptr;
-	uint64_t   indirect_offset = 0;
-	if (indirect_args != 0) {
-		// As DispatchDirect's: the arguments' owner, made current.
-		cache.EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
-		const auto id = cache.FindBuffer(indirect_args, 3u * sizeof(uint32_t));
-		if (Spec::Current() != nullptr && Spec::Current()->refused != nullptr) return false;
-		auto& owner     = cache.GetBuffer(id);
-		indirect_buffer = owner.Handle();
-		indirect_offset = owner.Offset(indirect_args);
+	bool                             storage_writes  = false;
+	auto&                            cache           = m_context.GetBufferCache();
+	vk::Buffer                       indirect_buffer = nullptr;
+	uint64_t                         indirect_offset = 0;
+	// (Mode 4) A speculation's dispatch whose lookups saw the buffer registration epoch move under them takes back its
+	// notes since its BDA preparation (State::RollbackTo) and takes its preparation, blocks and arguments once more at
+	// once, from the epoch then; a second move refuses as before. A first take that recorded work (RecordedWrites moved)
+	// is refused as before, never taken again, so no recorded work outlives its notes. What the first take did besides
+	// its notes (ring copies no command reads, posted ranges) is what a refused packet's Rollback leaves too.
+	auto* const retry_spec =
+	    kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? Spec::Current() : nullptr;
+	std::optional<Spec::Counts> retry_mark;
+	bool                        retry_bda  = false;
+	uint64_t                    retry_work = 0;
+	if (retry_spec != nullptr) {
+		retry_mark.emplace(retry_spec->Sizes());
+		retry_bda  = retry_spec->bda_all;
+		retry_work = LocalVulkanRecording::RecordedWrites();
 	}
-	if (cache.RegistrationEpoch() != registration)
+	for (uint32_t attempt = 0;; ++attempt) {
+		TablePrepareBda(pair, user_data); // (as TableDraw's: before the blocks)
+		const auto registration = cache.RegistrationEpoch(); // (as TableDraw's)
+		if (!TableBlocks(pair, user_data, blocks, &storage_writes)) return m_dispatch_declined = "table: blocks", false;
+		if (indirect_args != 0) {
+			// As DispatchDirect's: the arguments' owner, made current.
+			cache.EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
+			const auto id = cache.FindBuffer(indirect_args, 3u * sizeof(uint32_t));
+			if (Spec::Current() != nullptr && Spec::Current()->refused != nullptr) return false;
+			auto& owner     = cache.GetBuffer(id);
+			indirect_buffer = owner.Handle();
+			indirect_offset = owner.Offset(indirect_args);
+		}
+		if (cache.RegistrationEpoch() == registration) break;
+		if (attempt == 0 && retry_spec != nullptr && retry_spec->refused == nullptr &&
+		    LocalVulkanRecording::RecordedWrites() == retry_work) {
+			// (The blocks and arguments again, from the epoch now: what the commit checks is noted again by them.)
+			retry_spec->RollbackTo(*retry_mark, retry_bda);
+			blocks          = {};
+			storage_writes  = false;
+			indirect_buffer = nullptr;
+			indirect_offset = 0;
+			continue;
+		}
 		return LiveCounters::Add(LiveCounters::TableRegistered), m_dispatch_declined = "table: buffers registered meanwhile", false;
+	}
 	// (A speculation's lookups and preparation refuse without failing: nothing is recorded for a refused dispatch.)
 	if (const auto* spec = Spec::Current(); spec != nullptr && spec->refused != nullptr) return false;
 	phase.reset();

@@ -1341,6 +1341,24 @@ struct State {
 		checkpoint_bda_all = bda_all;
 		checkpoint_work    = work;
 	}
+	// (Mode 4, a table dispatch taken again: RenderExecutor::TableDispatch) The notes since `mark` (taken within the
+	// packet: Sizes, bda_all) taken back as Rollback takes back the packet's; the packet's own checkpoint kept.
+	void RollbackTo(const Counts& mark, bool mark_bda_all) {
+		const auto packet         = checkpoint;
+		const bool packet_bda_all = checkpoint_bda_all;
+		checkpoint                = mark;
+		checkpoint_bda_all        = mark_bda_all;
+		Rollback();
+		checkpoint         = packet;
+		checkpoint_bda_all = packet_bda_all;
+		// (NoteJournalRead grows the last record when it was noted since the packet's Mark, which `mark` may be after: a
+		// record from before `mark` grown since keeps its words only to `mark`, so its bytes are cut to them.)
+		if (journal_reads.size() == mark.journal_reads && mark.journal_reads > 0) {
+			auto&        last  = journal_reads.back();
+			const size_t words = journal_words.size() - std::min<size_t>(journal_words.size(), last.words);
+			last.bytes         = static_cast<uint32_t>(std::min<size_t>(last.bytes, words * 4));
+		}
+	}
 	// (The cumulative sets keep what the packet noted: they only make later decisions more careful.)
 	void Rollback() {
 		note_seen.clear(); // (before_merge)
