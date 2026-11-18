@@ -2172,7 +2172,12 @@ BufferId BufferCache::FindBufferSpec(uint64_t vaddr, uint64_t size) {
 		const auto* buffer = m_slot_buffers.try_get(owner);
 		if (buffer == nullptr) return Spec::Refuse("buffer registration (unregistered meanwhile)"), NULL_BUFFER_ID;
 		if (buffer->IsInBounds(vaddr, size)) {
-			if (!Spec::t_no_range) Spec::Current()->NoteBufferRange(vaddr, size); // (spec_reloc_refs: the caller records it)
+			if (!Spec::t_no_range) {
+				auto* spec = Spec::Current();
+				spec->NoteBufferRange(vaddr, size); // (spec_reloc_refs: the caller records it)
+				// (Its callers record the buffer's handle (dispatch-indirect arguments): never relocated.)
+				spec->NoteUnrel(vaddr, size);
+			}
 			return owner;
 		}
 	}
@@ -2421,6 +2426,33 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	}
 	Register(id);
 	return id;
+}
+
+BufferCache::RelocUpload BufferCache::UploadRelocated(BufferId id, uint64_t vaddr, uint64_t size) {
+	auto* buffer = GetBufferIfLive(id);
+	EXIT_IF(buffer == nullptr || !buffer->IsInBounds(vaddr, size));
+	// (The commit's thread, the GPU thread, outside any speculative translation: else refused, nothing done.)
+	if (!GuestGpu::IsGpuThread() || Spec::Current() != nullptr) return RelocUpload::Refused;
+	// GPU-written bytes over the range (written by work recorded before this point and the pages GPU-owned, or exact
+	// ranges): the in-order read takes the device's bytes there, which the live buffer may not hold. Refused.
+	if (m_memory_tracker.IsRegionGpuModified(vaddr, size) || m_gpu_modified_ranges.Intersects(vaddr, size))
+		return RelocUpload::Refused;
+	// A guest readback pending over it (its pages GPU-owned until it lands): refused, never drained here.
+	if (m_active_guest_readbacks != 0)
+		for (const auto& request: m_guest_readbacks) {
+			if (!request || vaddr >= request->begin + request->size || (vaddr < request->begin && size <= request->begin - vaddr))
+				continue;
+			if (std::ranges::any_of(request->pages, [&](const GuestRange& page) {
+				    return vaddr < page.End() && (vaddr >= page.address || size > page.address - vaddr);
+			    }))
+				return RelocUpload::Refused;
+		}
+	// Texture bytes the offload must bring back or wait for (a flush of the open buffer, a restore): refused.
+	if (TextureOffload::MustWaitBeforeRead(vaddr, size) || TextureOffload::Overlaps(vaddr, size)) return RelocUpload::Refused;
+	// (ObtainBuffer's for a read, not texel: DrainGuestReadback returns for a read-only binding, then its buffer path.)
+	TouchBuffer(*buffer);
+	(void)SynchronizeBuffer(*buffer, vaddr, size, false, false);
+	return m_memory_tracker.IsRegionCpuModified(vaddr, size) ? RelocUpload::StillDirty : RelocUpload::Uploaded;
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
@@ -2890,7 +2922,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSpec(Spec::State& spec, ui
 	else if (m_memory_tracker.IsRegionCpuModified(vaddr, size) || spec.JournalIntersects(vaddr, size))
 		spec.NoteCurrent(vaddr, size);
 	if (spec.touched_buffers.empty() || spec.touched_buffers.back() != *owner) spec.touched_buffers.push_back(*owner);
-	if (!Spec::t_no_range) spec.NoteBufferRange(vaddr, size); // (spec_reloc_refs: the caller records it)
+	if (!Spec::t_no_range) {
+		spec.NoteBufferRange(vaddr, size); // (spec_reloc_refs: the caller records it)
+		// (A buffer reference the commit cannot relocate: not a V# (patched by its entry), not the table path's index
+		// buffer or draw arguments (recorded as relocatable packets).)
+		if (Spec::t_reloc_scope == 0) spec.NoteUnrel(vaddr, size);
+	}
 	return {buffer, buffer->Offset(vaddr)};
 }
 

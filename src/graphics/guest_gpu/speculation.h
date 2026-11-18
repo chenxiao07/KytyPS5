@@ -227,7 +227,16 @@ private:
 	[[nodiscard]] Epochs  CurrentEpochs() const;
 	// Why the work of the segment no longer holds (a buffer or image it used registered over, a mapping changed), or
 	// null.
-	[[nodiscard]] const char* Changed(const Result& result, size_t index) const;
+	// (skip_registered: the registrations over its buffer ranges not looked at: RelocEligible did.)
+	[[nodiscard]] const char* Changed(const Result& result, size_t index, bool skip_registered = false) const;
+	// KYTY_SPECULATE=4 (Spec::State::reloc_on): whether a segment Changed() stopped with `why` passes with its
+	// relocatable buffer references patched: each range a registration moved over is covered whole by them, each resolves
+	// to one live registered buffer now, and no other buffer reference of the segment has a range a registration moved
+	// over. RelocPatch writes them (after its Before, before its splice); false: stop as before. RelocPatch's non-null
+	// answer is the stop's reason (a reference unresolved, or one over CPU-dirty memory its upload refused), with no cell
+	// written.
+	[[nodiscard]] bool        RelocEligible(const Result& result, size_t index, const char* why) const;
+	[[nodiscard]] const char* RelocPatch(Result& result, size_t index);
 	// redo_level_precise: a used image's unmap left the levels its segment sampled mapped (speculation.cpp).
 	[[nodiscard]] bool SampledLevelsMapped(const Spec::ImageUse& use, uint64_t mapping) const;
 	// The segments committed, the holes after them run: all, or up to what the work after it no longer holds

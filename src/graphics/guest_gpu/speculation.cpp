@@ -845,6 +845,8 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	r.pass   = 0;
 	r.blind  = false;
 	r.state.Clear();
+	// (Relocatable buffer references: the mode once a translation, so a live change cannot split a segment's notes.)
+	r.state.reloc_on      = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 	r.state.table_upload  = translator.table_upload.get();
 	r.state.shader_upload = translator.shader_upload.get();
 	r.state.cancel        = &translator.cancel;
@@ -1095,7 +1097,7 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 	return outcome;
 }
 
-const char* Speculation::Changed(const Result& result, size_t index) const {
+const char* Speculation::Changed(const Result& result, size_t index, bool skip_registered) const {
 	extern thread_local bool t_unmap_list_site; // (spec_unmap_list: its checks share one `since`)
 	struct ListSite {
 		ListSite() { t_unmap_list_site = true; }
@@ -1114,7 +1116,7 @@ const char* Speculation::Changed(const Result& result, size_t index) const {
 	if (mapping || buffers.RegistrationEpoch() != epochs.buffers)
 		for (size_t i = from.buffer_ranges; i < segment.end.buffer_ranges; ++i) {
 			const auto& range = state.buffer_ranges[i];
-			if (buffers.RegisteredSince(range.begin, range.end - range.begin, epochs.buffers)) {
+			if (!skip_registered && buffers.RegisteredSince(range.begin, range.end - range.begin, epochs.buffers)) {
 				// The 4 MiB region changed over the range itself, or only beside it (live spec_exact_reg_stop; -1, the default,
 				// and 1: on under KYTY_SPECULATE=4; 0 off: only a change over the range stops). Only mode 4 keeps the granule
 				// epochs RegisteredSinceExact reads, so outside it the switch is ignored whatever its value (a forced 1 there
@@ -1231,6 +1233,100 @@ static bool CommitVerifyDue() {
 	return every > 0 && ++count % static_cast<uint64_t>(every) == 0;
 }
 
+// Relocatable buffer references (KYTY_SPECULATE=4): see speculation.h. A range "moved" as Changed() finds it (the
+// region's registrations since the speculation began, and with spec_exact_reg_stop its granules'); covered when the
+// relocatable references' ranges of the segment cover it whole; each such reference resolves when one live registered
+// game buffer covers its range.
+bool Speculation::RelocEligible(const Result& result, size_t index, const char* why) const {
+	const auto& state = result.state;
+	if (!state.reloc_on || why == nullptr || (std::strcmp(why, "commit: buffers registered") != 0 &&
+	                                         std::strcmp(why, "commit: preparation registered buffers") != 0))
+		return false;
+	const auto  from = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
+	const auto& to   = state.closed[index].end;
+	if (to.reloc_refs == from.reloc_refs) return false;
+	auto&        buffers    = m_renderer.GetBufferCache();
+	static auto& exact_stop = LiveSwitch::Find("spec_exact_reg_stop", -1);
+	const bool   exact_on   = exact_stop.load(std::memory_order_relaxed) != 0; // (mode 4: reloc_on)
+	const auto   moved      = [&](const Spec::Range& range) { // (Changed()'s own predicate)
+		const auto size = range.end - range.begin;
+		return buffers.RegisteredSince(range.begin, size, result.epochs.buffers) &&
+		       (!exact_on || buffers.RegisteredSinceExact(range.begin, size, result.epochs.buffers));
+	};
+	// (The other references: allowed only when no registration moved over any of their ranges.)
+	for (size_t i = from.reloc_unrel; i < to.reloc_unrel; ++i)
+		if (moved(state.reloc_unrel[i])) return false;
+	thread_local std::vector<std::pair<uint64_t, uint64_t>> covered;
+	covered.clear();
+	for (size_t i = from.reloc_refs; i < to.reloc_refs; ++i) {
+		const auto& ref  = state.reloc_refs[i];
+		const auto* live = buffers.GetBufferIfLive(buffers.RegisteredBuffer(ref.begin, ref.end - ref.begin));
+		if (live == nullptr || !live->IsInBounds(ref.begin, ref.end - ref.begin)) return false;
+		covered.emplace_back(ref.begin, ref.end);
+	}
+	std::sort(covered.begin(), covered.end());
+	const auto whole = [&](uint64_t begin, uint64_t end) {
+		auto at = begin;
+		for (const auto& [b, e]: covered) {
+			if (b > at) break;
+			at = std::max(at, e);
+			if (at >= end) return true;
+		}
+		return at >= end;
+	};
+	for (size_t i = from.buffer_ranges; i < to.buffer_ranges; ++i) {
+		const auto& range = state.buffer_ranges[i];
+		if (moved(range) && !whole(range.begin, range.end)) return false;
+	}
+	return true;
+}
+
+// A segment's relocatable references let go of their cells once its chunks are spliced or discarded (a passive
+// producer's chunk goes back to its pool after its replay or its discard, and is reused: RelocPatch's null check then
+// stops the segment rather than write through one).
+static void RelocCellsRelease(Spec::State& state, size_t index) {
+	const auto from = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
+	const auto to   = state.closed[index].end;
+	for (size_t i = from.reloc_refs; i < to.reloc_refs && i < state.reloc_refs.size(); ++i) state.reloc_refs[i].cell = nullptr;
+}
+
+const char* Speculation::RelocPatch(Result& result, size_t index) {
+	auto&       state   = result.state;
+	auto&       buffers = m_renderer.GetBufferCache();
+	const auto  from    = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
+	const auto& to      = state.closed[index].end;
+	for (size_t i = from.reloc_refs; i < to.reloc_refs; ++i) {
+		const auto& ref  = state.reloc_refs[i];
+		const auto  id   = buffers.RegisteredBuffer(ref.begin, ref.end - ref.begin);
+		const auto* live = buffers.GetBufferIfLive(id);
+		if (live == nullptr || !live->IsInBounds(ref.begin, ref.end - ref.begin) || ref.cell == nullptr)
+			return "commit: a relocated buffer reference unresolved";
+		// The live buffer holds the old one's bytes only when they were copied (a join, a defragmentation or split
+		// move): a collector's retire copies none and leaves the pages CPU-dirty, and a buffer made later over the range
+		// uploads only its request. Before made current what the segment noted and the holes' writes, so CPU-dirty
+		// memory here is bytes the live buffer may not hold. (Read only: no region manager made, an untracked region
+		// answers dirty.) Its dirty pages are uploaded into the live buffer here, as the in-order draw's own lookup of
+		// the range would sync them before binding it (BufferCache::UploadRelocated): into the open command buffer
+		// (after the joins' copies, which mark the buffer so no upload prologue runs ahead of them) or the prologue
+		// ahead of it, both before the segment's work, which SubmitRecorded splices after. Refused: stopped as before.
+		if (buffers.IsRegionCpuDirtyNoCreate(ref.begin, ref.end - ref.begin)) {
+			const Spec::EffectSourceScope source(Spec::EffectSource::Commit);
+			const RenderLockGuard         lock(m_renderer.GetMutex());
+			if (buffers.UploadRelocated(id, ref.begin, ref.end - ref.begin) != BufferCache::RelocUpload::Uploaded)
+				return "commit: buffers registered";
+		}
+	}
+	for (size_t i = from.reloc_refs; i < to.reloc_refs; ++i) {
+		const auto& ref  = state.reloc_refs[i];
+		const auto  id   = buffers.RegisteredBuffer(ref.begin, ref.end - ref.begin);
+		const auto* live = buffers.GetBufferIfLive(id);
+		ref.cell->buffer = reinterpret_cast<uint64_t>(static_cast<VkBuffer>(live->Handle())); // NOLINT
+		ref.cell->offset = live->Offset(ref.begin);
+		buffers.TouchSpeculated(id);
+	}
+	return nullptr;
+}
+
 static bool SegmentWritesRange(const Spec::State& state, size_t index, const Spec::Counts& from, const Spec::Counts& to,
                                uint64_t address, uint64_t size); // (below)
 
@@ -1253,7 +1349,15 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		// cleared since; the guest memory it read as no GPU work had written it not written since (the effects
 		// logged since it began); the words it read from a speculation before it in memory now; the waits it found
 		// satisfied satisfied.
-		if (const char* why = Changed(result, index)) {
+		// (A segment stopped only for registrations over ranges its relocatable references cover passes; they are
+		// patched after its Before.)
+		bool        reloc       = false;
+		const char* changed_why = Changed(result, index);
+		if (changed_why != nullptr && RelocEligible(result, index, changed_why)) {
+			changed_why = Changed(result, index, true);
+			reloc       = changed_why == nullptr;
+		}
+		if (const char* why = changed_why) {
 			// (spec_stop_as_hole: the segment run the normal way as a hole, its recorded work dropped; the hole after it as
 			// after any segment.)
 			const auto as_hole = SegmentAsHole(result, cp, index);
@@ -1493,8 +1597,16 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		Before(result, index);
 		// (Its preparation registers what the work did not find registered (BDA ranges): a buffer merged away under
 		// the recorded work leaves it reading a destroyed one. The work after it is translated in order.)
-		if (CurrentEpochs() != prepared && Changed(result, index) != nullptr)
-			return ++m_stop_reasons["commit: preparation registered buffers"], Progress::Stopped;
+		if (CurrentEpochs() != prepared)
+			if (const char* prepared_why = Changed(result, index)) {
+				// (Before's own registrations over its relocatable references: the same rule.)
+				if (!RelocEligible(result, index, prepared_why) || Changed(result, index, true) != nullptr)
+					return ++m_stop_reasons["commit: preparation registered buffers"], Progress::Stopped;
+				reloc = true;
+			}
+		// Its relocatable references written as they resolve now (after Before's registrations; the joins' copies are in
+		// the open buffer, which SubmitRecorded submits before the segment's work).
+		if (const char* why = reloc ? RelocPatch(result, index) : nullptr) return ++m_stop_reasons[why], Progress::Stopped;
 		if (std::exchange(result.state.target_failed, false)) // (spec_commit_targets)
 			return ++m_stop_reasons["commit: a pending target not acquired"], Progress::Stopped;
 		if (std::exchange(result.state.images_failed, false)) // (spec_worker_images)
@@ -1542,6 +1654,7 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		if (const auto tick = scheduler.SubmitRecorded(*result.recorder, segment.recorded - result.submitted); tick != 0)
 			result.last_tick = tick;
 		result.submitted = segment.recorded;
+		RelocCellsRelease(result.state, index); // (its chunks spliced)
 		// (Worker packets: spliced into the open buffer, which goes on: the draw state this thread knew of it is not
 		// the buffer's any more. The recording worker's replay state is: the same buffer, replayed on the same thread.)
 		if (result.recorder->packets) {
@@ -2128,6 +2241,7 @@ Speculation::AsHole Speculation::SegmentAsHole(Result& result, CommandProcessor&
 	// Its recorded work dropped, never submitted: the GPU thread records it again.
 	m_renderer.GetCommandScheduler().DiscardFirst(*result.recorder, state.closed[index].recorded - result.submitted);
 	result.submitted = state.closed[index].recorded;
+	RelocCellsRelease(result.state, index); // (its chunks discarded)
 	const Spec::EffectSourceScope source(Spec::EffectSource::Hole);
 	auto&                         executor = m_renderer.GetRenderExecutor();
 	DrawStateObserver::Invalidate();

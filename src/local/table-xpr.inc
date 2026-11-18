@@ -2474,7 +2474,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 					pending_here.push_back({plan.BufferDword(i), held.address, held.size, false,
 					                        program.info.buffers[i].formatted, false, held.registration});
 				else
-					spec->NoteBufferRange(held.address, held.size);
+					spec->NoteBufferRange(held.address, held.size), spec->NoteUnrel(held.address, held.size);
 			}
 			const auto [word, stride]      = word_of(words4);
 			block[plan.BufferDword(i)]     = static_cast<uint32_t>(held.device);
@@ -2935,6 +2935,64 @@ static void TableScoutVerify(const Table& table, const Pair& pair, const Scout::
 		            differ[4] ? " apply" : "", detail);
 }
 
+// A speculation worker's table index-buffer bind and indirect draws under KYTY_SPECULATE=4 (Spec::State::reloc_on)
+// recorded as packets that carry the buffer handle and offset in a cell of their own (the packet's copy in the passive
+// producer's chunk), which the commit may rewrite (Speculation::RelocPatch: a registration that joined or replaced the
+// buffer since, the range's live buffer written in before the segment is spliced; nothing reads a passive producer's
+// chunk before its splice, and a discard reads none of it). Only over a game buffer; else (a ring copy, no worker
+// packets) the call is recorded as before.
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+namespace TableReloc {
+struct Packet {
+	VkCommandBuffer command = VK_NULL_HANDLE;
+	Spec::RelocCell cell;                 // (the copy's: RelocRef::cell points here)
+	uint32_t        op = 0, a = 0, b = 0; // 0 bind index (a: type); 1 draw indirect, 2 draw indexed indirect (a: count, b: stride)
+};
+static_assert(std::is_standard_layout_v<Packet> && std::is_trivially_copyable_v<Packet>);
+static void Replay(std::span<const LocalVulkanRecording::Segment> segments, const vk::detail::DispatchLoaderDynamic& dispatch) {
+	Packet packet;
+	std::memcpy(&packet, segments[0].data, sizeof(packet));
+	const auto command = LocalVulkanRecording::Resolve(packet.command);
+	const auto handle  = reinterpret_cast<VkBuffer>(packet.cell.buffer); // NOLINT (a 64-bit non-dispatchable handle)
+	if (packet.op == 0) dispatch.vkCmdBindIndexBuffer(command, handle, packet.cell.offset, static_cast<VkIndexType>(packet.a));
+	else if (packet.op == 1) dispatch.vkCmdDrawIndirect(command, handle, packet.cell.offset, packet.a, packet.b);
+	else dispatch.vkCmdDrawIndexedIndirect(command, handle, packet.cell.offset, packet.a, packet.b);
+}
+} // namespace TableReloc
+#endif
+// The call recorded as such a packet (true), with its reference noted in the speculation's state; false: record it plainly.
+// (A plain one over a game buffer, not a ring's copy (no guest address), is one more reference the commit cannot
+// relocate: noted as such, so the segment stops as before when a registration moved over its range.)
+// (No check that `used` is still the range's registered buffer: TableDraw found the registration epoch unmoved after its
+// lookups, and a registration after that moves it past the segment's base over the range, which the commit's Changed()
+// finds: the cell is then rewritten with the live buffer (RelocEligible / RelocPatch) or the segment stops.)
+// The caller calls it only with relocation on (a speculation's state with reloc_on).
+static bool TableRelocRecord(vk::CommandBuffer vk_buffer, Spec::State& spec, uint8_t kind,
+                             const std::pair<Buffer*, uint64_t>& used, uint64_t address, uint64_t size, uint32_t op,
+                             uint32_t a, uint32_t b) {
+	if (used.first == nullptr || size == 0 || used.first->CpuAddress() == 0) return false; // (a ring's copy: as before)
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	if (LocalVulkanRecording::Passive()) {
+		TableReloc::Packet packet {static_cast<VkCommandBuffer>(vk_buffer), {}, op, a, b};
+		packet.cell.buffer = reinterpret_cast<uint64_t>(static_cast<VkBuffer>(used.first->Handle())); // NOLINT
+		packet.cell.offset = used.second;
+		// (The cell is the packet's copy in the chunk: it stays there, unread, until the segment is spliced (replayed
+		// after) or discarded. The commit writes it on the GPU thread before the splice, the worker never after.)
+		const LocalVulkanRecording::Segment segment {&packet, sizeof(packet)};
+		void*                               copy = nullptr;
+		if (LocalVulkanRecording::EnqueuePacketCopy(TableReloc::Replay, segment, &copy) && copy != nullptr) {
+			auto* cell = reinterpret_cast<Spec::RelocCell*>(static_cast<std::byte*>(copy) + offsetof(TableReloc::Packet, cell));
+			spec.reloc_refs.push_back({address, address + size, kind, cell});
+			return true;
+		}
+	}
+#else
+	(void)vk_buffer, (void)kind, (void)op, (void)a, (void)b;
+#endif
+	spec.NoteUnrel(address, size);
+	return false;
+}
+
 RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
                                                       const NativeXprDrawState& draw_state,
                                                       std::span<const uint64_t> commands, uint64_t index_base,
@@ -2945,6 +3003,8 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	// reads in the draw.)
 	Spec::State* const spec_state =
 	    ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr;
+	// (A speculation's relocatable index buffer and draw arguments, TableRelocRecord: nothing of it runs without one.)
+	const bool reloc = spec_state != nullptr && spec_state->reloc_on;
 	auto&       cache  = *m_native_xpr;
 	const auto& sh     = buffer.GetShaders();
 	const auto  stages = pair.programs[1] != nullptr ? 2u : 1u;
@@ -3011,7 +3071,14 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		const auto registration_before = buffer_cache.RegistrationEpoch(); // (a speculation's: before its lookup)
 		std::optional<BufferCache::AheadSite> ahead_site; // (the lookup's site: read by a speculation's lookup only)
 		if (spec_state != nullptr) ahead_site.emplace(&held == &table.args ? 4 : 3);
-		const auto result = buffer_cache.ObtainBuffer(address, size, false);
+		// (Relocation on: these lookups' references are recorded relocatable, not noted as other references.)
+		struct RelocScope {
+			uint8_t old;
+			explicit RelocScope(uint8_t kind): old(std::exchange(Spec::t_reloc_scope, kind)) {}
+			~RelocScope() { Spec::t_reloc_scope = old; }
+		};
+		const auto lookup = [&] { return buffer_cache.ObtainBuffer(address, size, false); };
+		const auto result = reloc ? (RelocScope(&held == &table.args ? Spec::RelocArgs : Spec::RelocIndex), lookup()) : lookup();
 		region_epochs.fill({UINT64_MAX, 0}); // (its uploads may have moved them)
 		const auto owner  = spec_state != nullptr ? buffer_cache.RegisteredBuffer(address, size)
 		                                               : buffer_cache.FindBuffer(address, size);
@@ -3049,6 +3116,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 9);
 	std::array<std::pair<Buffer*, uint64_t>, 64> arguments;
 	std::array<uint32_t, 64>                     group_sizes;
+	std::array<uint64_t, 64>                     group_address; // (relocation only: written and read under `reloc`)
 	uint32_t                                     groups = 0;
 	for (size_t first = 0; first < commands.size();) {
 		size_t count = 1;
@@ -3057,6 +3125,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		if (owner == nullptr) return TableResult::Native;
 		arguments[groups]   = {owner, offset};
 		group_sizes[groups] = static_cast<uint32_t>(count);
+		if (reloc) group_address[groups] = commands[first];
 		++groups;
 		first += count;
 	}
@@ -3170,7 +3239,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
 		                        vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 		                        push_dwords * sizeof(uint32_t), push_data.dwords.data());
-	if (!same_index) vk_buffer.bindIndexBuffer(indices.first->Handle(), indices.second, index_type);
+	if (!same_index && !(reloc && TableRelocRecord(vk_buffer, *spec_state, Spec::RelocIndex, indices, index_base, index_bytes,
+	                                               0, static_cast<uint32_t>(static_cast<VkIndexType>(index_type)), 0)))
+		vk_buffer.bindIndexBuffer(indices.first->Handle(), indices.second, index_type);
 	if (direct != nullptr && !vertex_arguments) {
 		// This draw's offsets, as the normal path's ResolveVertexOffset/ResolveInstanceOffset give them: the index
 		// offset register, else (a vertex program that fetches) the user data its fetch adds.
@@ -3192,6 +3263,10 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	// (A draw of vertices of GPU-read arguments: their first vertex and instance from them, as the normal path's
 	// DrawAuto with gpu_args gives them (DrawOffsetSource::IndirectArgs), not from the index offset or user data.)
 	for (uint32_t group = 0; group < groups; ++group) {
+		if (reloc && TableRelocRecord(vk_buffer, *spec_state, Spec::RelocArgs, arguments[group], group_address[group],
+		                              uint64_t {group_sizes[group]} * stride, vertex_arguments ? 1u : 2u, group_sizes[group],
+		                              static_cast<uint32_t>(stride)))
+			continue;
 		if (vertex_arguments)
 			vk_buffer.drawIndirect(arguments[group].first->Handle(), arguments[group].second, group_sizes[group],
 			                       static_cast<uint32_t>(stride));

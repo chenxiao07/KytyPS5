@@ -96,7 +96,7 @@ struct Counts {
 	size_t current = 0, written = 0, bda = 0, invalidated = 0, writes = 0, touched_images = 0, touched_buffers = 0,
 	       clean_reads = 0, feedbacks = 0, buffer_ranges = 0, sets = 0, chain_reads = 0, waits = 0, cpu_copies = 0,
 	       late_reads = 0, texel_syncs = 0, pending_buffers = 0, table_ranges = 0, pending_targets = 0, indexed_draws = 0,
-	       scenes = 0, used_pairs = 0, left_clears = 0, journal_reads = 0, journal_words = 0;
+	       scenes = 0, used_pairs = 0, left_clears = 0, journal_reads = 0, journal_words = 0, reloc_refs = 0, reloc_unrel = 0;
 };
 
 // spec_pending_buffers (under KYTY_SPECULATE=4 only): a table V#'s range with no
@@ -122,6 +122,17 @@ struct PendingBuffer {
 inline thread_local bool t_pending_ok  = false; // (TableBlocks: a missing buffer may be left pending)
 inline thread_local bool t_pending_hit = false; // (ObtainBufferSpec: it was)
 inline thread_local bool t_no_range    = false; // (spec_reloc_refs: the V#'s lookups note no buffer range; the caller records it)
+// Relocatable buffer references (KYTY_SPECULATE=4, the mode read as a translation begins: State::reloc_on): the table
+// path's index-buffer bind and indirect draws a worker records as packets that carry the buffer handle and offset in a
+// cell of their own (State::reloc_refs), which the commit rewrites with the range's live buffer when a registration
+// joined or replaced it since (Speculation::RelocEligible / RelocPatch), where the segment stopped.
+inline constexpr uint8_t RelocIndex = 1, RelocArgs = 2;
+// (TableDraw's lookups of those two kinds, set only while relocation is on: ObtainBufferSpec notes the others.)
+inline thread_local uint8_t t_reloc_scope = 0;
+// A relocatable reference's cell: the handle (the vk::Buffer as its 64-bit value) and offset its packet's replay reads.
+struct RelocCell {
+	uint64_t buffer = 0, offset = 0;
+};
 // spec_nofault_journal: CopyGuest's reader while a no-fault read is served through the journal (the page's clean backing,
 // never a fault; a failure refuses the read, not the speculation).
 inline thread_local bool (*t_backing_copy)(void* out, uint64_t address, uint64_t bytes) = nullptr;
@@ -539,6 +550,23 @@ struct State {
 	// - the ranges of the game buffers it uses on the GPU (their buffers registered over them still: none registered
 	//   or unregistered in their tracker regions since it began);
 	std::vector<Range> buffer_ranges;
+	// - under KYTY_SPECULATE=4 (reloc_on, read as the translation begins: a live mode change cannot split a segment's
+	//   notes): its relocatable buffer references (the table path's index buffer and draw arguments), each a cell in its
+	//   packet's copy in the passive producer's chunk, valid until the segment's splice or discard (the commit writes it
+	//   before the splice: RelocPatch; RelocCellsRelease lets go of it after), and the ranges of the other buffer
+	//   references its lookups gave the work, which it records plainly (merged as buffer_ranges are: a union moved when a
+	//   part of it did). A segment holding any a registration moved over is not relocated.
+	struct RelocRef {
+		uint64_t   begin = 0, end = 0;
+		uint8_t    kind  = 0;       // RelocIndex / RelocArgs
+		RelocCell* cell  = nullptr;
+	};
+	std::vector<RelocRef> reloc_refs;
+	std::vector<Range>    reloc_unrel;
+	bool                  reloc_on = false;
+	void NoteUnrel(uint64_t address, uint64_t size) {
+		if (reloc_on) (void)Note(reloc_unrel, Sealed().reloc_unrel, address, size);
+	}
 	// - the descriptor sets it binds (a hole that retires one stops the commit before it: it may be reused under it);
 	std::vector<uint64_t> sets;
 	// - words it read from a previous speculation's pending writes, and the waits it found satisfied (ChainRead);
@@ -697,7 +725,7 @@ struct State {
 		        sets.size(),           chain_reads.size(),     waits.size(),       cpu_copies.size(),
 		        late_reads.size(),     texel_syncs.size(),     pending_buffers.size(), table_ranges.size(), pending_targets.size(),
 		        indexed_draws,         scenes,                 used_pairs.size(),      left_clears.size(),
-		        journal_reads.size(),  journal_words.size()};
+		        journal_reads.size(),  journal_words.size(),   reloc_refs.size(),  reloc_unrel.size()};
 	}
 	// Its pending guest memory writes or a previous speculation's over the range; the ranges its work or a previous
 	// one's writes.
@@ -1258,6 +1286,8 @@ struct State {
 		left_clears.resize(std::min(left_clears.size(), checkpoint.left_clears));
 		journal_reads.resize(std::min(journal_reads.size(), checkpoint.journal_reads));
 		journal_words.resize(std::min(journal_words.size(), checkpoint.journal_words));
+		reloc_refs.resize(std::min(reloc_refs.size(), checkpoint.reloc_refs));
+		reloc_unrel.resize(std::min(reloc_unrel.size(), checkpoint.reloc_unrel));
 		bda_all = checkpoint_bda_all;
 	}
 
@@ -1296,6 +1326,9 @@ struct State {
 		indexed_draws = 0;
 		scenes        = 0;
 		used_pairs.clear();
+		reloc_refs.clear();
+		reloc_unrel.clear();
+		reloc_on = false;
 		late = false;
 		bda.clear();
 		bda_all = false;

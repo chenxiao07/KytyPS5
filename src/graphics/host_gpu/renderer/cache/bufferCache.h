@@ -180,6 +180,14 @@ public:
 	[[nodiscard]] bool IsRegionCpuDirtyNoCreate(uint64_t vaddr, uint64_t size) const {
 		return m_memory_tracker.IsRegionCpuModifiedNoCreate(vaddr, size);
 	}
+	// The commit (on the GPU thread): a relocated reference's CPU-dirty range uploaded into its live buffer `id` as the
+	// in-order draw's lookup of it (ObtainBuffer, read, not texel) does: SynchronizeBuffer, into the open command buffer
+	// or its upload prologue, barriers its own. Refused with nothing done when the range holds GPU-written bytes (tracker
+	// or exact ranges), a guest readback is pending over it, the texture offload must restore or wait for its bytes, or
+	// the caller is not the GPU thread outside a speculative translation; StillDirty: the sync ran and pages stay
+	// CPU-dirty (unmapped ones).
+	enum class RelocUpload : uint8_t { Uploaded, Refused, StillDirty };
+	[[nodiscard]] RelocUpload UploadRelocated(BufferId id, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
