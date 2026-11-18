@@ -57,7 +57,8 @@ public:
 	// `may_fail` (a sampled texture's lookup): no image when the GPU cannot make one (its memory full, or more layers or
 	// bytes than the format allows), an invalid id, and none tried again for that memory for a while.
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false, bool may_fail = false);
-	[[nodiscard]] ImageId FindImageReadOnly(const ImageDesc& desc, bool exact_format); // (t_read_only)
+	// (t_read_only; mode 4: a view of an image ResolveOverlap picks gets its base level and layer as FindImage sets them.)
+	[[nodiscard]] ImageId FindImageReadOnly(ImageDesc& desc, bool exact_format);
 	// spec_commit_targets: a speculation's target acquired at its commit, as FindRenderTarget / FindDepthTarget do
 	// (the color DCC clear over the view's layers when `clear`); false: not that image any more, or not safe after.
 	[[nodiscard]] bool AcquireTargetAtCommit(ImageId id, uint64_t serial, uint32_t base_level, uint32_t level_count,
@@ -112,6 +113,17 @@ public:
 	};
 	static void ReadOnlyFail(const char* why) noexcept { if (t_read_only_failed == nullptr) t_read_only_failed = why; }
 	[[nodiscard]] static const char* ReadOnlyFailed() noexcept { return t_read_only_failed; }
+	// (Mode 4, a worker's set: FindImageReadOnly / FindTextureReadOnly) Why FindTexture with a storage view of `image` would
+	// change something (null: nothing but the GPU write, which the set's commit notes): MarkGpuModified (not GPU-owned yet),
+	// RefreshImage (a CPU, GPU-buffer or stencil-plane write pending; its pages not tracked whole, TrackImage),
+	// PrepareDccClear (metadata), TrackImageDownload (linear), AcquireImages (its first storage use moves its validity).
+	// Reads only.
+	[[nodiscard]] static const char* StorageChanges(const Image& image);
+	// (Mode 4, a set's validation outside role 0's own: a worker's) A view of an image ResolveOverlap picked (not the
+	// request's own backing, which IsSampledImageCurrent proves) still the image FindImage would pick: registered, current,
+	// GPU-owned, holding the request's resources, and no image registered or unregistered over the request's pages since
+	// `epoch` (the candidates FindImage resolves over unchanged: its pick is theirs alone).
+	[[nodiscard]] bool IsOverlapImageCurrent(ImageId id, const ImageDesc& desc, uint64_t epoch);
 	// The normal path's tests: the global first. Both flags are set only on a speculation's thread, which runs only
 	// while the mode is not 0 (started after it is set, joined before it is cleared), so mode 0 reads no thread-local
 	// here, as the base.
@@ -443,6 +455,8 @@ private:
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ResolveBlockTexelOverlap(const ImageInfo& requested, ImageId cached_id);
+	// (Mode 4, FindImageReadOnly) ResolveOverlap's pick over the candidates, read only; caller holds m_lock.
+	[[nodiscard]] ImageId       ResolveOverlapReadOnly(ImageDesc& desc, bool exact_format, const ImageIds& candidates);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
 	void                        PrepareDccClear(ImageId id, const ImageDesc& desc);

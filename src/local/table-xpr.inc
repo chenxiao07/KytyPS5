@@ -168,6 +168,9 @@ struct RenderExecutor::TableImageSet {
 	// KYTY_DRAW_READ_AFTER_WRITE=1 a draw with the set transits it every time (TableTransit), never in place, ordered
 	// after the last draw's write (Image::GetBarriers, issue #315).
 	bool                      read_after_write = false;
+	// (Mode 4) A worker built it with a storage image resolved read only (its commit's check notes the GPU write the owner's
+	// FindTexture would have, once each such image is still as the worker found it).
+	bool                      worker_storage = false;
 	// The words select another specialization, or an image no set can hold: the draws take the native path
 	// (TableResolveSet tries again after TableImageSet::RetryFrames).
 	bool                  refused = false;
@@ -1292,6 +1295,23 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 					const auto* image = textures.m_slot_images.try_get(dep.id);
 					if (image == nullptr || image->serial != dep.serial) return false;
 				}
+				// (Mode 4: each storage image still one the owner's FindTexture would change nothing on here, before the
+				// replay that binds the set (else the segment stops: the normal path refreshes or marks it); then the GPU
+				// write that FindTexture notes (CommitGpuWrite), as the owner's build of the set would have. A colour target
+				// bound as storage too is a target dep with the shader write in target_read (KYTY_TABLE_TARGET_READ): one as
+				// well.)
+				if (raw->worker_storage) {
+					const auto written = [](const TableImageSet::Image& dep) {
+						return dep.storage || (dep.target && (dep.target_read & vk::AccessFlagBits2::eShaderWrite));
+					};
+					for (const auto& dep: raw->images)
+						if (written(dep) && TextureCache::StorageChanges(textures.m_slot_images[dep.id]) != nullptr) return false;
+					for (const auto& dep: raw->images)
+						if (written(dep)) {
+							const auto& data = textures.m_slot_images[dep.id].info.data;
+							Spec::NoteGpuWrite(data.address, data.size);
+						}
+				}
 				return true;
 			};
 			return raw;
@@ -1446,6 +1466,36 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		ResetBindings();
 		return worker_refuse(TextureCache::ReadOnlyFailed());
 	}
+	// (Mode 4, a worker's set with a storage image: TextureCache::FindImageReadOnly.) A storage image the set also binds
+	// otherwise (either stage) is one the owner's build marks force_general and shader_write (BindImage), from this set's
+	// bindings alone (the owner's build binds both stages' images after ResetBindings, and resets them after; a target's
+	// binding marks no force_general; a null image none): `twice`, laid out below as the owner's build lays it out
+	// (General, whole, read and written; a target's attachment layout). A sampled binding left pending holds the null image
+	// here: of the storage image's bytes, it would be bound twice and its commit would make it read-only while the storage
+	// dep makes it General: refused.
+	bool                 worker_storage = false;
+	std::vector<ImageId> twice;
+	if (spec != nullptr)
+		for (uint32_t st = 0; st < stages; ++st)
+			for (const auto& binding: prepared[st].images) {
+				if (binding.desc.type != TextureCache::BindingType::Storage) continue;
+				worker_storage = true;
+				for (uint32_t other = 0; other < stages; ++other)
+					for (const auto& sampled: prepared[other].images) {
+						if (sampled.pending && sampled.pending_desc != nullptr) {
+							const auto& data  = sampled.pending_desc->info.data;
+							const auto& bytes = textures.GetImage(binding.image_id).info.data;
+							if (!bytes.Empty() && data.address < bytes.End() && bytes.address < data.End()) {
+								ResetBindings();
+								return worker_refuse("worker storage: bound twice, pending");
+							}
+						}
+						if (sampled.image_id == binding.image_id && sampled.desc.type != TextureCache::BindingType::Storage &&
+						    !textures.GetImage(binding.image_id).info.data.Empty() &&
+						    std::ranges::find(twice, binding.image_id) == twice.end())
+							twice.push_back(binding.image_id);
+					}
+			}
 	// An address probe's indirect image (a dispatch's): its root's elements in the order of the candidates the set's
 	// key holds (TableEvaluate's), each found among the dispatch's own (the normal path's materialization: the same
 	// enumeration, in the order the records name them); past them the null images it was padded with.
@@ -1479,9 +1529,12 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		for (auto& binding: prepared[st].images) {
 			auto&       image   = textures.GetImage(binding.image_id);
 			// (spec_worker_sets: the set's own bindings' state, which a speculation's read-only build does not mark (BindImage):
-			// all sampled textures there, neither written nor bound twice apart; the image's fields are the GPU thread's draw.)
-			const bool  bound_general = spec == nullptr && image.binding.force_general;
-			const bool  bound_written = spec == nullptr && image.binding.shader_write;
+			// the image's fields are the GPU thread's draw. An image the set binds both ways, `twice`, is what BindImage marks
+			// force_general and shader_write; its other images' shader_write changes nothing below, a storage binding's own
+			// test before it.)
+			const bool  twice_here    = spec != nullptr && std::ranges::find(twice, binding.image_id) != twice.end();
+			const bool  bound_general = spec == nullptr ? image.binding.force_general : twice_here;
+			const bool  bound_written = spec == nullptr ? image.binding.shader_write : twice_here;
 			const bool  storage = binding.desc.type == TextureCache::BindingType::Storage;
 			const auto  found   = draw_state == nullptr ? decltype(draw_state->targets.end()) {}
 			                                                : std::ranges::find(draw_state->targets, binding.image_id,
@@ -1641,6 +1694,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 #endif
 		);
 	set->resolution_epoch = epoch;
+	set->worker_storage   = worker_storage;
 	LiveCounters::Add(LiveCounters::TableEvaluations);
 	return publish();
 }
@@ -1755,6 +1809,13 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 		bool sampled = textures.IsSampledImageCurrent(dep.id, dep.desc, true);
 		bool current = sampled || textures.IsSampledDepthCurrent(dep.id, dep.desc, set.ResolutionEpoch(Role()));
 		const bool texture = dep.desc.type == TextureCache::BindingType::Texture;
+		// (Mode 4: a view of an image ResolveOverlap picked (a worker's set, FindImageReadOnly) fails IsSampledImageCurrent's
+		// own-backing proof; role 0's own validation proves it by the lookup below, any other by IsOverlapImageCurrent: the
+		// candidates unchanged since this role's last proof, the pick the same.)
+		if (!current && !own && (texture || dep.desc.type == TextureCache::BindingType::Storage) &&
+		    kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 &&
+		    textures.IsOverlapImageCurrent(dep.id, dep.desc, set.ResolutionEpoch(Role())))
+			current = true;
 		if (!current && own && (texture || dep.desc.type == TextureCache::BindingType::Storage) &&
 		    !m_context.GetCommandScheduler().Current().IsInvalid()) {
 			// A surface the game uses as depth and as colour in turn (0x28a010000 at 1-1 and Latria, twice a frame): the
