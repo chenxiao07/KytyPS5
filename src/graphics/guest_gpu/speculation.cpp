@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h" // (spec_depth_layers2: htile_load_decision)
+#include "kernel/memory.h" // (GuardedCopy: IsUniqueGuestBackingRangeAcrossMappings)
 #include "async-upload.h"
 #include "draw-state-observer.h"
 #include "frame-gen.h"
@@ -42,6 +43,7 @@ volatile std::atomic_uint32_t kyty_local_pipelines_evicting {0};
 namespace Libs::Graphics {
 
 bool CommitGuardedWrite(void* dst, const void* src, uint32_t size); // (graphicsRun.cpp: KYTY_WRITE_GUARD_SPEC)
+bool CommitGuardedCopyWrite(void* dst, const void* src, uint32_t size); // (graphicsRun.cpp: GuardedCopy)
 // (after_guard_batch)
 size_t CommitGuardedWriteRun(const uint64_t* addresses, const uint64_t* values, const uint32_t* sizes, size_t count);
 
@@ -2077,6 +2079,69 @@ void Speculation::Before(Result& result, size_t index) {
 	}
 }
 
+// KYTY_SPECULATE=4 with KYTY_WRITE_GUARD_SPEC: a commit's processor copy (a linear copy made on the CPU, between memory no
+// GPU work wrote) made as the commit's labels are instead of behind the whole upload queue. The copy's destination is a
+// release the game reads: the full drain made every upload job pushed before it read guest memory before the
+// destination's new bytes could be seen (issue #196). Here each run of destination pages whose bytes differ
+// (BufferCache::CopyGuestMemory's rule: the others are not written) is a guarded write (CommitGuardedCopyWrite:
+// DrainRange over the run, so a pending job reading it takes the old bytes; its pages armed; lift jobs pushed behind the
+// pending ones; the bytes written through the backing view): the game's view of them changes only after every earlier
+// job ran, as with the drain. The source is waited for by nothing (the jobs never write guest bytes; a lift is pushed
+// over the guest range [0, 1) on purpose, so no DrainRange meets it) and is read through its backing view: a source
+// page still guarded by an earlier label of this commit shows the label's bytes there (program order) and no read
+// faults into WriteGuard::OnFault's wait. The destination is compared through its backing view too (the same bytes; a
+// page an earlier run or label guarded is not read through the guest mapping). Spec::HostWriteParts as
+// CopyGuestMemory's writes: only what changes. The regions' epochs move as CopyGuestMemory's (NoteGuardedCopyWrite).
+// Not taken (false; the caller drains and copies from `done` on, as before):
+// - larger than 64 guard pages (GuardedWrite's fast form; the touch and the arm a page each: the 4 MiB culling copy keeps
+//   CopyGuestMemory's helpers and its fault-free protection-keeping writes);
+// - source and destination overlapping (each run is read as it stands, not as a copy made at once);
+// - a read watcher on either (an offload's pages: their bytes are not in the backing view yet, ReadFaults);
+// - GPU-modified memory on either (its bytes are not in the backing view until read back);
+// - no single backing range for either (TryGetBackingPointer);
+// - no upload job pending (the drain then waits for nothing and CopyGuestMemory needs no guard);
+// - the destination's memory mapped at another guest address too (IsUniqueGuestBackingRangeAcrossMappings false): the
+//   guard holds only this mapping's pages, and the game polling the release through the other one would see the new
+//   bytes, written through the backing view, before the earlier jobs ran;
+// - a guarded write refused (GuardedWrite's false: a page guarded with a protection not writable, no backing, the queue
+//   empty after the run's DrainRange, ...): its run and those after it copied after the drain, which waits for the lifts
+//   of the runs written before it too, so the guest mapping shows their bytes then.
+// A trade: a written run's write-protected pages take the write fault (TouchForWrite) where CopyGuestMemory kept their
+// protection and wrote through the backing view.
+static bool GuardedCopy(BufferCache& buffers, uint64_t dst, uint64_t src, uint64_t size, uint64_t& done) {
+	constexpr uint64_t MaxPages = 64;
+	done                        = 0;
+	const uint64_t first        = dst & ~(WriteGuard::Page - 1);
+	if (size == 0 || (dst + size - first + WriteGuard::Page - 1) / WriteGuard::Page > MaxPages) return false;
+	if (dst < src + size && src < dst + size) return false;
+	if (Libs::LibKernel::Memory::ReadFaults(dst, size) || Libs::LibKernel::Memory::ReadFaults(src, size)) return false;
+	if (buffers.IsRegionGpuModified(dst, size) || buffers.IsRegionGpuModified(src, size)) return false;
+	const uint8_t* to   = Libs::LibKernel::Memory::TryGetBackingPointer(dst, size);
+	const uint8_t* from = Libs::LibKernel::Memory::TryGetBackingPointer(src, size);
+	if (to == nullptr || from == nullptr) return false;
+	if (auto& worker = AsyncUpload::Get(); worker.Pushed() <= worker.Done()) return false;
+	// (After the idle test: the address space's shared lock and a coverage lookup a mapping, only when the guard would
+	// be used.)
+	if (!Libs::LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(dst, size)) return false;
+	const auto page_bytes = [&](uint64_t at) { return std::min(WriteGuard::Page - (dst + at) % WriteGuard::Page, size - at); };
+	const auto differs    = [&](uint64_t at) { return std::memcmp(to + at, from + at, page_bytes(at)) != 0; };
+	for (uint64_t at = 0; at < size;) {
+		while (at < size && !differs(at)) at += page_bytes(at);
+		done = at;
+		if (at == size) break;
+		uint64_t end = at;
+		while (end < size && differs(end)) end += page_bytes(end);
+		Spec::HostWriteParts parts;
+		parts.Find(dst + at, from + at, end - at, to + at);
+		if (!CommitGuardedCopyWrite(reinterpret_cast<void*>(dst + at), from + at, static_cast<uint32_t>(end - at)))
+			return false;
+		parts.Note();
+		buffers.NoteGuardedCopyWrite(dst + at, end - at);
+		at = done = end;
+	}
+	return true;
+}
+
 void Speculation::After(Result& result, size_t index) {
 	const Spec::EffectSourceScope source(Spec::EffectSource::Commit);
 	auto&       buffers  = m_renderer.GetBufferCache();
@@ -2178,8 +2243,13 @@ void Speculation::After(Result& result, size_t index) {
 			}
 		}
 		if (write.copy) {
+			// (Under KYTY_SPECULATE=4, the guard on and no full drain yet: the copy made as guarded writes of its
+			// differing destination pages, GuardedCopy above; else, or for what it did not write, the drain and
+			// CopyGuestMemory as before.)
+			uint64_t done = 0;
+			if (batch != 0 && guard && !drained && GuardedCopy(buffers, write.address, write.value, write.size, done)) continue;
 			drain();
-			buffers.CopyGuestMemory(write.address, write.value, write.size);
+			if (done < write.size) buffers.CopyGuestMemory(write.address + done, write.value + done, write.size - done);
 		} else {
 			if (!guard || !CommitGuardedWrite(reinterpret_cast<void*>(write.address), &write.value, write.size)) {
 				drain();

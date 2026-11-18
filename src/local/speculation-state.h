@@ -1850,7 +1850,9 @@ struct HostWriteParts {
 	uint32_t count = 0;
 	uint64_t address = 0, size = 0;
 	bool     whole = true;
-	void Find(uint64_t dst, const void* src, uint64_t bytes) {
+	// (`current`: where the destination's bytes are read when not at `dst` itself: its backing view, for a destination
+	// whose guest mapping a write guard holds; a commit's guarded copy, speculation.cpp's GuardedCopy.)
+	void Find(uint64_t dst, const void* src, uint64_t bytes, const void* current = nullptr) {
 		// (KYTY_SPECULATE_WRITE_PARTS, live speculate_write_parts: 0 logs every write whole, as before.)
 		static auto& on = LiveSwitch::Find("speculate_write_parts", 1);
 		address = dst, size = bytes, count = 0;
@@ -1858,9 +1860,10 @@ struct HostWriteParts {
 		        on.load(std::memory_order_relaxed) == 0;
 		if (whole) return;
 		const auto* from = static_cast<const uint8_t*>(src);
+		const auto* now  = current != nullptr ? static_cast<const uint8_t*>(current) : reinterpret_cast<const uint8_t*>(dst);
 		for (uint64_t at = 0; at < bytes;) {
 			const auto n = std::min(Granule - (dst + at) % Granule, bytes - at);
-			if (std::memcmp(reinterpret_cast<const void*>(dst + at), from + at, n) != 0) {
+			if (std::memcmp(now + at, from + at, n) != 0) {
 				if (count != 0 && parts[count - 1].first + parts[count - 1].second == dst + at) {
 					parts[count - 1].second += n;
 				} else if (count == parts.size()) {

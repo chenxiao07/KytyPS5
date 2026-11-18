@@ -3434,6 +3434,12 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 	write();
 }
 
+// (The guarded write's own fault path, TouchForWrite, marked the pages it found clean CPU-dirty, which moved their
+// epochs; pages CPU-dirty already change no state: their epochs move here, as CopyGuestMemory's NoteHostWrite.)
+void BufferCache::NoteGuardedCopyWrite(uint64_t vaddr, uint64_t size) {
+	m_memory_tracker.NoteHostWrite(vaddr, size);
+}
+
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid registered-region query\n");

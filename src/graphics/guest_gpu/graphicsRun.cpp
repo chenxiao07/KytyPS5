@@ -997,6 +997,16 @@ bool CommitGuardedWrite(void* dst, const void* src, uint32_t size) {
 	return true;
 }
 
+// A run of a commit's processor copy (speculation.cpp, GuardedCopy), its destination pages guarded as a label's are
+// (GuardedWrite: DrainRange over the run, the pages armed, the lift jobs behind the pending ones, the bytes through the
+// backing view); the scout told of it as of the copy's other writes (CopyGuestMemory: NoteHostWrite). False: nothing
+// written that the caller's drain does not order (GuardedWrite).
+bool CommitGuardedCopyWrite(void* dst, const void* src, uint32_t size) {
+	if (!GuardedWrite(dst, src, size)) return false;
+	if (Scout::Running()) Scout::NoteHostWrite(reinterpret_cast<uint64_t>(dst), size);
+	return true;
+}
+
 // A guest memory write of the command processor: a label, or data the game or later work reads. The buffer copies
 // recorded before it are made first (KYTY_ASYNC_UPLOAD): the game takes a label as the GPU being done and may rewrite
 // the buffers those copies read at once, and a copy made after that took the new bytes for the earlier draws (issue

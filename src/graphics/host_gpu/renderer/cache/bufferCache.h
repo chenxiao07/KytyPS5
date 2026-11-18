@@ -151,6 +151,9 @@ public:
 	                bool src_gds);
 	// CopyBuffer's copy on the CPU: only the destination pages whose bytes differ are written.
 	void CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size);
+	// A commit's copy bytes written by a guarded write (speculation.cpp, GuardedCopy): the regions' epochs move, as
+	// CopyGuestMemory's writes move them.
+	void NoteGuardedCopyWrite(uint64_t vaddr, uint64_t size);
 	// Called after an identified small GPU copy; it never submits or publishes guest data.
 	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
 	// KYTY_EAGER_FEEDBACK (live eager_feedback, default off: fps flat in PR #300): GPU thread, the copy-feedback
