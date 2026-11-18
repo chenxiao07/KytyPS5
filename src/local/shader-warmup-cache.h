@@ -98,28 +98,34 @@ template<class A> void Workgroup(A& a, ShaderWorkgroupInputInfo& s) {
     Array(a, s.threads_num);
     Fields(a, s.lds_size_dwords, s.scratch_size_dwords, s.host_subgroup_size, s.wave_size);
 }
+// A vertex input info as a record holds it: what translation and pipeline creation read of it (its slots below
+// resources_num; not the draw's vertex buffers, which the pipeline's vertex input state holds folded), also the form a
+// graphics pipeline's remake keeps it in (PipelineCache::GraphicsRemake). A Writer only reads `s`.
+template<class A> bool VisitVertexInput(A& a, ShaderVertexInputInfo& s) {
+    Fields(a, s.resources_num, s.fetch_attrib_reg, s.fetch_buffer_reg,
+        s.scratch_size_dwords, s.pa_cl_vs_out_cntl, s.start_instance_sgpr, s.fetch_external,
+        s.fetch_embedded, s.clip_space.enabled);
+    Array(a, s.clip_space.scale); Array(a, s.clip_space.offset); Array(a, s.clip_space.half_extent);
+    Workgroup(a, s.mesh);
+    Fields(a, s.mesh.input_primitive, s.mesh.primitives_per_group, s.mesh.vertices_per_group,
+        s.mesh.max_vertices, s.mesh.max_primitives, s.mesh.provoking_vertex);
+    if (!a.Good() || s.resources_num < 0 || s.resources_num > s.RES_MAX ||
+        s.start_instance_sgpr < -1 || s.start_instance_sgpr >= 8 + 32) return false;
+    for (int i = 0; i < s.resources_num; ++i) {
+        Array(a, s.resources[i].fields);
+        auto& dst = s.resources_dst[i];
+        Fields(a, dst.register_start, dst.registers_num, dst.attr_id, dst.fetch_index);
+    }
+    return a.Good();
+}
 template<class A> bool Visit(A& a, Record& r) {
     Fields(a, r.stage, r.hash, r.user_data_count, r.push_cursor);
     if (!Words(a, r.code, 256 * 1024) || !Words(a, r.back_code, 256 * 1024) ||
         !Words(a, r.static_key, 1024) || r.code.empty() || r.user_data_count > 108 ||
         r.push_cursor > 65536) return false;
     if (r.stage == ShaderType::Vertex || r.stage == ShaderType::Mesh) {
-        auto& s = r.vertex;
-        Fields(a, s.resources_num, s.fetch_attrib_reg, s.fetch_buffer_reg,
-            s.scratch_size_dwords, s.pa_cl_vs_out_cntl, s.start_instance_sgpr, s.fetch_external,
-            s.fetch_embedded, s.clip_space.enabled);
-        Array(a, s.clip_space.scale); Array(a, s.clip_space.offset); Array(a, s.clip_space.half_extent);
-        Workgroup(a, s.mesh);
-        Fields(a, s.mesh.input_primitive, s.mesh.primitives_per_group, s.mesh.vertices_per_group,
-            s.mesh.max_vertices, s.mesh.max_primitives, s.mesh.provoking_vertex);
-        if (!a.Good() || s.resources_num < 0 || s.resources_num > s.RES_MAX ||
-            s.start_instance_sgpr < -1 || s.start_instance_sgpr >= 8 + 32) return false;
-        for (int i = 0; i < s.resources_num; ++i) {
-            Array(a, s.resources[i].fields);
-            auto& dst = s.resources_dst[i];
-            Fields(a, dst.register_start, dst.registers_num, dst.attr_id, dst.fetch_index);
-        }
-        if ((r.stage == ShaderType::Mesh) != (s.mesh.threads_num[0] != 0)) return false;
+        if (!VisitVertexInput(a, r.vertex) || (r.stage == ShaderType::Mesh) != (r.vertex.mesh.threads_num[0] != 0))
+            return false;
     } else if (r.stage == ShaderType::Pixel) {
         auto& s = r.pixel;
         Fields(a, s.lod_stats_subgroup, s.input_num, s.ps_system_input_base,

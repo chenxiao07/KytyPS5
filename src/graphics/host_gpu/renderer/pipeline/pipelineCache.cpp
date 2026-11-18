@@ -3083,27 +3083,42 @@ bool KeepsRemake(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, bo
 }
 } // namespace
 
-// What a graphics pipeline is made of, as its remake keeps it (~11 KB: the vertex input info's 32 resource slots), without
-// the draw's resource values (ShaderStageRuntime::resources: no part of the pipeline). Cold memory once made.
+// What a graphics pipeline is made of, as its remake keeps it, without the draw's resource values
+// (ShaderStageRuntime::resources: no part of the pipeline). Cold memory once made.
 struct PipelineCache::GraphicsMakeInputs {
 	PipelineRenderingState   rendering;
 	PipelineVertexInputState vertex_input;
 	PipelineStaticParameters static_params;
-	ShaderVertexInputInfo    vs_input_info;
 	ShaderPixelInputInfo     ps_input_info;
 	ShaderProgram            vertex_program;
 	ShaderProgram            pixel_program;
 	bool                     ps_active       = false;
 	bool                     native_bindings = false;
 	bool                     table           = false; // the table pipelines' driver cache
+	// The vertex input info as a warmup record holds it (LocalShaderWarmup::VisitVertexInput: what pipeline creation
+	// reads of it), and its program. Whole, its three 32-slot arrays made ~10 KB of a remake's ~11 (16 GB policy at 1-1:
+	// 1,337 remakes held 14.6 MiB, growing with the pipelines of every world played).
+	std::vector<uint32_t>                           vs_input_words;
+	const ShaderRecompiler::IR::CompiledShaderInfo* vs_program = nullptr;
+
+	void SetVertexInput(const ShaderVertexInputInfo& info) {
+		LocalShaderWarmup::Writer writer; // (only reads it)
+		EXIT_IF(!LocalShaderWarmup::VisitVertexInput(writer, const_cast<ShaderVertexInputInfo&>(info)));
+		vs_input_words = std::move(writer.words);
+		vs_input_words.shrink_to_fit();
+		vs_program = info.stage.program;
+	}
 };
 
 std::shared_ptr<const std::function<void(PipelineCache::Pipeline&)>>
 PipelineCache::GraphicsRemake(GraphicsMakeInputs inputs) {
-	inputs.vs_input_info.stage.resources = {};
 	inputs.ps_input_info.stage.resources = {};
 	return std::make_shared<const std::function<void(Pipeline&)>>([this, in = std::move(inputs)](Pipeline& target) {
-		CreatePipelineInternal(m_graphics, target, in.rendering, in.vertex_input, in.vs_input_info, in.vertex_program,
+		const auto                vs_input_info = std::make_unique<ShaderVertexInputInfo>();
+		LocalShaderWarmup::Reader reader {in.vs_input_words};
+		EXIT_IF(!LocalShaderWarmup::VisitVertexInput(reader, *vs_input_info) || reader.cursor != in.vs_input_words.size());
+		vs_input_info->stage.program = in.vs_program;
+		CreatePipelineInternal(m_graphics, target, in.rendering, in.vertex_input, *vs_input_info, in.vertex_program,
 		                       in.ps_active ? &in.ps_input_info : nullptr, in.pixel_program, in.static_params,
 		                       in.table ? TablePipelineCache() : m_driver_cache, in.native_bindings, PipelineBuild::Full);
 	});
@@ -4995,7 +5010,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 				inputs.rendering       = job->rendering;
 				inputs.vertex_input    = job->vertex_input;
 				inputs.static_params   = job->static_params;
-				inputs.vs_input_info   = job->vs_input_info;
+				inputs.SetVertexInput(job->vs_input_info);
 				inputs.ps_input_info   = job->ps_input_info;
 				inputs.ps_active       = job->ps_active;
 				inputs.vertex_program  = job->vertex_program;
@@ -5069,7 +5084,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 		inputs.rendering       = rendering;
 		inputs.vertex_input    = iter->first.vertex_input;
 		inputs.static_params   = static_params;
-		inputs.vs_input_info   = vs_input_info;
+		inputs.SetVertexInput(vs_input_info);
 		inputs.ps_active       = ps_active;
 		inputs.vertex_program  = vertex_program;
 		inputs.pixel_program   = pixel_program;
