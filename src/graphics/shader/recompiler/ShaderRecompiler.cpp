@@ -804,7 +804,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	info_options.compute = compute;
 	IR::CollectShaderInfo(ir, info_options);
 	if (options.table_mode) {
-		IR::EnterTableMode(ir);
+		IR::EnterTableMode(ir, options.table_dense_indirect);
 		ir.table_slots_at_use = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureTableSlotsAtUse) != 0;
 	}
 	ir.native_float_min_max =

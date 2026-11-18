@@ -456,6 +456,9 @@ struct BindingLayout {
 	uint32_t                       buffer_word_count = 0; // one per buffer (BufferWord), or none
 	uint32_t                       lod_stats_count = 0;
 	uint32_t                       table_block_dwords = 0; // table mode: the block's device address (TablePlan)
+	// KYTY_SPEC_PAIR_DENSE_INDIRECT: the LOD statistics words (lod_stats_count of them) are in the table block
+	// (TablePlan::LodStatsBlockDword), not in the shader data. In memory only (not serialized).
+	bool                           lod_stats_in_block = false;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
@@ -466,7 +469,7 @@ struct BindingLayout {
 		return BufferWordDword() + buffer_word_count;
 	}
 	[[nodiscard]] uint32_t TableBlockDword() const {
-		return LodStatsDword() + lod_stats_count;
+		return LodStatsDword() + (lod_stats_in_block ? 0u : lod_stats_count);
 	}
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
 		return TableBlockDword() + table_block_dwords;
@@ -622,7 +625,12 @@ struct TablePlan {
 	static constexpr uint32_t IndirectCapacity      = 16;
 	static constexpr uint32_t IndirectMaxKeys       = 64;
 	static constexpr uint32_t IndirectMappingDwords = 1 + 2 * IndirectMaxKeys;
+	// KYTY_SPEC_PAIR_DENSE_INDIRECT: dense roots a vertex or pixel program may have (a compute program: one probe).
+	static constexpr uint32_t IndirectMaxRoots = 4;
 	std::vector<IndirectImage> indirect;
+	// KYTY_SPEC_PAIR_DENSE_INDIRECT: a pixel program's LOD statistics words in the block after the mappings (this many,
+	// one an image: BindingLayout::lod_stats_in_block), not in its push data; 0: none there. In memory only.
+	uint32_t lod_stats_words = 0;
 
 	// A buffer's dwords in the block: its device address (2), size in dwords, buffer word (IR::BufferWord, as
 	// IR::BufferDescriptorWord makes it) and stride, all from the V# the renderer resolved.
@@ -630,8 +638,11 @@ struct TablePlan {
 	[[nodiscard]] uint32_t BufferDword(size_t buffer) const {
 		return static_cast<uint32_t>(slots.size() + BufferDwords * buffer);
 	}
-	[[nodiscard]] uint32_t BlockDwords() const {
+	[[nodiscard]] uint32_t LodStatsBlockDword() const {
 		return BufferDword(buffers.size()) + static_cast<uint32_t>(indirect.size()) * IndirectMappingDwords;
+	}
+	[[nodiscard]] uint32_t BlockDwords() const {
+		return LodStatsBlockDword() + lod_stats_words;
 	}
 	bool                   operator==(const TablePlan&) const = default;
 };

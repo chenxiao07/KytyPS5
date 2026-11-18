@@ -116,8 +116,9 @@ void RetryTableUserData(const Program& program, BindingLayout& next, uint32_t st
 	next.push_data_start_dword = PushData::StartFor(start, next.ShaderDataDwords());
 	const auto reduced         = static_cast<uint32_t>(next.user_data_registers.size());
 	if (!next.UsesPushData()) {
-		EXIT("shader binding layout failed: %s (reduced %u -> %u, cursor %u, needs %u of %u)",
-		     TablePushOverflowText, plain, reduced, start, next.ShaderDataDwords(), PushData::DwordCount);
+		EXIT("shader binding layout failed: %s (reduced %u -> %u, cursor %u, needs %u of %u)%s",
+		     TablePushOverflowText, plain, reduced, start, next.ShaderDataDwords(), PushData::DwordCount,
+		     next.lod_stats_in_block ? TableDensePushText : ""); // (KYTY_SPEC_PAIR_DENSE_INDIRECT's count)
 		std::abort();
 	}
 	const char* stage = program.stage == ShaderType::Vertex  ? "VS"
@@ -280,7 +281,7 @@ bool PlanningOnlyHandle(const Program& program, const Inst& handle) {
 	       });
 }
 
-void EnterTableMode(Program& program) {
+void EnterTableMode(Program& program, bool dense_indirect) {
 	const auto refuse = [&](const char* reason) {
 		EXIT("table mode refused: hash=0x%016" PRIx64 " %s\n", program.shader_hash, reason);
 	};
@@ -367,13 +368,50 @@ void EnterTableMode(Program& program) {
 		if (image.indirect_root != ImageResource::NoIndirectImage) {
 			if (image.indirect_root == index) {
 				const auto& probe = program.descriptor_sources.at(image.source).indirect_image;
-				if (program.stage != ShaderType::Compute || !probe || probe->item_bound == 0 || probe->key_bound != 0 ||
-				    probe->item_bound + 1u > TablePlan::IndirectMaxKeys || !plan.indirect.empty() ||
+				// KYTY_SPEC_PAIR_DENSE_INDIRECT (`dense_indirect`): a vertex or pixel program's dense table (its T#s at
+				// heap + table_offset + key * 32, the key below key_bound: ResourceTracking's TryMakeDenseIndirectImage),
+				// without a loop bound, of at most IndirectMaxKeys keys: the renderer enumerates it as resource
+				// materialization does (EnumerateDense), every key 0..key_bound-1 in the mapping. Without the option, or
+				// another form, refused as before.
+				// Several dense roots in one program (two material tables, images 0 and 9 of Demon's Souls' PS c509ed46 and
+				// five more), each its own entry: its own enumeration, mapping, elements (TableIndirectForm pads each root's
+				// group) and LOD statistics words in the block (AllocateBindings), up to IndirectMaxRoots.
+				const bool graphics = program.stage == ShaderType::Vertex || program.stage == ShaderType::Pixel;
+				const bool dense    = dense_indirect && graphics && probe && probe->key_bound != 0 && probe->item_bound == 0 &&
+				                   probe->bound_source == DescriptorSource::IndirectImage::NoBoundSource &&
+				                   probe->key_bound <= TablePlan::IndirectMaxKeys;
+				const bool roots    = dense ? plan.indirect.size() >= TablePlan::IndirectMaxRoots : !plan.indirect.empty();
+				if ((!dense && (program.stage != ShaderType::Compute || !probe || probe->item_bound == 0 ||
+				                probe->key_bound != 0 || probe->item_bound + 1u > TablePlan::IndirectMaxKeys)) ||
+				    roots ||
 				    image.mip_mode != ImageMipMode::None || image.written || image.atomic ||
 				    image.resource_class == ImageResourceClass::Storage ||
 				    image.indirect_search_iterations != ImageResource::RuntimeIndirectSearch ||
-				    image.indirect_resources.size() != TablePlan::IndirectCapacity)
-					refuse("an indirect image or one of dynamic mip levels");
+				    image.indirect_resources.size() != TablePlan::IndirectCapacity) {
+					// (KYTY_SPEC_PAIR_DENSE_INDIRECT: with the option, a vertex or pixel root refused says which condition, the
+					// pipeline cache counting each (spec_pair_dense_root_*). Without it, the base's text as before.)
+					const bool image_form = image.mip_mode != ImageMipMode::None || image.written || image.atomic ||
+					                        image.resource_class == ImageResourceClass::Storage;
+					refuse(dense_indirect && graphics
+					           ? (!dense     ? "an indirect image or one of dynamic mip levels: dense indirect image root: another form"
+					              : roots    ? "an indirect image or one of dynamic mip levels: dense indirect image root: roots"
+					              : image_form ? "an indirect image or one of dynamic mip levels: dense indirect image root: image form"
+					              : image.indirect_search_iterations != ImageResource::RuntimeIndirectSearch
+					                         ? "an indirect image or one of dynamic mip levels: dense indirect image root: search"
+					                         : "an indirect image or one of dynamic mip levels: dense indirect image root: elements")
+					       : "an indirect image or one of dynamic mip levels");
+				}
+				if (dense) {
+					// (No records table: the keys are 0..key_bound-1. The heap's address only.)
+					const auto& heap      = program.descriptor_sources.at(probe->heap_source);
+					const auto  heap_low  = TableOperand(heap.dwords[0], program.srt_reads.size()),
+					           heap_high = TableOperand(heap.dwords[1], program.srt_reads.size());
+					if (heap.dword_count != 2 || !heap_low || !heap_high)
+						refuse("an indirect image table mode cannot address: dense indirect image root: address");
+					plan.indirect.push_back({index, *probe, TablePlan::Operand {}, TablePlan::Operand {}, *heap_low, *heap_high, 0});
+					plan.images.emplace_back(); // (no words)
+					continue;
+				}
 				const auto& records = program.descriptor_sources.at(probe->material_source);
 				const auto& heap    = program.descriptor_sources.at(probe->heap_source);
 				const auto  records_low = TableOperand(records.dwords[0], program.srt_reads.size()),
@@ -384,8 +422,14 @@ void EnterTableMode(Program& program) {
 				    !heap_high)
 					refuse("an indirect image table mode cannot address");
 				plan.indirect.push_back({index, *probe, *records_low, *records_high, *heap_low, *heap_high, 0});
-			} else if (plan.indirect.empty() || image.indirect_root != plan.indirect.back().root) {
-				refuse("an indirect image or one of dynamic mip levels");
+			} else if (std::ranges::none_of(plan.indirect, [&](const TablePlan::IndirectImage& entry) {
+				           return entry.root == image.indirect_root;
+			           })) {
+				// (Its root's entry, any of them: one root, the last as before; several dense roots, each group's. The base's
+				// text without the option: KYTY_SPEC_PAIR_DENSE_INDIRECT's count reads the other.)
+				refuse(dense_indirect && (program.stage == ShaderType::Vertex || program.stage == ShaderType::Pixel)
+				           ? "an indirect image or one of dynamic mip levels: indirect image candidate without its root"
+				           : "an indirect image or one of dynamic mip levels");
 			}
 			plan.images.emplace_back(); // (no words)
 			continue;
@@ -465,6 +509,15 @@ void EnterTableMode(Program& program) {
 		const auto& read = plan.slots[slot];
 		for (const auto* operand: {&read.low, &read.high, &read.offset, &read.records}) mark(plan.cpu, *operand);
 	}
+	// KYTY_SPEC_PAIR_DENSE_INDIRECT: a line for each program taken with a dense root (the table module made for it).
+	if (dense_indirect && program.stage != ShaderType::Compute)
+		for (const auto& entry: plan.indirect) {
+			static std::atomic<uint32_t> reports {0};
+			if (reports.fetch_add(1, std::memory_order_relaxed) < 64)
+				std::printf("Table: dense indirect root: %s 0x%016" PRIx64 " image %u keys %u table 0x%x\n",
+				            program.stage == ShaderType::Vertex ? "VS" : "PS", program.shader_hash, entry.root,
+				            static_cast<unsigned>(entry.probe.key_bound), static_cast<unsigned>(entry.probe.table_offset));
+		}
 	program.table_plan    = std::move(plan);
 	program.table_mode    = true;
 	program.info.uses_dma = true;
@@ -491,6 +544,14 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool ena
 	if (enable_lod_stats && program.stage == ShaderType::Pixel && !program.info.images.empty()) {
 		next.lod_stats_count = static_cast<uint32_t>(program.info.images.size());
 		AddBinding(next, DescriptorBindingKind::LodStats);
+		// KYTY_SPEC_PAIR_DENSE_INDIRECT: a table pixel program with an indirect plan (only a dense root takes one in a
+		// pixel program, EnterTableMode's option) keeps its LOD statistics words in its block after the mappings
+		// (TablePlan::lod_stats_words): 16 elements a root would not fit the push constants (two roots and ~10 images:
+		// 40 words of 32). The same words, one an image, the emitter reading them from the block (EmitLodStats).
+		if (program.table_mode && !program.table_plan.indirect.empty()) {
+			next.lod_stats_in_block            = true;
+			program.table_plan.lod_stats_words = next.lod_stats_count;
+		}
 	}
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
@@ -560,7 +621,11 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool ena
 	if (program.table_mode && table_dead_user_data && next.ShaderDataDwords() != 0 && !next.UsesPushData())
 		RetryTableUserData(program, next, push_data_start_dword);
 	if (next.ShaderDataDwords() != 0 && !next.UsesPushData()) {
-		if (program.table_mode) BindingFail(TablePushOverflowText);
+		if (program.table_mode) {
+			// (KYTY_SPEC_PAIR_DENSE_INDIRECT: a program with LOD words in its block names it, for the count.)
+			static const std::string dense_text = std::string(TablePushOverflowText) + TableDensePushText;
+			BindingFail(next.lod_stats_in_block ? dense_text.c_str() : TablePushOverflowText);
+		}
 		AddBinding(next, DescriptorBindingKind::ShaderData);
 	}
 

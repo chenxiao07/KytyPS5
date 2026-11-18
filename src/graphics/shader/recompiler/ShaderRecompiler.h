@@ -27,6 +27,10 @@ struct CompileOptions {
 	// Table mode: the user data laid out without those registers whether they fit or not (IR::AllocateBindings;
 	// KYTY_SPEC_PAIR_PUSH_FIT: the pipeline cache sets it for a pixel program's reduced table form only).
 	bool                        table_reduce_user_data     = false;
+	// Table mode: a vertex or pixel program's dense indirect image (a T# table indexed by a bounded key) taken as an
+	// indirect root, as a compute program's address probe is (IR::EnterTableMode; KYTY_SPEC_PAIR_DENSE_INDIRECT, the
+	// renderer sets it).
+	bool                        table_dense_indirect       = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;

@@ -603,6 +603,21 @@ static bool OverflowElsewhere(const P& p, uint32_t cursor, bool push_fit) {
 	return push_fit && !p.handle && p.table_overflow_cursor != UINT32_MAX && p.table_overflow_cursor != cursor;
 }
 
+// KYTY_SPEC_PAIR_DENSE_INDIRECT (live spec_pair_dense_indirect; mode-toggle row {1, 0}: KYTY_SPECULATE=4 only, the mode checked first):
+// a vertex or pixel table translation takes a dense indirect image (a T# table indexed by a bounded key: Demon's Souls'
+// material pixel programs, ~3 'table: pair refused' holes a frame) as an indirect root, as a compute program's address
+// probe is (CompileOptions::table_dense_indirect, IR::EnterTableMode; the renderer enumerates it per draw, TableEvaluate's
+// TableEnumerateDense, and binds its elements in that order, TableResolveSet). Read where a table translation is asked
+// for (the job's options, AheadJob's, the static precompile's), as table_dead_user_data: a module made keeps its form, a
+// program refused before it is on stays refused (on from start-up, by its environment variable). Off: EnterTableMode
+// refuses those programs as before, so no module, key or path changes. On: new table modules only for the programs
+// refused today for that root ("indirect image root (compute only)"), and new table pipeline keys for their pairs.
+static bool TableDenseIndirectOn() {
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return false;
+	static auto& on = LiveSwitch::Find("spec_pair_dense_indirect", ModeToggle::Default("spec_pair_dense_indirect"));
+	return on.load(std::memory_order_relaxed) != 0;
+}
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -677,7 +692,30 @@ struct PipelineCache::ProgramCache {
 	};
 	// A table job's translation, on the worker that takes it: the one call both the draw's job (Get) and one made ahead
 	// (PostTableAhead) run, over the job's own inputs.
+	// KYTY_SPEC_PAIR_DENSE_INDIRECT (spec_pair_dense_root_*): a vertex or pixel table translation refused with the option on,
+	// by the condition its text names: a root of another form (a loop bound, a key bound over 64, not dense), more roots
+	// than IndirectMaxRoots, a written or dynamic-mip image, no runtime search, other than 16 elements (TableIndirectForm
+	// left it: a group of more candidates, more images), a heap table mode cannot address, a candidate without its root,
+	// shader data not fitting the push constants with the LOD words in the block.
+	static void NoteDenseRefusal(const std::string& refused) {
+		using L         = LiveCounters::Id;
+		const auto root = refused.find(ShaderRecompiler::IR::TableDenseRootText);
+		if (root != std::string::npos) {
+			const auto what = std::string_view(refused).substr(root + std::strlen(ShaderRecompiler::IR::TableDenseRootText));
+			LiveCounters::Add(what.starts_with("another form") ? L::SpecPairDenseRootForm
+			                  : what.starts_with("roots")      ? L::SpecPairDenseRootRoots
+			                  : what.starts_with("image form") ? L::SpecPairDenseRootImage
+			                  : what.starts_with("search")     ? L::SpecPairDenseRootSearch
+			                  : what.starts_with("elements")   ? L::SpecPairDenseRootElements
+			                                                   : L::SpecPairDenseRootAddress);
+		} else if (refused.find("indirect image candidate without its root") != std::string::npos) {
+			LiveCounters::Add(L::SpecPairDenseRootCandidate);
+		} else if (refused.find(ShaderRecompiler::IR::TableDensePushText) != std::string::npos) {
+			LiveCounters::Add(L::SpecPairDenseRootPush);
+		}
+	}
 	static void RunTableJob(TableJob& job, vk::Device device) {
+		const auto begin = std::chrono::steady_clock::now(); // (KYTY_SPEC_PAIR_DENSE_INDIRECT's compile time)
 		try {
 			Common::RecoverableExitScope recoverable;
 			auto translated = ShaderRecompiler::TranslateProgram(job.code, job.options);
@@ -690,6 +728,25 @@ struct PipelineCache::ProgramCache {
 			job.refused = refused.message;
 			if (job.refused.empty() || job.refused.back() != '\n') job.refused += '\n';
 		}
+		// KYTY_SPEC_PAIR_DENSE_INDIRECT: a vertex or pixel table module with a dense root (the only indirect root those
+		// stages take), counted with its time; the first ones printed with how it was asked for (a draw's job: its pair's
+		// draws took the normal path until it was done; ahead: before its first draw).
+		if (job.options.table_dense_indirect && job.result && job.options.stage != ShaderType::Compute &&
+		    !job.info.table_plan.indirect.empty()) [[unlikely]] {
+			const auto us = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count());
+			LiveCounters::Add(LiveCounters::SpecPairDenseCompiles);
+			LiveCounters::Add(LiveCounters::SpecPairDenseCompileUs, us);
+			static std::atomic<uint32_t> reports {0};
+			if (reports.fetch_add(1, std::memory_order_relaxed) < 32)
+				std::printf("Table: dense indirect module: %s 0x%016llx compiled in %.1f ms (%s)\n",
+				            job.options.stage == ShaderType::Pixel ? "PS" : "VS",
+				            static_cast<unsigned long long>(job.options.shader_hash), static_cast<double>(us) / 1000.0,
+				            job.ahead ? "ahead" : "draw");
+		}
+		// (Refused with the option on: each condition counted, by the texts EnterTableMode and AllocateBindings give.)
+		if (job.options.table_dense_indirect && !job.refused.empty() && job.options.stage != ShaderType::Compute)
+			[[unlikely]] NoteDenseRefusal(job.refused);
 		if (job.ahead && job.after) job.after(job);
 		job.done.store(true, std::memory_order_release);
 		if (job.ahead && job.after_done) job.after_done(job);
@@ -2772,7 +2829,8 @@ struct PipelineCache::ProgramCache {
 			}
 			// An indirect image with the table program's elements (its candidates' count is the draw's or dispatch's:
 			// one program takes any), the snapshot it binds from padded alike (TableResolveSet).
-			(void)ShaderRecompiler::IR::TableIndirectForm(table_specialization, &resources.images);
+			(void)ShaderRecompiler::IR::TableIndirectForm(table_specialization, &resources.images,
+			                                              TableDenseIndirectOn() && (stage == ShaderType::Vertex || stage == ShaderType::Pixel));
 		};
 		if (entry != programs.end()) {
 			const ShaderRecompiler::IR::ResourceSpecialization* borrowed_specialization = nullptr;
@@ -2935,6 +2993,7 @@ struct PipelineCache::ProgramCache {
 				job->options.table_mode = true;
 				job->options.table_dead_user_data = TableDeadUserDataOn();
 				job->options.table_reduce_user_data = table_reduced;
+				job->options.table_dense_indirect = TableDenseIndirectOn();
 				job->options.user_data = job->user_data;
 				job->options.back_code = job->back_code;
 				job->options.input_info = {};
@@ -3474,11 +3533,14 @@ struct PipelineCache::ProgramCache {
 		LocalShaderWarmup::Record record;
 	};
 	// The table form of a seed's specialization, as Get's table branch makes it (table_portable 0: no byte-base offsets,
-	// the indirect image's form).
+	// the indirect image's form; a dense root's for a vertex or pixel program only, as Get's).
 	static ShaderRecompiler::IR::ResourceSpecialization AheadSpecialization(const AheadSeed& seed) {
 		auto table_specialization = seed.record.specialization;
 		for (auto& buffer: table_specialization.buffers) buffer.byte_base_offset = false;
-		(void)ShaderRecompiler::IR::TableIndirectForm(table_specialization, nullptr);
+		const auto stage = seed.record.stage;
+		(void)ShaderRecompiler::IR::TableIndirectForm(table_specialization, nullptr,
+		                                              TableDenseIndirectOn() &&
+		                                                  (stage == ShaderType::Vertex || stage == ShaderType::Pixel));
 		return table_specialization;
 	}
 	// The job of `seed`'s table program at `cursor`, put into its entry as Get's table branch makes one (under the cache's
@@ -3532,6 +3594,7 @@ struct PipelineCache::ProgramCache {
 		}
 		options.table_mode           = true;
 		options.table_dead_user_data = TableDeadUserDataOn();
+		options.table_dense_indirect = TableDenseIndirectOn();
 		options.user_data            = job->user_data;
 		options.back_code            = job->back_code;
 		source.table_jobs.push_back(job);

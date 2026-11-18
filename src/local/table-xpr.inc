@@ -477,6 +477,9 @@ struct RenderExecutor::TableXpr {
 	// An indirect image's candidates for the draw or dispatch being made (per stage), in the order its set binds them
 	// (TableEvaluate: the set's key; TableResolveSet), and the enumeration's scratch.
 	std::array<std::vector<ShaderRecompiler::IR::DescriptorValue>, 2> indirect;
+	// (KYTY_SPEC_PAIR_DENSE_INDIRECT: per stage, each indirect image's count of them in `indirect`, in plan order: a
+	// program with several dense roots has their candidates one after another there.)
+	std::array<std::vector<uint32_t>, 2>                              indirect_counts;
 	ShaderRecompiler::IR::AddressProbeCandidates                      probe;
 };
 // KYTY_TABLE_MEMO: a descriptor set left service (NativeXprRetireSet): a memo entry may hold it.
@@ -1580,6 +1583,10 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 					return nullptr; // (no set this draw: the next one compiles the pair again)
 				}
 			}
+			// (KYTY_SPEC_PAIR_DENSE_INDIRECT: counted for a pair with a dense root: its candidates' shapes another program's.)
+			if (!pair.programs[0]->table_plan.indirect.empty() ||
+			    (stages == 2 && !pair.programs[1]->table_plan.indirect.empty()))
+				LiveCounters::Add(LiveCounters::SpecPairDenseShapeRefused);
 			return refuse(vertex_info.stage.program != pair.programs[0] ? "another specialization (VS)"
 			                                                            : "another specialization (PS)");
 		}
@@ -1682,6 +1689,47 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				if (found == elements.end() || elements[j] >= images.size() || *found >= original.size())
 					return refuse("indirect candidates differ");
 				images[elements[j]] = original[*found];
+			}
+		}
+	} else {
+		// KYTY_SPEC_PAIR_DENSE_INDIRECT: a vertex or pixel program's dense indirect image (a draw's), as the dispatch's
+		// above, per stage: its root's elements in the order of the candidates the set's key holds (TableEvaluate's: key
+		// 0's first, the rest by their words), each found among the stage's own (the normal path's materialization,
+		// MaterializeDenseIndirectImage: each distinct T# in the order of the first key that names it), past them the
+		// null images it was padded with. Required: the block's mapping (TableEvaluate) names element positions in the
+		// key's order; bound in the specialization's order instead, a key whose T# sorts elsewhere would sample another
+		// key's texture. (No stage has an indirect image without the switch: a pair's programs, never a module, decide.)
+		for (uint32_t st = 0; st < stages; ++st) {
+			const auto& program = *pair.programs[st];
+			if (program.table_plan.indirect.empty()) continue;
+			LiveCounters::Add(LiveCounters::SpecPairDenseSetMisses);
+			const auto differ = [&] {
+				LiveCounters::Add(LiveCounters::SpecPairDenseSetDiffer);
+				ResetBindings();
+				return refuse("indirect candidates differ");
+			};
+			// (Each root's candidates, in plan order, one after another in TableEvaluate's `indirect`: its count of them.)
+			const auto& all    = OwnTable().indirect[st];
+			const auto& counts = OwnTable().indirect_counts[st];
+			if (counts.size() != program.table_plan.indirect.size()) return differ();
+			size_t first = 0, t = 0;
+			for (const auto& entry: program.table_plan.indirect) {
+				const auto& elements = program.info.images.at(entry.root).indirect_resources;
+				const auto& own      = runtimes[st]->resources.images;
+				if (first + counts[t] > all.size()) return differ();
+				const auto wanted = std::span<const ShaderRecompiler::IR::DescriptorValue>(all).subspan(first, counts[t]);
+				first += counts[t++];
+				auto& images = prepared[st].images;
+				if (wanted.size() > elements.size()) return differ();
+				const auto original = images;
+				for (size_t j = 0; j < wanted.size(); ++j) {
+					const auto found = std::ranges::find_if(elements, [&](uint32_t resource) {
+						return resource < own.size() && own[resource] == wanted[j];
+					});
+					if (found == elements.end() || elements[j] >= images.size() || *found >= original.size())
+						return differ();
+					images[elements[j]] = original[*found];
+				}
 			}
 		}
 	}
@@ -2041,6 +2089,84 @@ static uint32_t TableCodeWord(const ShaderRecompiler::IR::TablePlan::Operand& op
 	                                                                                    : static_cast<uint32_t>(address >> 32u);
 }
 
+// KYTY_SPEC_PAIR_DENSE_INDIRECT (live spec_pair_dense_indirect, default 0; KYTY_SPECULATE=4 only; the pipeline cache
+// sets CompileOptions::table_dense_indirect from it): a vertex or pixel table program's dense indirect image (T#s at heap +
+// table_offset + key * 32, the key below key_bound: IR::EnterTableMode) enumerated as resource materialization does
+// (IR::EnumerateDense: MaterializeDenseIndirectImage, the normal path's function, over the heap address the block's slots
+// give), with its counts. False: the normal path takes the draw. The enumeration's guest reads are the materialization
+// readers' (MaterializationReaders, as the address probe's): 1 KiB clean span reads of the table, word by word where a
+// span is refused, all through TryReadGpuCleanBackingToHost, which refuses GPU-dirty or GPU-modified bytes and, on a
+// speculation's thread, its own written or journaled ranges (the enumeration then fails: the normal path) and notes the
+// rest as the speculation's clean reads (SpeculationReadsClean / CleanReadKept): the commit re-checks them as it does
+// TableEvaluate's slot reads (NativeXprReader::Read -> ReadJournaled, noted clean): a hole or processor write over them
+// stops the commit before the reading segment (an unvalued read: any write; ReadJournaled's are valued). Its range sync
+// (MakeRangeReadable) refuses the speculation over GPU-written bytes (SyncGpuCleanBackingSpec); on the GPU thread it reads
+// them back, as the normal path's materialization does at that draw.
+[[gnu::noinline]] static bool TableEnumerateDense(const ShaderRecompiler::IR::TablePlan::IndirectImage& entry,
+                                                  const ShaderRecompiler::IR::ImageResource& root, uint64_t heap,
+                                                  const ShaderRecompiler::IR::SrtRuntime&    runtime,
+                                                  ShaderRecompiler::IR::AddressProbeCandidates& found) {
+	using Plan = ShaderRecompiler::IR::TablePlan;
+	// (KYTY_TABLE_INDIRECT=0 keeps indirect images off the table path: dispatches are declined for one, these draws too.)
+	if (kyty_local_table_indirect_mode.load(std::memory_order_relaxed) == 0)
+		return LiveCounters::Add(LiveCounters::SpecPairDenseRefusedIndirectOff), false;
+	if (!ShaderRecompiler::IR::EnumerateDense(entry.probe, root, heap, runtime, found))
+		return LiveCounters::Add(LiveCounters::SpecPairDenseUnreadable), false;
+	const auto count = static_cast<uint32_t>(found.descriptors.size());
+	uint32_t   valid = 0;
+	for (const auto& descriptor: found.descriptors)
+		if (std::ranges::any_of(descriptor.dwords, [](uint32_t word) { return word != 0; })) ++valid;
+	if (valid > 15) LiveCounters::Add(LiveCounters::SpecPairDenseWide);
+	if (found.dropped_shapes != 0) LiveCounters::Add(LiveCounters::SpecPairDenseShapeDrops);
+	if (count > Plan::IndirectCapacity) return LiveCounters::Add(LiveCounters::SpecPairDenseOverCapacity), false;
+	if (found.keys.size() > Plan::IndirectMaxKeys || found.candidates.size() != found.keys.size())
+		return LiveCounters::Add(LiveCounters::SpecPairDenseRefusedKeys), false;
+	if (count == 0) return LiveCounters::Add(LiveCounters::SpecPairDenseRefusedOther), false;
+	LiveCounters::Add(LiveCounters::SpecPairDenseTaken);
+	return true;
+}
+// KYTY_SPEC_PAIR_DENSE_INDIRECT: a dense candidate's words without the LOD statistics fields (NativeXprLodStatsMask), the
+// form its order and the set's key take.
+static std::array<uint32_t, 8> TableDenseLodMasked(const ShaderRecompiler::IR::DescriptorValue& candidate) {
+	std::array<uint32_t, 8> masked;
+	for (uint32_t w = 0; w < 8; ++w) masked[w] = candidate.dwords[w] & ~NativeXprLodStatsMask[w];
+	return masked;
+}
+// KYTY_SPEC_PAIR_DENSE_INDIRECT: a pixel program's indirect elements' LOD statistics words. TableEvaluate pushes 0 for
+// them (their plan descriptors have no words); element j (the root's indirect_resources[j]) takes candidates[j]'s, the T#
+// the set binds there (TableResolveSet's order), as RebindBuffers gives a normal path element its own T#'s. The stage's
+// words are the last `pushed` of `lod_stats`, by image; elements past the candidates (null images) keep 0. (`candidates`:
+// this root's, of TableEvaluate's `out`.)
+[[gnu::noinline]] static void TableDenseLodStats(const ShaderRecompiler::IR::CompiledShaderInfo&            program,
+                                                 const ShaderRecompiler::IR::TablePlan::IndirectImage&       entry,
+                                                 std::span<const ShaderRecompiler::IR::DescriptorValue>      candidates,
+                                                 std::vector<uint32_t>&                                      lod_stats) {
+	const auto pushed = std::min<size_t>(program.bindings.lod_stats_count, program.table_plan.images.size());
+	if (lod_stats.size() < pushed || entry.root >= program.info.images.size()) return;
+	const auto  base     = lod_stats.size() - pushed;
+	const auto& elements = program.info.images[entry.root].indirect_resources;
+	for (size_t j = 0; j < candidates.size() && j < elements.size(); ++j) {
+		if (elements[j] >= pushed) continue;
+		ShaderTextureResource desc;
+		std::memcpy(&desc, candidates[j].dwords.data(), sizeof(desc));
+		lod_stats[base + elements[j]] = desc.MipStatsCntEn() ? (0x80000000u | desc.MipStatsCntId() |
+		                                                        (uint32_t(desc.BaseLevel()) << 8u) |
+		                                                        (uint32_t(desc.MinLodWarn5()) << 12u))
+		                                                     : 0u;
+	}
+}
+// KYTY_SPEC_PAIR_DENSE_INDIRECT: a pixel program whose LOD statistics words are in its block (lod_stats_in_block, a
+// program with a dense root): the stage's words (the last `words` of `lod_stats`, by image) copied to
+// TablePlan::LodStatsBlockDword, where the shader reads them (TableDraw pushes none for it).
+[[gnu::noinline]] static void TableDenseLodToBlock(const ShaderRecompiler::IR::TablePlan& plan,
+                                                   const std::vector<uint32_t>& lod_stats, std::vector<uint32_t>& block) {
+	const auto words = std::min<size_t>(plan.lod_stats_words, lod_stats.size());
+	const auto at    = plan.LodStatsBlockDword();
+	if (block.size() < at + plan.lod_stats_words) return;
+	std::fill_n(block.begin() + at, plan.lod_stats_words, 0u);
+	std::copy_n(lod_stats.end() - static_cast<ptrdiff_t>(words), words, block.begin() + at);
+}
+
 // The slots of the pair's stages, read into their blocks where the plans address them from the user data and lower
 // slots (a pointer read from memory may hold anything: what is read through it must be mapped), and the T#/S# words
 // they make (TableXpr::words, the set's key) and the pixel stage's LOD statistics words. False: something unmapped.
@@ -2134,6 +2260,7 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 		const auto& program = *pair.programs[st];
 		auto&       out     = table.indirect[st];
 		out.clear();
+		table.indirect_counts[st].clear();
 		if (program.table_plan.indirect.empty()) return true;
 		thread_local const auto runtime = [] {
 			ShaderRecompiler::IR::SrtRuntime value;
@@ -2155,9 +2282,15 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 		using Plan = ShaderRecompiler::IR::TablePlan;
 		for (const auto& entry: program.table_plan.indirect) {
 			auto& found = table.probe;
-			if (!ShaderRecompiler::IR::EnumerateAddressProbe(entry.probe, program.info.images[entry.root],
-			                                                 address(entry.records_low, entry.records_high),
-			                                                 address(entry.heap_low, entry.heap_high), runtime, found))
+			// (KYTY_SPEC_PAIR_DENSE_INDIRECT: a vertex or pixel program's dense table, key_bound set (EnterTableMode takes
+			// no other form with one): TableEnumerateDense. The rest is the address probe's: the order, the mapping by
+			// key, the words in the set's key.)
+			if (entry.probe.key_bound != 0
+			        ? !TableEnumerateDense(entry, program.info.images[entry.root], address(entry.heap_low, entry.heap_high),
+			                               runtime, found)
+			        : !ShaderRecompiler::IR::EnumerateAddressProbe(entry.probe, program.info.images[entry.root],
+			                                                       address(entry.records_low, entry.records_high),
+			                                                       address(entry.heap_low, entry.heap_high), runtime, found))
 				return false;
 			const auto count = static_cast<uint32_t>(found.descriptors.size());
 			if (count == 0 || count > Plan::IndirectCapacity || found.keys.size() > Plan::IndirectMaxKeys ||
@@ -2165,10 +2298,24 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 				return false;
 			std::array<uint32_t, Plan::IndirectCapacity> order {}, position {};
 			for (uint32_t j = 0; j < count; ++j) order[j] = j;
-			std::sort(order.begin() + 1, order.begin() + count,
-			          [&](uint32_t a, uint32_t b) { return found.descriptors[a].dwords < found.descriptors[b].dwords; });
+			// (KYTY_SPEC_PAIR_DENSE_INDIRECT: a dense table's candidates ordered, and keyed below, by their words without the
+			// LOD statistics fields, as plain images are keyed: the game reassigns the counters every frame, which never
+			// change an image's resolution or view (NativeXprLodStatsMask), and a key of the full words would make a new
+			// set every frame. Candidates equal without them resolve to the same image: either order binds the same.
+			// The set's own reorder (TableResolveSet) and the LOD words (TableDenseLodStats) take the full words of `out`.)
+			const bool dense = entry.probe.key_bound != 0;
+			if (dense)
+				std::sort(order.begin() + 1, order.begin() + count, [&](uint32_t a, uint32_t b) {
+					return TableDenseLodMasked(found.descriptors[a]) < TableDenseLodMasked(found.descriptors[b]);
+				});
+			else
+				std::sort(order.begin() + 1, order.begin() + count,
+				          [&](uint32_t a, uint32_t b) { return found.descriptors[a].dwords < found.descriptors[b].dwords; });
 			for (uint32_t j = 0; j < count; ++j) position[order[j]] = j;
+			const auto first = out.size(); // (this root's candidates: out[first, first + count); several dense roots)
 			for (uint32_t j = 0; j < count; ++j) out.push_back(found.descriptors[order[j]]);
+			table.indirect_counts[st].push_back(count);
+			const auto own = std::span<const ShaderRecompiler::IR::DescriptorValue>(out).subspan(first, count);
 			std::array<uint32_t, Plan::IndirectMaxKeys> by_key {};
 			const auto keys = static_cast<uint32_t>(found.keys.size());
 			for (uint32_t k = 0; k < keys; ++k) by_key[k] = k;
@@ -2180,9 +2327,21 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 				mapping[1 + 2 * k] = found.keys[by_key[k]];
 				mapping[2 + 2 * k] = position[found.candidates[by_key[k]]];
 			}
+			// (KYTY_SPEC_PAIR_DENSE_INDIRECT: a pixel program's elements have LOD statistics words (a compute program's
+			// none): element j, which the set binds out[j] at, takes out[j]'s, as the normal path's element takes its
+			// own T#'s (RebindBuffers); the stage's words are the last ones pushed above, by image; the padding's null: 0.)
+			if (program.bindings.lod_stats_count != 0) TableDenseLodStats(program, entry, own, table.lod_stats);
 			words.push_back(count);
-			for (const auto& candidate: out) words.insert(words.end(), candidate.dwords.begin(), candidate.dwords.end());
+			if (dense)
+				for (const auto& candidate: own) {
+					const auto masked = TableDenseLodMasked(candidate);
+					words.insert(words.end(), masked.begin(), masked.end());
+				}
+			else
+				for (const auto& candidate: own) words.insert(words.end(), candidate.dwords.begin(), candidate.dwords.end());
 		}
+		// (KYTY_SPEC_PAIR_DENSE_INDIRECT: a dense pixel program's LOD statistics words, complete now, into its block.)
+		if (program.table_plan.lod_stats_words != 0) TableDenseLodToBlock(program.table_plan, table.lod_stats, table.blocks[st]);
 		return true;
 	};
 	for (uint32_t st = 0; st < stages; ++st) {
@@ -3229,6 +3388,7 @@ static void TableScoutApply(Table& table, const Pair& pair, const Scout::Ticket&
 		in += ticket.slot_words[st];
 		segments += ticket.segments[st];
 		table.indirect[st].clear();
+		table.indirect_counts[st].clear();
 	}
 	in = segments;
 	table.words.assign(in, in + ticket.image_words);
@@ -3733,7 +3893,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			const auto index = bindings.user_data_registers[i] - program.user_data_base;
 			push_data.dwords[bindings.push_data_start_dword + i] = index < user_data[st].size() ? user_data[st][index] : 0;
 		}
-		if (program.stage == ShaderType::Pixel)
+		// (KYTY_SPEC_PAIR_DENSE_INDIRECT: a program with its LOD statistics words in its block has none here: TableEvaluate
+		// put them there.)
+		if (program.stage == ShaderType::Pixel && !bindings.lod_stats_in_block)
 			for (size_t i = 0; i < table.lod_stats.size(); ++i)
 				push_data.dwords[bindings.push_data_start_dword + bindings.LodStatsDword() + i] = table.lod_stats[i];
 		push_data.dwords[bindings.push_data_start_dword + bindings.TableBlockDword()]     = static_cast<uint32_t>(blocks[st]);

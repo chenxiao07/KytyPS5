@@ -17,6 +17,10 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword = 0, bool
 // The text of a table mode refusal because the shader data do not fit the push constants (in the recoverable exit's
 // message; the pipeline cache tells such a refusal by it).
 inline constexpr const char* TablePushOverflowText = "table mode user data do not fit the push constants";
+// KYTY_SPEC_PAIR_DENSE_INDIRECT: appended to that refusal for a program with a dense root (its LOD words in the block),
+// and the start of each refusal of a vertex or pixel root with the option on (the pipeline cache counts them by these).
+inline constexpr const char* TableDensePushText = " [dense indirect]";
+inline constexpr const char* TableDenseRootText = "dense indirect image root: ";
 
 // A handle (GetBufferResource, GetAddressResource) whose every use is a load only the CPU-side plan reads
 // (MemoryInfo::planning_only: LoadAddressU32, ReadConstBuffer), which the SPIR-V emitter emits nothing for, so no word
@@ -25,7 +29,10 @@ inline constexpr const char* TablePushOverflowText = "table mode user data do no
 
 // Table mode (Program::table_mode) for a program it can serve: only reads, of buffers whose V#s and of SRT
 // words whose addresses the flattened SRT plan derives from user data. Exits (recoverable) otherwise.
-void EnterTableMode(Program& program);
+// `dense_indirect` (CompileOptions::table_dense_indirect, KYTY_SPEC_PAIR_DENSE_INDIRECT): a vertex or pixel program's
+// dense indirect image (DescriptorSource::IndirectImage with a key bound, no loop bound) is taken as an indirect root
+// (TablePlan::IndirectImage, its probe's key_bound telling it from a compute program's address probe); refused without.
+void EnterTableMode(Program& program, bool dense_indirect = false);
 
 const DescriptorBinding* FindBinding(const BindingLayout& layout, DescriptorBindingKind kind);
 
