@@ -2,6 +2,7 @@
 #include "live-census.h"
 #include "write-guard.h"
 #include "live-counters.h"
+#include "mode-toggle.h"
 #include "async-upload.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 
@@ -607,6 +608,10 @@ void GpuResourceManager::SynchronizeDirtyBdaRegions(GuestRange range) {
 	const auto first = range.address / TRACKER_REGION_SIZE;
 	if (first >= BdaDirtyRegions::Regions) return;
 	const auto last = std::min((range.End() - 1) / TRACKER_REGION_SIZE, BdaDirtyRegions::Regions - 1);
+	// KYTY_SPEC_BDA_CLEAN_SKIP (live spec_bda_clean_skip; on under KYTY_SPECULATE=4, 0 otherwise: mode-toggle.h; set, it
+	// acts in either mode): in a region synced, a request with no page CPU-dirty is not visited (below).
+	static auto& clean_skip_switch = LiveSwitch::Find("spec_bda_clean_skip", ModeToggle::Default("spec_bda_clean_skip"));
+	const bool   clean_skip        = clean_skip_switch.load(std::memory_order_relaxed) != 0;
 	for (auto word = first / 64; word <= last / 64; ++word) {
 		auto mask = ~uint64_t {0};
 		if (word == first / 64) mask &= ~uint64_t {0} << (first % 64);
@@ -621,6 +626,21 @@ void GpuResourceManager::SynchronizeDirtyBdaRegions(GuestRange range) {
 			    [](const auto& request, uint64_t begin) { return request.address + request.size <= begin; });
 			bool unproven = false;
 			for (; it != m_bda_region_requests.end() && it->address < region_begin + TRACKER_REGION_SIZE; ++it) {
+				// KYTY_SPEC_BDA_CLEAN_SKIP: a request proven before (not new, not unproven: cpu_epoch set), its region's
+				// registrations unchanged since, whose visit would sync (its region's CPU epoch moved), and no page of which
+				// is CPU-dirty under the region's lock: its visit would copy nothing (SynchronizeBuffer's read-only sync
+				// uploads only what IsRegionCpuModified finds; DrainGuestReadback returns at once for it; a sync stamp left
+				// older only makes a later visit look again; the sync index is rebuilt lazily by the next call that needs
+				// it). Skipped, it is proven at the epoch read under that lock, as the visit would have proven it; a
+				// dirtying after it moves the epoch. A forced request (a registration since, or cpu_epoch 0) is visited.
+				if (clean_skip && it->cpu_epoch != 0 &&
+				    it->registration_epoch == m_buffer_cache.RegionRegistrationEpoch(it->address)) {
+					if (const auto now = m_buffer_cache.CpuModificationEpoch(it->address, it->size); now != 0 && now != it->cpu_epoch)
+						if (const auto clean = m_buffer_cache.CleanRangeEpoch(it->address, it->size); clean != 0) {
+							it->cpu_epoch = clean;
+							continue;
+						}
+				}
 				m_buffer_cache.SynchronizeRegionRequest(*it);
 				unproven |= it->cpu_epoch == 0;
 			}

@@ -36,6 +36,16 @@ public:
 		const auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
 		return manager == nullptr ? 0 : manager->CpuModificationEpoch();
 	}
+	// KYTY_SPEC_BDA_CLEAN_SKIP: RegionManager::CleanRangeEpoch for a range within one region, under its lock; no region
+	// manager made (never tracked, all its pages CPU-dirty) or a range over several regions: 0.
+	[[nodiscard]] uint64_t CleanRangeEpoch(uint64_t vaddr, uint64_t size) const {
+		if (!GuestRange {vaddr, size}.Valid() || vaddr / TRACKER_REGION_SIZE != (vaddr + size - 1) / TRACKER_REGION_SIZE)
+			return 0;
+		auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+		if (manager == nullptr) return 0;
+		std::scoped_lock lock(manager->lock);
+		return manager->CleanRangeEpoch(vaddr, size);
+	}
 	// A write protection of the region's pages is queued (KYTY_ASYNC_REPROTECT): their copies are taken
 	// after it lands, so a write before it is uploaded and one after it faults.
 	[[nodiscard]] bool DeferredProtectionPending(uint64_t vaddr) const {

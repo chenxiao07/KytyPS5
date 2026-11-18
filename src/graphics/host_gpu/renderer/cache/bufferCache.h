@@ -246,6 +246,10 @@ public:
 	[[nodiscard]] bool DeferredProtectionPending(uint64_t vaddr) const {
 		return m_memory_tracker.DeferredProtectionPending(vaddr);
 	}
+	// KYTY_SPEC_BDA_CLEAN_SKIP: MemoryTracker::CleanRangeEpoch (GpuResourceManager::SynchronizeDirtyBdaRegions).
+	[[nodiscard]] uint64_t CleanRangeEpoch(uint64_t vaddr, uint64_t size) const {
+		return m_memory_tracker.CleanRangeEpoch(vaddr, size);
+	}
 	[[nodiscard]] uint64_t CpuModificationEpoch(uint64_t vaddr, uint64_t size) const {
 		if (!GuestRange {vaddr, size}.Valid()) return 0;
 		constexpr uint64_t MaxRegions = 64;

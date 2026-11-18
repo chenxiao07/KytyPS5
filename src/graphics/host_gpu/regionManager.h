@@ -260,6 +260,15 @@ public:
 		if (m_deferred_protects.load(std::memory_order_acquire) != 0) return 0;
 		return m_cpu_epoch.load(std::memory_order_acquire);
 	}
+	// KYTY_SPEC_BDA_CLEAN_SKIP (the caller holds `lock`): the region's CPU epoch when no page of [vaddr, vaddr + size) is
+	// CPU-dirty (m_cpu_dirty: the test SynchronizeBuffer makes before it uploads anything) and the epoch proves something
+	// (no write protection queued: CpuModificationEpoch); else 0.
+	[[nodiscard]] uint64_t CleanRangeEpoch(uint64_t vaddr, uint64_t size) const noexcept {
+		const auto epoch = CpuModificationEpoch();
+		if (epoch == 0) return 0;
+		const auto [start, end] = GetPageRange(vaddr, size);
+		return m_cpu_dirty.AnyInRange(start, end) ? 0 : epoch;
+	}
 	// KYTY_ASYNC_REPROTECT: a write protection of pages in this region is queued.
 	void BeginDeferredProtection() noexcept { m_deferred_protects.fetch_add(1, std::memory_order_acq_rel); }
 	[[nodiscard]] bool DeferredProtectionPending() const noexcept {
