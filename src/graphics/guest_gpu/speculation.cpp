@@ -1724,7 +1724,10 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 			// its own or the role's last / previous / memo set, so all move; one only the dropped replay bound may then
 			// stop that segment's commit for nothing: the price of the rule.)
 			for (auto& proposed: result.state.proposed_sets)
-				if (proposed.segment == index) proposed.segment = index + 1;
+				if (proposed.segment == index) {
+					proposed.segment = index + 1;
+					if (proposed.on_hole) proposed.on_hole();
+				}
 			const auto run = RunHole(result, cp, index, false);
 			if (run == HoleRun::Blocked) return result.blocked = index, result.blocked_as_hole = true, Progress::Blocked;
 			if (run == HoleRun::Changed) return Progress::Stopped;

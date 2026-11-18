@@ -292,6 +292,21 @@ struct RenderExecutor::NativeXprDrawState {
 	// spec_depth_layers2 (mode 4 only): the depth target as the normal path resolved it at the capture. Immutable once
 	// captured (a capture again replaces the state): a worker reads it under the catalog's read lock and keeps the pointer.
 	std::shared_ptr<const RenderDepthInfo> depth_info;
+	// (Mode 4, set at captures; TableWorkerEntry) The capture's pipeline inputs (the targets as the normal path resolved
+	// them, whether a pixel shader runs, the topology), immutable once captured (a capture again replaces the state,
+	// capture_id moves; a worker keeps the pointer); the hash of the context registers and the user configuration
+	// (WorkerEntryContextHash); `derived`: made by a worker from a sibling's capture (TableWorkerEntry).
+	struct PipelineInputs {
+		RenderColorInfo       color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+		uint32_t              color_count              = 0;
+		RenderDepthInfo       depth_info;
+		bool                  ps_active                = true;
+		vk::PrimitiveTopology topology                 = vk::PrimitiveTopology::eTriangleList;
+		bool                  primitive_restart_enable = false;
+	};
+	std::shared_ptr<const PipelineInputs> pipeline_inputs;
+	uint64_t                              ctx_hash = 0;
+	bool                                  derived  = false;
 	// The frame a draw last used it (NativeXprCollect lets one go that none used for NativeXprCache::StateKeepFrames).
 	mutable uint64_t                 used_frame = 0;
 	void Use(uint64_t frame) const { std::atomic_ref<uint64_t>(used_frame).store(frame, std::memory_order_relaxed); }
@@ -655,6 +670,9 @@ struct RenderExecutor::NativeXprCache {
 		--index_count;
 	}
 	std::unordered_map<uint64_t, std::unique_ptr<NativeXprDrawState>, HashedKey> states;
+	// (Mode 4, TableWorkerEntry) The state key captured last under a context hash (NativeXprDrawState::ctx_hash), under the
+	// catalog's write; a worker checks the state it names (it may have left: states sweep without it).
+	std::unordered_map<uint64_t, uint64_t> sibling_index;
 	// Invalidated records: their sets retire once the GPU passed retire_tick;
 	// their logged reads stay for learning until the key is stored again.
 	std::unordered_map<uint64_t, std::unique_ptr<NativeXprRecord>, HashedKey> stale;
@@ -1129,6 +1147,12 @@ bool RenderExecutor::NativeXprSweepStates(NativeXprCache& cache, uint64_t frame)
 	std::erase_if(cache.states, [&](const auto& item) {
 		return item.second->UsedFrame() + NativeXprCache::StateKeepFrames < frame;
 	});
+	// (The sibling index without the states gone; mode 4's only.)
+	if (!cache.sibling_index.empty())
+		std::erase_if(cache.sibling_index, [&](const auto& entry) {
+			const auto it = cache.states.find(entry.second);
+			return it == cache.states.end() || it->second->ctx_hash != entry.first;
+		});
 	if (cache.states.size() == before) return true;
 	cache.emit           = {};
 	cache.last_state     = nullptr;
@@ -1832,10 +1856,21 @@ void RenderExecutor::NativeXprEmitDynamic(NativeXprCache& cache, vk::CommandBuff
 	}
 }
 
+// (Mode 4, TableWorkerEntry) The context registers and the user configuration, hashed in full (NativeXprStateKey's part
+// without the shader stages' registers): two draw states with the same hash differ only in their shaders.
+static uint64_t WorkerEntryContextHash(CommandBuffer& buffer) {
+	const auto& ctx = buffer.GetRegisters();
+	const auto& cfg = buffer.GetUserConfig();
+	return XXH3_64bits_withSeed(&cfg, sizeof(cfg), XXH3_64bits(&ctx, sizeof(ctx)));
+}
+// The captures' ids (NativeXprDrawState::capture_id; a worker's derived state takes one too).
+static std::atomic<uint64_t> g_xpr_captures {0};
+
 // The draw state under `state_key`: the render targets as this draw left them (a reopened rendering loads),
 // their layouts and the dynamic state.
 void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRenderState& state,
-                                           const RenderState& rendering, uint64_t state_key) {
+                                           const RenderState& rendering, uint64_t state_key,
+                                           vk::PrimitiveTopology topology, bool primitive_restart_enable) {
 	auto& cache    = NativeXprState();
 	auto& textures = m_context.GetTextureCache();
 	NativeXprDrawState draw_state;
@@ -1869,8 +1904,7 @@ void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRend
 		                              metadata_of(desc), view.base_layer, image.serial, desc.info});
 	}
 	draw_state.meta_epoch = 0;
-	static std::atomic<uint64_t> captures {0};
-	draw_state.capture_id = captures.fetch_add(1, std::memory_order_relaxed) + 1;
+	draw_state.capture_id = g_xpr_captures.fetch_add(1, std::memory_order_relaxed) + 1;
 	for (const auto& target: draw_state.targets) {
 		textures.NoteMetaUse(target.metadata, target.id.index); // (KYTY_TABLE_SERIALS)
 		draw_state.target_ids.push_back(target.id);
@@ -1887,12 +1921,28 @@ void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRend
 	draw_state.resolved     = ResolveGraphicsDynamicParams(draw_state.dynamic.buffer, draw_state.dynamic.indexed_viewports,
 	                                                       draw_state.dynamic.colors, draw_state.dynamic.color_count,
 	                                                       draw_state.dynamic.depth);
+	// (Mode 4: what a worker needs to make a table entry under this state or a sibling of it, TableWorkerEntry.)
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+		auto inputs = std::make_shared<NativeXprDrawState::PipelineInputs>();
+		for (uint32_t i = 0; i < state.color_count; ++i) inputs->color_info[i] = state.color_info[i];
+		inputs->color_count              = state.color_count;
+		inputs->depth_info               = state.depth_info;
+		inputs->ps_active                = state.ps_active;
+		inputs->topology                 = topology;
+		inputs->primitive_restart_enable = primitive_restart_enable;
+		draw_state.pipeline_inputs       = std::move(inputs);
+		draw_state.ctx_hash              = WorkerEntryContextHash(buffer);
+	}
 	// Entries stay at their address (emission tracking compares pointers); a
 	// replaced state must be emitted again.
 	const auto write = CatalogWrite();
 	auto&      slot  = cache.states[state_key];
 	if (!slot) slot = std::make_unique<NativeXprDrawState>();
 	*slot = std::move(draw_state);
+	if (slot->ctx_hash != 0) { // (mode 4; bounded: NativeXprSweepStates prunes it with the states)
+		if (cache.sibling_index.size() >= 65536) cache.sibling_index.clear();
+		cache.sibling_index[slot->ctx_hash] = state_key;
+	}
 	slot->Use(m_context.FrameNumber());
 	if (cache.emit.state == slot.get()) cache.emit.state = nullptr;
 }
@@ -2125,7 +2175,7 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 		}
 	}
 
-	NativeXprCaptureState(buffer, state, rendering, state_key);
+	NativeXprCaptureState(buffer, state, rendering, state_key, topology, primitive_restart_enable);
 
 	// A relocated key: without the roots' and the unread words, with the words the try added (NativeXprTry).
 	if (!record->roots.empty() || !record->unread.empty()) {
@@ -3429,6 +3479,9 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
                                    uint64_t index_bytes, vk::IndexType index_type, bool keep_clears,
                                    const NativeXprDirect* direct) {
 	auto&           cache = *m_native_xpr;
+	// (A state a worker derived from a sibling's capture, mode 4's only, is the table path's: its layouts and its first
+	// rendering are not this record's draw's; the normal path draws, and a store captures the state again.)
+	if (draw_state.derived) return false;
 	auto& upload = m_context.GetBufferCache().GetShaderUploadBuffer();
 	if (upload.Handle() != record.upload) {
 		return false;

@@ -391,6 +391,9 @@ private:
 	[[nodiscard]] bool NativeXprDraw(CommandBuffer& buffer, const NativeXprDrawArgs& args);
 
 public:
+	// (Mode 4; table-xpr.inc) What a worker made for a draw until its commit publishes it (public: the kept holders' list is
+	// a file-level static there).
+	struct TableEntryHolder;
 	// Runtime entry points for the command processor (kyty_local_native_xpr_mode).
 	// A direct indexed draw (DRAW_INDEX_2 / DRAW_INDEX_OFFSET_2): its indices, count and instances; or a direct draw
 	// of vertices (DRAW_INDEX_AUTO, not `indexed`: the count is of vertices; table draws only). `indirect` (not
@@ -529,6 +532,15 @@ private:
 	                      const NativeXprDirectDraw* direct);
 	// spec_worker_images: a worker's set's pending slots completed by the GPU thread at its commit (Speculation::Before).
 	[[nodiscard]] bool TableCompletePendingImages(TableImageSet& set);
+	// (Mode 4; table-xpr.inc) A speculation makes the table entry a draw lacks (a new pair, a new draw state from a
+	// sibling's capture, a variant), draws with it, and its commit publishes it (nullopt: not made, refused as before).
+	[[nodiscard]] std::optional<TableResult> TableWorkerEntry(CommandBuffer& buffer, TablePair* existing, uint64_t pair_hash,
+	                                                          std::span<const uint64_t> commands, uint64_t index_base,
+	                                                          uint64_t index_bytes, vk::IndexType index_type,
+	                                                          const NativeXprDirectDraw* direct);
+	[[nodiscard]] bool TableEntryCheck(const TableEntryHolder& holder);
+	void               TableEntrySettle(const std::shared_ptr<TableEntryHolder>& holder, bool commit);
+	void               TableRetireEntryOrphans();
 	[[nodiscard]] TableImageSet* TableResolveSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
 	                                             const NativeXprDrawState* draw_state, std::span<const uint32_t> words);
 	[[nodiscard]] bool           TableValidateSet(TableImageSet& set);
@@ -546,7 +558,7 @@ private:
 	void TableStore(CommandBuffer& buffer, const DrawRenderState& state, vk::PrimitiveTopology topology,
 	                bool primitive_restart_enable, const RenderState& rendering, bool storable);
 	void NativeXprCaptureState(CommandBuffer& buffer, const DrawRenderState& state, const RenderState& rendering,
-	                           uint64_t state_key);
+	                           uint64_t state_key, vk::PrimitiveTopology topology, bool primitive_restart_enable);
 	[[nodiscard]] bool NativeXprTargetsCurrent(const NativeXprDrawState& draw_state);
 	// (`command`: the draw's command buffer, its registers for spec_depth_layers2; none: no target is left to the commit.)
 	[[nodiscard]] bool NativeXprEmitTargets(const NativeXprDrawState& draw_state, vk::CommandBuffer vk_buffer,

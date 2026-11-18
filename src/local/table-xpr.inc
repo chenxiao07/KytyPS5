@@ -517,6 +517,65 @@ void RenderExecutor::TableForgetStates() {
 				}
 }
 
+// (Mode 4, TableWorkerEntry below) This draw's topology and primitive restart, as the normal path derives them
+// (GetDrawTopology; ResolvePrimitiveRestart less its scan, which only stops the emulator when a custom reset value is in the
+// indices): the draw kind and the index size are not in the state key or the context hash. False: not derivable here
+// (refused).
+static bool WorkerEntryDrawTopology(const CommandBuffer& buffer, bool indexed, vk::IndexType index_type,
+                                    vk::PrimitiveTopology& topology, bool& restart) {
+	restart = false;
+	if (!GetDrawTopology(buffer.GetUserConfig(), !indexed, topology)) return false;
+	if (!indexed) return true; // (DrawAuto: no restart)
+	const auto control = buffer.GetUserConfig().GetPrimitiveResetControl();
+	if ((control & ~0x3u) != 0) return false;
+	if ((control & 0x1u) == 0) return true;
+	switch (buffer.GetUserConfig().GetPrimType()) {
+		case Prospero::PrimitiveType::kLineStrip:
+		case Prospero::PrimitiveType::kTriFan:
+		case Prospero::PrimitiveType::kTriStrip: break;
+		default: return true;
+	}
+	uint32_t element_size = 0;
+	if (index_type == vk::IndexType::eUint16) element_size = 2;
+	else if (index_type == vk::IndexType::eUint32) element_size = 4;
+	else return false;
+	const auto index_mask  = UINT32_MAX >> ((4 - element_size) * 8);
+	const auto reset_index = buffer.GetRegisters().GetPrimitiveResetIndex();
+	if ((control & 0x2u) != 0 && (reset_index & ~index_mask) != 0) return true;
+	restart = (reset_index & index_mask) == index_mask;
+	return true;
+}
+
+// (Mode 4, TableWorkerEntry below) What a worker made for a draw, held until its commit publishes it.
+struct RenderExecutor::TableEntryHolder {
+	std::remove_cvref_t<decltype(TableXpr::pairs)> node; // a new pair: its one node (moved into the catalog's map at publication)
+	TablePair*                                     pair = nullptr; // drawn with: the node's, or the catalog's
+	TableVariant                                   variant;        // the variant made here (own_variant)
+	TableVariant*                                  drawn_variant = nullptr;
+	bool                                           own_variant   = false;
+	std::unique_ptr<NativeXprDrawState>            state;          // derived from a sibling's capture (null: the key's own)
+	const NativeXprDrawState*                      drawn_state = nullptr;
+	uint64_t                                       capture     = 0; // drawn_state's capture_id
+	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> programs {};
+	uint64_t                                       pair_hash = 0, key = 0;
+	bool                                           new_pair  = false;
+	std::atomic<bool>                              poisoned {false}; // a set of its draws sampled a target: never published
+	// (The records of the unrecorded permutations it rests on and the normal pipeline made for it, put in at its commit
+	// (PipelineCache::CommitAdopted); dropped if never committed.)
+	std::shared_ptr<PipelineCache::AdoptedCommit> adopted;
+	// (An entry made with records: a later draw of this translation drawn with it is so only when its own normal lookups
+	// read clean and are in its commit (TableWorkerEntry's reuse, PipelineCache::AdoptedCovers); the targets its normal
+	// pipeline key is built from: the base state's inputs.)
+	bool                                                      reuse_checked = false;
+	std::shared_ptr<const NativeXprDrawState::PipelineInputs> inputs;
+};
+// (Mode 4) Holders not published whole, kept until no speculation translates or has a result unfinished (TableSweepPairs): a
+// draw recorded with them, and the proposals settled after theirs (their sets, into a new pair's node), may still refer to
+// them.
+static std::mutex                                                     g_entry_orphans_mutex;
+static std::vector<std::shared_ptr<RenderExecutor::TableEntryHolder>> g_entry_orphans;
+static std::atomic<uint32_t>                                          g_entry_orphans_n {0};
+
 // The pairs and dispatches no draw or dispatch looked up for PairKeepFrames leave, their image sets retired. Every
 // pointer to a pair goes too: the lookups' (pair_cache, found_*), the last draw's and dispatch's, the store request,
 // the gather and the prefetch chain (next). Only the catalog's owner, while no speculation translates or has a result
@@ -530,6 +589,7 @@ void RenderExecutor::TableSweepPairs() {
 	// (Put off while a speculation translates or has a result unfinished: tried at every call until done. Checked again
 	// under the lock: a translation counted after it reads the catalog after the sweep, and sees its epoch.)
 	if (kyty_local_speculations_live.load(std::memory_order_seq_cst) != 0) return;
+	if (g_entry_orphans_n.load(std::memory_order_relaxed) != 0) TableRetireEntryOrphans(); // (mode 4's only)
 	table->pairs_swept = frame;
 	if (table->pairs.size() + table->dispatches.size() <= TableXpr::PairsKept) return;
 	const auto write = CatalogWrite();
@@ -672,6 +732,18 @@ static void TablePrefetchNext(Pair*& previous, Pair& pair) {
 // TableContinue). The set build keeps it across the program lookup (`unlocked` there only tests it), so the lookup's guest
 // reads are made without a fault: a fault there would wait for the GPU thread while it waits for the catalog's write.
 static thread_local std::shared_lock<std::shared_mutex>* t_catalog_read = nullptr;
+// (Mode 4, TableWorkerEntry) The variant it made and draws with now, not in its pair's vector (TableResolveSet's re-find
+// after an unlock does not apply to it); the poisoned flag of the entry drawn with (TableDraw sets it).
+static thread_local const void*        t_entry_variant = nullptr;
+static thread_local std::atomic<bool>* t_entry_poison  = nullptr;
+// (Mode 4, the GPU thread) TableDraw refused a draw under a state a worker derived from a sibling's capture whose set holds
+// a target; its caller (TableTry) then takes the store path for the draw (request_store), so the in-order store captures
+// the state and replaces the derived one.
+static thread_local bool t_store_derived = false;
+// (Mode 4) A speculation's draw that lacks its table entry makes it itself (TableWorkerEntry).
+[[nodiscard]] static bool WorkerEntryOn() {
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+}
 // catalog_writer_first: before a worker's table try takes the catalog shared, it waits while the owner waits to write
 // (pause, then yield), unless this thread holds the catalog shared already.
 static void CatalogGate(const std::atomic<int32_t>& writer_waiting, bool on) {
@@ -724,7 +796,13 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		const auto pair_hash = XXH3_64bits(pair_key.data(), sizeof(pair_key));
 		// (Another executor's catalog: what it learned, none of it made here.)
 		const auto found = catalog == nullptr || Role() == 0 ? decltype(catalog->pairs.end()) {} : catalog->pairs.find(pair_hash);
-		if (Role() != 0 && (catalog == nullptr || found == catalog->pairs.end())) return Spec::Refuse("table store"), TableResult::Native;
+		if (Role() != 0 && (catalog == nullptr || found == catalog->pairs.end())) {
+			// (Mode 4: the worker makes the pair itself, TableWorkerEntry.)
+			if (catalog != nullptr && WorkerEntryOn())
+				if (const auto drawn = TableWorkerEntry(buffer, nullptr, pair_hash, commands, index_base, index_bytes, index_type, direct))
+					return *drawn;
+			return Spec::Refuse("table store"), TableResult::Native;
+		}
 		// (A frame's draws use ~600 pairs at 1-1: 256 entries missed often, each a cold map bucket and node.)
 		const auto entries = (kyty_local_table_mru.load(std::memory_order_relaxed) & 1u) != 0 ? TableXpr::PairCacheEntries : 256;
 		auto&      cached  = table.pair_cache[pair_hash & (entries - 1)];
@@ -858,6 +936,8 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 				                               index_type, direct);
 				table.memo_set     = nullptr;
 				table.memo_verify  = false;
+				// (Mode 4: a derived state's draw refused for a target in its set: the store path, as below.)
+				if (memo_state.derived && std::exchange(t_store_derived, false)) return request_store();
 				return result;
 			}
 		}
@@ -869,13 +949,24 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	                          : std::ranges::find(pair.variants, cache.state_key, &TableXpr::Variant::state);
 	if (variant != pair.variants.end()) pair.variant_hint = static_cast<uint32_t>(variant - pair.variants.begin());
 	if (variant != pair.variants.end() && variant->refused) return Spec::Refuse("table: variant refused"), TableResult::Native;
-	if (pair.programs[0] == nullptr || variant == pair.variants.end() || variant->pipeline == nullptr)
+	if (pair.programs[0] == nullptr || variant == pair.variants.end() || variant->pipeline == nullptr) {
+		// (Mode 4: the worker makes the variant, and the draw state if the key has none, TableWorkerEntry.)
+		if (Role() != 0 && pair.programs[0] != nullptr && WorkerEntryOn())
+			if (const auto drawn = TableWorkerEntry(buffer, &pair, 0, commands, index_base, index_bytes, index_type, direct))
+				return *drawn;
 		return LiveCounters::Add(LiveCounters::TableStoreVariant), request_store();
+	}
 	// The draw state (TableStore captures it).
 	if (cache.last_state == nullptr || cache.last_state_key != cache.state_key) {
 		const auto& states   = Catalog().NativeXprState().states;
 		const auto  state_it = states.find(cache.state_key);
-		if (state_it == states.end()) return request_store();
+		if (state_it == states.end()) {
+			// (Mode 4: the worker derives the draw state from a sibling's, TableWorkerEntry.)
+			if (Role() != 0 && WorkerEntryOn())
+				if (const auto drawn = TableWorkerEntry(buffer, &pair, 0, commands, index_base, index_bytes, index_type, direct))
+					return *drawn;
+			return request_store();
+		}
 		cache.last_state_key = cache.state_key;
 		cache.last_state     = state_it->second.get();
 	}
@@ -883,6 +974,10 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	TablePrefetchArrays(pair, pair.LastSet(Role()));
 	if (!NativeXprTargetsCurrent(draw_state)) return LiveCounters::Add(LiveCounters::TableStoreTargets), request_store();
 	const auto result = TableDraw(buffer, pair, *variant, draw_state, commands, index_base, index_bytes, index_type, direct);
+	// (Mode 4, the GPU thread: a state a worker derived from a sibling's capture whose draw TableDraw refused for a target in
+	// its set: the store path for it, as for a draw whose state has no capture or whose targets are not current; TableStore's
+	// capture then replaces the derived state.)
+	if (draw_state.derived && std::exchange(t_store_derived, false)) return request_store();
 	if (memo && result == TableResult::Drawn)
 		table.MemoAt(&pair, cache.state_key) = {&pair, cache.state_key, table.memo_epoch, &draw_state,
 		                                        const_cast<TableImageSet*>(table.last_set),
@@ -911,9 +1006,11 @@ bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64
 	std::optional<RenderLockGuard> lock;
 	if (Role() == 0) lock.emplace(m_context.GetMutex());
 	if (!NativeXprTargetsCurrent(*table.last_state)) return false;
-	if (TableDraw(buffer, *table.last_pair, variant, *table.last_state, commands, index_base, index_bytes, index_type,
-	              direct) != TableResult::Drawn)
-		return false;
+	const auto drawn = TableDraw(buffer, *table.last_pair, variant, *table.last_state, commands, index_base, index_bytes,
+	                             index_type, direct);
+	// (Mode 4: a derived state's refusal mark cleared: the packet goes to NativeXprTry again, whose TableTry asks the store.)
+	if (table.last_state->derived) t_store_derived = false;
+	if (drawn != TableResult::Drawn) return false;
 	LiveCounters::Add(LiveCounters::TableContinued, std::max<size_t>(commands.size(), 1));
 	return true;
 }
@@ -1262,11 +1359,12 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			// grew meanwhile moved the variant TableDraw holds by reference, and reads after this set (its pipeline, its
 			// index as the role's last variant). Refused then, as when the variant left.)
 			const auto again = std::ranges::find(pair.variants, held->state, &TableVariant::state);
-			if (again == pair.variants.end() || &*again != variant) return worker_refuse("worker set: catalog changed");
+			if (variant != t_entry_variant && (again == pair.variants.end() || &*again != variant)) // (a worker entry's own)
+				return worker_refuse("worker set: catalog changed");
 			// (TableStore's targets path updates a variant in place, without moving the epoch or
 			// the vector: its pipeline swapped, or null while TryCreateGraphicsPipeline is pending, or the variant refused.
 			// The set's layout and TableDraw's bind read that pipeline: refused unless it is the one held before the unlock.)
-			if (again->pipeline != held->pipeline || again->pipeline == nullptr || again->refused)
+			if (variant != t_entry_variant && (again->pipeline != held->pipeline || again->pipeline == nullptr || again->refused))
 				return worker_refuse("worker set: catalog changed");
 		}
 		if (m_context.GetPipelineCache().TablePending())
@@ -3036,6 +3134,14 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (spec_state != nullptr && set != nullptr)
 		spec_state->NoteSet(reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(set->set)));
 	if (set == nullptr) return LiveCounters::Add(LiveCounters::TableNoSet), Spec::Refuse("table: no set"), TableResult::Native;
+	// (Mode 4: a state a worker derived from a sibling's capture has that capture's attachment layouts, made for shaders that
+	// sampled no target: a set that holds a target leaves the table path, and an entry not yet published with it. The GPU
+	// thread's in-order draw: its caller takes the store path, t_store_derived.)
+	if (draw_state.derived && !TableSetApart(*set, draw_state)) {
+		if (t_entry_poison != nullptr) t_entry_poison->store(true, std::memory_order_relaxed);
+		if (spec_state == nullptr && Role() == 0 && Spec::Current() == nullptr) t_store_derived = true;
+		return Spec::Refuse("table: derived state, a target sampled"), TableResult::Native;
+	}
 
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 3);
@@ -3575,7 +3681,7 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 		variant->mapping        = mapping;
 		variant->fetch_embedded = table_state.vs_input_info.fetch_embedded;
 	}
-	NativeXprCaptureState(buffer, state, rendering, table.store_state);
+	NativeXprCaptureState(buffer, state, rendering, table.store_state, topology, primitive_restart_enable);
 }
 
 // --- Table dispatches ---------------------------------------------------------------------------------------------
@@ -3853,4 +3959,547 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	// (A later table draw binds its pipeline and set again: the graphics state is untouched.)
 	LiveCounters::Add(LiveCounters::TableDispatches);
 	return true;
+}
+
+// --- Mode 4: the worker that meets the draw makes the table entry -----------------------------------------------------
+//
+// Under KYTY_SPECULATE=4 (WorkerEntryOn), a speculation's draw whose pair is not in the catalog, or whose pair lacks the
+// draw-state key's variant or the key's captured state, was refused ("table store"): the GPU thread ran it as a hole, the
+// normal draw, and TableStore made the entry. Here the worker makes what TableStore would, from the same inputs, or nothing:
+//  - THE GATE (the recording): the draw's normal programs are permutations in memory (GetGraphicsPrograms with t_find_only:
+//    none translated or recorded) and its normal pipeline is built in memory (FindGraphicsPipeline); so the normal draw this
+//    replaces would record nothing. Or the commit records for it what the normal draw would (below: adopted permutations,
+//    a private normal pipeline). Its vertex shader binds no vertex buffers and no mesh stage (TableStore's storable gate).
+//  - The draw state: the key's own capture if there is one; else DERIVED from a sibling's, the state captured last under the
+//    same context and user configuration hash (other shaders): the targets, layouts and rendering as captured (the context
+//    resolves them alike; the sibling's targets current, NativeXprTargetsCurrent), its dynamic state but for the vertex
+//    program's indexed viewports (LocalDrawRecording::Capture's one shader input: from the normal vertex program), its
+//    hash and resolution recomputed, a capture id of its own. Refused when the sibling's capture holds a feedback-loop or
+//    general layout or a feedback aspect (a pixel shader that sampled a target), and a set of a draw under a derived state
+//    that holds a target leaves the table path (TableDraw; the holder is then never published; the GPU thread's own draw
+//    under it takes the store path, which captures the state again): no feedback guess.
+//  - ps_active as the normal path computes it (DrawHasActivePixelShader), equal to the capture's.
+//  - The programs: GetGraphicsPrograms in table mode with the capture's export mapping and ps_active (a pair's own portable
+//    masks); table programs and ready now (else refused: TableStore's own refusals stay the GPU thread's); for a pair in the
+//    catalog, its programs (else another specialization: refused).
+//  - The variant: the pair's for the key when stored (its pipeline), else TryCreateGraphicsPipelineWorker as TableStore's
+//    TryCreateGraphicsPipeline (ready now; else its compile posted and this draw refused), its mapping and fetch_embedded as
+//    TableStore sets them.
+//  - A new pair: vs, ps, start instance, the programs, TableRuns; its variant in it; proven by this role (generation).
+// A normal program not in memory whose module the prefetch holds done is adopted by the worker (t_adopt_only), under the
+// pipeline cache's lock as the GPU thread's normal draw adopts it, but not recorded there: the entry's commit records it
+// from the lookup's own inputs (ProgramCache::NoteMet, AdoptedCommit) and, when the normal pipeline of the draw is not in
+// memory, puts in the one the worker made privately (CreatePrivateGraphicsPipeline: a Fast first build only, after the
+// table gates passed), with its recipe, as the in-order draw's create would have. Nothing is translated: a program the
+// prefetch does not hold done stays a refusal.
+// The lookups run with the catalog's read lock dropped (the RULE at TableResolveSet), relocked; then the catalog's epoch,
+// the pair (absent; or its programs and variant), the base state (its capture) are those held before, else refused. Drawn as
+// any worker table draw; proposed (Spec::State::proposed_sets, `pair` null) before the draw, checked at its segment's Before
+// (TableEntryCheck: the state's targets current, the pair's programs), published at its commit (TableEntrySettle, under the
+// owner's write): a new pair by node insert while the catalog has none for the key, a variant into the pair (as TableStore
+// stores one), a derived state into the states while none is there for the key. What is not published whole is kept until no
+// speculation is live (g_entry_orphans; TableRetireEntryOrphans retires a kept node's sets).
+std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(CommandBuffer& buffer, TablePair* existing,
+                                                                           uint64_t pair_hash, std::span<const uint64_t> commands,
+                                                                           uint64_t index_base, uint64_t index_bytes,
+                                                                           vk::IndexType index_type,
+                                                                           const NativeXprDirectDraw* direct) {
+	auto* const spec = Spec::Current();
+	if (spec == nullptr || Role() == 0 || GuestGpu::IsGpuThread() || CatalogTable() == nullptr ||
+	    Catalog().m_native_xpr == nullptr || m_native_xpr == nullptr || FrameGen::Enabled())
+		return std::nullopt;
+	const auto&    sh             = buffer.GetShaders();
+	const auto&    ctx            = buffer.GetRegisters();
+	const auto     vs_address     = sh.GetVs().es_regs.data_addr, ps_address = sh.GetPs().ps_regs.data_addr;
+	const auto     start_instance = sh.GetVs().start_instance_user_sgpr;
+	const auto     key            = m_native_xpr->state_key;
+	const uint64_t tag            = existing != nullptr ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(existing)) : pair_hash;
+	const uint64_t mix            = (tag * 0x9e3779b97f4a7c15ull) ^ key;
+	const auto     draw           = [&](TableEntryHolder& h) -> std::optional<TableResult> {
+		t_entry_variant   = h.own_variant ? h.drawn_variant : nullptr;
+		t_entry_poison    = &h.poisoned;
+		const auto result = TableDraw(buffer, *h.pair, *h.drawn_variant, *h.drawn_state, commands, index_base, index_bytes,
+		                              index_type, direct);
+		t_entry_variant   = nullptr;
+		t_entry_poison    = nullptr;
+		OwnTable().last_pair = nullptr; // (TableContinue reads the role's last variant out of the pair's vector)
+		return result;
+	};
+	const auto& states = Catalog().NativeXprState().states;
+	// (The recording, per draw: a draw drawn with an entry made with records is served early as the entry's own draw is, so its
+	// own normal lookups (find-only, as the entry's: this draw's registers, the entry's export mapping and targets, this draw's
+	// topology and restart) must meet only what that entry's commit records and puts in: the unrecorded permutations among its
+	// records, the normal pipeline in memory or its own. Else (another specialization or key: what this draw's in-order normal
+	// draw would record is in no commit) it is not drawn with that entry; it makes its own below, whose commit holds its
+	// records and pipeline (or is refused, and the hole records them). Run with the catalog's read lock dropped, as the entry's
+	// lookups; false in `changed`: the catalog as it was (else refused, nothing held across the relock).)
+	const auto reuse_covered = [&](const TableEntryHolder& h, bool& changed) {
+		changed            = false;
+		const auto& inputs = *h.inputs;
+		const bool  ps_on  = DrawHasActivePixelShader(buffer);
+		if (ps_on != inputs.ps_active) return false;
+		vk::PrimitiveTopology topology = vk::PrimitiveTopology::eTriangleList;
+		bool                  restart  = false;
+		if (!WorkerEntryDrawTopology(buffer, direct != nullptr ? direct->indexed : index_bytes != 0, index_type, topology, restart))
+			return false;
+		const auto since    = CatalogTable()->epoch;
+		auto&      cache    = m_context.GetPipelineCache();
+		const bool unlocked = t_catalog_read != nullptr && t_catalog_read->owns_lock();
+		if (unlocked) t_catalog_read->unlock();
+		struct Flags {
+			bool reads = false, find_only = false;
+			~Flags() {
+				if (reads) PipelineCache::t_no_fault_reads = false, PipelineCache::t_strict_reads = false;
+				if (find_only) PipelineCache::t_find_only = false, PipelineCache::g_find_only_users.fetch_sub(1, std::memory_order_relaxed);
+			}
+		} flags;
+		PipelineCache::t_no_fault_reads  = true;
+		PipelineCache::t_strict_reads    = true; // (a specialization word not read clean fails the lookup: another entry)
+		flags.reads                      = true;
+		PipelineCache::t_no_fault_failed = false;
+		ShaderVertexInputInfo vertex;
+		ShaderPixelInputInfo  pixel;
+		ResetNativeVertexInput(vertex);
+		ResetNativeStageInput(pixel);
+		PipelineCache::g_find_only_users.fetch_add(1, std::memory_order_relaxed);
+		PipelineCache::t_find_only   = true;
+		flags.find_only              = true;
+		PipelineCache::t_adopt_ids_n = 0;
+		const auto normal = cache.GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx, buffer.GetUserConfig(),
+		                                              h.variant.mapping, ps_on, vertex, pixel);
+		PipelineCache::t_find_only = false;
+		PipelineCache::g_find_only_users.fetch_sub(1, std::memory_order_relaxed);
+		flags.find_only = false;
+		const bool own  = !PipelineCache::t_no_fault_failed && static_cast<bool>(normal.vertex) && vertex.stage.program != nullptr &&
+		                 (!ps_on || (static_cast<bool>(normal.pixel) && pixel.stage.program != nullptr)) &&
+		                 cache.AdoptedCovers(h.adopted.get(), {inputs.color_info, inputs.color_count}, inputs.depth_info, vertex, buffer,
+		                                     ps_on ? &pixel : nullptr, topology, restart, normal.vertex, normal.pixel);
+		PipelineCache::t_adopt_ids_n    = 0;
+		PipelineCache::t_no_fault_reads = false;
+		PipelineCache::t_strict_reads   = false;
+		flags.reads                     = false;
+		if (unlocked) {
+			CatalogGate(Catalog().m_catalog_writer_waiting, CatalogWriterFirst());
+			t_catalog_read->lock();
+		}
+		changed = spec->refused != nullptr || CatalogTable() == nullptr || CatalogTable()->epoch != since;
+		return own;
+	};
+	// (One this translation made already for this pair and key: drawn with again.)
+	for (const auto& p: spec->proposed_sets) {
+		if (p.pair != nullptr || p.hash != mix) continue;
+		auto& h = *static_cast<TableEntryHolder*>(p.set);
+		if (h.key != key || h.new_pair != (existing == nullptr) ||
+		    (existing != nullptr ? h.pair != existing : h.pair_hash != pair_hash))
+			continue;
+		// (An entry made with records: this draw's own normal lookups in its commit, above; else the next, or an entry of its
+		// own.)
+		if (h.reuse_checked) {
+			bool       changed = false;
+			const bool own     = reuse_covered(h, changed);
+			if (changed) return std::nullopt;
+			if (!own) continue;
+		}
+		if (h.poisoned.load(std::memory_order_relaxed)) return std::nullopt;
+		if (h.pair->vs != vs_address || h.pair->ps != ps_address || h.pair->start_instance != start_instance) return std::nullopt;
+		if (existing != nullptr && (existing->programs != h.programs || existing->refused || existing->respecialize))
+			return std::nullopt;
+		if (h.state == nullptr) {
+			const auto again = states.find(key);
+			if (again == states.end() || again->second.get() != h.drawn_state || h.drawn_state->capture_id != h.capture)
+				return std::nullopt;
+		}
+		// (The pair's stored variant: found again, its vector may have grown since: TableStore pushes under its write.)
+		if (!h.new_pair && !h.own_variant) {
+			const auto v = std::ranges::find(existing->variants, key, &TableVariant::state);
+			if (v == existing->variants.end() || v->refused || v->pipeline != h.variant.pipeline) return std::nullopt;
+			h.drawn_variant = &*v;
+		}
+		if (!NativeXprTargetsCurrent(*h.drawn_state)) return std::nullopt;
+		return draw(h);
+	}
+	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> programs_held {};
+	std::array<uint32_t, 2>                                        portable {};
+	TableVariant*                                                  stored_variant = nullptr;
+	if (existing != nullptr) {
+		if (existing->programs[0] == nullptr || existing->refused || existing->respecialize) return std::nullopt;
+		programs_held = existing->programs;
+		portable      = existing->portable;
+		if (const auto v = std::ranges::find(existing->variants, key, &TableVariant::state); v != existing->variants.end()) {
+			if (v->refused) return std::nullopt;
+			if (v->pipeline != nullptr) stored_variant = &*v;
+		}
+	}
+	// The draw state: the key's own capture, else a sibling's to derive it from.
+	const NativeXprDrawState* base     = nullptr;
+	uint64_t                  base_key = key;
+	bool                      derive   = false;
+	if (const auto own = states.find(key); own != states.end()) {
+		base = own->second.get();
+	} else {
+		const auto  ctx_hash = WorkerEntryContextHash(buffer);
+		const auto& index    = Catalog().NativeXprState().sibling_index;
+		const auto  named    = index.find(ctx_hash);
+		const auto  sibling  = named != index.end() ? states.find(named->second) : states.end();
+		if (named == index.end() || sibling == states.end() || sibling->second->ctx_hash != ctx_hash) return std::nullopt;
+		base     = sibling->second.get();
+		base_key = named->second;
+		derive   = true;
+	}
+	const auto inputs = base->pipeline_inputs; // (shared: alive after the unlock)
+	if (!inputs) return std::nullopt;
+	if (derive) {
+		constexpr auto feedback = vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+		constexpr auto general  = vk::ImageLayout::eGeneral;
+		bool           loop     = base->dynamic.feedback_aspects != vk::ImageAspectFlags {};
+		for (const auto& target: base->targets) loop |= target.layout == feedback || target.layout == general;
+		for (const auto* rendering: {&base->rendering, &base->first_rendering}) {
+			for (const auto& attachment: rendering->color_attachments)
+				loop |= attachment.image_layout == feedback || attachment.image_layout == general;
+			loop |= rendering->depth_stencil_attachment.image_layout == feedback ||
+			        rendering->depth_stencil_attachment.image_layout == general;
+		}
+		if (loop) return std::nullopt;
+	}
+	if (!NativeXprTargetsCurrent(*base)) return std::nullopt;
+	const bool ps_active = DrawHasActivePixelShader(buffer);
+	if (ps_active != inputs->ps_active) return std::nullopt;
+	if (existing != nullptr && (programs_held[1] != nullptr) != ps_active) return std::nullopt;
+	// (This draw's topology and restart, as TableStore takes them: the capture's are its own draw's.)
+	vk::PrimitiveTopology topology = vk::PrimitiveTopology::eTriangleList;
+	bool                  restart  = false;
+	if (!WorkerEntryDrawTopology(buffer, direct != nullptr ? direct->indexed : index_bytes != 0, index_type, topology, restart))
+		return std::nullopt;
+	const auto                          base_capture = base->capture_id;
+	std::unique_ptr<NativeXprDrawState> derived;
+	if (derive) derived = std::make_unique<NativeXprDrawState>(*base); // (copied under the lock: a capture again rewrites it in place)
+	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX> mapping {};
+	for (uint32_t i = 0; i < inputs->color_count; ++i) mapping[inputs->color_info[i].target_slot] = inputs->color_info[i].export_mapping;
+	const auto since      = CatalogTable()->epoch;
+	const auto generation = ShaderMapGeneration(); // (before the lookups: a new pair is proven as of then)
+	auto&      pipelines  = m_context.GetPipelineCache();
+	// (The lookups with the catalog's read lock dropped; guest reads without a fault.)
+	// (The stored variant's pipeline, read under the lock: TableStore's push_back may move the vector while it is dropped.)
+	const PipelineCache::Pipeline* stored_pipeline = stored_variant != nullptr ? stored_variant->pipeline : nullptr;
+	const bool unlocked = t_catalog_read != nullptr && t_catalog_read->owns_lock();
+	if (unlocked) t_catalog_read->unlock();
+	// (The lookups' thread flags, cleared on the way out of a RecoverableExit through them too; each only if set here and not
+	// cleared on the normal way. The catalog's relock is not covered.)
+	struct LookupFlags {
+		bool reads = false, find_only = false, adopt_only = false, records = false;
+		~LookupFlags() {
+			if (reads) PipelineCache::t_no_fault_reads = false;
+			if (adopt_only) PipelineCache::t_adopt_only = false;
+			if (records) PipelineCache::t_adopt_records = false;
+			if (find_only) PipelineCache::t_find_only = false, PipelineCache::g_find_only_users.fetch_sub(1, std::memory_order_relaxed);
+		}
+	} flags;
+	PipelineCache::t_no_fault_reads  = true;
+	flags.reads                      = true;
+	PipelineCache::t_no_fault_failed = false;
+	ShaderVertexInputInfo normal_vertex;
+	ShaderPixelInputInfo  normal_pixel;
+	ResetNativeVertexInput(normal_vertex);
+	ResetNativeStageInput(normal_pixel);
+	PipelineCache::g_find_only_users.fetch_add(1, std::memory_order_relaxed);
+	PipelineCache::t_find_only   = true;
+	flags.find_only              = true;
+	PipelineCache::t_adopt_ids_n = 0; // (the unrecorded permutations this lookup finds, adopted earlier by a worker's lookup)
+	// (These lookups make the records of the unrecorded permutations they meet, from their own inputs, for the entry's commit.)
+	PipelineCache::t_adopt_records = true;
+	flags.records                  = true;
+	auto normal = pipelines.GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx, buffer.GetUserConfig(),
+	                                            mapping, ps_active, normal_vertex, normal_pixel);
+	uint32_t unrecorded_met     = PipelineCache::t_adopt_ids_n;
+	bool     normal_read_failed = PipelineCache::t_no_fault_failed;
+	bool gate_programs = !normal_read_failed && static_cast<bool>(normal.vertex) && normal_vertex.stage.program != nullptr &&
+	                     (!ps_active || (static_cast<bool>(normal.pixel) && normal_pixel.stage.program != nullptr));
+	// (A program not in memory whose module the prefetch holds done is adopted here, as the GPU thread's normal draw would
+	// adopt it: under the pipeline cache's lock (GetGraphicsPrograms takes it; the catalog's is dropped above), the permutation
+	// published but not recorded here: the entry's commit records it with these lookups' own inputs, else the first in-order
+	// lookup that finds it. Nothing is translated: a program the prefetch does not hold done stays a refusal, the GPU thread's
+	// draw makes it.)
+	if (!gate_programs && !normal_read_failed) {
+		ResetNativeVertexInput(normal_vertex);
+		ResetNativeStageInput(normal_pixel);
+		PipelineCache::t_adopt_only      = true;
+		flags.adopt_only                 = true;
+		PipelineCache::t_adopt_adopted   = 0;
+		PipelineCache::t_adopt_ids_n     = 0;
+		PipelineCache::t_no_fault_failed = false;
+		normal = pipelines.GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx, buffer.GetUserConfig(), mapping,
+		                                       ps_active, normal_vertex, normal_pixel);
+		PipelineCache::t_adopt_only = false;
+		flags.adopt_only            = false;
+		unrecorded_met              = PipelineCache::t_adopt_ids_n;
+		normal_read_failed          = PipelineCache::t_no_fault_failed;
+		gate_programs = !normal_read_failed && static_cast<bool>(normal.vertex) && normal_vertex.stage.program != nullptr &&
+		                (!ps_active || (static_cast<bool>(normal.pixel) && normal_pixel.stage.program != nullptr));
+	}
+	PipelineCache::t_find_only = false;
+	PipelineCache::g_find_only_users.fetch_sub(1, std::memory_order_relaxed);
+	flags.find_only                = false;
+	PipelineCache::t_adopt_records = false;
+	flags.records                  = false;
+	const bool storable      = gate_programs && normal_vertex.buffers_num == 0 && normal_vertex.mesh.threads_num[0] == 0;
+	bool       gate_pipeline = storable && pipelines.FindGraphicsPipeline({inputs->color_info, inputs->color_count}, inputs->depth_info,
+	                                                                       normal_vertex, buffer, ps_active ? &normal_pixel : nullptr,
+	                                                                       topology, restart, normal.vertex, normal.pixel) != nullptr;
+	// (The records of the unrecorded permutations met; the normal pipeline, when missing, is made privately below, once the
+	// table gates pass. Same inputs as the lookup above: this draw's normal programs and input infos, the capture's targets,
+	// this draw's topology and restart.)
+	std::shared_ptr<PipelineCache::AdoptedCommit> adopted_commit;
+	if (storable && unrecorded_met != 0) adopted_commit = pipelines.TakeAdoptedRecords();
+	// (Only where the private build may be made at all (a Fast first build: CreatePrivateGraphicsPipeline).)
+	const bool want_private = adopted_commit != nullptr && !gate_pipeline && pipelines.PrivateBuildsAllowed();
+	// (An entry on an unrecorded permutation only with its commit's records in hand.)
+	const bool unrecorded_held = unrecorded_met != 0 && adopted_commit == nullptr;
+	ShaderVertexInputInfo vertex_info;
+	ShaderPixelInputInfo  pixel_info;
+	ResetNativeVertexInput(vertex_info);
+	ResetNativeStageInput(pixel_info);
+	bool                                     read_failed = false, pending = false, table_mode = false, other = false;
+	const PipelineCache::Pipeline*           pipeline    = stored_pipeline;
+	std::shared_ptr<const std::atomic<bool>> compiling;
+	// (An entry on an unrecorded permutation without its records is refused below: nothing made for it. One with its records
+	// goes on to the table gates before its private normal pipeline is made.)
+	if ((gate_pipeline || want_private) && !unrecorded_held) {
+		PipelineCache::t_no_fault_failed = false;
+		const auto programs = pipelines.GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx, buffer.GetUserConfig(),
+		                                                    mapping, ps_active, vertex_info, pixel_info, true, portable);
+		read_failed        = PipelineCache::t_no_fault_failed;
+		pending            = pipelines.TablePending();
+		const auto* vertex = vertex_info.stage.program;
+		const auto* pixel  = ps_active ? pixel_info.stage.program : nullptr;
+		table_mode = !read_failed && !pending && static_cast<bool>(programs.vertex) && vertex != nullptr && vertex->table_mode &&
+		             vertex->stage == ShaderType::Vertex && vertex_info.buffers_num == 0 &&
+		             (!ps_active || (static_cast<bool>(programs.pixel) && pixel != nullptr && pixel->table_mode));
+		if (table_mode && existing != nullptr && (vertex != programs_held[0] || pixel != programs_held[1])) table_mode = false, other = true;
+		if (table_mode && pipeline == nullptr)
+			pipeline = pipelines.TryCreateGraphicsPipelineWorker({inputs->color_info, inputs->color_count}, inputs->depth_info, vertex_info,
+			                                                     buffer, ps_active ? &pixel_info : nullptr, topology, restart,
+			                                                     programs.vertex, programs.pixel, true, compiling);
+		if (existing == nullptr) programs_held = {vertex, pixel};
+		// (The normal pipeline made privately only now, the table gates passed: a refused entry makes none. Not made because
+		// the cache has the key by now (made meanwhile): found, the records alone committed.)
+		if (want_private && table_mode && pipeline != nullptr) {
+			gate_pipeline = pipelines.CreatePrivateGraphicsPipeline(*adopted_commit, {inputs->color_info, inputs->color_count},
+			                                                        inputs->depth_info, normal_vertex, buffer,
+			                                                        ps_active ? &normal_pixel : nullptr, topology, restart,
+			                                                        normal.vertex, normal.pixel) ||
+			                pipelines.FindGraphicsPipeline({inputs->color_info, inputs->color_count}, inputs->depth_info, normal_vertex,
+			                                               buffer, ps_active ? &normal_pixel : nullptr, topology, restart,
+			                                               normal.vertex, normal.pixel) != nullptr;
+		}
+	}
+	PipelineCache::t_no_fault_reads = false;
+	flags.reads                     = false;
+	if (unlocked) {
+		CatalogGate(Catalog().m_catalog_writer_waiting, CatalogWriterFirst());
+		t_catalog_read->lock();
+	}
+	// (A Spec::Refuse during the lookups, e.g. SyncGpuCleanBackingSpec's "GPU-written guest memory" (its read then goes on):
+	// the packet is refused, and what the lookups read may not be the in-order memory: no entry.)
+	if (spec->refused != nullptr) return std::nullopt;
+	if (!gate_programs || !storable || !gate_pipeline || unrecorded_held || read_failed || pending || other || !table_mode ||
+	    pipeline == nullptr)
+		return std::nullopt;
+	// (After the relock: the catalog, the pair and the base state as they were.)
+	if (CatalogTable() == nullptr || CatalogTable()->epoch != since) return std::nullopt;
+	if (existing == nullptr) {
+		if (CatalogTable()->pairs.contains(pair_hash)) return std::nullopt;
+	} else {
+		if (existing->programs != programs_held || existing->refused || existing->respecialize) return std::nullopt;
+		const auto v = std::ranges::find(existing->variants, key, &TableVariant::state);
+		if (stored_variant != nullptr ? (v == existing->variants.end() || &*v != stored_variant || v->pipeline != pipeline || v->refused)
+		                              : (v != existing->variants.end() && (v->refused || v->pipeline != nullptr)))
+			return std::nullopt;
+	}
+	if (const auto again = states.find(base_key);
+	    again == states.end() || again->second.get() != base || base->capture_id != base_capture || base->pipeline_inputs != inputs)
+		return std::nullopt;
+	if (derive && states.contains(key)) return std::nullopt;
+	if (!NativeXprTargetsCurrent(*base)) return std::nullopt;
+	// The entry.
+	auto  holder             = std::make_shared<TableEntryHolder>();
+	auto& h                  = *holder;
+	h.key                    = key;
+	h.reuse_checked          = adopted_commit != nullptr; // (its later draws' own lookups checked, above)
+	h.inputs                 = inputs;
+	h.pair_hash              = pair_hash;
+	h.new_pair               = existing == nullptr;
+	h.programs               = programs_held;
+	h.adopted                = std::move(adopted_commit);
+	h.variant.state          = key;
+	h.variant.pipeline       = pipeline;
+	h.variant.mapping        = mapping;
+	h.variant.fetch_embedded = vertex_info.fetch_embedded;
+	if (derive) {
+		auto& made           = *derived;
+		made.capture_id      = g_xpr_captures.fetch_add(1, std::memory_order_relaxed) + 1;
+		made.meta_epoch      = 0;
+		made.targets_epoch   = 0;
+		made.targets_checked = 0;
+		made.targets_erased = 0, made.targets_span_begin = 0, made.targets_span_end = 0;
+		made.emitted_epoch   = UINT64_MAX;
+		made.emitted_serials = UINT64_MAX;
+		made.used_frame      = 0;
+		made.derived         = true;
+		// (Its first rendering without the sibling's clears: those were the sibling draw's own; the rendering has none.)
+		made.first_rendering           = made.rendering;
+		made.dynamic.indexed_viewports = UsesIndexedViewports(normal_vertex);
+		made.dynamic_hash              = XXH3_64bits(&made.dynamic, sizeof(made.dynamic));
+		made.resolved = ResolveGraphicsDynamicParams(made.dynamic.buffer, made.dynamic.indexed_viewports, made.dynamic.colors,
+		                                             made.dynamic.color_count, made.dynamic.depth);
+		h.state       = std::move(derived);
+		h.drawn_state = h.state.get();
+	} else {
+		h.drawn_state = base;
+	}
+	h.capture = h.drawn_state->capture_id;
+	if (existing == nullptr) {
+		auto& pair          = h.node.try_emplace(pair_hash).first->second;
+		pair.vs             = vs_address;
+		pair.ps             = ps_address;
+		pair.start_instance = start_instance;
+		pair.programs       = programs_held;
+		TableRuns(pair);
+		pair.variants.push_back(h.variant);
+		pair.Generation(Role()) = generation; // (its programs are those of the code at its addresses as of the lookups)
+		h.pair          = &pair;
+		h.drawn_variant = &pair.variants.back();
+		h.own_variant   = false; // (in the node pair's vector: TableResolveSet finds it there)
+	} else {
+		h.pair = existing;
+		if (stored_variant != nullptr) {
+			h.drawn_variant = stored_variant;
+		} else {
+			h.drawn_variant = &h.variant;
+			h.own_variant   = true;
+		}
+	}
+	auto* const owner = &Catalog();
+	auto* const raw   = holder.get();
+	spec->proposed_sets.push_back({nullptr, mix, raw, spec->closed.size(), false,
+	                               [owner, holder](bool commit) { owner->TableEntrySettle(holder, commit); }});
+	spec->proposed_sets.back().check = [owner, raw] { return owner->TableEntryCheck(*raw); };
+	// (Its segment re-run as a hole drew the draw in order, maybe through the table without a normal lookup: what its commit
+	// would do for the draw is not done at a later segment's (records, private pipeline dropped here).)
+	if (raw->adopted != nullptr) spec->proposed_sets.back().on_hole = [raw] { raw->adopted.reset(); };
+	return draw(h);
+}
+
+// (Mode 4) At the entry's segment's Before, the GPU thread (the catalog's owner): the state drawn with still current, the
+// pair's programs those it was made with. False: the segment is not committed as recorded (Speculation: images_failed).
+bool RenderExecutor::TableEntryCheck(const TableEntryHolder& h) {
+	if (m_table_xpr == nullptr || m_native_xpr == nullptr || h.drawn_state == nullptr) return false;
+	if (!h.new_pair && (h.pair->programs != h.programs || h.pair->refused || h.pair->respecialize)) return false;
+	if (h.state == nullptr) {
+		const auto& states = NativeXprState().states;
+		const auto  again  = states.find(h.key);
+		if (again == states.end() || again->second.get() != h.drawn_state || h.drawn_state->capture_id != h.capture) return false;
+	}
+	return NativeXprTargetsCurrent(*h.drawn_state);
+}
+
+static void TableEntryOrphan(const std::shared_ptr<RenderExecutor::TableEntryHolder>& holder) {
+	const std::lock_guard lock(g_entry_orphans_mutex);
+	g_entry_orphans.push_back(holder);
+	g_entry_orphans_n.store(static_cast<uint32_t>(g_entry_orphans.size()), std::memory_order_relaxed);
+}
+
+// (Mode 4) At the entry's segment's commit (`commit`; false: never committed), the GPU thread, under the owner's write:
+// published as TableStore stores, while the catalog has nothing there; what is not published whole is kept
+// (TableEntryOrphan).
+void RenderExecutor::TableEntrySettle(const std::shared_ptr<TableEntryHolder>& holder, bool commit) {
+	auto& h = *holder;
+	// (Never committed: its records and private pipeline go (destroyed here, on the GPU thread).)
+	if (!commit) return h.adopted.reset(), TableEntryOrphan(holder);
+	// (What the in-order draw would have done for this draw, which the commit spares it, in stream order: the records, then
+	// the normal pipeline and its recipe. Published whole or not: the draw is committed. The cache's m_mutex only, no other
+	// lock held.)
+	if (h.adopted != nullptr) {
+		m_context.GetPipelineCache().CommitAdopted(*h.adopted);
+		h.adopted.reset();
+	}
+	if (h.poisoned.load(std::memory_order_relaxed)) return TableEntryOrphan(holder);
+	if (h.state != nullptr) {
+		auto& textures = m_context.GetTextureCache(); // (as NativeXprCaptureState notes its targets)
+		for (const auto& target: h.state->targets) textures.NoteMetaUse(target.metadata, target.id.index);
+	}
+	bool whole = true;
+	{
+		const auto write = CatalogWrite();
+		auto*      table = m_table_xpr.get();
+		auto&      cache = NativeXprState();
+		const auto frame = m_context.FrameNumber();
+		if (table == nullptr) {
+			whole = false;
+		} else if (h.new_pair) {
+			if (!table->pairs.contains(h.pair_hash)) {
+				auto node                = h.node.extract(h.pair_hash);
+				node.mapped().used_frame = frame;
+				auto inserted            = table->pairs.insert(std::move(node));
+				TableScoutPublish(inserted.position->second);
+			} else {
+				whole = false;
+			}
+		} else if (h.own_variant) {
+			auto& pair = *h.pair;
+			if (pair.programs != h.programs || pair.refused || pair.respecialize) {
+				whole = false;
+			} else {
+				auto stored = std::ranges::find(pair.variants, h.key, &TableVariant::state);
+				if (stored == pair.variants.end()) {
+					pair.variants.push_back(h.variant);
+				} else if (!stored->refused && stored->pipeline == nullptr) {
+					stored->pipeline       = h.variant.pipeline;
+					stored->mapping        = h.variant.mapping;
+					stored->fetch_embedded = h.variant.fetch_embedded;
+				} else if (stored->refused || stored->pipeline != h.variant.pipeline) {
+					whole = false;
+				}
+			}
+		}
+		if (h.state != nullptr) {
+			if (whole && !cache.states.contains(h.key)) {
+				auto& slot = cache.states[h.key];
+				slot       = std::move(h.state);
+				slot->Use(frame);
+			} else {
+				whole = false;
+			}
+		}
+	}
+	if (!whole) TableEntryOrphan(holder);
+}
+
+// (Mode 4) The kept holders go once no speculation translates or has a result unfinished (TableSweepPairs, the catalog's
+// owner): a kept node's sets retired as a swept pair's; the executors' and the sets' pointers into a kept state dropped as
+// when states leave (TableForgetStates).
+void RenderExecutor::TableRetireEntryOrphans() {
+	if (Role() != 0 || m_table_xpr == nullptr) return;
+	std::vector<std::shared_ptr<TableEntryHolder>> list;
+	{
+		const std::lock_guard lock(g_entry_orphans_mutex);
+		list.swap(g_entry_orphans);
+		g_entry_orphans_n.store(0, std::memory_order_relaxed);
+	}
+	if (list.empty()) return;
+	const auto write = CatalogWrite();
+	if (kyty_local_speculations_live.load(std::memory_order_seq_cst) != 0) {
+		const std::lock_guard lock(g_entry_orphans_mutex);
+		g_entry_orphans.insert(g_entry_orphans.end(), list.begin(), list.end());
+		g_entry_orphans_n.store(static_cast<uint32_t>(g_entry_orphans.size()), std::memory_order_relaxed);
+		return;
+	}
+	for (auto& holder: list)
+		for (auto& [hash, pair]: holder->node)
+			for (auto& [words, set]: pair.sets) NativeXprRetireSet(set->pool, set->set);
+	list.clear();
+	auto& cache          = NativeXprState();
+	cache.emit           = {};
+	cache.last_state     = nullptr;
+	cache.last_state_key = 0;
+	TableForgetStates();
 }

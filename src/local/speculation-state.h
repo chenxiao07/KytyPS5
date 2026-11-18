@@ -663,6 +663,7 @@ struct State {
 		};
 		std::vector<Completed> completed;
 		std::function<bool()>     check; // (spec_proposed_check: still current at its segment's commit)
+		std::function<void()>     on_hole; // (its segment re-run as a hole, the GPU thread: what must not move to the next one)
 	};
 	std::vector<ProposedSet> proposed_sets;
 	void SettleProposedSets(size_t committed_segment, bool all) {

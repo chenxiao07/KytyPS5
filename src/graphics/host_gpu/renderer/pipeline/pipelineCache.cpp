@@ -184,8 +184,15 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 		*value = 0;
 		return true;
 	}
-	return value != nullptr &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBackingToHost(address, value, sizeof(*value));
+	if (value != nullptr && Libs::LibKernel::Memory::TryReadGpuCleanBackingToHost(address, value, sizeof(*value))) return true;
+	// (TableWorkerEntry's adopt-only, record-making and reuse lookups on a worker: a specialization word it could not read
+	// clean, the GPU's or its own speculation's pending or written range, would make the materialization pick another
+	// specialization than the in-order one, quietly: a failed read, the lookup refused. Mode 0 tests the global first, on
+	// this failure path only.)
+	if (Spec::On() && PipelineCache::t_no_fault_reads &&
+	    (PipelineCache::t_adopt_only || PipelineCache::t_adopt_records || PipelineCache::t_strict_reads)) [[unlikely]]
+		PipelineCache::t_no_fault_failed = true;
+	return false;
 }
 
 bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
@@ -1859,11 +1866,14 @@ struct PipelineCache::ProgramCache {
 
 	// The prefetched translation of the program `lookup_key` names, met for the first time: taken over
 	// once done (waiting for it when a worker translates it now), else null and left to the caller.
-	Prefetch::Group* PrefetchedGroup(const ShaderParams& params) {
+	// (`adopt_only`: a worker's adopt-only lookup (TableWorkerEntry, mode 4), Get's own gate; false on every other lookup.)
+	Prefetch::Group* PrefetchedGroup(const ShaderParams& params, bool adopt_only = false) {
 		if (prefetch == nullptr || !prefetch->ready.load(std::memory_order_acquire)) return nullptr;
 		const auto found = prefetch->index.find(lookup_key);
 		if (found == prefetch->index.end()) return nullptr;
 		auto& group = *found->second;
+		// (A worker's adopt-only lookup: a group not done yet is left to the GPU thread's lookup, which claims or waits.)
+		if (adopt_only && group.state.load(std::memory_order_acquire) != Prefetch::Done) return nullptr;
 		prefetch->Follow(group.first_record);
 		auto state = group.state.load(std::memory_order_acquire);
 		if (state == Prefetch::Pending &&
@@ -1878,6 +1888,13 @@ struct PipelineCache::ProgramCache {
 		group.state.store(Prefetch::Taken, std::memory_order_relaxed);
 		prefetch->adopted++;
 		return &group;
+	}
+	// (An adopt-only lookup: a group PrefetchedGroup took whose plan then did not materialize for the worker's draw (a failed
+	// evaluation, a guest word it could not read) goes back to Done, under m_mutex as it was taken; nothing of it was moved
+	// (its plan only loaded), so the in-order lookup takes it over as it would have.)
+	void ReturnPrefetchedGroup(Prefetch::Group& group) {
+		group.state.store(Prefetch::Done, std::memory_order_release);
+		prefetch->adopted--;
 	}
 
 	// The prefetched translations of a program the warmup already holds (the recording's records it did not translate:
@@ -2089,6 +2106,78 @@ struct PipelineCache::ProgramCache {
 		};
 	}
 
+	// The warmup record of a permutation Get makes (or finds unrecorded): one builder, so both hold the same fields.
+	template <typename InputInfo>
+	void FillRecord(LocalShaderWarmup::Record& record, ShaderType stage, const ShaderParams& params, const InputInfo& input_info,
+	                uint32_t push_data_cursor, const ShaderRecompiler::IR::ResourceSpecialization& specialization) const {
+		record.stage           = stage;
+		record.hash            = params.hash;
+		record.user_data_count = static_cast<uint32_t>(params.user_data.size());
+		record.push_cursor     = push_data_cursor;
+		record.static_key      = lookup_key.static_state;
+		record.code.assign(params.code.begin(), params.code.end());
+		record.back_code.assign(params.back_code.begin(), params.back_code.end());
+		record.specialization = specialization;
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) record.vertex = input_info;
+		else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) record.pixel = input_info;
+		else record.compute = input_info;
+	}
+	// (Mode 4, TableWorkerEntry) A permutation a worker's adopt-only lookup adopted is not recorded there (its segment may
+	// never commit; its inputs are the worker's). Its shader id waits here, and it is recorded once, by the first of:
+	// - a lookup that is not find-only and finds it (RecordFound, at Get's two finds): the lookup that would have adopted it
+	//   and called warmup.Add in order; the record is made from that lookup's own inputs (its push cursor, input info, static
+	//   key, and the permutation's specialization, which the find matched) at its place in the stream;
+	// - the commit of a worker entry resting on it (RecordMet, from the entry's own lookup's record, t_met_records);
+	// - the warmup beside the game meeting it for a record of the file first (TranslateWarmup): the record's index, as when
+	//   the warmup makes the permutation before the game's lookup.
+	// One none meets stays unrecorded, as in order (no in-order lookup made it). Under m_mutex. Empty unless a worker adopted
+	// (mode 0: always empty, Get's finds test only that).
+	std::unordered_set<uint64_t> unrecorded;
+	// The records this thread's find-only or adopt-only lookups would make of the unrecorded permutations they meet, from
+	// their own inputs (the push cursor, input info, static key of this lookup and the permutation's specialization, which its
+	// find matched or its adoption made), in t_adopt_ids' order: what the in-order lookup of the same draw records
+	// (FillRecord, as there). Taken by PipelineCache::TakeAdoptedRecords.
+	static inline thread_local std::array<LocalShaderWarmup::Record, 2> t_met_records {};
+	static inline thread_local std::array<bool, 2>                      t_met_made {};
+	// (A find-only or adopt-only lookup met unrecorded permutation `id`: noted for its caller, with its record if asked.)
+	template <typename InputInfo>
+	void NoteMet(uint64_t id, ShaderType stage, const ShaderParams& params, const InputInfo& input_info, uint32_t push_data_cursor,
+	             const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+		const auto n = PipelineCache::t_adopt_ids_n;
+		if (n >= PipelineCache::t_adopt_ids.size()) return;
+		PipelineCache::t_adopt_ids[n] = id;
+		// (Not where the code was not copied before the lock (params.code_unread: `code` is the guest's span, which may fault
+		// here under m_mutex, or hold bytes not yet in order): no record, so no entry.)
+		t_met_made[n] = PipelineCache::t_adopt_records && warmup.Enabled() && !params.code_unread;
+		if (t_met_made[n]) {
+			t_met_records[n] = {};
+			FillRecord(t_met_records[n], stage, params, input_info, push_data_cursor, specialization);
+		}
+		PipelineCache::t_adopt_ids_n = n + 1;
+	}
+	// (At the commit of an entry resting on it: recorded with the entry's own record, unless something recorded it since.)
+	void RecordMet(uint64_t id, LocalShaderWarmup::Record& record) {
+		if (unrecorded.erase(id) == 0) return;
+		const auto index = warmup.Add(record);
+		if (index != LocalShaderWarmup::NoShader) recorded_programs[id] = index;
+	}
+	template <typename InputInfo>
+	void RecordFound(const Permutation& found, ShaderType stage, const ShaderParams& params, const InputInfo& input_info,
+	                 uint32_t push_data_cursor) {
+		const auto it = unrecorded.find(found.handle.id);
+		if (it == unrecorded.end()) return;
+		// (A find-only lookup, a worker's: not recorded there; its caller learns it met one.)
+		if (PipelineCache::g_find_only_users.load(std::memory_order_relaxed) != 0 && PipelineCache::t_find_only) {
+			NoteMet(found.handle.id, stage, params, input_info, push_data_cursor, found.specialization);
+			return;
+		}
+		unrecorded.erase(it);
+		LocalShaderWarmup::Record record;
+		FillRecord(record, stage, params, input_info, push_data_cursor, found.specialization);
+		const auto index = warmup.Add(record);
+		if (index != LocalShaderWarmup::NoShader) recorded_programs[found.handle.id] = index;
+	}
+
 	template <typename InputInfo>
 	// `table_mode`: the permutation compiled in table mode (ShaderRecompiler::IR::EnterTableMode), empty
 	// when the program does not allow it.
@@ -2119,7 +2208,23 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
-		if (entry != programs.end() && !entry->second.warm_code.empty()) {
+		// (A worker's find-only lookup, TableWorkerEntry's, mode 4: a program entry kept for its warm code (the boot warmup's,
+		// not compared with the game's code by an in-order lookup yet). The compare the in-order lookup makes below, made here
+		// on the worker's own copy of the code only: the bytes CopyShaderCode copied BEFORE this lock through the guarded read
+		// (code_address set, code_unread clear); never a guest read under m_mutex (a fault there waits for the GPU thread,
+		// which waits for this lock). Not copied, or another code: empty (the entry left as it is: its erase or retire stays
+		// the in-order lookup's). Equal: on to the find, the entry left as it is too (its warm code kept for the in-order
+		// lookup's own compare): read only. The permutations found are the warmup's, recorded at the boot: the find records
+		// nothing, as the in-order find records nothing.)
+		bool warm_checked = false;
+		if (entry != programs.end() && !entry->second.warm_code.empty() &&
+		    PipelineCache::g_find_only_users.load(std::memory_order_relaxed) != 0 && PipelineCache::t_find_only) {
+			if (params.code_unread || params.code_address == 0 || !std::ranges::equal(params.code, entry->second.warm_code) ||
+			    !std::ranges::equal(params.back_code, entry->second.warm_back_code))
+				return {};
+			warm_checked = true;
+		}
+		if (entry != programs.end() && !entry->second.warm_code.empty() && !warm_checked) {
 			if (params.code_unread) return UnreadCode();
 			if (!std::ranges::equal(params.code, entry->second.warm_code) ||
 			    !std::ranges::equal(params.back_code, entry->second.warm_back_code)) {
@@ -2213,6 +2318,8 @@ struct PipelineCache::ProgramCache {
 			    source.guarded_publication == source.specialization_guard.publication &&
 			    compatible_push_data(*source.guarded_permutation)) {
 				const auto* selected = source.guarded_permutation;
+				if (!unrecorded.empty()) [[unlikely]] // (one adopted off the in-order path, recorded here as its adoption would have)
+					RecordFound(*selected, stage, params, input_info, push_data_cursor);
 				publish_stage(selected->program);
 				selected->program.bindings.AdvancePushData(push_data_cursor);
 				return selected->handle;
@@ -2226,12 +2333,23 @@ struct PipelineCache::ProgramCache {
 					source.guarded_permutation = &*permutation;
 					source.guarded_publication = source.specialization_guard.publication;
 				}
+				if (!unrecorded.empty()) [[unlikely]] // (as above)
+					RecordFound(*permutation, stage, params, input_info, push_data_cursor);
 				publish_stage(permutation->program);
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
 			if (borrowed_specialization) specialization = *borrowed_specialization;
 		}
+		// (A worker's find-only lookup, t_find_only: no permutation in memory: none is adopted, translated or recorded.
+		// t_adopt_only: one the prefetch holds done is adopted below, as here on the GPU thread; one that would be translated
+		// is not.)
+		const bool find_only  = PipelineCache::g_find_only_users.load(std::memory_order_relaxed) != 0 && PipelineCache::t_find_only;
+		const bool adopt_only = find_only && PipelineCache::t_adopt_only;
+		if (find_only && !adopt_only) return {};
+		// (A guest word this lookup, or the pixel program's before it, could not read made the specialization of a zero:
+		// nothing is adopted for it; the caller refuses the draw as a read.)
+		if (adopt_only && PipelineCache::t_no_fault_failed) return {};
 
 		ShaderStageInputInfo stage_input {};
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
@@ -2347,11 +2465,15 @@ struct PipelineCache::ProgramCache {
 		// A program met for the first time that the prefetch translated: its plan, materialized for
 		// this draw, and its modules are taken over.
 		if (entry == programs.end()) {
-			if (auto* group = PrefetchedGroup(params)) {
+			if (auto* group = PrefetchedGroup(params, adopt_only)) {
 				if (!ReportMaterialization(label, stage, params.hash, report,
 				                           ShaderRecompiler::IR::MaterializeResources(*group->plan, runtime, resources,
-				                                                                      specialization, &report)))
+				                                                                      specialization, &report))) {
+					if (adopt_only) ReturnPrefetchedGroup(*group); // (left as found for the in-order lookup)
 					return {};
+				}
+				// (A word the worker could not read: the specialization is not this draw's; the group goes back.)
+				if (adopt_only && PipelineCache::t_no_fault_failed) return ReturnPrefetchedGroup(*group), ShaderProgram {};
 				entry = programs.try_emplace(lookup_key, std::move(*group->plan)).first;
 				entry->second.source_digest = group->source;
 				entry->second.prefetched = std::move(group->modules);
@@ -2369,8 +2491,11 @@ struct PipelineCache::ProgramCache {
 		bool       translated_here = false;
 		double     translate_ms    = 0.0;
 		const auto adopt = [&] { return AdoptPrefetchedModule(entry->second, options, specialization, push_data_cursor); };
-		if (entry == programs.end() ||
-		    (adopt() == nullptr && (!TakePrefetchedModules(entry->second, params) || adopt() == nullptr))) {
+		const bool need_translation = entry == programs.end() ||
+		                              (adopt() == nullptr && (!TakePrefetchedModules(entry->second, params) || adopt() == nullptr));
+		if (need_translation && adopt_only) return {};
+		if (adopt_only) ++PipelineCache::t_adopt_adopted;
+		if (need_translation) {
 			translated_here = true;
 			// With the slow-call log: the translation's specialization-independent part (front) and
 			// whether the program had other permutations already.
@@ -2420,20 +2545,17 @@ struct PipelineCache::ProgramCache {
 			            static_cast<unsigned long long>(params.hash), translated_here ? 1 : 0, translate_ms,
 			            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - source_begin).count());
 		if (warmup.Enabled()) {
-			LocalShaderWarmup::Record record;
-			record.stage = stage;
-			record.hash = params.hash;
-			record.user_data_count = static_cast<uint32_t>(params.user_data.size());
-			record.push_cursor = push_data_cursor;
-			record.static_key = lookup_key.static_state;
-			record.code.assign(params.code.begin(), params.code.end());
-			record.back_code.assign(params.back_code.begin(), params.back_code.end());
-			record.specialization = permutation.specialization;
-			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) record.vertex = input_info;
-			else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) record.pixel = input_info;
-			else record.compute = input_info;
-			const auto index = warmup.Add(record);
-			if (index != LocalShaderWarmup::NoShader) recorded_programs[permutation.handle.id] = index;
+			if (adopt_only) {
+				// (Not recorded on the worker; kept unrecorded, recorded in order: `unrecorded` above. Its shader id goes to the
+				// caller, which records it at its entry's commit, or makes no entry on it.)
+				NoteMet(permutation.handle.id, stage, params, input_info, push_data_cursor, permutation.specialization);
+				unrecorded.insert(permutation.handle.id);
+			} else {
+				LocalShaderWarmup::Record record;
+				FillRecord(record, stage, params, input_info, push_data_cursor, permutation.specialization);
+				const auto index = warmup.Add(record);
+				if (index != LocalShaderWarmup::NoShader) recorded_programs[permutation.handle.id] = index;
+			}
 		}
 		publish_stage(permutation.program);
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -2713,7 +2835,11 @@ struct PipelineCache::ProgramCache {
 			       p.program.bindings.push_data_start_dword ==
 			           ShaderRecompiler::IR::PushData::StartFor(record.push_cursor, p.program.bindings.ShaderDataDwords());
 		});
-		return found != entry->second.permutations.end() ? &*found : nullptr;
+		if (found == entry->second.permutations.end()) return nullptr;
+		// (One a worker adopted that no in-order lookup has met is not there yet for the recording's warmup, as in order:
+		// its pipelines are made where the draw makes them, with their recipes.)
+		if (!unrecorded.empty() && unrecorded.contains(found->handle.id)) return nullptr;
+		return &*found;
 	}
 
 	void TranslateWarmup(Common::Mutex& mutex, bool background, const std::atomic<bool>& stop) {
@@ -2774,6 +2900,9 @@ struct PipelineCache::ProgramCache {
 				});
 				if (found != entry->second.permutations.end()) {
 					warm_permutations[index] = &*found;
+					// (One a worker adopted unrecorded is this record's, as when the warmup makes it before the game's
+					// lookup; the game's find then records nothing.)
+					if (!unrecorded.empty() && unrecorded.erase(found->handle.id) != 0) recorded_programs[found->handle.id] = uint32_t(index);
 					DropWarmJob(device, *job);
 					continue;
 				}
@@ -4693,6 +4822,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	if (pixel_active) {
 		pixel_info.lod_stats_subgroup = m_graphics.fragment_subgroup_reduction;
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor, table_mode, table_portable[1]);
+		// (A worker's adopt-only lookup: a pixel program not found or adopted left the cursor where it was: the vertex program
+		// is not looked up at a cursor the draw does not have (it would be adopted for it). The caller refuses the draw.)
+		if (!result.pixel && g_find_only_users.load(std::memory_order_relaxed) != 0 && t_find_only && t_adopt_only) return result;
 	}
 	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor, table_mode, table_portable[0]);
 	return result;
@@ -4814,12 +4946,160 @@ PipelineCache::Pipeline* PipelineCache::TryCreateGraphicsPipeline(
 	                                  native_bindings, true);
 }
 
+PipelineCache::Pipeline* PipelineCache::FindGraphicsPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+                                                             const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+                                                             const ShaderPixelInputInfo* ps_input_info,
+                                                             vk::PrimitiveTopology topology, bool primitive_restart_enable,
+                                                             const ShaderProgram& vertex_program,
+                                                             const ShaderProgram& pixel_program) {
+	Common::LockGuard   lock(m_mutex);
+	GraphicsPipelineKey key {};
+	if (!NormalGraphicsKey(colors, depth, vs_input_info, command, ps_input_info, topology, primitive_restart_enable, vertex_program,
+	                       pixel_program, key))
+		return nullptr;
+	const auto found = m_graphics_pipelines.find(key);
+	return found != m_graphics_pipelines.end() ? found->second.get() : nullptr;
+}
+
+bool PipelineCache::NormalGraphicsKey(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+                                      const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+                                      const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+                                      bool primitive_restart_enable, const ShaderProgram& vertex_program,
+                                      const ShaderProgram& pixel_program, GraphicsPipelineKey& key) const {
+	if (colors.size() > RENDER_COLOR_ATTACHMENTS_MAX || !vertex_program || vs_input_info.stage.program == nullptr) return false;
+	const bool ps_active = ps_input_info != nullptr;
+	if (ps_active && !pixel_program) return false;
+	const auto color_count = static_cast<uint32_t>(colors.size());
+
+	auto&                  ctx = command.GetRegisters();
+	const HW::ModeControl& mc  = ctx.GetModeControl();
+
+	// (`key`: value-initialized by the caller, `{}` as the create's: the static parameters compare and hash as bytes.)
+	key.vs_shader_id            = vertex_program.id;
+	key.ps_shader_id            = ps_active ? pixel_program.id : 0;
+	key.native_bindings         = false;
+	auto& static_params         = key.static_params;
+	auto& rendering             = key.rendering;
+	rendering.color_count       = color_count;
+	uint32_t attachment_samples = 0;
+	for (uint32_t i = 0; i < color_count; i++) {
+		if (!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined) return false;
+		static_params.color_mask[i] = colors[i].export_mapping.ApplyMask(
+		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
+		rendering.color_formats[i] = colors[i].desc.view_info.format;
+		if (attachment_samples == 0) {
+			attachment_samples = colors[i].desc.info.samples;
+		} else if (attachment_samples != colors[i].desc.info.samples) {
+			return false;
+		}
+	}
+	const bool with_depth =
+	    depth.desc.view_info.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id);
+	if (with_depth) {
+		const auto aspects       = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
+		rendering.depth_format   = aspects & vk::ImageAspectFlagBits::eDepth
+		                               ? depth.desc.view_info.format
+		                               : vk::Format::eUndefined;
+		rendering.stencil_format = aspects & vk::ImageAspectFlagBits::eStencil
+		                               ? depth.desc.view_info.format
+		                               : vk::Format::eUndefined;
+		if (attachment_samples == 0) {
+			attachment_samples = depth.desc.info.samples;
+		} else if (attachment_samples != depth.desc.info.samples) {
+			return false;
+		}
+	}
+	if (color_count == 0 && !with_depth) {
+		attachment_samples = render_sample_count(ctx.GetAaConfig().msaa_num_samples);
+		if (!static_cast<bool>(
+		        m_graphics.GetPhysicalDeviceProperties().limits.framebufferNoAttachmentsSampleCounts &
+		        vulkan_sample_count(attachment_samples)))
+			return false;
+	}
+	if (attachment_samples == 0 || vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {}) return false;
+
+	const auto& clip_control               = ctx.GetClipControl();
+	static_params.negative_one_to_one      = !clip_control.dx_clip_space;
+	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
+	static_params.topology                 = topology;
+	static_params.primitive_restart_enable = primitive_restart_enable;
+	static_params.samples                  = attachment_samples;
+	static_params.sample_shading_enable =
+	    ps_active && attachment_samples > 1 && ps_input_info->ps_sample_shading;
+	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) return false;
+	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
+	static_params.depth_min_bounds         = depth.depth_min_bounds;
+	static_params.depth_max_bounds         = depth.depth_max_bounds;
+	static_params.stencil_test_enable      = depth.stencil_test_enable;
+	static_params.stencil_front            = depth.stencil_static_front;
+	static_params.stencil_back             = depth.stencil_static_back;
+	const bool rect_list     = topology == vk::PrimitiveTopology::ePatchList;
+	static_params.cull_back  = !rect_list && mc.cull_back;
+	static_params.cull_front = !rect_list && mc.cull_front;
+	static_params.face       = mc.face;
+	static_params.provoking_vtx_last = mc.provoking_vtx_last;
+	static_params.polygon_mode =
+	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
+
+	for (uint32_t i = 0; i < color_count; i++) {
+		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
+		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
+		static_params.color_srcblend[i]       = bc.color_srcblend;
+		static_params.color_comb_fcn[i]       = bc.color_comb_fcn;
+		static_params.color_destblend[i]      = bc.color_destblend;
+		static_params.alpha_srcblend[i]       = bc.alpha_srcblend;
+		static_params.alpha_comb_fcn[i]       = bc.alpha_comb_fcn;
+		static_params.alpha_destblend[i]      = bc.alpha_destblend;
+		static_params.separate_alpha_blend[i] = bc.separate_alpha_blend;
+		static_params.blend_enable[i]         = bc.enable;
+		static_params.blend_bypass[i]         = rt.info.blend_bypass;
+	}
+	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
+		if (vs_input_info.buffers_num < 0 || vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||
+		    vs_input_info.resources_num < 0 || vs_input_info.resources_num > ShaderVertexInputInfo::RES_MAX)
+			return false;
+		key.vertex_input.binding_count   = static_cast<uint8_t>(vs_input_info.buffers_num);
+		key.vertex_input.attribute_count = static_cast<uint8_t>(vs_input_info.resources_num);
+		uint32_t attributes_num          = 0;
+		for (int binding = 0; binding < vs_input_info.buffers_num; binding++) {
+			const auto& buffer = vs_input_info.buffers[binding];
+			if (buffer.attr_num < 0 || buffer.attr_num > ShaderVertexInputBuffer::ATTR_MAX) return false;
+			attributes_num += static_cast<uint32_t>(buffer.attr_num);
+			if (attributes_num > static_cast<uint32_t>(vs_input_info.resources_num)) return false;
+			key.vertex_input.bindings[binding] = {.stride   = buffer.stride,
+			                                      .instance = buffer.fetch_index != 0};
+			for (int attribute = 0; attribute < buffer.attr_num; attribute++) {
+				const auto index = buffer.attr_indices[attribute];
+				if (index < 0 || index >= vs_input_info.resources_num) return false;
+				key.vertex_input.attributes[index] = {
+				    .offset  = buffer.attr_offsets[attribute],
+				    .binding = static_cast<uint8_t>(binding),
+				};
+			}
+		}
+		if (attributes_num != static_cast<uint32_t>(vs_input_info.resources_num)) return false;
+	}
+	return true;
+}
+
+PipelineCache::Pipeline* PipelineCache::TryCreateGraphicsPipelineWorker(
+    std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+    const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+    const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+    bool primitive_restart_enable, const ShaderProgram& vertex_program,
+    const ShaderProgram& pixel_program, bool native_bindings, std::shared_ptr<const std::atomic<bool>>& waiting) {
+	return CreateGraphicsPipelineImpl(colors, depth, vs_input_info, command, ps_input_info, topology,
+	                                  primitive_restart_enable, vertex_program, pixel_program,
+	                                  native_bindings, true, &waiting);
+}
+
 PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const ShaderProgram& vertex_program,
-    const ShaderProgram& pixel_program, bool native_bindings, bool async) {
+    const ShaderProgram& pixel_program, bool native_bindings, bool async,
+    std::shared_ptr<const std::atomic<bool>>* worker_waiting) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
 	EXIT_IF(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
@@ -4829,7 +5109,8 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	const auto color_count = static_cast<uint32_t>(colors.size());
 
 	Common::LockGuard lock(m_mutex);
-	PromoteOptimized();
+	// (A worker's call, TryCreateGraphicsPipelineWorker: left to the GPU thread, which swaps pipelines in place.)
+	if (worker_waiting == nullptr) PromoteOptimized();
 	auto&             ctx = command.GetRegisters();
 
 	const HW::ModeControl& mc = ctx.GetModeControl();
@@ -4973,7 +5254,8 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 		if (auto pending = m_pending_graphics_pipelines.find(key);
 		    pending != m_pending_graphics_pipelines.end()) {
 			if (!pending->second->done.load(std::memory_order_acquire)) {
-				m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(pending->second, &pending->second->done);
+				(worker_waiting != nullptr ? *worker_waiting : m_pipeline_waiting) =
+				    std::shared_ptr<const std::atomic<bool>>(pending->second, &pending->second->done);
 				return nullptr;
 			}
 			auto finished = std::move(pending->second->pipeline);
@@ -5033,7 +5315,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 			job->done.store(true, std::memory_order_release);
 		});
 		LiveCounters::Add(LiveCounters::AsyncPipelines);
-		m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
+		(worker_waiting != nullptr ? *worker_waiting : m_pipeline_waiting) = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 		return nullptr;
 	}
 
@@ -5120,6 +5402,162 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	}
 
 	return iter->second.get();
+}
+
+// (TableWorkerEntry, mode 4) See the header. The private pipeline is owned here until the commit moves it into
+// m_graphics_pipelines; dropped (never committed, or the cache made the key meanwhile), it is destroyed: it was never bound
+// (the entry draws with its table pipeline), and its build wrote nothing that outlives it (PipelineBuild::Fast: the stores
+// and the driver cache only looked up, an unoptimized build in no cache).
+struct PipelineCache::AdoptedCommit {
+	vk::Device                               device = nullptr;
+	std::array<uint64_t, 2>                  ids {};
+	std::array<LocalShaderWarmup::Record, 2> records {};
+	uint32_t                                 count = 0;
+	GraphicsPipelineKey                      key {};
+	std::unique_ptr<Pipeline>                pipeline; // (null: the normal pipeline was in memory, or none made)
+	GraphicsMakeInputs                       inputs;
+	bool                                     from_store = false;
+	uint64_t                                 create_us  = 0;
+	~AdoptedCommit() {
+		if (pipeline == nullptr || pipeline->pipeline == nullptr) return;
+		DeviceFault::ForgetPipeline(static_cast<VkPipeline>(pipeline->pipeline));
+		device.destroyPipeline(pipeline->pipeline, nullptr);
+	}
+};
+
+std::shared_ptr<PipelineCache::AdoptedCommit> PipelineCache::TakeAdoptedRecords() {
+	const auto count = t_adopt_ids_n;
+	if (count == 0 || count > t_adopt_ids.size()) return nullptr;
+	for (uint32_t i = 0; i < count; ++i)
+		if (!ProgramCache::t_met_made[i]) return nullptr;
+	auto commit    = std::make_shared<AdoptedCommit>();
+	commit->device = m_graphics.device;
+	commit->count  = count;
+	for (uint32_t i = 0; i < count; ++i) {
+		commit->ids[i]              = t_adopt_ids[i];
+		commit->records[i]          = std::move(ProgramCache::t_met_records[i]);
+		ProgramCache::t_met_made[i] = false;
+	}
+	return commit;
+}
+
+bool PipelineCache::CreatePrivateGraphicsPipeline(AdoptedCommit& commit, std::span<const RenderColorInfo> colors,
+                                                  const RenderDepthInfo& depth, const ShaderVertexInputInfo& vs_input_info,
+                                                  CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
+                                                  vk::PrimitiveTopology topology, bool primitive_restart_enable,
+                                                  const ShaderProgram& vertex_program, const ShaderProgram& pixel_program) {
+	if (commit.pipeline != nullptr || FirstBuild(m_graphics) != PipelineBuild::Fast) return false;
+	// (The create's key, CreateGraphicsPipelineImpl's: NormalGraphicsKey, `commit.key` value-initialized as the create's.)
+	if (!NormalGraphicsKey(colors, depth, vs_input_info, command, ps_input_info, topology, primitive_restart_enable, vertex_program,
+	                       pixel_program, commit.key))
+		return false;
+	{
+		Common::LockGuard lock(m_mutex);
+		if (m_graphics_pipelines.contains(commit.key) || m_pending_graphics_pipelines.contains(commit.key)) return false;
+	}
+	const bool ps_active = ps_input_info != nullptr;
+	auto&      in        = commit.inputs;
+	in.rendering         = commit.key.rendering;
+	in.vertex_input      = commit.key.vertex_input;
+	in.static_params     = commit.key.static_params;
+	in.SetVertexInput(vs_input_info);
+	in.ps_active         = ps_active;
+	if (ps_active) in.ps_input_info = *ps_input_info;
+	in.vertex_program  = vertex_program;
+	in.pixel_program   = pixel_program;
+	in.native_bindings = false;
+	in.table           = false;
+	// (As the create's synchronous build, CreateGraphicsPipelineImpl: the same inputs, the driver cache, FirstBuild; off the
+	// lock, as a compile worker's build: the driver cache takes concurrent creates.)
+	auto       made  = std::make_unique<Pipeline>();
+	const auto begin = std::chrono::steady_clock::now();
+	CreatePipelineInternal(m_graphics, *made, commit.key.rendering, commit.key.vertex_input, vs_input_info, vertex_program,
+	                       ps_input_info, pixel_program, commit.key.static_params, m_driver_cache, false, PipelineBuild::Fast);
+	commit.from_store = LastPipelineFromStore();
+	commit.create_us  = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count());
+	if (made->pipeline == nullptr || made->pipeline_layout == nullptr) {
+		if (made->pipeline != nullptr) {
+			DeviceFault::ForgetPipeline(static_cast<VkPipeline>(made->pipeline));
+			m_graphics.device.destroyPipeline(made->pipeline, nullptr);
+		}
+		return false;
+	}
+	commit.pipeline = std::move(made);
+	return true;
+}
+
+bool PipelineCache::PrivateBuildsAllowed() const {
+	return FirstBuild(m_graphics) == PipelineBuild::Fast;
+}
+
+void PipelineCache::CommitAdopted(AdoptedCommit& commit) {
+	Common::LockGuard lock(m_mutex);
+	// The permutations' records first, as the in-order lookup makes them before its draw's pipeline.
+	for (uint32_t i = 0; i < commit.count; ++i) m_program_cache->RecordMet(commit.ids[i], commit.records[i]);
+	if (commit.pipeline == nullptr) return;
+	// (Made meanwhile, by an in-order draw before this one or an earlier commit: that one stays, recipe and all, as the
+	// in-order create would have found it; this one is destroyed with `commit`.)
+	if (m_graphics_pipelines.contains(commit.key) || m_pending_graphics_pipelines.contains(commit.key)) return;
+	// What CreateGraphicsPipelineImpl's synchronous create does after its build, in its order.
+	if (!commit.from_store) {
+		m_play_compiles.fetch_add(1, std::memory_order_relaxed);
+		m_play_compile_us.fetch_add(commit.create_us, std::memory_order_relaxed);
+	}
+	m_render_pipelines++;
+	m_render_pipeline_ms += static_cast<double>(commit.create_us) / 1000.0;
+	MainPipelineDone();
+	auto [iter, inserted] = m_graphics_pipelines.emplace(commit.key, std::move(commit.pipeline));
+	EXIT_IF(!inserted);
+	if (kyty_local_pipeline_index_mode.load(std::memory_order_relaxed) != 0)
+		m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
+	const auto& in   = commit.inputs;
+	const auto  make = [this, in](PipelineBuild build) {
+		return [=, this](Pipeline& target) {
+			// (The vertex input info as GraphicsRemake reads it back from its record.)
+			const auto                vs_input_info = std::make_unique<ShaderVertexInputInfo>();
+			LocalShaderWarmup::Reader reader {in.vs_input_words};
+			EXIT_IF(!LocalShaderWarmup::VisitVertexInput(reader, *vs_input_info) || reader.cursor != in.vs_input_words.size());
+			vs_input_info->stage.program = in.vs_program;
+			CreatePipelineInternal(m_graphics, target, in.rendering, in.vertex_input, *vs_input_info, in.vertex_program,
+			                       in.ps_active ? &in.ps_input_info : nullptr, in.pixel_program, in.static_params, m_driver_cache,
+			                       false, build);
+		};
+	};
+	if (KeepsRemake(m_graphics, *iter->second, commit.from_store)) iter->second->remake = GraphicsRemake(in);
+	BuildOptimized(*iter->second, make(PipelineBuild::Optimize));
+	LocalShaderWarmup::PipelineRecord recipe;
+	recipe.vertex       = m_program_cache->RecordedIndex(in.vertex_program);
+	recipe.pixel        = in.ps_active ? m_program_cache->RecordedIndex(in.pixel_program) : LocalShaderWarmup::NoShader;
+	recipe.rendering    = iter->first.rendering;
+	recipe.vertex_input = iter->first.vertex_input;
+	recipe.state        = iter->first.static_params;
+	if (recipe.vertex != LocalShaderWarmup::NoShader && (!in.ps_active || recipe.pixel != LocalShaderWarmup::NoShader)) {
+		m_program_cache->warmup.AddPipeline(recipe);
+		iter->second->recipe = LocalShaderWarmup::RecipeKey(recipe);
+	}
+}
+
+bool PipelineCache::AdoptedCovers(const AdoptedCommit* commit, std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+                                  const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+                                  const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+                                  bool primitive_restart_enable, const ShaderProgram& vertex_program,
+                                  const ShaderProgram& pixel_program) {
+	const auto met = t_adopt_ids_n;
+	if (met > t_adopt_ids.size()) return false;
+	for (uint32_t i = 0; i < met; ++i) {
+		if (commit == nullptr) return false;
+		const auto end = commit->ids.begin() + commit->count;
+		if (std::find(commit->ids.begin(), end, t_adopt_ids[i]) == end) return false;
+	}
+	// (The key as FindGraphicsPipeline builds it, under the cache's lock as there.)
+	Common::LockGuard   lock(m_mutex);
+	GraphicsPipelineKey key {};
+	if (!NormalGraphicsKey(colors, depth, vs_input_info, command, ps_input_info, topology, primitive_restart_enable, vertex_program,
+	                       pixel_program, key))
+		return false;
+	if (m_graphics_pipelines.contains(key)) return true;
+	return commit != nullptr && commit->pipeline != nullptr && key == commit->key;
 }
 
 PipelineCache::Pipeline&

@@ -267,6 +267,52 @@ public:
 	                          vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                          const ShaderProgram& vertex_program, const ShaderProgram& pixel_program,
 	                          bool native_bindings);
+	// A speculation's thread (TableWorkerEntry, mode 4): TryCreateGraphicsPipeline leaving PromoteOptimized to the GPU
+	// thread and giving its compile's completion in `waiting` (PipelineWaiting is the GPU thread's).
+	[[nodiscard]] Pipeline*
+	TryCreateGraphicsPipelineWorker(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+	                                const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+	                                const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+	                                bool primitive_restart_enable, const ShaderProgram& vertex_program,
+	                                const ShaderProgram& pixel_program, bool native_bindings,
+	                                std::shared_ptr<const std::atomic<bool>>& waiting);
+	// (TableWorkerEntry) The normal graphics pipeline these inputs make (CreateGraphicsPipeline's), when it is built in
+	// memory; null otherwise (pending, not made, or inputs the create refuses). Looks up only: nothing made, posted or recorded.
+	[[nodiscard]] Pipeline* FindGraphicsPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+	                                            const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+	                                            const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+	                                            bool primitive_restart_enable, const ShaderProgram& vertex_program,
+	                                            const ShaderProgram& pixel_program);
+	// (TableWorkerEntry, mode 4) What a worker entry resting on normal permutations not recorded yet (t_adopt_ids) holds for
+	// its commit, which does what the in-order draw would have done (CommitAdopted, the GPU thread, in stream order): the
+	// permutations' records (made from the entry's own lookups, ProgramCache::t_met_records) and, when the normal pipeline
+	// was not in memory, that pipeline, made privately by the worker as CreateGraphicsPipeline would make it
+	// (CreatePrivateGraphicsPipeline), put into the cache with its warmup recipe. Not committed: dropped (the private
+	// pipeline destroyed, nothing recorded).
+	struct AdoptedCommit;
+	// The records this thread's last normal lookups made of the unrecorded permutations they met (t_adopt_ids_n of them);
+	// null when there are none (warmup off, or a record not made).
+	[[nodiscard]] std::shared_ptr<AdoptedCommit> TakeAdoptedRecords();
+	// (A later draw drawn with such an entry: what this thread's last normal lookups (find-only) met for it is all in `commit`:
+	// the unrecorded permutations they met (t_adopt_ids) are among its records, and the normal pipeline of these inputs is in
+	// memory or the commit's own (its key). Null `commit`: none met, and the pipeline in memory. False: this draw's own in-order
+	// normal draw could record what no commit holds.)
+	[[nodiscard]] bool AdoptedCovers(const AdoptedCommit* commit, std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+	                                 const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+	                                 const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+	                                 bool primitive_restart_enable, const ShaderProgram& vertex_program,
+	                                 const ShaderProgram& pixel_program);
+	// The normal pipeline FindGraphicsPipeline found missing, made into `commit` off the cache: false (nothing made) where the
+	// create refuses the inputs, where the first build is not PipelineBuild::Fast (a full build writes the driver cache and the
+	// played pipelines' store, which a dropped one could not take back), or where the cache has or is making it.
+	[[nodiscard]] bool CreatePrivateGraphicsPipeline(AdoptedCommit& commit, std::span<const RenderColorInfo> colors,
+	                                                 const RenderDepthInfo& depth, const ShaderVertexInputInfo& vs_input_info,
+	                                                 CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
+	                                                 vk::PrimitiveTopology topology, bool primitive_restart_enable,
+	                                                 const ShaderProgram& vertex_program, const ShaderProgram& pixel_program);
+	void CommitAdopted(AdoptedCommit& commit);
+	// (Whether CreatePrivateGraphicsPipeline may make one here: the first build is PipelineBuild::Fast.)
+	[[nodiscard]] bool PrivateBuildsAllowed() const;
 	Pipeline& CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	                                const ShaderProgram&          compute_program);
 	// The last GetGraphicsPrograms or GetComputeProgram in table mode found a program a worker still translates
@@ -281,6 +327,31 @@ public:
 	// caller refuses). A fault there waited for the GPU thread with the cache's lock held: a freeze.
 	static inline thread_local bool t_no_fault_reads  = false;
 	static inline thread_local bool t_no_fault_failed = false;
+	// (TableWorkerEntry, mode 4) A speculation's normal-mode GetGraphicsPrograms that only looks up: a program that is not a
+	// permutation in memory (it would be adopted from the prefetch or translated, and recorded) comes back empty, nothing made.
+	// A program entry that still holds its warm code is compared on the code copied before the lock only (params.code_unread
+	// clear), the entry left as it is; not copied, or another code: empty.
+	static inline thread_local bool t_find_only = false;
+	// With t_find_only, a program whose permutation is not in memory but whose module the prefetch holds DONE is adopted
+	// here as the GPU thread's normal draw adopts it (under m_mutex: the permutation published), but NOT recorded: it is kept
+	// unrecorded (ProgramCache::unrecorded) and recorded by the first in-order lookup that finds it, or by the commit of an
+	// entry resting on it (AdoptedCommit). Nothing is translated, and a group not done (pending: the caller would claim it to
+	// translate it; running: the caller would wait) is left as it is; one taken whose plan did not materialize for the draw
+	// goes back. t_adopt_adopted counts the permutations adopted by this lookup, t_adopt_ids the shader ids of those kept
+	// unrecorded and of unrecorded ones a find-only lookup found (t_adopt_ids_n of them, at most one a stage; the caller
+	// resets it before each GetGraphicsPrograms).
+	static inline thread_local bool                    t_adopt_only    = false;
+	static inline thread_local uint32_t                t_adopt_adopted = 0;
+	static inline thread_local std::array<uint64_t, 2> t_adopt_ids {};
+	static inline thread_local uint32_t                t_adopt_ids_n   = 0;
+	// (Those lookups also make the records of the unrecorded permutations they meet, for the entry's commit:
+	// TakeAdoptedRecords. Set by the caller around them.)
+	static inline thread_local bool t_adopt_records = false;
+	// (A reuse draw's find-only lookups (TableWorkerEntry's reuse check): a specialization word not read clean fails the
+	// lookup (t_no_fault_failed) as under t_adopt_records, without making records. Set by the caller.)
+	static inline thread_local bool t_strict_reads = false;
+	// (The speculations inside such a lookup now: ProgramCache::Get tests this plain global before the thread-local.)
+	static inline std::atomic<uint32_t> g_find_only_users {0};
 	// When TablePending: the completion of that translation (set once it is done).
 	[[nodiscard]] std::shared_ptr<const std::atomic<bool>> TableWaiting() const;
 	// When TryCreateGraphicsPipeline or TryCreateComputePipeline returned null: the completion of that compile.
@@ -427,6 +498,14 @@ private:
 	size_t                        m_driver_cache_saved_size = 0;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
+	// (TableWorkerEntry) The key CreateGraphicsPipelineImpl builds for a normal pipeline of these inputs, built the same way
+	// (keep the two in step); false where the create would refuse them (its EXITs). Reads registers and the device's
+	// properties only.
+	[[nodiscard]] bool NormalGraphicsKey(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+	                                     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+	                                     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+	                                     bool primitive_restart_enable, const ShaderProgram& vertex_program,
+	                                     const ShaderProgram& pixel_program, GraphicsPipelineKey& key) const;
 	// Pipelines remain owned by m_graphics_pipelines until this cache is destroyed.
 	// Both indices use the complete GraphicsPipelineKey equality predicate.
 	std::unordered_map<GraphicsPipelineKey, Pipeline*, NativeGraphicsPipelineKeyHash>
@@ -477,7 +556,8 @@ private:
 	                                     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
 	                                     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
 	                                     bool primitive_restart_enable, const ShaderProgram& vertex_program,
-	                                     const ShaderProgram& pixel_program, bool native_bindings, bool async);
+	                                     const ShaderProgram& pixel_program, bool native_bindings, bool async,
+	                                     std::shared_ptr<const std::atomic<bool>>* worker_waiting = nullptr);
 	void      FinishCompileWorkers();
 	bool      m_session_reported = false; // (ReportSession)
 	// The start-up warmup (the constructor's choices): in front of the game, or beside it on m_warmup_thread
