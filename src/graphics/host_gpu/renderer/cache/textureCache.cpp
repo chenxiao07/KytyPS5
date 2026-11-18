@@ -3735,8 +3735,15 @@ ImageId TextureCache::FindImageReadOnly(ImageDesc& desc, bool exact_format) {
 		TouchImage(image); // (a speculation's: noted for its commit)
 		return result;
 	}
-	if (!image.registered || image.depth_id || image.binding.needs_rebind)
+	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
+		// (spec_worker_images, mode 4: a sampled view's own-backing image unregistered or replaced, left to the commit as a
+		// missing one is: FindImage there finds or makes what the in-order lookup does. Not under a depth association, nor
+		// with metadata on either side.)
+		if (t_pending_images_ok && !image.depth_id && !image.info.HasMetadata() && !desc.info.HasMetadata() &&
+		    SameBacking(image.info, desc.info, false))
+			return t_pending_hit = true, ImageId {};
 		return ReadOnlyFail("worker set: image not current"), ImageId {};
+	}
 	if (exact_format && image.info.pixel_format != desc.info.pixel_format)
 		return ReadOnlyFail("worker set: image format"), ImageId {};
 	if (!image.info.resources.Contains(desc.info.resources)) return ReadOnlyFail("worker set: image resources"), ImageId {};
@@ -3893,9 +3900,19 @@ vk::ImageView TextureCache::FindTextureReadOnly(ImageId id, const ImageDesc& des
 		return ReadOnlyFail(why), vk::ImageView {};
 	};
 	if (!image->info.data.Empty()) {
-		if (!image->registered || image->depth_id || image->binding.needs_rebind)
+		if (!image->registered || image->depth_id || image->binding.needs_rebind) {
+			// (spec_worker_images: as FindImageReadOnly's, an image not current left to the commit.)
+			if (t_pending_images_ok && !image->depth_id && !image->info.HasMetadata() && !desc.info.HasMetadata())
+				return pending("worker set: image not current");
 			return ReadOnlyFail("worker set: image not current"), vk::ImageView {};
-		if (image->info.HasMetadata()) return ReadOnlyFail("worker set: metadata"), vk::ImageView {};
+		}
+		if (image->info.HasMetadata()) {
+			// (spec_worker_images: FindTexture's metadata step a no-op on it (MetadataBindNoopLocked), the slot completed at
+			// the commit, which tests the step again before its FindTexture (PendingImage::metadata); its upload, first
+			// sampling and new view there too.)
+			if (t_pending_images_ok && MetadataBindNoopLocked(*image, desc) == 0) return pending("worker set: metadata");
+			return ReadOnlyFail("worker set: metadata"), vk::ImageView {};
+		}
 		if (RefreshPending(*image, desc)) {
 			if (t_pending_images_ok && !image->depth_id) return pending("worker set: upload"); // (spec_worker_images)
 			return ReadOnlyFail("worker set: upload"), vk::ImageView {};
