@@ -28,6 +28,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -67,12 +68,35 @@ static std::mutex                                        g_mutex;
 static uint32_t                                          g_next_submission_id = 1;
 static uint32_t                                          g_next_file_id       = 1;
 static std::unordered_map<uint32_t, SubmissionState>     g_submissions;
-static std::unordered_map<std::string, ResolvedPathInfo> g_resolved_paths;
+// The guest paths resolved, where they never move or go (a path is resolved once and kept), for g_resolved_paths' keys to
+// view: a std::string key gave each of the ~224K paths the game resolves at start-up a heap block of its own besides
+// its node (~50 characters: 64-80 bytes with the heap's header; ~10 MiB in all). Under g_mutex.
+class PathArena {
+public:
+	std::string_view Keep(std::string_view path) {
+		if (m_chunks.empty() || m_size - m_used < path.size()) {
+			m_size = std::max(ChunkBytes, path.size());
+			m_chunks.push_back(std::make_unique<char[]>(m_size));
+			m_used = 0;
+		}
+		char* at = m_chunks.back().get() + m_used;
+		std::memcpy(at, path.data(), path.size());
+		m_used += path.size();
+		return {at, path.size()};
+	}
+
+private:
+	static constexpr size_t              ChunkBytes = size_t {256} << 10u;
+	std::vector<std::unique_ptr<char[]>> m_chunks;
+	size_t                               m_size = 0, m_used = 0;
+};
+static PathArena                                              g_path_arena;
+static std::unordered_map<std::string_view, ResolvedPathInfo> g_resolved_paths;
 // The files by id (at file_id - 1: ids are handed out in order from 1, under g_mutex): their g_resolved_paths entries
 // (the guest path and its info), which never move or go (a node map; a path is resolved once and kept). Two maps by id
 // held a second copy of each host path and its size before: the game resolves its ~250K paths at start-up, so the copies
 // were tens of MiB of heap.
-using ResolvedPath = std::pair<const std::string, ResolvedPathInfo>;
+using ResolvedPath = std::pair<const std::string_view, ResolvedPathInfo>;
 static std::vector<const ResolvedPath*> g_files_by_id;
 // The host paths of the files read so far, by id: made from the guest path at a file's first read as resolving it makes
 // them (GetRealFilename: the mount point's directory or archive and the rest of the path). The game resolves ~224K paths
@@ -155,7 +179,7 @@ static bool TryGetHostPath(uint32_t file_id, std::string* out) {
 			*out = kept->second;
 			return true;
 		}
-		guest_path = entry->first;
+		guest_path.assign(entry->first);
 	}
 	// (Outside g_mutex, as ResolveOnePath: the mount points take a lock of their own.)
 	auto             host_path = Common::PathToString(LibKernel::FileSystem::GetRealFilename(guest_path));
@@ -250,7 +274,9 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		bool log_missing = false;
 		{
 			std::scoped_lock lock(g_mutex);
-			auto [it, inserted] = g_resolved_paths.emplace(path, info);
+			auto       it       = g_resolved_paths.find(path);
+			const bool inserted = it == g_resolved_paths.end();
+			if (inserted) it = g_resolved_paths.emplace(g_path_arena.Keep(path), info).first;
 			if (!inserted) {
 				info = it->second;
 			} else if (info.result == OK) {
