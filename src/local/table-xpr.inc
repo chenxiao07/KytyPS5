@@ -3091,6 +3091,19 @@ static bool TableRelocRecord(vk::CommandBuffer vk_buffer, Spec::State& spec, uin
 	return false;
 }
 
+// (Mode 4) A worker's table draw whose blocks, argument and index lookups saw the registration epoch move (the GPU thread's
+// registrations, anywhere: a speculation's lookups register nothing) is kept when no registration since reached the tracker
+// regions of a buffer range its open segment used (a superset of this draw's: its notes merge into them), and refused as
+// before otherwise. The commit's Changed() asks the same of those ranges since the speculation began.
+static bool TableWorkerKeepsMoved(const Spec::State& spec, const BufferCache& cache, uint64_t epoch) {
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return false;
+	for (size_t i = spec.Sealed().buffer_ranges; i < spec.buffer_ranges.size(); ++i) {
+		const auto& range = spec.buffer_ranges[i];
+		if (cache.RegisteredSince(range.begin, range.end - range.begin, epoch)) return false;
+	}
+	return true;
+}
+
 RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
                                                       const NativeXprDrawState& draw_state,
                                                       std::span<const uint64_t> commands, uint64_t index_base,
@@ -3249,7 +3262,8 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		});
 		if (indices.first == nullptr) return TableResult::Native;
 	}
-	if (buffer_cache.RegistrationEpoch() != registration)
+	if (buffer_cache.RegistrationEpoch() != registration &&
+	    (spec_state == nullptr || !TableWorkerKeepsMoved(*spec_state, buffer_cache, registration)))
 		return LiveCounters::Add(LiveCounters::TableRegistered), TableResult::Native;
 	// (A speculation's lookups and preparation refuse without failing: nothing is recorded for a refused draw.)
 	if (spec_state != nullptr && spec_state->refused != nullptr) return TableResult::Native;
