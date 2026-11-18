@@ -650,6 +650,10 @@ struct PipelineCache::ProgramCache {
 		bool plan_pinned = false;
 		// KYTY_SPEC_PRELOAD_FIX: sent out as a preload no lookup used; not preloaded again until a lookup uses it.
 		bool preload_shunned = false;
+		// (Mode 4) The scene whose warmup listed it last (KeepScenePlans; SceneTags::None: none), and whether a lookup has
+		// met it since.
+		bool     keep_met   = false;
+		uint32_t keep_scene = SceneTags::None;
 	};
 	// (Mode 4) The pinned plans (AheadJob): released at their first lookup (EnsurePlan), when the entry leaves the programs,
 	// and at each scene change (SceneLoop, WarmScene).
@@ -818,6 +822,7 @@ struct PipelineCache::ProgramCache {
 		auto& source = entry->second;
 		Unpin(source);                  // ((Mode 4) its first lookup)
 		source.preload_shunned = false; // (KYTY_SPEC_PRELOAD_FIX: a lookup used it)
+		source.keep_met        = true;  // ((Mode 4) met since its scene's warmup)
 		const auto last_use    = source.plan_use;
 		source.plan_use        = plan_clock;
 		if (source.plan_preloaded) {
@@ -862,6 +867,7 @@ struct PipelineCache::ProgramCache {
 	void EnsurePlan(SourceEntry& source) {
 		Unpin(source);                  // ((Mode 4) its first lookup)
 		source.preload_shunned = false; // (KYTY_SPEC_PRELOAD_FIX: a lookup used it)
+		source.keep_met        = true;  // ((Mode 4) met since its scene's warmup)
 		const auto last_use    = source.plan_use;
 		source.plan_use        = plan_clock;
 		if (source.plan_preloaded) {
@@ -930,7 +936,19 @@ struct PipelineCache::ProgramCache {
 		// (The unused preloads, oldest preload first, then the idle plans, least recently used first.)
 		const auto by_use = [](const SourceEntry* source) { return source->plan_use; };
 		if (unused != 0) std::ranges::sort(idle.begin(), idle.begin() + static_cast<std::ptrdiff_t>(unused), {}, by_use);
-		std::ranges::sort(idle.begin() + static_cast<std::ptrdiff_t>(unused), idle.end(), {}, by_use);
+		// (Mode 4) Among the idle plans the current scene's last (KeepScenePlans): those a lookup met since its warmup, then
+		// those not met yet (what a first arrival needs); each least recently used first. The budget still wins.
+		const uint32_t keep_scene = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? SceneTags::Current()
+		                                                                                              : SceneTags::None;
+		if (keep_scene != SceneTags::None) {
+			const auto by_rank = [keep_scene](const SourceEntry* source) {
+				const uint32_t rank = source->keep_scene != keep_scene ? 0u : source->keep_met ? 1u : 2u;
+				return std::pair {rank, source->plan_use};
+			};
+			std::ranges::sort(idle.begin() + static_cast<std::ptrdiff_t>(unused), idle.end(), {}, by_rank);
+		} else {
+			std::ranges::sort(idle.begin() + static_cast<std::ptrdiff_t>(unused), idle.end(), {}, by_use);
+		}
 		idle.resize(std::min(idle.size(), in_memory - budget));
 		uint32_t writes = 0;
 		auto     freed  = std::make_shared<std::vector<ShaderRecompiler::IR::ResourcePlan>>();
@@ -3306,6 +3324,39 @@ struct PipelineCache::ProgramCache {
 	// (Under the cache's m_mutex) Table pipelines made ahead queued or building, which read their table permutations'
 	// programs and modules: while any is, a dropped entry is retired, not freed (ReleaseRetired).
 	uint32_t ahead_pipeline_builds = 0;
+	// (Mode 4, the warmup thread in WarmScene) The programs of the recording's recipes (those of `only` where given)
+	// marked as `scene`'s, not met since: the sweep sends them out last while the scene is current (SweepPlans). The
+	// records decoded without the cache's lock (the warmup thread's own views), the programs marked under `mutex` (the
+	// cache's); a program the cache lacks, or holds of other code, is left. A program two scenes list is the last warmed
+	// one's; a scene left behind: its marks are not read, its plans age as any.
+	void KeepScenePlans(uint32_t scene, const std::unordered_set<uint64_t>* only, Common::Mutex& mutex) {
+		std::vector<uint8_t> needed(warm_records.size(), 0);
+		for (const auto& words: warm_recipes) {
+			if (only != nullptr && !only->contains(LocalShaderWarmup::RecipeKey(words))) continue;
+			LocalShaderWarmup::PipelineRecord recipe;
+			LocalShaderWarmup::Reader         reader {words};
+			if (!LocalShaderWarmup::VisitPipeline(reader, recipe)) continue;
+			for (const auto index: {recipe.vertex, recipe.pixel, recipe.compute})
+				if (index < needed.size()) needed[index] = 1;
+		}
+		std::vector<std::pair<ProgramKey, uint64_t>> keys; // (the key, the code's digest)
+		for (size_t i = 0; i < needed.size(); ++i) {
+			if (needed[i] == 0) continue;
+			LocalShaderWarmup::Record record;
+			LocalShaderWarmup::Reader reader {warm_records[i]};
+			if (!LocalShaderWarmup::Visit(reader, record)) continue;
+			keys.emplace_back(ProgramKey {record.stage, record.hash, record.user_data_count,
+			                              static_cast<uint32_t>(record.code.size()), record.static_key},
+			                  SourceDigest(record.code, record.back_code));
+		}
+		Common::LockGuard lock(mutex);
+		for (const auto& [key, digest]: keys) {
+			const auto entry = programs.find(key);
+			if (entry == programs.end() || entry->second.source_digest != digest) continue;
+			entry->second.keep_scene = scene;
+			entry->second.keep_met   = false;
+		}
+	}
 	struct AheadSeed {
 		ProgramKey                key;
 		uint64_t                  digest = 0;
@@ -4674,6 +4725,8 @@ void PipelineCache::WarmScene(uint32_t scene, uint64_t compute_video, bool in_me
 			Common::LockGuard lock(m_mutex);
 			programs.ReleasePlanPins();
 		}
+		// The programs of the scene's recipes (the set WarmPipelines makes pipelines of) marked as the scene's.
+		programs.KeepScenePlans(scene, known || !in_memory ? &only : nullptr, m_mutex);
 		const auto posted = programs.PostTableAhead(programs.warm_records, programs.warm_recipes,
 		                                            known || !in_memory ? &only : nullptr, m_mutex);
 		PipelineCacheLog("Table ahead: {}: {} table programs queued (their vertex programs follow their pixel programs)",
