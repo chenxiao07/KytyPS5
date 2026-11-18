@@ -271,6 +271,14 @@ public:
 		m_cpu_epoch.fetch_add(1, std::memory_order_acq_rel);
 		m_deferred_protects.fetch_sub(1, std::memory_order_acq_rel);
 	}
+	// KYTY_SPEC_UPLOAD_PIPE: `count` queued deferred protections of this region over adjacent ranges, [vaddr, vaddr + size)
+	// together, as one: the pages' protection as each would give it (it is read per page when it runs), the epoch and the
+	// pending count moved by `count`, as `count` calls would.
+	void ApplyDeferredProtections(uint64_t vaddr, uint64_t size, uint32_t count) {
+		m_page_manager.ReapplyProtection(vaddr, size);
+		m_cpu_epoch.fetch_add(count, std::memory_order_acq_rel);
+		m_deferred_protects.fetch_sub(count, std::memory_order_acq_rel);
+	}
 
 	template <DirtySource source, bool all = false>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {

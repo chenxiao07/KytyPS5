@@ -2729,7 +2729,11 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 				    [](void* manager, uint64_t address, uint64_t size) {
 					    static_cast<RegionManager*>(manager)->ApplyDeferredProtection(address, size);
 				    },
-				    item.manager, item.address, item.size, item.address, item.size);
+				    item.manager, item.address, item.size, item.address, item.size,
+				    // (KYTY_SPEC_UPLOAD_PIPE: `count` of them over adjacent ranges as one.)
+				    [](void* manager, uint64_t address, uint64_t size, uint64_t count) {
+					    static_cast<RegionManager*>(manager)->ApplyDeferredProtections(address, size, static_cast<uint32_t>(count));
+				    });
 			} else {
 				item.manager->ApplyDeferredProtection(item.address, item.size);
 			}
@@ -3108,7 +3112,11 @@ void BufferCache::QueueImageProtects(std::span<const StagingPiece> copied, bool 
 		    [](void* manager, uint64_t address, uint64_t bytes) {
 			    static_cast<PageManager*>(manager)->SyncProtection(address, bytes);
 		    },
-		    m_image_protect_manager, range.address, range.size, range.address, range.size);
+		    m_image_protect_manager, range.address, range.size, range.address, range.size,
+		    // (KYTY_SPEC_UPLOAD_PIPE: adjacent ones as one; it reads each page's watchers when it runs.)
+		    [](void* manager, uint64_t address, uint64_t bytes, uint64_t) {
+			    static_cast<PageManager*>(manager)->SyncProtection(address, bytes);
+		    });
 	}
 	m_image_protects.clear();
 }
@@ -3132,7 +3140,7 @@ bool BufferCache::PushImageStagingCopies(uint8_t* staging, uint64_t vaddr, uint6
 	// Partly unmapped (a texture pool with released layers): the worker reads the mapped
 	// parts; the render thread copied hundreds of MiB here synchronously before.
 	AsyncUpload::Get().PushCall(ReadMappedOrZeroCall, reinterpret_cast<void*>(vaddr),
-	                            reinterpret_cast<uint64_t>(staging), size, vaddr, size);
+	                            reinterpret_cast<uint64_t>(staging), size, vaddr, size, AsyncUpload::Worker::JobKind::Read);
 	return false;
 }
 
@@ -3217,7 +3225,8 @@ std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<Sta
 		// when memory is mapped there (TextureCache::MapMemory).
 		if (async) {
 			AsyncUpload::Get().PushCall(ReadMappedOrZeroCall, reinterpret_cast<void*>(piece.vaddr),
-			                            reinterpret_cast<uint64_t>(target), piece.size, piece.vaddr, piece.size);
+			                            reinterpret_cast<uint64_t>(target), piece.size, piece.vaddr, piece.size,
+			                            AsyncUpload::Worker::JobKind::Read);
 			queued = true;
 			continue;
 		}

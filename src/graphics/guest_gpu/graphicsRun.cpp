@@ -934,7 +934,7 @@ static bool GuardedWrite(void* dst, const void* src, uint32_t size) {
 		}
 	}
 	for (uint64_t page = first; page < end; page += WriteGuard::Page)
-		(void)worker.PushCall(LiftGuardCall, nullptr, page, token, 0, 1);
+		(void)worker.PushCall(LiftGuardCall, nullptr, page, token, 0, 1, AsyncUpload::Worker::JobKind::Lift);
 	worker.Kick();
 	const bool written = armed && WriteGuardedBacking(address, bytes.data(), size);
 	// (Not written: the caller's drain waits for the lifts too, then writes through the guest mapping.)
@@ -984,7 +984,7 @@ size_t CommitGuardedWriteRun(const uint64_t* addresses, const uint64_t* values, 
 		token = WriteGuard::NextToken();
 		armed = WriteGuard::Arm(page, token);
 	}
-	(void)worker.PushCall(LiftGuardCall, nullptr, page, token, 0, 1);
+	(void)worker.PushCall(LiftGuardCall, nullptr, page, token, 0, 1, AsyncUpload::Worker::JobKind::Lift);
 	worker.Kick();
 	if (!armed) return 0;
 	size_t written = 0;
