@@ -433,6 +433,7 @@ void Shut(Runtime& r) {
 		if (r.parcels[index].state.load(std::memory_order_acquire) != Parcel::Free) ReleaseSlot(r, index);
 	ForgetSlotHolds(r);
 	g_active.store(false, std::memory_order_seq_cst);
+	SpinGate::Quiet(SpinGate::QuietWeave, false);
 }
 
 void StandDown(const char* line) {
@@ -533,6 +534,8 @@ bool Start(const Bodies& bodies) {
 		r->parcels[i].result = std::make_shared<Result>();
 	g_runtime.store(r, std::memory_order_release);
 	g_active.store(true, std::memory_order_seq_cst);
+	// (While Active(), nothing spins beside the shader prefetch: spin-gate.h's Quiet. Pause and Shut clear it.)
+	SpinGate::Quiet(SpinGate::QuietWeave, true);
 	try {
 		r->reader = std::thread([r] { ReaderMain(*r); });
 		for (uint32_t worker = 0; worker < r->workers; ++worker)
@@ -597,6 +600,7 @@ void Pause() {
 	r->feed_head.store(r->feed_tail.load(std::memory_order_acquire), std::memory_order_release);
 	ForgetSlotHolds(*r);
 	g_active.store(false, std::memory_order_seq_cst);
+	SpinGate::Quiet(SpinGate::QuietWeave, false);
 }
 
 void Resume() {
@@ -605,6 +609,7 @@ void Resume() {
 	// The frees made while paused went unlogged: every clock read before reads as the log turned over (FreedHits 2).
 	g_freed_seq.store(g_freed_seq.load(std::memory_order_relaxed) + FreedEntries + 1, std::memory_order_release);
 	g_active.store(true, std::memory_order_seq_cst);
+	SpinGate::Quiet(SpinGate::QuietWeave, true);
 	r->epoch.fetch_add(1, std::memory_order_seq_cst);
 	WakeReader();
 }

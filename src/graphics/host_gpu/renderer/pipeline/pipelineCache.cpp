@@ -38,6 +38,7 @@
 #include "mode-toggle.h"
 #include "slow-log.h"
 #include "speculation-state.h"
+#include "spin-gate.h"
 #include "startup-progress.h"
 
 #include <algorithm>
@@ -1997,6 +1998,8 @@ struct PipelineCache::ProgramCache {
 			                 p.groups.size(), p.inputs.records.size(), added, ranked, threads, p.gentle_threads,
 			                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
 			p.ready.store(true, std::memory_order_release);
+			// (Nothing spins while it translates beside the weave, until the "all" line: spin-gate.h's Quiet.)
+			if (!p.groups.empty()) SpinGate::Quiet(SpinGate::QuietPrefetch, true);
 			// (No program at all, every input the warmup's: no worker reaches the "all" line, so it is written here.)
 			if (p.groups.empty()) {
 				PipelineCacheLog("Shader prefetch: all 0 programs translated (every input the warmup's)");
@@ -2051,6 +2054,7 @@ struct PipelineCache::ProgramCache {
 				                 "of SPIR-V made ({} MiB compressed in the file)",
 				                 p.groups.size(), p.cache_loaded, p.spirv_bytes.load(std::memory_order_relaxed) >> 20u,
 				                 p.spill_end.load(std::memory_order_relaxed) >> 20u);
+				SpinGate::Quiet(SpinGate::QuietPrefetch, false);
 				if (!p.spill_owned) SaveDiskCache(disk, true);
 				std::vector<std::vector<uint32_t>>().swap(p.inputs.records); // no longer read
 				const auto mib = [&](PrefetchMemoryPart part) { return p.memory[part].load(std::memory_order_relaxed) >> 20u; };

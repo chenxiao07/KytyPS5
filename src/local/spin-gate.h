@@ -7,6 +7,11 @@
 // spinning; held to 4, 43-50 fps with lows of 3-5 spinning, 57-63 not. So the workers spin while the processors this
 // process may run on keep three CPUs idle on average (measured every 250 ms, spinning included), and again from five
 // (more than the spins' own burn: no flapping). kyty_local_spin_gate (KYTY_SPIN_GATE): 1 so, 0 always spin, 2 never.
+//
+// With 1, nothing spins while the weave runs beside the shader prefetch (Quiet): the prefetch translates on the
+// processors the spins, the scout and the weave's workers take. At the 1-1 bench without the prefetch cache, the
+// prefetch took 33.25 s from its start line to its "all" line under the weave against 27.75 s in mode 0, slower for
+// load, not waiting; with no spinning (2) 29.25 s, done before the HUD. Mode 0 and mode 4 spin as before.
 
 #include "live-counters.h"
 #include "local-platform.h"
@@ -32,6 +37,26 @@ inline uint64_t g_last_idle = 0, g_last_cpus = 0;
 inline int64_t  g_last_ns     = 0;
 inline uint32_t g_transitions = 0;
 
+// Spinning stopped while both bits are set (Quiet): the pipeline cache's from the prefetch's start line to its "all"
+// line, weave.cpp's while Weave::Active(). A prefetch that never reaches its "all" line keeps spinning off for the
+// session, as 2 does.
+inline constexpr uint32_t    QuietPrefetch = 1, QuietWeave = 2, QuietBoth = QuietPrefetch | QuietWeave;
+inline std::atomic<uint32_t> g_quiet {0};
+
+inline void Quiet(uint32_t reason, bool on) {
+	const uint32_t was = on ? g_quiet.fetch_or(reason, std::memory_order_relaxed)
+	                        : g_quiet.fetch_and(~reason, std::memory_order_relaxed);
+	const uint32_t now = on ? was | reason : was & ~reason;
+	if ((was == QuietBoth) != (now == QuietBoth))
+		std::printf("Spin gate: the hand-off workers %s\n",
+		            now == QuietBoth ? "stop spinning while the shader prefetch runs beside the weave"
+		                             : "spin as the gate says again");
+}
+
+[[nodiscard]] inline bool Quieted() {
+	return g_quiet.load(std::memory_order_relaxed) == QuietBoth;
+}
+
 inline void Measure(int64_t now) {
 	uint64_t idle = 0, cpus = 0;
 	if (!LocalPlatform::ProcessCpusIdleTime(&idle, &cpus)) return; // (unknown: stays open)
@@ -54,7 +79,7 @@ inline void Measure(int64_t now) {
 // A worker about to spin: whether it may (the recording worker measures: `measure`).
 inline bool Open(bool measure) {
 	if (const auto mode = kyty_local_spin_gate.load(std::memory_order_relaxed); mode != 1) return mode == 0;
-	if (!measure) return g_open.load(std::memory_order_relaxed);
+	if (!measure) return g_open.load(std::memory_order_relaxed) && !Quieted();
 	const int64_t now =
 	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 	if (now >= g_next_ns.load(std::memory_order_relaxed) && g_measuring.try_lock()) {
@@ -62,7 +87,7 @@ inline bool Open(bool measure) {
 		Measure(now);
 		g_measuring.unlock();
 	}
-	return g_open.load(std::memory_order_relaxed);
+	return g_open.load(std::memory_order_relaxed) && !Quieted();
 }
 
 } // namespace SpinGate

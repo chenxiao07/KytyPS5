@@ -221,6 +221,12 @@ Ids `Weave*` in `src/local/live-counters.h`; names as `measure` prints them:
 the gate is shut too (`weave_parcels_gate_skipped` counts those), since a parcel left is made by the GPU thread, on
 the frame's path.
 
+While the weave runs beside the shader prefetch, from the prefetch's start line to its "all" line, the gate stays
+shut for every thread that asks it: the weave's reader and workers, the scout, `Kyty.Record` and `Kyty.Upload`. The
+prefetch translates on the processors those spins would take. The log says so (`Spin gate: the hand-off workers stop
+spinning while the shader prefetch runs beside the weave`, then `... spin as the gate says again`). A prefetch that
+never reaches its "all" line keeps the spinning off for the session. `KYTY_SPIN_GATE=0` or `2` is kept as set.
+
 ## 9. Mode 0
 
 With `KYTY_WEAVE` unset, mode 0 runs upstream's code. Each hook on a path the GPU thread takes is one relaxed load of a
