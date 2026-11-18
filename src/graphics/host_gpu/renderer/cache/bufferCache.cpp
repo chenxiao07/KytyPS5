@@ -11,6 +11,7 @@
 #include "live-trace-gpu.h"
 #include "native-resource-state.h"
 #include "async-upload.h"
+#include "write-guard.h"
 #include "parallel-pages.h"
 #include "readback-queue.h"
 #include "fresh-memory.h"
@@ -3362,6 +3363,44 @@ static void DrainCopyDestination(uint64_t vaddr, uint64_t size) {
 	if (drain.load(std::memory_order_relaxed) != 0) AsyncUpload::DrainRange(vaddr, size);
 }
 
+// KYTY_SPEC_LABEL_KNOWN_WRITER: CopyGuestMemory's keep-protection write for the GPU thread's other writes into watched
+// pages (a commit's labels, WRITE_DATA and end-of-pipe labels, a linear copy's CPU-dirty runs), which faulted: the write
+// window released the memory tracker's watch, and the next upload of the covering buffer armed it again (~36 pairs a
+// frame on the GPU thread in play). Exact, as the fault would have it: the images over the range invalidated first
+// (TextureCache::InvalidateMemory: pending downloads released, CPU aliases invalidated), the pages CPU-dirty
+// (MarkRegionAsCpuDirtyKeepProtection: the epoch, the dirty clock and the BDA mark move as ChangeState moves them; only
+// the written pages, where the window took up to 16), the bytes in the backing view (the guest's view shows them: the
+// same memory; fresh granules marked written there, TryWrite*Backing; an offload's range given back first). The watch
+// stays: the guest CPU's next write to the pages faults and drops it as for any dirty page, and the next upload finds
+// them protected already. Not taken, the caller's write as before: no watcher on the range (it does not fault); a write
+// guard on a page (its protection is not the page manager's); a read watcher (GPU-written bytes to read back first, an
+// offload's hold, a read guard); a view a partial unmap is mapping again; GPU-modified pages (only this thread marks
+// them, so a range found unmodified stays so until the write); no single backing mapping for the range.
+bool BufferCache::WriteGuestKnownWriter(uint64_t vaddr, const void* data, uint64_t size, bool source_in_guest) {
+	static auto& on = LiveSwitch::Find("spec_label_known_writer", ModeToggle::Default("spec_label_known_writer"));
+	if (on.load(std::memory_order_relaxed) == 0 || !GuestGpu::IsGpuThread() || m_resources == nullptr || data == nullptr ||
+	    size == 0 || !GuestRange {vaddr, size}.Valid())
+		return false;
+	uint64_t first = 0, end = 0;
+	if (!m_resources->WatchedSpan(vaddr, size, &first, &end) || WriteGuard::GuardedBacking(vaddr, size) != nullptr ||
+	    Libs::LibKernel::Memory::ReadFaults(vaddr, size) || Libs::LibKernel::Memory::InRemapWindow(vaddr) ||
+	    Libs::LibKernel::Memory::InRemapWindow(vaddr + size - 1) || m_memory_tracker.IsRegionGpuModified(vaddr, size))
+		return false;
+	// (A source in guest memory read here, its faults served outside the backing write: GuardedWrite's order.)
+	if (source_in_guest) {
+		thread_local std::vector<uint8_t> bytes;
+		bytes.resize(size);
+		std::memcpy(bytes.data(), data, size);
+		data = bytes.data();
+	}
+	// (As the write fault would: the images over the pages first.)
+	m_texture_cache.InvalidateMemory(vaddr, size);
+	if (!m_memory_tracker.MarkRegionAsCpuDirtyKeepProtection(vaddr, size)) return false;
+	// (Not GPU-modified: no data writer writes these pages, so the CPU-owned writer first, as WriteGuardedBacking.)
+	return Libs::LibKernel::Memory::TryWriteCpuBacking(vaddr, data, size) ||
+	       Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size);
+}
+
 void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size) {
 	// The game's linear copies mostly rewrite what the destination already holds (95% of the bytes in the fixed
 	// scene): only the destination pages whose bytes differ are written, so the others stay clean (no upload of their
@@ -3390,6 +3429,12 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 			}
 			// (Memory the backing view does not hold: written through the guest's view, unprotected first.)
 			InvalidateMemory(address, bytes);
+		} else if (WriteGuestKnownWriter(address, from, bytes)) {
+			// (KYTY_SPEC_LABEL_KNOWN_WRITER: CPU-dirty pages still watched, written the way above since their upload, are
+			// written the same way again, their epoch moved by the mark: no write fault releasing the watch.)
+			parts.Note();
+			if (Scout::Running()) Scout::NoteHostWrite(address, bytes);
+			return;
 		}
 		// (Pages CPU-dirty already change no state: their epoch moves, a copy of their bytes taken meanwhile is
 		// stale. A linear copy is a dispatch, no point the observation epoch moves at.)

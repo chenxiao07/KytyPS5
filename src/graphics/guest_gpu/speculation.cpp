@@ -2616,7 +2616,9 @@ void Speculation::After(Result& result, size_t index) {
 					const auto& w = state.writes[k];
 					if (k >= i + done && !CommitGuardedWrite(reinterpret_cast<void*>(w.address), &w.value, w.size)) {
 						drain();
-						std::memcpy(reinterpret_cast<void*>(w.address), &w.value, w.size);
+						// (KYTY_SPEC_LABEL_KNOWN_WRITER: into watched pages through the backing view, the watch kept.)
+						if (!buffers.WriteGuestKnownWriter(w.address, &w.value, w.size))
+							std::memcpy(reinterpret_cast<void*>(w.address), &w.value, w.size);
 					}
 					Spec::NoteHostWrite(w.address, w.size);
 					Spec::NoteLabel(w.address);
@@ -2646,7 +2648,10 @@ void Speculation::After(Result& result, size_t index) {
 		} else {
 			if (!guard || !CommitGuardedWrite(reinterpret_cast<void*>(write.address), &write.value, write.size)) {
 				drain();
-				std::memcpy(reinterpret_cast<void*>(write.address), &write.value, write.size);
+				// (KYTY_SPEC_LABEL_KNOWN_WRITER: into watched pages through the backing view, the watch kept,
+				// BufferCache::WriteGuestKnownWriter; else, and with it off, through the guest's view.)
+				if (!buffers.WriteGuestKnownWriter(write.address, &write.value, write.size))
+					std::memcpy(reinterpret_cast<void*>(write.address), &write.value, write.size);
 			}
 			// (A speculation translated after it that read memory there before: Spec::EffectsLog.)
 			Spec::NoteHostWrite(write.address, write.size);

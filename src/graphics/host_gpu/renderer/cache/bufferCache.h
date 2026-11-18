@@ -154,6 +154,15 @@ public:
 	// A commit's copy bytes written by a guarded write (speculation.cpp, GuardedCopy): the regions' epochs move, as
 	// CopyGuestMemory's writes move them.
 	void NoteGuardedCopyWrite(uint64_t vaddr, uint64_t size);
+	// KYTY_SPEC_LABEL_KNOWN_WRITER (live spec_label_known_writer; on under KYTY_SPECULATE=4, 0 otherwise: mode-toggle.h;
+	// set, it acts in either mode; the GPU thread only): the GPU thread's own write of guest bytes into watched memory
+	// made through the backing view, its pages marked CPU-dirty with their write protection kept (CopyGuestMemory's
+	// form), in place of the write fault that released the watch (and the upload that armed it again). True: written,
+	// the caller writes nothing. False: not written, the caller writes as before (images over the range may have been
+	// invalidated and its pages marked CPU-dirty: both exact before a write). `source_in_guest`: `data` may be guest
+	// memory (a packet's bytes): read into a local copy first, so a fault reading it is served before the backing write's
+	// locks are taken (GuardedWrite's order).
+	[[nodiscard]] bool WriteGuestKnownWriter(uint64_t vaddr, const void* data, uint64_t size, bool source_in_guest = false);
 	// Called after an identified small GPU copy; it never submits or publishes guest data.
 	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
 	// KYTY_EAGER_FEEDBACK (live eager_feedback, default off: fps flat in PR #300): GPU thread, the copy-feedback

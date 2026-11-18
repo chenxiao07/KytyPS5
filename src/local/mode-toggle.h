@@ -37,7 +37,7 @@ inline constexpr Row Table[] = {
     {"table_memo", 1, 0},               {"spec_worker_packets", 1, 0},  {"table_learn_portable", 2, 0},
     {"table_dead_user_data", 1, 0},     {"spec_gpu_affinity", 1, 0},
     {"spec_backing_range_lock", 1, 0},  {"spec_upload_pipe", 1, 0},      {"spec_pipecache_split", 1, 0},
-    {"spec_bda_clean_skip", 1, 0},      {"spec_preload_fix", 1, 0}, {"spec_texcache_shared", 1, 0},
+    {"spec_bda_clean_skip", 1, 0},      {"spec_preload_fix", 1, 0},      {"spec_label_known_writer", 1, 0}, {"spec_texcache_shared", 1, 0},
     {"spec_texcache_upload_unlocked", 0, 0},
 };
 // KYTY_TABLE_TARGET_READ (not a live switch: read where image sets are made): on under mode 4.

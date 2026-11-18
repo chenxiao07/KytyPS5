@@ -1048,7 +1048,11 @@ static void WriteGuestMemory(void* dst, const void* src, uint32_t size) {
 				parts.Find(reinterpret_cast<uint64_t>(dst), src, size);
 			else
 				parts.address = reinterpret_cast<uint64_t>(dst), parts.size = size;
-			std::memcpy(dst, src, size);
+			// (KYTY_SPEC_LABEL_KNOWN_WRITER: into watched pages through the backing view, the watch kept,
+			// BufferCache::WriteGuestKnownWriter; else, and with it off, through the guest's view.)
+			if (g_gpu_buffers == nullptr ||
+			    !g_gpu_buffers->WriteGuestKnownWriter(reinterpret_cast<uint64_t>(dst), src, size, /*source_in_guest=*/true))
+				std::memcpy(dst, src, size);
 			parts.Note();
 			if (Scout::Running()) Scout::NoteWrite(dst, size); // (as upstream: the unguarded write)
 		}
