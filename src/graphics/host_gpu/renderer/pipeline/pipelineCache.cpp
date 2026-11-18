@@ -506,6 +506,9 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
 		bool                                         table_mode = false; // an empty handle: refused
+		// (Mode 4, under the cache's m_mutex) A table permutation published ahead (AheadPermutation) that no lookup has
+		// found yet: no draw holds it (every pointer a draw holds comes from a lookup, which clears it). DropAheadUnmet.
+		bool ahead_unmet = false;
 	};
 
 	// A permutation the prefetch translated, its SPIR-V in the prefetch's scratch file: zstd-compressed (spirv_bytes,
@@ -535,7 +538,44 @@ struct PipelineCache::ProgramCache {
 		vk::ShaderModule                               module = nullptr; // the result's, made by the worker
 		std::string                                    refused;
 		std::atomic<bool>                              done {false};
+		// (Mode 4, PostTableAhead) Made ahead of its draw from a recorded seed. `claimed`: its translation taken by a worker
+		// (the ahead pool's, or the table workers' once a draw met it queued: `promoted`); `taken`: a draw or
+		// AheadPermutation took its result (its module then the permutation's, under the cache's m_mutex); `after`: run by
+		// the worker that translated it, before `done` (the paired vertex programs' jobs); `after_done`: just after `done`
+		// (the pair's table pipelines, PipelinesAhead).
+		bool                           ahead = false;
+		std::atomic<bool>              claimed {false}, promoted {false};
+		bool                           taken  = false;
+		vk::Device                     device = nullptr;
+		std::function<void(TableJob&)> after, after_done;
+		TableJob() = default;
+		KYTY_CLASS_NO_COPY(TableJob);
+		~TableJob() {
+			// (Made ahead and never taken: its module destroyed, as a dropped program's.)
+			if (!ahead || taken || module == nullptr || !device) return;
+			DestroyShaderModule(device, module);
+			LiveCounters::g_shader_modules.fetch_sub(1, std::memory_order_relaxed);
+		}
 	};
+	// A table job's translation, on the worker that takes it: the one call both the draw's job (Get) and one made ahead
+	// (PostTableAhead) run, over the job's own inputs.
+	static void RunTableJob(TableJob& job, vk::Device device) {
+		try {
+			Common::RecoverableExitScope recoverable;
+			auto translated = ShaderRecompiler::TranslateProgram(job.code, job.options);
+			job.result      = ShaderRecompiler::CompileProgram(std::move(translated), job.options, job.specialization,
+			                                                   job.push_data_cursor);
+			job.module      = CreateModule(device, job.options, job.result->spirv);
+			job.info        = TakeOnWorker(*job.result);
+		} catch (const Common::RecoverableExit& refused) {
+			// (A line of its own in the log: most exit messages end without one.)
+			job.refused = refused.message;
+			if (job.refused.empty() || job.refused.back() != '\n') job.refused += '\n';
+		}
+		if (job.ahead && job.after) job.after(job);
+		job.done.store(true, std::memory_order_release);
+		if (job.ahead && job.after_done) job.after_done(job);
+	}
 
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
@@ -2230,8 +2270,9 @@ struct PipelineCache::ProgramCache {
 			    !std::ranges::equal(params.back_code, entry->second.warm_back_code)) {
 				std::erase_if(by_program, [&](const auto& item) { return item.second.first == &entry->second; });
 				ForgetPlanLoads(entry->second);
-				// (A warmup beside the game may be making pipelines of its permutations: kept until it is done.)
-				if (warming) {
+				// (A warmup beside the game may be making pipelines of its permutations: kept until it is done. So too while
+				// table pipelines made ahead (mode 4) are queued or building: ReleaseRetired.)
+				if (warming || ahead_pipeline_builds != 0) {
 					retired.push_back(programs.extract(entry));
 				} else {
 					for (const auto& p : entry->second.permutations) {
@@ -2327,6 +2368,8 @@ struct PipelineCache::ProgramCache {
 			if (const auto permutation = find_permutation();
 			    permutation != entry->second.permutations.end()) {
 				if (!permutation->handle) return {}; // table mode refused
+				// (Mode 4: a table permutation published ahead, found by its first lookup: a draw holds it from here on.)
+				if (permutation->ahead_unmet) [[unlikely]] permutation->ahead_unmet = false;
 				// Only a borrowed result certifies this exact guard publication.
 				// An ineligible reference transaction must not relabel an old guard.
 				if (borrowed_specialization && !table_mode) {
@@ -2413,32 +2456,25 @@ struct PipelineCache::ProgramCache {
 					job->options.input_info.compute = &job->compute;
 				}
 				jobs.push_back(job);
-				push_job([job, device = device] {
-					try {
-						Common::RecoverableExitScope recoverable;
-						auto translated = ShaderRecompiler::TranslateProgram(job->code, job->options);
-						job->result     = ShaderRecompiler::CompileProgram(std::move(translated), job->options,
-						                                                   job->specialization, job->push_data_cursor);
-						job->module     = CreateModule(device, job->options, job->result->spirv);
-						job->info       = TakeOnWorker(*job->result);
-					} catch (const Common::RecoverableExit& refused) {
-						// (A line of its own in the log: most exit messages end without one.)
-						job->refused = refused.message;
-						if (job->refused.empty() || job->refused.back() != '\n') job->refused += '\n';
-					}
-					job->done.store(true, std::memory_order_release);
-				});
+				push_job([job, device = device] { RunTableJob(*job, device); });
 				Pending() = true;
 				Waiting() = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 				return {};
 			}
 			const auto job = *found;
+			// (Mode 4: a job posted ahead (PostTableAhead) still queued on the ahead pool moves to the table workers now, as
+			// the draw's own would be, run by whichever takes it first.)
+			if (job->ahead && !job->done.load(std::memory_order_acquire) && !job->promoted.exchange(true, std::memory_order_relaxed))
+				[[unlikely]] push_job([job, device = device] {
+					if (!job->claimed.exchange(true, std::memory_order_acq_rel)) RunTableJob(*job, device);
+				});
 			if (!job->done.load(std::memory_order_acquire)) {
 				Pending() = true;
 				Waiting() = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 				return {};
 			}
 			jobs.erase(found);
+			job->taken = true; // (its module, if any, the permutation's below)
 			Permutation permutation {.specialization = table_specialization, .table_mode = true};
 			if (job->result) {
 				const ShaderParams job_params {.code = job->code, .user_data = job->user_data, .hash = params.hash,
@@ -2842,6 +2878,305 @@ struct PipelineCache::ProgramCache {
 		return &*found;
 	}
 
+	// (Mode 4) The table programs of a scene's recorded pairs, translated on the ahead pool (push_ahead: background threads
+	// off the render CPUs) before a draw meets them, into the program entry's table jobs where the draw's own Get would post
+	// its job: a draw whose table specialization and push data cursor are a job's finds it there (made, or moved to the
+	// table workers if still queued) instead of posting one. Then each pair's table pipelines, one per recipe, once both of
+	// its table programs are made (PipelinesAhead).
+	std::function<void(std::function<void()>)> push_ahead;
+	// (Set under the cache's m_mutex before the pools are reset at shutdown (FinishCompileWorkers): no job is pushed to the
+	// ahead pool after it, so none makes a pool again; read under that lock too, by PushAhead and a job's `after`.)
+	bool ahead_stopping = false;
+	// (Under the cache's m_mutex) Table pipelines made ahead queued or building, which read their table permutations'
+	// programs and modules: while any is, a dropped entry is retired, not freed (ReleaseRetired).
+	uint32_t ahead_pipeline_builds = 0;
+	struct AheadSeed {
+		ProgramKey                key;
+		uint64_t                  digest = 0;
+		LocalShaderWarmup::Record record;
+	};
+	// The table form of a seed's specialization, as Get's table branch makes it (table_portable 0: no byte-base offsets,
+	// the indirect image's form).
+	static ShaderRecompiler::IR::ResourceSpecialization AheadSpecialization(const AheadSeed& seed) {
+		auto table_specialization = seed.record.specialization;
+		for (auto& buffer: table_specialization.buffers) buffer.byte_base_offset = false;
+		(void)ShaderRecompiler::IR::TableIndirectForm(table_specialization, nullptr);
+		return table_specialization;
+	}
+	// The job of `seed`'s table program at `cursor`, put into its entry as Get's table branch makes one (under the cache's
+	// m_mutex): the same inputs, but for the user data's values, which the translation does not read (the count only:
+	// Translate's user_data_base / count, DetectEmbeddedVertexFetch's size; the values are the SRT walker's at the draw).
+	// Null where the entry is not there or holds other code, or the job or a table permutation of it is there already.
+	std::shared_ptr<TableJob> AheadJob(const AheadSeed& seed, uint32_t cursor) {
+		const auto& record = seed.record;
+		if (record.stage != ShaderType::Vertex && record.stage != ShaderType::Pixel) return nullptr;
+		const auto entry = programs.find(seed.key);
+		if (entry == programs.end() || entry->second.source_digest != seed.digest) return nullptr;
+		auto& source               = entry->second;
+		auto  table_specialization = AheadSpecialization(seed);
+		for (const auto& job: source.table_jobs)
+			if (job->push_data_cursor == cursor && job->specialization == table_specialization) return nullptr;
+		for (const auto& p: source.permutations)
+			if (p.table_mode && p.specialization == table_specialization &&
+			    p.program.bindings.push_data_start_dword ==
+			        ShaderRecompiler::IR::PushData::StartFor(cursor, p.program.bindings.ShaderDataDwords()))
+				return nullptr;
+		auto job              = std::make_shared<TableJob>();
+		job->ahead            = true;
+		job->device           = device;
+		job->specialization   = std::move(table_specialization);
+		job->push_data_cursor = cursor;
+		job->code             = record.code;
+		job->back_code        = record.back_code;
+		job->user_data.assign(record.user_data_count, 0u);
+		// (Get's options, field by field; then its table job's.)
+		auto& options            = job->options;
+		options.stage            = record.stage;
+		options.enable_lod_stats = true;
+		options.shader_hash      = record.hash;
+		options.dump_ir          = Config::GetShaderLogDirection() != Config::ShaderLogDirection::Silent;
+		options.early_dump       = options.dump_ir;
+		options.dump_label       = record.stage == ShaderType::Vertex ? "ShaderRecompiler VS" : "ShaderRecompiler PS";
+		if (record.stage == ShaderType::Vertex) {
+			job->vertex               = record.vertex;
+			options.input_info.vertex = &job->vertex;
+			options.scratch_dwords    = job->vertex.scratch_size_dwords;
+			options.user_data_base    = 8;
+		} else {
+			job->pixel               = record.pixel;
+			options.input_info.pixel = &job->pixel;
+			options.scratch_dwords   = job->pixel.scratch_size_dwords;
+		}
+		options.table_mode           = true;
+		options.table_dead_user_data = TableDeadUserDataOn();
+		options.user_data            = job->user_data;
+		options.back_code            = job->back_code;
+		source.table_jobs.push_back(job);
+		return job;
+	}
+	void PushAhead(const std::shared_ptr<TableJob>& job) {
+		if (ahead_stopping) return; // (shutdown: left unrun, freed with its entry)
+		push_ahead([job, device = device] {
+			if (!job->claimed.exchange(true, std::memory_order_acq_rel)) RunTableJob(*job, device);
+		});
+	}
+	// A recorded pair's seeds and the fixed-function states of its recipes (each one pipeline of the pair the game made),
+	// whose table pipelines are made on the ahead pool once both table programs are (PipelinesAhead).
+	struct AheadPair {
+		std::shared_ptr<AheadSeed>                     vertex, pixel; // (pixel null: a pair without a pixel shader)
+		std::vector<LocalShaderWarmup::PipelineRecord> recipes;
+	};
+	// (The pipeline cache's, set in its constructor; called under its m_mutex.)
+	std::function<void(const std::vector<LocalShaderWarmup::PipelineRecord>&, const Permutation&, const ShaderVertexInputInfo&,
+	                   const Permutation*, const ShaderPixelInputInfo*)>
+	    table_pipelines_ahead;
+	// (Under the cache's m_mutex) `seed`'s table permutation at `cursor`. Its job made ahead and done is published first, as
+	// the draw's Get publishes it (its table branch: the job out of the entry's jobs, the permutation finished from its
+	// result and stored), which the draw then finds as one made. Null: not made yet (a job of a draw's own or still running),
+	// refused, or the entry gone.
+	Permutation* AheadPermutation(const AheadSeed& seed, uint32_t cursor) {
+		const auto entry = programs.find(seed.key);
+		if (entry == programs.end() || entry->second.source_digest != seed.digest) return nullptr;
+		auto&      source               = entry->second;
+		const auto table_specialization = AheadSpecialization(seed);
+		const auto found                = std::ranges::find_if(source.table_jobs, [&](const auto& job) {
+            return job->push_data_cursor == cursor && job->specialization == table_specialization;
+        });
+		if (found != source.table_jobs.end()) {
+			const auto job = *found;
+			if (!job->ahead || !job->done.load(std::memory_order_acquire) || !job->result) return nullptr;
+			source.table_jobs.erase(found);
+			job->taken = true;
+			const ShaderParams job_params {.code = job->code, .user_data = job->user_data, .hash = seed.record.hash,
+			                               .back_code = job->back_code};
+			auto permutation = FinishPermutation(job_params, job->options, *job->result, std::move(job->info),
+			                                     ShaderRecompiler::IR::ResourceSpecialization {table_specialization}, job->module);
+			permutation.table_mode = true;
+			auto& stored           = source.permutations.emplace_back(std::move(permutation));
+			if (!stored.handle) return nullptr;
+			stored.ahead_unmet = true; // (until a lookup finds it: DropAheadUnmet)
+			if (TableFormatIndexOn()) by_program.try_emplace(&stored.program, std::pair {&source, &stored});
+			return &stored;
+		}
+		for (auto& p: source.permutations)
+			if (p.table_mode && p.specialization == table_specialization &&
+			    p.program.bindings.push_data_start_dword ==
+			        ShaderRecompiler::IR::PushData::StartFor(cursor, p.program.bindings.ShaderDataDwords()))
+				return p.handle ? &p : nullptr;
+		return nullptr;
+	}
+	// (Under the cache's m_mutex, at a scene's warmup before it posts its own: PipelineCache::DropTableAheadUnmet, after
+	// the table pipelines) The bound on what the ahead pool holds: what the earlier scenes' batches made ahead that no draw
+	// took goes.
+	// - A job made ahead that no draw met (`promoted`: set by the Get that finds it unmade; one a Get finds made is taken at
+	//   once, out of the jobs), not running: out of its entry's jobs (one still queued claimed first, so the pool skips it);
+	//   freed with its last reference, its module with it (~TableJob).
+	// - A table permutation published ahead that no lookup has found (`ahead_unmet`) and no table pipeline building now
+	//   reads (`building`): its module destroyed and its slot made one no lookup matches: program cleared, no handle, no
+	//   specialization, push data start PushData::DwordCount + 1, a value PushData::StartFor never returns (the cursor, at
+	//   most DwordCount, or NoStart), so no scan comparing it with StartFor's matches it (Get's find, AheadJob's,
+	//   AheadPermutation's, PostTableAhead's); table_mode kept, so no normal lookup matches it either. Out of by_program. The
+	//   slot stays: draws hold pointers to the deque's other permutations, which an erase would move.
+	// A later draw's lookup then finds none and makes it as with nothing made ahead: Get's table branch posts its own job,
+	// the same translation over the draw's inputs (RunTableJob), the same SPIR-V; a new shader id, as any program made the
+	// first time (ids are the session's, never recorded).
+	void DropAheadUnmet(const std::unordered_set<const ShaderRecompiler::IR::CompiledShaderInfo*>& building) {
+		for (auto& [key, source]: programs) {
+			(void)key;
+			for (auto it = source.table_jobs.begin(); it != source.table_jobs.end();) {
+				const auto& job  = *it;
+				const bool  drop = job->ahead && !job->promoted.load(std::memory_order_relaxed) &&
+				                  (!job->claimed.exchange(true, std::memory_order_acq_rel) || job->done.load(std::memory_order_acquire));
+				it = drop ? source.table_jobs.erase(it) : it + 1;
+			}
+			for (auto& permutation: source.permutations) {
+				if (!permutation.ahead_unmet || building.contains(&permutation.program)) continue;
+				by_program.erase(&permutation.program);
+				DestroyShaderModule(device, permutation.handle.module);
+				if (permutation.handle.module) LiveCounters::g_shader_modules.fetch_sub(1, std::memory_order_relaxed);
+				permutation.handle                                 = {};
+				permutation.program                                = {};
+				permutation.program.bindings.push_data_start_dword = ShaderRecompiler::IR::PushData::DwordCount + 1u;
+				permutation.specialization                         = {};
+				permutation.ahead_unmet                            = false;
+			}
+		}
+	}
+	// (Under the cache's m_mutex) `pair`'s table pipelines, its vertex program's table permutation at `cursor` and its pixel
+	// program's at 0 both made (else nothing: the later of the two jobs' after_done comes here again), queued on the ahead
+	// pool by the pipeline cache (table_pipelines_ahead) where none is there for the key.
+	void PipelinesAhead(const AheadPair& pair, uint32_t cursor) {
+		if (!table_pipelines_ahead || ahead_stopping || pair.recipes.empty()) return;
+		Permutation* vertex = AheadPermutation(*pair.vertex, cursor);
+		if (vertex == nullptr) return;
+		Permutation* pixel = pair.pixel != nullptr ? AheadPermutation(*pair.pixel, 0) : nullptr;
+		if (pair.pixel != nullptr && pixel == nullptr) return;
+		table_pipelines_ahead(pair.recipes, *vertex, pair.vertex->record.vertex, pixel,
+		                      pixel != nullptr ? &pair.pixel->record.pixel : nullptr);
+	}
+	// The scene's recorded pairs (`recipes`, `only`: its recipe keys; null: all) whose vertex shader is a table one (no vertex
+	// buffers): each pixel seed's table program at cursor 0, then, once it is made, its paired vertex seeds' at the cursor
+	// after its push data (GetGraphicsPrograms looks the pixel program up first); a pair without a pixel shader's vertex
+	// seed at 0. Each pair's table pipelines too, one per recipe of it, once both of its table programs are made (the
+	// after_done of each job: whichever comes second finds both; PipelinesAhead). The seeds decoded here, off the lock; the
+	// jobs put in under `mutex` (the cache's). Returns the jobs posted.
+	size_t PostTableAhead(std::span<const std::span<const uint32_t>> records, const std::vector<std::vector<uint32_t>>& recipes,
+	                      const std::unordered_set<uint64_t>* only, Common::Mutex& mutex) {
+		if (!push_ahead) return 0;
+		using Pairs = std::vector<std::shared_ptr<AheadPair>>;
+		std::unordered_map<uint32_t, std::shared_ptr<AheadSeed>> seeds;
+		std::unordered_map<uint32_t, std::shared_ptr<Pairs>>     by_pixel;
+		Pairs                                                    vertex_alone;
+		const auto seed_of = [&](uint32_t index) -> std::shared_ptr<AheadSeed> {
+			if (index >= records.size()) return nullptr;
+			if (const auto found = seeds.find(index); found != seeds.end()) return found->second;
+			auto                      seed = std::make_shared<AheadSeed>();
+			LocalShaderWarmup::Reader reader {records[index]};
+			if (!LocalShaderWarmup::Visit(reader, seed->record)) seed = nullptr;
+			if (seed != nullptr) {
+				const auto& r = seed->record;
+				seed->key     = {r.stage, r.hash, r.user_data_count, static_cast<uint32_t>(r.code.size()), r.static_key};
+				seed->digest  = SourceDigest(r.code, r.back_code);
+			}
+			return seeds[index] = seed;
+		};
+		// (A pair once per vertex seed, its recipes gathered.)
+		const auto pair_in = [&](Pairs& pairs, const std::shared_ptr<AheadSeed>& vertex, const std::shared_ptr<AheadSeed>& pixel,
+		                         const LocalShaderWarmup::PipelineRecord& recipe) {
+			auto found = std::ranges::find_if(pairs, [&](const auto& pair) { return pair->vertex == vertex; });
+			if (found == pairs.end()) {
+				auto pair    = std::make_shared<AheadPair>();
+				pair->vertex = vertex;
+				pair->pixel  = pixel;
+				found        = pairs.insert(pairs.end(), std::move(pair));
+			}
+			(*found)->recipes.push_back(recipe);
+		};
+		for (const auto& words: recipes) {
+			if (only != nullptr && !only->contains(LocalShaderWarmup::RecipeKey(words))) continue;
+			LocalShaderWarmup::PipelineRecord recipe;
+			LocalShaderWarmup::Reader         reader {words};
+			if (!LocalShaderWarmup::VisitPipeline(reader, recipe) || recipe.compute != LocalShaderWarmup::NoShader) continue;
+			if (recipe.vertex_input.binding_count != 0) continue; // (a table pair's vertex shader fetches no vertex buffer)
+			const auto vertex = seed_of(recipe.vertex);
+			if (vertex == nullptr || vertex->record.stage != ShaderType::Vertex) continue;
+			if (recipe.pixel == LocalShaderWarmup::NoShader) {
+				pair_in(vertex_alone, vertex, nullptr, recipe);
+				continue;
+			}
+			const auto pixel = seed_of(recipe.pixel);
+			if (pixel == nullptr || pixel->record.stage != ShaderType::Pixel) continue;
+			auto& list = by_pixel[recipe.pixel];
+			if (list == nullptr) list = std::make_shared<Pairs>();
+			pair_in(*list, vertex, pixel, recipe);
+		}
+		size_t               posted  = 0;
+		auto* const          self    = this;
+		Common::Mutex* const lock_of = &mutex;
+		// (A pair's vertex seed at `cursor`, under the lock; its pipelines from the job's after_done, or at once where no job
+		// is posted (its table program there already, or another's job).)
+		const auto post_vertex = [self, lock_of](const std::shared_ptr<AheadPair>& pair, uint32_t cursor) -> size_t {
+			const auto job = self->AheadJob(*pair->vertex, cursor);
+			if (job == nullptr) {
+				self->PipelinesAhead(*pair, cursor);
+				return 0;
+			}
+			job->after_done = [self, lock_of, pair, cursor](TableJob&) {
+				Common::LockGuard relock(*lock_of);
+				self->PipelinesAhead(*pair, cursor);
+			};
+			self->PushAhead(job);
+			return 1;
+		};
+		// (The cache's lock a pair at a time: the GPU thread's lookups wait for one pair's jobs at most.)
+		for (const auto& [index, pairs]: by_pixel) {
+			const auto&       pixel = *seeds[index];
+			Common::LockGuard lock(mutex);
+			if (const auto job = AheadJob(pixel, 0)) {
+				job->after = [self, lock_of, pairs, post_vertex](TableJob& made) {
+					if (!made.result) return; // (refused in table mode: its pair is refused, nothing to pair)
+					uint32_t cursor = 0;
+					made.info.bindings.AdvancePushData(cursor);
+					Common::LockGuard relock(*lock_of);
+					if (self->ahead_stopping) return; // (shutdown: no more jobs)
+					for (const auto& pair: *pairs) (void)post_vertex(pair, cursor);
+				};
+				// (The pairs whose vertex job ran first, or was not posted: their pipelines now.)
+				job->after_done = [self, lock_of, pairs, held = seeds[index]](TableJob& made) {
+					if (!made.result) return;
+					Common::LockGuard relock(*lock_of);
+					const auto*       published = self->AheadPermutation(*held, 0);
+					if (published == nullptr) return;
+					uint32_t cursor = 0;
+					published->program.bindings.AdvancePushData(cursor);
+					for (const auto& pair: *pairs) self->PipelinesAhead(*pair, cursor);
+				};
+				PushAhead(job);
+				++posted;
+				continue;
+			}
+			// (The pixel program's table permutation made already, at cursor 0: its vertex seeds at once.)
+			const auto entry = programs.find(pixel.key);
+			if (entry == programs.end() || entry->second.source_digest != pixel.digest) continue;
+			const auto table_specialization = AheadSpecialization(pixel);
+			for (const auto& p: entry->second.permutations) {
+				if (!p.table_mode || !p.handle || p.specialization != table_specialization ||
+				    p.program.bindings.push_data_start_dword !=
+				        ShaderRecompiler::IR::PushData::StartFor(0, p.program.bindings.ShaderDataDwords()))
+					continue;
+				uint32_t cursor = 0;
+				p.program.bindings.AdvancePushData(cursor);
+				for (const auto& pair: *pairs) posted += post_vertex(pair, cursor);
+				break;
+			}
+		}
+		for (const auto& pair: vertex_alone) {
+			Common::LockGuard lock(mutex);
+			posted += post_vertex(pair, 0);
+		}
+		return posted;
+	}
+
 	void TranslateWarmup(Common::Mutex& mutex, bool background, const std::atomic<bool>& stop) {
 		const auto begin = std::chrono::steady_clock::now();
 		// At most a minute of start-up warmup (KYTY_SHADER_WARMUP_SECONDS; 0: all recorded inputs, as a precompile run,
@@ -2959,7 +3294,7 @@ struct PipelineCache::ProgramCache {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
-		ReleaseRetired();
+		ReleaseRetired(true);
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
@@ -2974,7 +3309,10 @@ struct PipelineCache::ProgramCache {
 	// has (Get) wait here, their modules alive, until it is done (it may be making their pipelines).
 	bool                                       warming = false;
 	std::vector<decltype(programs)::node_type> retired;
-	void ReleaseRetired() {
+	// (`all`: the cache's end. Else none while table pipelines made ahead are queued or building (mode 4): the last done
+	// releases them, RunAheadTablePipeline.)
+	void ReleaseRetired(bool all = false) {
+		if (!all && ahead_pipeline_builds != 0) return;
 		for (auto& node: retired)
 			for (const auto& permutation: node.mapped().permutations) {
 				DestroyShaderModule(device, permutation.handle.module);
@@ -3015,6 +3353,10 @@ struct PipelineCache::PendingGraphicsPipeline {
 	ShaderProgram             pixel_program;
 	bool                      native_bindings = false;
 	std::atomic<bool>         done {false};
+	// (Mode 4) Made ahead of its draw from a recorded recipe (the pipeline cache's table_pipelines_ahead). `claimed`: its
+	// build taken by a worker (the ahead pool's, or the table workers' once a draw met it unbuilt: `promoted`).
+	bool              ahead = false;
+	std::atomic<bool> claimed {false}, promoted {false};
 };
 
 // Threads that create pipelines off the render thread (vkCreate* calls are thread-safe, and the
@@ -3099,6 +3441,14 @@ PipelineCache::CompileWorkers& PipelineCache::TableWorkers() {
 		m_table_workers = std::make_unique<CompileWorkers>(std::max(2u, std::thread::hardware_concurrency() / 2u), true);
 	}
 	return *m_table_workers;
+}
+
+PipelineCache::CompileWorkers& PipelineCache::AheadWorkers() {
+	if (m_ahead_workers == nullptr) {
+		// (A quarter of the table workers': background threads, behind nothing a draw waits for.)
+		m_ahead_workers = std::make_unique<CompileWorkers>(std::max(1u, std::thread::hardware_concurrency() / 8u), true);
+	}
+	return *m_ahead_workers;
 }
 
 PipelineCache::CompileWorkers& PipelineCache::OptimizeWorkers() {
@@ -3500,6 +3850,13 @@ void PipelineCache::FinishCompileWorkers() {
 	m_program_cache->prefetch_live.store(nullptr, std::memory_order_release);
 	m_program_cache->prefetch.reset();
 	m_stopping.store(true, std::memory_order_relaxed);
+	{
+		// (No job pushed to the ahead pool from here on, from the warmup thread or a job's `after` on a pool thread: none
+		// builds the pool again while it and the table workers are reset.)
+		Common::LockGuard lock(m_mutex);
+		m_program_cache->ahead_stopping = true;
+	}
+	m_ahead_workers.reset(); // (before the table workers its jobs may move to)
 	m_optimize_workers.reset();
 	m_table_workers.reset();
 	m_compile_workers.reset();
@@ -3552,6 +3909,46 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		if (g_live_pipeline_cache != nullptr) g_live_pipeline_cache->ReportObjects(id);
 	};
 	m_program_cache->push_job = [this](std::function<void()> job) { TableWorkers().Push(std::move(job)); };
+	m_program_cache->push_ahead = [this](std::function<void()> job) { AheadWorkers().Push(std::move(job)); };
+	// (Mode 4, under m_mutex, from ProgramCache::PipelinesAhead) A recorded pair's table pipelines, one per recipe, put where
+	// the draw's TryCreateGraphicsPipeline puts its own compile (m_pending_graphics_pipelines, by the key it builds: the
+	// recipe's rendering, vertex input and static parameters, the pair's table programs, native bindings) and built on the
+	// ahead pool with the inputs that compile takes; none where the key is made or pending already.
+	m_program_cache->table_pipelines_ahead = [this](const std::vector<LocalShaderWarmup::PipelineRecord>& recipes,
+	                                                const ProgramCache::Permutation& vertex, const ShaderVertexInputInfo& vertex_info,
+	                                                const ProgramCache::Permutation* pixel, const ShaderPixelInputInfo* pixel_info) {
+		for (const auto& recipe: recipes) {
+			GraphicsPipelineKey key {};
+			key.rendering       = recipe.rendering;
+			key.vs_shader_id    = vertex.handle.id;
+			key.ps_shader_id    = pixel != nullptr ? pixel->handle.id : 0;
+			key.vertex_input    = recipe.vertex_input;
+			key.static_params   = recipe.state;
+			key.native_bindings = true;
+			if (m_graphics_pipelines.contains(key) || m_pending_graphics_pipelines.contains(key)) continue;
+			auto job                         = std::make_shared<PendingGraphicsPipeline>();
+			job->rendering                   = key.rendering;
+			job->vertex_input                = key.vertex_input;
+			job->static_params               = key.static_params;
+			job->vs_input_info               = vertex_info;
+			job->vs_input_info.stage.program = &vertex.program;
+			job->ps_active                   = pixel != nullptr;
+			if (pixel != nullptr) {
+				job->ps_input_info               = *pixel_info;
+				job->ps_input_info.stage.program = &pixel->program;
+			}
+			job->vertex_program  = vertex.handle;
+			job->pixel_program   = pixel != nullptr ? pixel->handle : ShaderProgram {};
+			job->native_bindings = true;
+			job->ahead           = true;
+			m_pending_graphics_pipelines.emplace(key, job);
+			m_table_pipeline_jobs.fetch_add(1, std::memory_order_relaxed);
+			++m_program_cache->ahead_pipeline_builds;
+			AheadWorkers().Push([this, job] {
+				if (!job->claimed.exchange(true, std::memory_order_acq_rel)) RunAheadTablePipeline(*job);
+			});
+		}
+	};
 	// (The static store first: whether it is there sets how much of the driver caches is loaded.)
 	StartupProgress::Report("Loading the pipeline cache", 0, 0);
 	InitializeStaticCache(false);
@@ -3773,6 +4170,8 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 void PipelineCache::WarmScene(uint32_t scene, uint64_t compute_video, bool in_memory) {
 	auto& programs = *m_program_cache;
 	m_scenes_warmed.insert(scene);
+	// (Mode 4) What the earlier batches made ahead that no draw took dropped, before this scene posts its own.
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) DropTableAheadUnmet();
 	bool known = scene != SceneTags::None && SceneTags::Knows(scene);
 	std::unordered_set<uint64_t> only;
 	if (known) only = SceneTags::Recipes(scene);
@@ -3827,6 +4226,14 @@ void PipelineCache::WarmScene(uint32_t scene, uint64_t compute_video, bool in_me
 		m_scene_warmed_all = true;
 		if (!in_memory)
 			for (const auto& words: programs.warm_recipes) only.insert(LocalShaderWarmup::RecipeKey(words));
+	}
+	// (Mode 4) The scene's recorded table pairs' table programs queued on the ahead pool now, before its draws meet them,
+	// ahead of its pipelines, and their table pipelines once both programs of a pair are made (ProgramCache::PostTableAhead).
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+		const auto posted = programs.PostTableAhead(programs.warm_records, programs.warm_recipes,
+		                                            known || !in_memory ? &only : nullptr, m_mutex);
+		PipelineCacheLog("Table ahead: {}: {} table programs queued (their vertex programs follow their pixel programs)",
+		                 scene != SceneTags::None ? SceneTags::Name(scene) : std::string("no scene"), posted);
 	}
 	WarmPipelines(compute_video, true, known || !in_memory ? &only : nullptr);
 	if (!in_memory) {
@@ -5093,6 +5500,86 @@ PipelineCache::Pipeline* PipelineCache::TryCreateGraphicsPipelineWorker(
 	                                  native_bindings, true, &waiting);
 }
 
+// A compile TryCreateGraphicsPipeline posted, on the worker that takes it (and a table pipeline made ahead's, mode 4: the
+// one body both run, over the job's own inputs).
+void PipelineCache::RunPendingGraphicsPipeline(PendingGraphicsPipeline& pending, bool table) {
+	auto* const job = &pending;
+	// (KYTY_HITCH_LOG_MS: a pipeline no cache held, compiled while its draws took another path.)
+	SlowLog::Scope slow([&](double ms) {
+		const auto* pixel = job->ps_active ? job->ps_input_info.stage.program : nullptr;
+		std::printf("SLOW AsyncGraphicsPipeline %.1f ms %s VS=0x%016llx PS=0x%016llx\n", ms, table ? "table" : "native",
+		            static_cast<unsigned long long>(job->vs_input_info.stage.program->shader_hash),
+		            static_cast<unsigned long long>(pixel != nullptr ? pixel->shader_hash : 0));
+	}, SlowLog::HitchThreshold());
+	CreatePipelineInternal(m_graphics, *job->pipeline, job->rendering, job->vertex_input,
+	                       job->vs_input_info, job->vertex_program,
+	                       job->ps_active ? &job->ps_input_info : nullptr, job->pixel_program,
+	                       job->static_params, table ? TablePipelineCache() : m_driver_cache,
+	                       job->native_bindings);
+	if (KeepsRemake(m_graphics, *job->pipeline, LastPipelineFromStore())) {
+		GraphicsMakeInputs inputs;
+		inputs.rendering       = job->rendering;
+		inputs.vertex_input    = job->vertex_input;
+		inputs.static_params   = job->static_params;
+		inputs.SetVertexInput(job->vs_input_info);
+		inputs.ps_input_info   = job->ps_input_info;
+		inputs.ps_active       = job->ps_active;
+		inputs.vertex_program  = job->vertex_program;
+		inputs.pixel_program   = job->pixel_program;
+		inputs.native_bindings = job->native_bindings;
+		inputs.table           = table;
+		job->pipeline->remake  = GraphicsRemake(std::move(inputs));
+	}
+	if (table) TablePipelineDone();
+	else MainPipelineDone();
+	job->done.store(true, std::memory_order_release);
+}
+
+// (Mode 4) A table pipeline made ahead, built as the draw's own compile would be (RunPendingGraphicsPipeline); the last
+// build done releases the program entries retired meanwhile.
+void PipelineCache::RunAheadTablePipeline(PendingGraphicsPipeline& job) {
+	RunPendingGraphicsPipeline(job, true);
+	Common::LockGuard lock(m_mutex);
+	if (--m_program_cache->ahead_pipeline_builds == 0 && !m_program_cache->warming) m_program_cache->ReleaseRetired();
+}
+
+// (Mode 4, at each scene's warmup before it posts its own batch: WarmScene) The bound on what the ahead pool holds: what
+// the earlier batches made ahead that no draw took goes. Each table pipeline made ahead that no draw met (`promoted`: set by
+// the draw that finds it unbuilt; one a draw finds built leaves the map at once): queued (not started), claimed so the pool
+// skips it and its build's counts taken back (m_table_pipeline_jobs, ahead_pipeline_builds); built, its VkPipeline
+// destroyed; building now, left, and its two programs with it; out of m_pending_graphics_pipelines. Then the programs
+// (ProgramCache::DropAheadUnmet). What a draw met lives as anything a draw made: a program until its code changes (Get's
+// warm-code compare), a pipeline for the session or until the pipeline eviction takes it where it keeps a remake
+// (EvictIdlePipelines). A later meet of a dropped pipeline's key is TryCreateGraphicsPipeline's own compile, the same
+// inputs and body. Nothing here records: the recording, the recipes and the warmup file are untouched.
+void PipelineCache::DropTableAheadUnmet() {
+	Common::LockGuard                                                   lock(m_mutex);
+	std::unordered_set<const ShaderRecompiler::IR::CompiledShaderInfo*> building;
+	for (auto it = m_pending_graphics_pipelines.begin(); it != m_pending_graphics_pipelines.end();) {
+		const auto job = it->second;
+		if (!job->ahead || job->promoted.load(std::memory_order_relaxed)) {
+			++it;
+			continue;
+		}
+		if (!job->claimed.exchange(true, std::memory_order_acq_rel)) {
+			// (Queued, never to run: its build's counts taken back.)
+			m_table_pipeline_jobs.fetch_sub(1, std::memory_order_release);
+			if (--m_program_cache->ahead_pipeline_builds == 0 && !m_program_cache->warming) m_program_cache->ReleaseRetired();
+		} else if (!job->done.load(std::memory_order_acquire)) {
+			building.insert(job->vs_input_info.stage.program);
+			if (job->ps_active) building.insert(job->ps_input_info.stage.program);
+			++it;
+			continue;
+		} else if (job->pipeline->pipeline != nullptr) {
+			DeviceFault::ForgetPipeline(static_cast<VkPipeline>(job->pipeline->pipeline));
+			m_graphics.device.destroyPipeline(job->pipeline->pipeline, nullptr);
+			job->pipeline->pipeline = nullptr;
+		}
+		it = m_pending_graphics_pipelines.erase(it);
+	}
+	m_program_cache->DropAheadUnmet(building);
+}
+
 PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
@@ -5253,6 +5740,13 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	if (async) {
 		if (auto pending = m_pending_graphics_pipelines.find(key);
 		    pending != m_pending_graphics_pipelines.end()) {
+			// (Mode 4: one made ahead still queued on the ahead pool moves to the table workers now, as the draw's own
+			// compile would be, built by whichever takes it first.)
+			if (const auto& ahead = pending->second; ahead->ahead && !ahead->done.load(std::memory_order_acquire) &&
+			                                         !ahead->promoted.exchange(true, std::memory_order_relaxed)) [[unlikely]]
+				TableWorkers().Push([this, job = ahead] {
+					if (!job->claimed.exchange(true, std::memory_order_acq_rel)) RunAheadTablePipeline(*job);
+				});
 			if (!pending->second->done.load(std::memory_order_acquire)) {
 				(worker_waiting != nullptr ? *worker_waiting : m_pipeline_waiting) =
 				    std::shared_ptr<const std::atomic<bool>>(pending->second, &pending->second->done);
@@ -5283,37 +5777,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 		m_pending_graphics_pipelines.emplace(key, job);
 		const bool table = vs_input_info.stage.program != nullptr && vs_input_info.stage.program->table_mode;
 		if (table) m_table_pipeline_jobs.fetch_add(1, std::memory_order_relaxed);
-		(table ? TableWorkers() : Workers()).Push([this, job, table] {
-			// (KYTY_HITCH_LOG_MS: a pipeline no cache held, compiled while its draws took another path.)
-			SlowLog::Scope slow([&](double ms) {
-				const auto* pixel = job->ps_active ? job->ps_input_info.stage.program : nullptr;
-				std::printf("SLOW AsyncGraphicsPipeline %.1f ms %s VS=0x%016llx PS=0x%016llx\n", ms, table ? "table" : "native",
-				            static_cast<unsigned long long>(job->vs_input_info.stage.program->shader_hash),
-				            static_cast<unsigned long long>(pixel != nullptr ? pixel->shader_hash : 0));
-			}, SlowLog::HitchThreshold());
-			CreatePipelineInternal(m_graphics, *job->pipeline, job->rendering, job->vertex_input,
-			                       job->vs_input_info, job->vertex_program,
-			                       job->ps_active ? &job->ps_input_info : nullptr, job->pixel_program,
-			                       job->static_params, table ? TablePipelineCache() : m_driver_cache,
-			                       job->native_bindings);
-			if (KeepsRemake(m_graphics, *job->pipeline, LastPipelineFromStore())) {
-				GraphicsMakeInputs inputs;
-				inputs.rendering       = job->rendering;
-				inputs.vertex_input    = job->vertex_input;
-				inputs.static_params   = job->static_params;
-				inputs.SetVertexInput(job->vs_input_info);
-				inputs.ps_input_info   = job->ps_input_info;
-				inputs.ps_active       = job->ps_active;
-				inputs.vertex_program  = job->vertex_program;
-				inputs.pixel_program   = job->pixel_program;
-				inputs.native_bindings = job->native_bindings;
-				inputs.table           = table;
-				job->pipeline->remake  = GraphicsRemake(std::move(inputs));
-			}
-			if (table) TablePipelineDone();
-			else MainPipelineDone();
-			job->done.store(true, std::memory_order_release);
-		});
+		(table ? TableWorkers() : Workers()).Push([this, job, table] { RunPendingGraphicsPipeline(*job, table); });
 		LiveCounters::Add(LiveCounters::AsyncPipelines);
 		(worker_waiting != nullptr ? *worker_waiting : m_pipeline_waiting) = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 		return nullptr;

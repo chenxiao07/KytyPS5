@@ -517,6 +517,11 @@ private:
 	class CompileWorkers;
 	std::unordered_map<GraphicsPipelineKey, std::shared_ptr<PendingGraphicsPipeline>, GraphicsPipelineKeyHash>
 	                                m_pending_graphics_pipelines;
+	void RunPendingGraphicsPipeline(PendingGraphicsPipeline& job, bool table);
+	// (Mode 4) A table pipeline made ahead of its draw, on the ahead pool (or the table workers once met).
+	void RunAheadTablePipeline(PendingGraphicsPipeline& job);
+	// (Mode 4, at each scene's warmup) What the earlier batches made ahead that no draw took dropped: the bound.
+	void DropTableAheadUnmet();
 	struct PendingComputePipeline;
 	std::unordered_map<uint64_t, std::shared_ptr<PendingComputePipeline>> m_pending_compute_pipelines;
 	std::unique_ptr<CompileWorkers> m_compile_workers;
@@ -524,6 +529,10 @@ private:
 	// Table mode programs and pipelines (src/local/table-xpr.inc): a new area brings hundreds, which ahead of the
 	// native records' pipelines in one queue kept the draws on the normal path for a minute.
 	std::unique_ptr<CompileWorkers> m_table_workers;
+	// (Mode 4) The table programs and pipelines of a scene's recorded pairs made ahead of their draws
+	// (ProgramCache::PostTableAhead): a few background threads of their own, behind nothing a draw waits for (a draw that
+	// meets one still queued moves it to the table workers).
+	std::unique_ptr<CompileWorkers> m_ahead_workers;
 	// The optimized builds of pipelines in use unoptimized (BuildOptimized): background threads of their own, so a
 	// pipeline a draw waits for is never queued behind them (0.1-4 s each).
 	std::unique_ptr<CompileWorkers> m_optimize_workers;
@@ -599,6 +608,7 @@ private:
 	}
 	CompileWorkers& Workers();
 	CompileWorkers& TableWorkers();
+	CompileWorkers& AheadWorkers(); // (mode 4: the table programs and pipelines made ahead of their draws)
 	CompileWorkers& OptimizeWorkers();
 	void            BuildOptimized(Pipeline& pipeline, std::function<void(Pipeline&)> build);
 	void            PromoteOptimized();
