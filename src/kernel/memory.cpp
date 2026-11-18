@@ -1507,9 +1507,17 @@ bool TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsTranslatingThread() ||
 		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
-		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size) || !SpeculationReadsClean(vaddr, size)) {
+		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
 			return false;
 		}
+		// A speculation's clean read over a target its own draws left to their commits' acquisition: in order an earlier
+		// draw's FindRenderTarget / FindDepthTarget marks the image GPU-modified and IsRegionGpuModified refuses the read
+		// (the lookup goes on unspecialized, the span unread); a worker's draw leaves that mark to its commit, so the test
+		// above passes it. Refused, as in order. (Mode 0: the plain global, no thread-local.)
+		if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 &&
+		    Graphics::TextureCache::SpecTargetOver(vaddr, size))
+			return false;
+		if (!SpeculationReadsClean(vaddr, size)) return false;
 	}
 	return TryReadBackingToHost(vaddr, data, size);
 }

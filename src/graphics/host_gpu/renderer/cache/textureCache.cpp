@@ -5087,6 +5087,14 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, cons
 	}
 }
 
+bool TextureCache::SpecTargetOver(uint64_t address, uint64_t size) {
+	const auto* spec = Spec::Current();
+	if (spec == nullptr || size == 0) return false;
+	for (const auto& target: spec->pending_targets)
+		if (target.image != nullptr && target.image->Overlaps(address, size)) return true;
+	return false;
+}
+
 bool TextureCache::HasTrackedDataOverlap(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) return true;
 	std::scoped_lock lock {m_lock};

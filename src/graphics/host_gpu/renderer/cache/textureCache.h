@@ -97,6 +97,14 @@ public:
 	// spec_worker_images: a sampled texture not made or not ready may be left to the commit (a hit, no refusal).
 	static inline thread_local bool t_pending_images_ok = false;
 	static inline thread_local bool t_pending_hit       = false;
+	// The calling speculation's targets its own draws leave to their commits' acquisition (Spec::State::pending_targets,
+	// any segment of the translation: one not GPU-owned or CPU / buffer dirty when drawn, a layered depth target's draw,
+	// which the in-order FindRenderTarget / FindDepthTarget marks GPU-modified at the draw): whether one is over the range;
+	// false without one or a speculation. Pushed at the draw's emit, after its own lookups' reads, as in order the draw's
+	// target acquisition follows its programs' and bindings' reads. Not any image: a target the draw emits as it is
+	// (SafeToDownload: GPU-modified, CPU-clean) and a storage image a worker binds (GPU-owned) are GPU-modified already, as
+	// IsRegionGpuModified asks (a CPU write or unmap after that stops the segment at its commit).
+	[[nodiscard]] static bool SpecTargetOver(uint64_t address, uint64_t size);
 	struct ReadOnlyScope {
 		ReadOnlyScope() { t_read_only = true; t_read_only_failed = nullptr; }
 		~ReadOnlyScope() { t_read_only = false; }
