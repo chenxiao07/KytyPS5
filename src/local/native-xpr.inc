@@ -307,6 +307,37 @@ struct RenderExecutor::NativeXprDrawState {
 	std::shared_ptr<const PipelineInputs> pipeline_inputs;
 	uint64_t                              ctx_hash = 0;
 	bool                                  derived  = false;
+	// (Mode 4) Captured by a worker (RenderExecutor::WorkerCaptureTargets), or derived from such a capture (copied with it):
+	// its depth target's shader reads are decided at each emission (NativeXprEmitTargets).
+	bool                                  worker_captured = false;
+	// (Mode 4, a worker's capture) The colour targets it took as the in-order FindImage's reuse of an existing image
+	// (TextureCache::t_adopt_picks), proven again at the entry's commit check (TextureCache::AdoptedTargetCurrent).
+	std::vector<TextureCache::AdoptPick>  adopted;
+	// (Mode 4, a worker's capture) The colour targets it found no image for, made by its commit (TableEntryResolveVirtual);
+	// null: none, or made (the state's targets then the real ones). Each such target is in `targets` with the id VirtualId()
+	// (no image: never allocated), not in target_ids; its attachment's view in `rendering` is Placeholder(index), which a
+	// rendering's begin names in a cell its commit writes (TableVirtualRendering). Never published while set.
+	struct Virtual {
+		struct Target {
+			uint32_t                attachment = 0; // its colour attachment (rendering's, the pipeline inputs')
+			uint32_t                target     = 0; // its index in `targets`
+			TextureCache::ImageDesc desc;           // the desc the in-order FindImage is asked with
+		};
+		std::vector<Target>                         targets;
+		std::vector<std::pair<uint32_t, uint64_t*>> cells; // (a target's index, a view cell in a recorded rendering's begin)
+		size_t                                      segment = 0; // the segment of the translation it was captured in
+		// (The speculation's range lists' sizes where the capture's segment begins (its sealed counts: a note merges into the
+		// entry before it, so a size at the capture could miss one): what its work notes from there on is tested at the
+		// commit, a read before the draw in that segment too (conservative).)
+		size_t from_current = 0, from_written = 0, from_invalidated = 0, from_texel_syncs = 0, from_buffer_ranges = 0,
+		       from_cpu_copies = 0, from_pending_buffers = 0, from_table_ranges = 0;
+		[[nodiscard]] vk::ImageView Placeholder(size_t index) const {
+			// (Odd, never a handle the driver gives: unique to this record and target while it lives.)
+			return vk::ImageView {reinterpret_cast<VkImageView>(reinterpret_cast<uintptr_t>(this) + 1u + 2u * index)}; // NOLINT
+		}
+	};
+	std::shared_ptr<Virtual>               virtual_targets;
+	[[nodiscard]] static constexpr ImageId VirtualId() noexcept { return ImageId {ImageId::INVALID_INDEX - 1u, 0u}; }
 	// The frame a draw last used it (NativeXprCollect lets one go that none used for NativeXprCache::StateKeepFrames).
 	mutable uint64_t                 used_frame = 0;
 	void Use(uint64_t frame) const { std::atomic_ref<uint64_t>(used_frame).store(frame, std::memory_order_relaxed); }
@@ -1909,12 +1940,17 @@ void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRend
 		textures.NoteMetaUse(target.metadata, target.id.index); // (KYTY_TABLE_SERIALS)
 		draw_state.target_ids.push_back(target.id);
 	}
-	draw_state.dynamic = LocalDrawRecording::Capture(
-	    buffer, state.vs_input_info, state.color_info, state.color_count, state.depth_info,
-	    m_context.GetGraphics().attachment_feedback_loop_enabled,
-	    rendering.depth_stencil_attachment.image_layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
-	        ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eDepth}
-	        : vk::ImageAspectFlags {});
+	// (Mode 4: the dynamic state's padding zero (CaptureZeroed), so a worker's capture of the same draw is the same bytes.)
+	const bool mode4    = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+	const auto feedback = rendering.depth_stencil_attachment.image_layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+	                          ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eDepth}
+	                          : vk::ImageAspectFlags {};
+	draw_state.dynamic =
+	    mode4 ? LocalDrawRecording::CaptureZeroed(buffer, state.vs_input_info, state.color_info, state.color_count,
+	                                              state.depth_info, m_context.GetGraphics().attachment_feedback_loop_enabled,
+	                                              feedback)
+	          : LocalDrawRecording::Capture(buffer, state.vs_input_info, state.color_info, state.color_count, state.depth_info,
+	                                        m_context.GetGraphics().attachment_feedback_loop_enabled, feedback);
 	draw_state.dynamic_hash = XXH3_64bits(&draw_state.dynamic, sizeof(draw_state.dynamic));
 	if (Spec::DepthLayers2On()) // (spec_depth_layers2)
 		draw_state.depth_info = std::make_shared<const RenderDepthInfo>(state.depth_info);
@@ -1922,7 +1958,7 @@ void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRend
 	                                                       draw_state.dynamic.colors, draw_state.dynamic.color_count,
 	                                                       draw_state.dynamic.depth);
 	// (Mode 4: what a worker needs to make a table entry under this state or a sibling of it, TableWorkerEntry.)
-	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+	if (mode4) {
 		auto inputs = std::make_shared<NativeXprDrawState::PipelineInputs>();
 		for (uint32_t i = 0; i < state.color_count; ++i) inputs->color_info[i] = state.color_info[i];
 		inputs->color_count              = state.color_count;
@@ -3233,7 +3269,18 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 	// normal path's FindDepthTarget uploads first (RefreshImage).
 	const bool refuse_written = spec != nullptr && Spec::CopyImageRefuseOn();
 	const bool open_writes    = refuse_written && spec->OpenSegmentWritesAny();
+	// (Mode 4: a worker's capture whose commit makes some of its colour targets (never the GPU thread's: never published).)
+	const bool virtual_targets = spec != nullptr && draw_state.virtual_targets != nullptr;
 	for (const auto& target: draw_state.targets) {
+		// (A target the commit makes, acquires and moves to its layout ahead of the replay; its memory written by the open
+		// segment refused as a real target's is.)
+		if (virtual_targets && target.id == NativeXprDrawState::VirtualId()) {
+			if (open_writes && spec->OpenSegmentWritesImage(target.requested)) {
+				LiveCounters::Add(LiveCounters::SpecTargetOpenWritesN);
+				return Spec::Refuse("target written in its segment"), false;
+			}
+			continue;
+		}
 		auto* image = textures.m_slot_images.try_get(target.id);
 		if (image == nullptr || image->serial != target.serial || !image->registered)
 			return Spec::Refuse("table: target released"), false;
@@ -3382,6 +3429,7 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 	// (Not a speculation's answer: it holds as after holes the commit may not reach.)
 	if (spec == nullptr) draw_state.meta_epoch = meta_epoch;
 	for (const auto& target: draw_state.targets) {
+		if (virtual_targets && target.id == NativeXprDrawState::VirtualId()) continue; // (as above)
 		auto& image = textures.GetImage(target.id); // LRU, as acquisition does
 		// (The whole image's layout stands for its subresources while they share one state. Else, as after a
 		// speculation's commit that left a layer elsewhere (rendering to layer 0 of four left the image's layout the
@@ -3391,8 +3439,32 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 			// (A target the table set's shaders sample: with their access, which TableTransit gives it next, the whole
 			// image's; else that transition would follow this one at every draw, a render pass break each.)
 			const auto read = reading != nullptr ? TableTargetRead(*reading, target.id) : vk::AccessFlags2 {};
-			if (read) image.Transit(target.layout, target.access | read, std::nullopt, vk_buffer);
-			else image.Transit(target.layout, target.access, target.range, vk_buffer);
+			// (Mode 4: a state a worker captured gives its depth target the shader reads as the normal path's acquisition
+			// would at THIS draw (DepthAttachmentAccess, AcquireRenderTargets' rule, from the image's state now), not as one
+			// capture moment left them: the decal pass's alternation (a stencil mark under this state, a decal sampling depth
+			// under a GPU-captured one) then needs no barrier between them, as between two GPU-captured states. No aspect
+			// sampled by the draw: a derived state's draw that samples a target leaves the table path (TableDraw). A
+			// speculation reads its entry for the image (the state at the segment's first touch, read under the image's state
+			// lock or from the chain before it, then the segment's own transitions; the Transit below takes the same entry;
+			// the commit restores the image to that first-touch state before the replay), never the backing, which the GPU
+			// thread writes; the GPU thread reads the backing.)
+			auto access = target.access;
+			if (draw_state.worker_captured && target.requested.IsDepth()) [[unlikely]] {
+				const VulkanImageState* now     = nullptr;
+				bool                    uniform = true;
+				if (spec != nullptr) {
+					const auto* entry = image.SpeculativeEntry();
+					now               = &entry->state;
+					uniform           = entry->subresources.empty();
+				} else {
+					now     = &image.backing.state;
+					uniform = image.backing.subresource_states.empty();
+				}
+				access |= DepthAttachmentAccess(target.layout, *now, uniform, vk::ImageAspectFlags {}, vk::ImageAspectFlags {}) &
+				          vk::AccessFlagBits2::eShaderRead;
+			}
+			if (read) image.Transit(target.layout, access | read, std::nullopt, vk_buffer);
+			else image.Transit(target.layout, access, target.range, vk_buffer);
 		}
 	}
 	return true;
@@ -3410,6 +3482,18 @@ bool RenderExecutor::NativeXprTargetsCurrent(const NativeXprDrawState& draw_stat
 	const auto checked  = textures.ResolutionEpoch();
 	// (Every table draw asked: a slot lookup and a cold image object per target, ~28K a frame at 1-1.)
 	if (draw_state.targets_checked == checked) return true;
+	// (Mode 4: a worker's capture whose commit makes some of its colour targets: never marked checked (targets_checked
+	// UINT64_MAX until its commit made them), its real targets looked at in full each time; the others are the commit's to
+	// make (AcquireVirtualTargetAtCommit is their test).)
+	if (draw_state.virtual_targets != nullptr) [[unlikely]] {
+		for (const auto& target: draw_state.targets) {
+			if (target.id == NativeXprDrawState::VirtualId()) continue;
+			uint64_t epoch = 0;
+			if (!textures.m_slot_images.is_allocated(target.id) || !textures.IsTargetCurrent(target.id, target.requested, epoch))
+				return false;
+		}
+		return true;
+	}
 	// (A live id is the same object: an erase moves its slot's generation, which the id names. The image itself, a cold
 	// line per target, is not read; nor the slots while no image was erased since the last check.)
 	const auto mode     = kyty_local_targets_shortcut.load(std::memory_order_relaxed);
@@ -4003,12 +4087,18 @@ void RenderExecutor::NativeXprVerify(CommandBuffer& buffer, const DrawRenderStat
 		if (a.color_attachments[i].image_view != rendering.color_attachments[i].image_view) mismatch |= 256u;
 	if (a.depth_stencil_attachment.image_layout != rendering.depth_stencil_attachment.image_layout)
 		mismatch |= 512u;
-	const auto dynamic = LocalDrawRecording::Capture(
-	    buffer, state.vs_input_info, state.color_info, state.color_count, state.depth_info,
-	    m_context.GetGraphics().attachment_feedback_loop_enabled,
+	// (Captured as NativeXprCaptureState captures the state's: mode 4 CaptureZeroed, its padding zero, else Capture.)
+	const auto verify_feedback =
 	    rendering.depth_stencil_attachment.image_layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 	        ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eDepth}
-	        : vk::ImageAspectFlags {});
+	        : vk::ImageAspectFlags {};
+	const auto dynamic =
+	    ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4
+	        ? LocalDrawRecording::CaptureZeroed(buffer, state.vs_input_info, state.color_info, state.color_count,
+	                                            state.depth_info, m_context.GetGraphics().attachment_feedback_loop_enabled,
+	                                            verify_feedback)
+	        : LocalDrawRecording::Capture(buffer, state.vs_input_info, state.color_info, state.color_count, state.depth_info,
+	                                      m_context.GetGraphics().attachment_feedback_loop_enabled, verify_feedback);
 	if (std::memcmp(&dynamic, &draw_state.dynamic, sizeof(dynamic)) != 0) mismatch |= 1024u;
 	// Direct draws: the offsets the record holds for this state.
 	if (emit.state_offsets) {

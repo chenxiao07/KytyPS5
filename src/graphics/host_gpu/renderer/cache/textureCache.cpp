@@ -615,6 +615,7 @@ size_t TextureCache::ReclaimImageMemory(uint64_t bytes, bool all) {
 	constexpr uint64_t UnusedTicks  = 16;
 	// (A speculation's recorder cannot wait for the GPU: the GPU thread translates that work again.)
 	if (CommandScheduler::ThreadRecorder() != nullptr) throw CommandScheduler::RecorderRefusal {"ReclaimImageMemory"};
+	m_reclaims.fetch_add(1, std::memory_order_relaxed); // (mode 4: AcquireVirtualTargetAtCommit's test)
 	const auto         start        = std::chrono::steady_clock::now();
 	const uint64_t     goal         = all ? UINT64_MAX : std::max(bytes * 2, uint64_t {256} << 20u);
 	const uint64_t     download_max = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download).Size() / 2;
@@ -3558,7 +3559,8 @@ void TextureCache::HoldLayers(ImageInfo& info, uint32_t& first) {
 // judged by the frame counter now (an image not old enough now gives the merged image, as FindImage then). After the loop
 // FindImage's own tests: the pick of another format (exact_format) or without the request's resources is freed or aliased
 // and an image inserted: refused; and the pick must be GPU-owned.
-ImageId TextureCache::ResolveOverlapReadOnly(ImageDesc& desc, bool exact_format, const ImageIds& candidates) {
+ImageId TextureCache::ResolveOverlapReadOnly(ImageDesc& desc, bool exact_format, const ImageIds& candidates,
+                                             std::pair<int32_t, int32_t>* view) {
 	const auto frame      = m_frame.load(std::memory_order_relaxed);
 	ImageId    merged     {};
 	int32_t    view_mip   = -1;
@@ -3622,6 +3624,7 @@ ImageId TextureCache::ResolveOverlapReadOnly(ImageDesc& desc, bool exact_format,
 	if (!image.IsGpuModified()) return {};
 	if (view_mip >= 0) desc.view_info.base_level = static_cast<uint32_t>(view_mip);
 	if (view_layer >= 0) desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
+	if (view != nullptr) *view = {view_mip, view_layer};
 	return merged;
 }
 
@@ -3663,6 +3666,10 @@ ImageId TextureCache::FindImageReadOnly(ImageDesc& desc, bool exact_format) {
 	const bool mode4   = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 	const bool storage = desc.type == BindingType::Storage && mode4;
 	if (desc.type != BindingType::Texture && !storage) return ReadOnlyFail("worker set: not a texture"), ImageId {};
+	// (Mode 4: memory a no-image target of this translation covers, from its capture on: in order its image is there from
+	// that draw on (its commit makes it ahead of the segment's replay); a lookup there is not translated against it.)
+	if (!desc.info.data.Empty() && SpecVirtualOverlap(desc.info.data.address, desc.info.data.size))
+		return ReadOnlyFail("worker: a no-image target's memory"), ImageId {};
 	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
 	if (desc.info.data.Empty()) {
 		const auto type = desc.info.type == Prospero::ImageType::kColor1D || desc.info.type == Prospero::ImageType::kColor3D
@@ -3735,6 +3742,125 @@ ImageId TextureCache::FindImageReadOnly(ImageDesc& desc, bool exact_format) {
 	if (!image.info.resources.Contains(desc.info.resources)) return ReadOnlyFail("worker set: image resources"), ImageId {};
 	TouchImage(image); // (a speculation's: noted for its commit)
 	return result;
+}
+
+bool TextureCache::GuestAliasedAt(ImageId id) {
+	if (m_guest_aliases == 0) return false;
+	const auto*               written = m_slot_images.try_get(id);
+	ImagePageTable::PageRange pages {};
+	if (written == nullptr || !ImagePageTable::TryGetPageRange(written->info.data.address, 1, pages)) return false;
+	bool aliased = false;
+	if (const auto* owners = m_image_page_table.Find(pages.first))
+		owners->ForEach([&](ImageId other_id) {
+			const auto* other = m_slot_images.try_get(other_id);
+			aliased |= other_id != id && other != nullptr && other->guest_alias &&
+			           other->info.data.address == written->info.data.address && GuestTexture(*other);
+		});
+	return aliased;
+}
+
+// (Mode 4, a worker's capture of a new draw state: RenderExecutor::WorkerCaptureTargets) FindImage on its thread for a
+// colour or depth target (ReadOnlyScope with t_read_only_targets): FindImage's first lookups' exact match (the last image
+// of the same backing), registered, current, holding the view's resources, already used as that kind of target, with no
+// guest alias the in-order FindImage of a target would free (FreeGuestAliases); a colour target with no exact match whose
+// in-order FindImage would reuse an existing image (ResolveOverlapReadOnly's pick, noted in t_adopt_picks, the same tests
+// after it); a colour target with nothing on its pages (the in-order FindImage makes it fresh, with no overlap to resolve)
+// and no metadata or DCC metadata: a hit (t_virtual_hit), made by the commit (AcquireVirtualTargetAtCommit). Anything else
+// fails (ReadOnlyFail): nothing is made, merged, freed, bound or drained.
+ImageId TextureCache::FindTargetReadOnly(ImageDesc& desc, bool exact_format) {
+	if (desc.type != BindingType::RenderTarget && desc.type != BindingType::DepthTarget)
+		return ReadOnlyFail("worker capture: not a target"), ImageId {};
+	if (desc.info.data.Empty()) return ReadOnlyFail("worker capture: no target memory"), ImageId {};
+	if (SpecVirtualOverlap(desc.info.data.address, desc.info.data.size))
+		return ReadOnlyFail("worker: a no-image target's memory"), ImageId {};
+	const bool     color = desc.type == BindingType::RenderTarget;
+	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
+	ImageId        result {};
+	if (kyty_local_preparation_lookup_mode.load(std::memory_order_relaxed) != 0) {
+		ImagePageTable::PageRange pages {};
+		if (ImagePageTable::TryGetPageRange(desc.info.data.address, desc.info.data.size, pages)) {
+			if (const auto* owners = m_image_page_table.Find(pages.first)) {
+				owners->ForEach([&](ImageId id) {
+					const auto* image = m_slot_images.try_get(id);
+					if (image != nullptr && SameBacking(image->info, desc.info, exact_format)) result = id;
+				});
+			}
+		}
+	}
+	ImageIds candidates;
+	if (!result) {
+		candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		for (const auto id: candidates)
+			if (SameBacking(m_slot_images[id].info, desc.info, exact_format)) result = id;
+		if (!result && color && t_adopt_targets_ok && !candidates.empty()) {
+			std::pair<int32_t, int32_t> view {-1, -1}; // (the view the mirror sets: kept with the pick)
+			if (const auto pick = ResolveOverlapReadOnly(desc, exact_format, candidates, &view); pick && !GuestAliasedAt(pick)) {
+				result = pick;
+				t_adopt_picks.push_back({desc.info.data.address, pick, m_slot_images[pick].serial, exact_format, view.first,
+				                         view.second});
+			}
+		}
+	}
+	if (!result) {
+		if (color && t_virtual_targets_ok &&
+		    (!desc.info.HasMetadata() || desc.info.metadata.kind == ImageMetadataKind::Dcc) &&
+		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, true).empty())
+			return t_virtual_hit = true, ImageId {};
+		return ReadOnlyFail("worker capture: no image"), ImageId {};
+	}
+	auto& image = m_slot_images[result];
+	// (Mode 4: an image being uploaded with the readers let in (UploadWindow), found or among those the pick looked at: not
+	// current.)
+	if (m_lock.SharedMode()) {
+		bool refreshing = image.refreshing;
+		for (const ImageId id: candidates)
+			if (const auto* other = m_slot_images.try_get(id); other != nullptr && other->refreshing) refreshing = true;
+		if (refreshing) return ReadOnlyFail("worker set: image refreshing"), ImageId {};
+	}
+	if (OpenSegmentWrote(image.info) || OpenSegmentWrote(desc.info)) return ImageId {};
+	if (!image.registered || image.depth_id || image.binding.needs_rebind)
+		return ReadOnlyFail("worker capture: image not current"), ImageId {};
+	if (exact_format && image.info.pixel_format != desc.info.pixel_format)
+		return ReadOnlyFail("worker set: image format"), ImageId {};
+	if (!image.info.resources.Contains(desc.info.resources)) return ReadOnlyFail("worker set: image resources"), ImageId {};
+	if (color ? !image.usage.render_target : !image.usage.depth_target)
+		return ReadOnlyFail("worker capture: not a target yet"), ImageId {};
+	if (GuestAliasedAt(result)) return ReadOnlyFail("worker capture: guest alias"), ImageId {};
+	TouchImage(image); // (a speculation's: noted for its commit)
+	return result;
+}
+
+bool TextureCache::FindTargetViewReadOnly(ImageId id, const ImageDesc& desc, TargetView& out) {
+	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
+	auto*          image = m_slot_images.try_get(id);
+	if (image == nullptr) return ReadOnlyFail("worker capture: image gone"), false;
+	if (!image->registered || image->depth_id || image->binding.needs_rebind || (m_lock.SharedMode() && image->refreshing))
+		return ReadOnlyFail("worker capture: image not current"), false;
+	if (desc.type == BindingType::RenderTarget ? !image->usage.render_target : !image->usage.depth_target)
+		return ReadOnlyFail("worker capture: not a target yet"), false;
+	if (image->backing.samples != desc.info.samples) return ReadOnlyFail("worker capture: samples"), false;
+	const auto view = image->FindView(desc.view_info, true);
+	if (!view) return ReadOnlyFail("worker capture: new view"), false;
+	TouchImage(*image); // (a speculation's: noted for its commit)
+	out.view   = view;
+	out.serial = image->serial;
+	return true;
+}
+
+bool TextureCache::AdoptedTargetCurrent(const ImageInfo& requested, const AdoptPick& pick) {
+	std::scoped_lock lock {m_lock};
+	const auto*      image = m_slot_images.try_get(pick.id);
+	if (image == nullptr || image->serial != pick.serial || !image->registered || image->depth_id || image->binding.needs_rebind)
+		return false;
+	// (The same pick now: FindImage's loop over those images, read only; a stale one it would free refuses. And the same
+	// view: a level / layer inside the image, which FindImage sets afresh at each candidate.)
+	ImageDesc desc;
+	desc.type                              = BindingType::RenderTarget;
+	desc.info                              = requested;
+	const auto                  candidates = FindImagesInRegion(requested.data.address, requested.data.size, false);
+	std::pair<int32_t, int32_t> view {-1, -1};
+	return !candidates.empty() && ResolveOverlapReadOnly(desc, pick.exact_format, candidates, &view) == pick.id &&
+	       view == std::pair {pick.view_level, pick.view_layer} && !GuestAliasedAt(pick.id);
 }
 
 // spec_worker_sets: FindTexture on a set-building speculation's thread (ReadOnlyScope): the view of a current image that
@@ -3828,7 +3954,7 @@ bool TextureCache::ImagesOverWritten(uint64_t address, uint64_t size,
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool may_fail) {
-	if (ReadOnly()) return FindImageReadOnly(desc, exact_format);
+	if (ReadOnly()) return t_read_only_targets ? FindTargetReadOnly(desc, exact_format) : FindImageReadOnly(desc, exact_format);
 	size_t         slow_candidates = 0;
 	SlowLog::Scope slow([&](double ms) {
 		std::printf("SLOW FindImage %.1f ms addr=0x%llx size=0x%llx type=%u fmt=%u %ux%ux%u levels=%u layers=%u "
@@ -4177,6 +4303,10 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	if (!GuestRange {address, size}.Valid()) {
 		return {};
 	}
+	// (Mode 4: in order an image is there, which the calling translation's commit makes; it has no id for it: its packet
+	// refused, the in-order path then answers.)
+	if (SpecVirtualOverlap(address, size))
+		return Spec::Refuse("worker: a no-image target's memory"), ImageId {};
 	std::scoped_lock lock {m_lock};
 	if (kyty_local_image_granules_mode.load(std::memory_order_relaxed) == 2 && !MayHaveImages(address, 1)) {
 		return {};
@@ -4320,7 +4450,10 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	}
 	TouchImage(image);
 	image.MarkGpuModified();
-	if (!image.usage.render_target) ++image.validity;
+	if (!image.usage.render_target) {
+		++image.validity;
+		g_target_lookup_epoch.fetch_add(1, std::memory_order_release); // (mode 4: a worker's refused capture tried again)
+	}
 	image.usage.render_target = true;
 	PrepareDccClear(id, desc);
 	RefreshImage(id, true);
@@ -4329,6 +4462,49 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	const auto view = image.FindView(desc.view_info);
 	NameImageBinding(m_graphics, image, view, desc.type, desc.view_info);
 	return view;
+}
+
+ImageId TextureCache::AcquireVirtualTargetAtCommit(ImageDesc& desc, vk::ImageView& view, uint64_t& serial) {
+	view   = nullptr;
+	serial = 0;
+	// (A DCC target's: FindRenderTarget's PrepareDccClear applies its pending clear, as in order.)
+	if (desc.type != BindingType::RenderTarget || desc.info.data.Empty() ||
+	    (desc.info.HasMetadata() && desc.info.metadata.kind != ImageMetadataKind::Dcc))
+		return {};
+	{
+		// (What FindImage meets: nothing on the target's pages (a fresh image, no overlap resolved, no alias freed), or the
+		// one image of its exact backing, current, alone there.)
+		std::scoped_lock lock {m_lock};
+		const auto       owners = FindImagesInRegion(desc.info.data.address, desc.info.data.size, true);
+		if (owners.size() > 1) return {};
+		if (owners.size() == 1) {
+			const auto  only  = owners[0];
+			const auto* image = m_slot_images.try_get(only);
+			if (image == nullptr || !image->registered || image->depth_id || image->binding.needs_rebind ||
+			    !SameBacking(image->info, desc.info, true) || GuestAliasedAt(only))
+				return {};
+		}
+	}
+	const auto reclaims = m_reclaims.load(std::memory_order_relaxed);
+	const auto asked    = desc;
+	const auto id       = FindImage(desc);
+	// (A creation that had to reclaim memory may have freed an image the segment's recorded work uses (one its draws before
+	// this one would have touched first in order); a lookup that moved the view or the image's format is not the worker's.)
+	if (!id || m_reclaims.load(std::memory_order_relaxed) != reclaims || !(desc.view_info == asked.view_info) ||
+	    desc.info.pixel_format != asked.info.pixel_format || desc.info.samples != asked.info.samples ||
+	    !(desc.info.extent == asked.info.extent))
+		return {};
+	{
+		// (The test above and FindImage take the lock apart: an image put on those pages between them (another thread's)
+		// would have been met by FindImage. Only the one image it gave is there, or the segment stops.)
+		std::scoped_lock lock {m_lock};
+		const auto       owners = FindImagesInRegion(desc.info.data.address, desc.info.data.size, true);
+		if (owners.size() != 1 || owners[0] != id) return {};
+	}
+	view = FindRenderTarget(id, desc);
+	if (!view) return {};
+	serial = m_slot_images[id].serial;
+	return id;
 }
 
 bool TextureCache::AcquireDepthDrawAtCommit(ImageId id, uint64_t serial, const ImageDesc& desc, DepthDrawState* out) {
@@ -4374,7 +4550,10 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	}
 	TouchImage(image);
 	image.MarkGpuModified();
-	if (!image.usage.depth_target) ++image.validity;
+	if (!image.usage.depth_target) {
+		++image.validity;
+		g_target_lookup_epoch.fetch_add(1, std::memory_order_release); // (mode 4: a worker's refused capture tried again)
+	}
 	image.usage.depth_target = true;
 	const bool scoped = RefreshDepthLayers(id, desc.view_info);
 	if (!scoped) {
@@ -5421,14 +5600,24 @@ bool TextureCache::SpecTargetOver(uint64_t address, uint64_t size) {
 	return false;
 }
 
+bool TextureCache::SpecVirtualOverlap(uint64_t address, uint64_t size) {
+	if (!Spec::On() || size == 0 || t_virtual_ranges.ranges.empty()) return false;
+	const auto* spec = Spec::Current();
+	return spec != nullptr && spec->id == t_virtual_ranges.spec_id && t_virtual_ranges.Overlaps(address, size);
+}
+
 bool TextureCache::HasTrackedDataOverlap(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) return true;
+	// (Mode 4: a no-image target of the calling translation, its image the commit's.)
+	if (SpecVirtualOverlap(address, size)) return true;
 	std::scoped_lock lock {m_lock};
 	return !FindImagesInRegion(address, size, false).empty();
 }
 
 bool TextureCache::HasGpuWrittenImageOverlap(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) return true;
+	// (Mode 4: a no-image target of the calling translation, GPU-written by its draw from it on in order.)
+	if (SpecVirtualOverlap(address, size)) return true;
 	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		const auto& image = m_slot_images[id];
@@ -5563,6 +5752,9 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return false;
 	}
+	// (Mode 4: a no-image target of the calling translation, its image the commit's, GPU-written by its draw from it on in
+	// order.)
+	if (SpecVirtualOverlap(address, size)) return true;
 	// No image over the range: neither the lock nor the page walk. (The command processor asks for every indirect
 	// register table, ~11K a frame at 1-1, in memory the CPU writes; the locked instruction alone was 0.7% of the GPU
 	// thread.) A registration racing a reader without the lock makes no image the GPU wrote.
@@ -5582,6 +5774,7 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 
 bool TextureCache::IsRegionImageBacked(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) return false;
+	if (SpecVirtualOverlap(address, size)) return true; // (a no-image target the calling speculation's commit makes)
 	if (!m_lock.ReadShared([&] { return MayHaveImagesRead(address, size); })) return false;
 	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
 	return !FindImagesInRegion(address, size, false).empty();

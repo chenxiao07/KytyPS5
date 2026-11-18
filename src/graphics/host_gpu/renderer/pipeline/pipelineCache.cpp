@@ -191,8 +191,23 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	// specialization than the in-order one, quietly: a failed read, the lookup refused. Mode 0 tests the global first, on
 	// this failure path only.)
 	if (Spec::On() && PipelineCache::t_no_fault_reads &&
-	    (PipelineCache::t_adopt_only || PipelineCache::t_adopt_records || PipelineCache::t_strict_reads)) [[unlikely]]
+	    (PipelineCache::t_adopt_only || PipelineCache::t_adopt_records || PipelineCache::t_strict_reads)) [[unlikely]] {
+		// (Mode 4: a buffer word GPU work wrote, not the translation's own write, fails the in-order read too
+		// (TryReadGpuCleanBackingToHost on the GPU thread: GPU-dirty bytes, no clean read), and the lookup goes on
+		// unspecialized there as here: false, as in order, noted for the commit to find it failing still
+		// (Speculation's SrtVerifyHolds; a clean read there stops the segment). The translation's own written and journaled
+		// ranges are tested first, then SrtVerifyEligible: no image over the word.)
+		if (auto* spec = Spec::Current(); spec != nullptr && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 &&
+		                                  !spec->WrittenIntersects(address, sizeof(uint32_t)) &&
+		                                  !spec->JournalIntersects(address, sizeof(uint32_t)) &&
+		                                  Libs::LibKernel::Memory::SrtVerifyEligible(address, sizeof(uint32_t))) {
+			auto& reads = spec->srt_verify;
+			if (reads.size() == spec->Sealed().srt_verify || reads.back().address != address || !reads.back().expect_fail)
+				reads.push_back({address, 0, true});
+			return false;
+		}
 		PipelineCache::t_no_fault_failed = true;
+	}
 	return false;
 }
 
@@ -210,6 +225,21 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 		// (A speculation's program lookup: never a fault, which would wait for the GPU thread under the cache's lock. Set
 		// only under a speculation: mode 0 tests the global, as the base reads no thread-local here.)
 		if (!Libs::LibKernel::Memory::TryReadGuestNoFault(address, value, sizeof(*value))) {
+			// (Mode 4: a buffer word GPU work wrote (SrtVerifyEligible: its GPU-dirty bytes, no image over it), not the
+			// translation's own write or journaled one: the word of the stale clean backing, noted with its value
+			// (Spec::State::srt_verify; the same word with the same value once in the open segment) and checked at the commit
+			// against the in-order read (Speculation's SrtVerifyHolds), instead of refusing the lookup.)
+			if (auto* spec = Spec::Current(); spec != nullptr && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 &&
+			                                  !spec->WrittenIntersects(address, sizeof(*value)) &&
+			                                  !spec->JournalIntersects(address, sizeof(*value)) &&
+			                                  Libs::LibKernel::Memory::SrtVerifyEligible(address, sizeof(*value)) &&
+			                                  Libs::LibKernel::Memory::TryReadBackingToHost(address, value, sizeof(*value))) {
+				auto& reads = spec->srt_verify;
+				if (reads.size() == spec->Sealed().srt_verify || reads.back().address != address || reads.back().value != *value ||
+				    reads.back().expect_fail)
+					reads.push_back({address, *value});
+				return true;
+			}
 			PipelineCache::t_no_fault_failed = true;
 			*value                           = 0;
 		}
@@ -293,6 +323,25 @@ void MaterializationReaders(ShaderRecompiler::IR::SrtRuntime& runtime) {
 	runtime.sync_memory                = SyncShaderGuestMemory;
 	runtime.try_read_memory_span       = ReadShaderMemorySpan;
 	runtime.mapping_end                = ShaderMappingEnd;
+}
+
+uint32_t ReadSrtWordInOrder(uint64_t address) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	// (The in-order read: never a speculation's no-fault read, whatever this thread's lookup state.)
+	const bool no_fault = std::exchange(PipelineCache::t_no_fault_reads, false);
+	uint32_t   value    = 0;
+	(void)ReadShaderRawGuestMemory(nullptr, address, &value);
+	PipelineCache::t_no_fault_reads = no_fault;
+	return value;
+}
+
+bool ReadSpecializationWordInOrder(uint64_t address) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	const bool no_fault = std::exchange(PipelineCache::t_no_fault_reads, false); // (the in-order read, as above)
+	uint32_t   value    = 0;
+	const bool read     = ReadShaderGuestMemory(nullptr, address, &value);
+	PipelineCache::t_no_fault_reads = no_fault;
+	return read;
 }
 
 namespace {
@@ -772,7 +821,7 @@ struct PipelineCache::ProgramCache {
 					std::lock_guard lock(loads->mutex);
 					loads->plans[entry] = std::move(loaded);
 				}
-			});
+			}, true);
 		}
 	}
 
@@ -973,10 +1022,11 @@ struct PipelineCache::ProgramCache {
 			PipelineCacheLog("Shader plans: {} out of memory ({} now), {} brought back so far ({} beside the render thread, "
 			                 "{} of those used)",
 			                 plans_out, freed->size(), plan_reloads + plan_preloads, plan_preloads, plan_preload_uses);
-		if (push_job) push_job([freed] { freed->clear(); });
+		if (push_job) push_job([freed] { freed->clear(); }, true);
 	}
-	// Runs a job on the pipeline cache's compile workers (set by PipelineCache).
-	std::function<void(std::function<void()>)> push_job;
+	// Runs a job on the pipeline cache's compile workers (set by PipelineCache); `background`: a plan preload or housekeeping
+	// (mode 4: the table workers' background lane).
+	std::function<void(std::function<void()>, bool)> push_job;
 	// The last table mode Get found its permutation still translating (empty, not refused), and that translation's
 	// completion. Mode 0: the members, as the base (only the GPU thread looks programs up). Under a speculation, per
 	// thread (spec_worker_sets: a speculation's set build looks programs up beside the GPU thread; each reads the
@@ -2846,7 +2896,7 @@ struct PipelineCache::ProgramCache {
 					job->options.input_info.compute = &job->compute;
 				}
 				jobs.push_back(job);
-				push_job([job, device = device] { RunTableJob(*job, device); });
+				push_job([job, device = device] { RunTableJob(*job, device); }, false);
 				Pending() = true;
 				Waiting() = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 				return {};
@@ -2857,7 +2907,7 @@ struct PipelineCache::ProgramCache {
 			if (job->ahead && !job->done.load(std::memory_order_acquire) && !job->promoted.exchange(true, std::memory_order_relaxed))
 				[[unlikely]] push_job([job, device = device] {
 					if (!job->claimed.exchange(true, std::memory_order_acq_rel)) RunTableJob(*job, device);
-				});
+				}, false);
 			if (!job->done.load(std::memory_order_acquire)) {
 				Pending() = true;
 				Waiting() = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
@@ -3870,10 +3920,16 @@ public:
 		for (auto& thread: m_threads) thread.join();
 	}
 	KYTY_CLASS_NO_COPY(CompileWorkers);
-	void Push(std::function<void()> job) {
+	// (Mode 4, the table workers) Three lanes, each in push order: a worker takes the park lane's front first (a compile a
+	// worker entry is parked on: ParkCompiling), then the asked-for lane's (a job something waits for: every job outside
+	// mode 4), and the background lane's (plan preloads, housekeeping) only when both are empty, so a preload never starts
+	// while an asked-for job is queued. Exact: a job's result does not depend on when a background thread runs it. A
+	// lookup never waits on a preload (it reads a plan still loading itself: TakeLoadedPlan).
+	enum class Lane : uint8_t { Asked, Background, Park };
+	void Push(std::function<void()> job, Lane lane = Lane::Asked) {
 		{
 			std::lock_guard lock(m_mutex);
-			m_jobs.push_back(std::move(job));
+			(lane == Lane::Park ? m_park : lane == Lane::Background ? m_low : m_jobs).push_back(std::move(job));
 		}
 		m_wake.notify_one();
 	}
@@ -3890,7 +3946,7 @@ private:
 			std::function<void()> job;
 			{
 				std::unique_lock lock(m_mutex);
-				const auto       ready = [this] { return m_stop || !m_jobs.empty(); };
+				const auto       ready = [this] { return m_stop || !m_jobs.empty() || !m_park.empty() || !m_low.empty(); };
 				if (worked && !m_wake.wait_for(lock, IdleRelease, ready)) {
 					lock.unlock();
 					ShaderRecompiler::ReleaseThreadScratch();
@@ -3899,9 +3955,10 @@ private:
 				}
 				m_wake.wait(lock, ready);
 				// Queued jobs still run at shutdown: their pipelines are destroyed with the rest.
-				if (m_jobs.empty() || (m_stop && m_background)) return;
-				job = std::move(m_jobs.front());
-				m_jobs.pop_front();
+				if ((m_jobs.empty() && m_park.empty() && m_low.empty()) || (m_stop && m_background)) return;
+				auto& lane = !m_park.empty() ? m_park : !m_jobs.empty() ? m_jobs : m_low;
+				job        = std::move(lane.front());
+				lane.pop_front();
 			}
 			job();
 			worked = true;
@@ -3911,6 +3968,8 @@ private:
 	std::mutex                        m_mutex;
 	std::condition_variable           m_wake;
 	std::deque<std::function<void()>> m_jobs;
+	std::deque<std::function<void()>> m_park; // (mode 4: the compiles parked worker entries wait on)
+	std::deque<std::function<void()>> m_low;  // (mode 4: plan preloads, housekeeping)
 	bool                              m_stop = false;
 	const bool                        m_background;
 	std::vector<std::thread>          m_threads;
@@ -4398,7 +4457,11 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	LiveCounters::g_objects_report = [](uint64_t id) {
 		if (g_live_pipeline_cache != nullptr) g_live_pipeline_cache->ReportObjects(id);
 	};
-	m_program_cache->push_job = [this](std::function<void()> job) { TableWorkers().Push(std::move(job)); };
+	// (Mode 4: a background job (a plan preload, housekeeping) on the table workers' background lane.)
+	m_program_cache->push_job = [this](std::function<void()> job, bool background) {
+		const bool low = background && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+		TableWorkers().Push(std::move(job), low ? CompileWorkers::Lane::Background : CompileWorkers::Lane::Asked);
+	};
 	m_program_cache->push_ahead = [this](std::function<void()> job) { AheadWorkers().Push(std::move(job)); };
 	// (Mode 4, under m_mutex, from ProgramCache::PipelinesAhead) A recorded pair's table pipelines, one per recipe, put where
 	// the draw's TryCreateGraphicsPipeline puts its own compile (m_pending_graphics_pipelines, by the key it builds: the
@@ -6087,6 +6150,71 @@ void PipelineCache::DropTableAheadUnmet() {
 	m_program_cache->DropAheadUnmet(building);
 }
 
+// (Mode 4, ParkCompiling) The job and its key (the job held: its `done` and inputs stay readable whatever the map does).
+struct PipelineCache::ParkedPipeline {
+	GraphicsPipelineKey                      key;
+	std::shared_ptr<PendingGraphicsPipeline> job;
+};
+
+std::shared_ptr<PipelineCache::ParkedPipeline> PipelineCache::ParkCompiling(const std::shared_ptr<const std::atomic<bool>>& waiting,
+                                                                            Pipeline&                                       layouts) {
+	if (waiting == nullptr) return nullptr;
+	std::shared_ptr<ParkedPipeline> parked;
+	{
+		Common::LockGuard lock(m_mutex);
+		for (const auto& [key, job]: m_pending_graphics_pipelines)
+			if (&job->done == waiting.get()) {
+				parked = std::make_shared<ParkedPipeline>(ParkedPipeline {key, job});
+				break;
+			}
+	}
+	if (parked == nullptr) return nullptr;
+	// (The parked compile pushed again on the table workers' park lane, taken before the asked-for lane, so the commit's
+	// check finds it done more often; it runs once (`claimed`: the first of its two pushes to start builds it). Only the order
+	// of background compiles changes. Not for a job made ahead: a draw's meet promotes those already.)
+	const auto* parked_vs = parked->job->vs_input_info.stage.program; // (a table pipeline's job: the table workers')
+	if (!parked->job->ahead && parked_vs != nullptr && parked_vs->table_mode && !parked->job->done.load(std::memory_order_acquire) &&
+	    !parked->job->promoted.exchange(true, std::memory_order_relaxed))
+		TableWorkers().Push(
+		    [this, job = parked->job] {
+			    if (!job->claimed.exchange(true, std::memory_order_acq_rel)) RunPendingGraphicsPipeline(*job, true);
+		    },
+		    CompileWorkers::Lane::Park);
+	// (The job's inputs are written before it is put in the map, under m_mutex, and never after: read here as its compile
+	// reads them.)
+	const auto& job = *parked->job;
+	SharedGraphicsLayouts(m_graphics, layouts, job.vs_input_info, job.ps_active ? &job.ps_input_info : nullptr, job.native_bindings);
+	return parked;
+}
+
+bool PipelineCache::ParkedDone(const ParkedPipeline& parked) {
+	return parked.job->done.load(std::memory_order_acquire);
+}
+
+PipelineCache::Pipeline* PipelineCache::ResolveParked(const ParkedPipeline& parked) {
+	if (!ParkedDone(parked)) return nullptr;
+	Common::LockGuard lock(m_mutex);
+	// (CreateGraphicsPipelineImpl's lookup of the key, as the GPU thread's TryCreateGraphicsPipeline makes it: the pipeline in
+	// memory, else the finished job's moved in. PromoteOptimized, which that call makes first, swaps builds in place: the
+	// same Pipeline either way.)
+	const bool indexed = kyty_local_pipeline_index_mode.load(std::memory_order_relaxed) != 0;
+	if (indexed)
+		if (auto found = m_native_graphics_pipelines.find(parked.key); found != m_native_graphics_pipelines.end()) return found->second;
+	if (auto iter = m_graphics_pipelines.find(parked.key); iter != m_graphics_pipelines.end()) {
+		if (indexed) m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
+		return iter->second.get();
+	}
+	const auto pending = m_pending_graphics_pipelines.find(parked.key);
+	if (pending == m_pending_graphics_pipelines.end() || pending->second != parked.job) return nullptr;
+	auto finished = std::move(pending->second->pipeline);
+	m_pending_graphics_pipelines.erase(pending);
+	EXIT_NOT_IMPLEMENTED(finished->pipeline == nullptr || finished->pipeline_layout == nullptr);
+	auto [iter, inserted] = m_graphics_pipelines.emplace(parked.key, std::move(finished));
+	EXIT_IF(!inserted);
+	if (indexed) m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
+	return iter->second.get();
+}
+
 PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
@@ -6284,7 +6412,11 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 		m_pending_graphics_pipelines.emplace(key, job);
 		const bool table = vs_input_info.stage.program != nullptr && vs_input_info.stage.program->table_mode;
 		if (table) m_table_pipeline_jobs.fetch_add(1, std::memory_order_relaxed);
-		(table ? TableWorkers() : Workers()).Push([this, job, table] { RunPendingGraphicsPipeline(*job, table); });
+		// (A table job a parked worker entry pushes again on the park lane (ParkCompiling): whichever push starts first
+		// builds it.)
+		(table ? TableWorkers() : Workers()).Push([this, job, table] {
+			if (!table || !job->claimed.exchange(true, std::memory_order_acq_rel)) RunPendingGraphicsPipeline(*job, table);
+		});
 		LiveCounters::Add(LiveCounters::AsyncPipelines);
 		(worker_waiting != nullptr ? *worker_waiting : m_pipeline_waiting) = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 		return nullptr;

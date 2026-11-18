@@ -63,6 +63,10 @@ void EndTransitGroup() noexcept;
 // Moves whenever an image's barrier state (layout, access) is set outside a speculation's own view: what was found
 // in place holds while it does not.
 [[nodiscard]] uint64_t ImageStateEpoch() noexcept;
+// (Mode 4) Moves when an image gets a new view (Image::FindView) or is first used as a colour or depth target
+// (TextureCache::FindRenderTarget / FindDepthTarget). With the resolution epoch (TextureCache::CaptureRefusalEpoch): what a
+// worker capture's target lookups depend on beyond the registers, but an image's needs_rebind or depth alias.
+inline std::atomic<uint64_t> g_target_lookup_epoch {0};
 class Image;
 // (`image`: the one whose state moved, which its serial records too; null when unknown, which moves every image's.)
 void MoveImageStateEpoch(const Image* image = nullptr) noexcept;

@@ -1599,6 +1599,16 @@ bool TryReadGuestNoFault(uint64_t vaddr, void* data, uint64_t size) {
 	return false;
 }
 
+// (No image over the word, GPU-modified or not: an earlier draw or dispatch of the open segment may render into or store to
+// one there, and an image's write is noted only at its commit (the written set holds buffer writes), so both reads would
+// take the stale word where the in-order read faults and downloads the image. Raw FLAT / GLOBAL stores never run: the
+// SPIR-V emitter fails a program with one.)
+bool SrtVerifyEligible(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) &&
+	       !GetGpuResources().GetTextureCache().IsRegionImageBacked(vaddr, size);
+}
+
 bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean) {
 	if (!data || size < 8 || size > (clean ? 4096u : 64u) || size % 4 != 0 || !g_gpu_resources ||
 	    !Graphics::GuestGpu::IsTranslatingThread() || !IsGpuAddressRange(vaddr, size))

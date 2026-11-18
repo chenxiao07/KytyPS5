@@ -134,6 +134,17 @@ public:
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
+	// (Mode 4, a speculation's thread, around one BeginRendering: RenderingHookScope) The begin's call recorded by the hook
+	// instead when it returns true (a rendering naming a view its commit makes: table-xpr.inc's TableVirtualRendering).
+	using RenderingHook = bool (*)(void* data, vk::CommandBuffer command, const vk::RenderingInfo& rendering);
+	static inline thread_local RenderingHook t_rendering_hook      = nullptr;
+	static inline thread_local void*         t_rendering_hook_data = nullptr;
+	struct RenderingHookScope {
+		RenderingHookScope(RenderingHook hook, void* data) noexcept { t_rendering_hook = hook, t_rendering_hook_data = data; }
+		~RenderingHookScope() { t_rendering_hook = nullptr, t_rendering_hook_data = nullptr; }
+		RenderingHookScope(const RenderingHookScope&)            = delete;
+		RenderingHookScope& operator=(const RenderingHookScope&) = delete;
+	};
 	void EndRendering() const;
 	// The render pass `state` again after an interruption (a copy of an attachment): its attachments loaded, not
 	// cleared, and `state` kept as the current one, so that the next BeginRendering with it continues the pass.
@@ -557,10 +568,29 @@ private:
 	                                                          std::span<const uint64_t> commands, uint64_t index_base,
 	                                                          uint64_t index_bytes, vk::IndexType index_type,
 	                                                          const NativeXprDirectDraw* direct);
-	[[nodiscard]] bool TableEntryCheck(const TableEntryHolder& holder);
+	[[nodiscard]] bool TableEntryCheck(TableEntryHolder& holder);
 	void               TableEntrySettle(const std::shared_ptr<TableEntryHolder>& holder, bool commit);
 	void               TableEntrySettleInOrder(TableEntryHolder& holder);
 	void               TableRetireEntryOrphans();
+	// (Mode 4; table-xpr.inc) A worker's own capture of a draw state no capture of whose context exists (its targets
+	// resolved read only); the commit's resolution of an entry parked on its table pipeline's compile; the commit's making
+	// of a captured state's colour targets no image existed for, and the hook that records a rendering's begin naming them.
+	[[nodiscard]] std::unique_ptr<NativeXprDrawState> WorkerCaptureTargets(CommandBuffer& buffer, vk::PrimitiveTopology topology,
+	                                                                       bool restart, uint64_t ctx_hash);
+	[[nodiscard]] bool TableEntryResolveParked(TableEntryHolder& holder);
+	[[nodiscard]] bool TableEntryResolveVirtual(TableEntryHolder& holder, const void* spec_state);
+	static bool        TableVirtualRendering(void* data, vk::CommandBuffer command, const vk::RenderingInfo& rendering);
+	// (Mode 4; table-xpr.inc) A worker's draw drawn with an entry not in the catalog yet (its translation's own new pair's,
+	// the catalog's pair made since; or one whose segment committed, its catalog part waiting), the commit's add of such
+	// an entry, and the check at the commit of a draw drawn with one.
+	[[nodiscard]] std::optional<TableResult> TableEntryOverlay(CommandBuffer& buffer, const TablePair* existing,
+	                                                           std::span<const uint64_t> commands, uint64_t index_base,
+	                                                           uint64_t index_bytes, vk::IndexType index_type,
+	                                                           const NativeXprDirectDraw* direct);
+	void               TableEntryOverlayAdd(const std::shared_ptr<TableEntryHolder>& holder);
+	[[nodiscard]] bool TableEntryOverlayCheck(TableEntryHolder& holder);
+	// (Mode 4) Whether a captured state's adopted targets are still what the in-order FindImage would reuse.
+	[[nodiscard]] bool TableAdoptedCurrent(const NativeXprDrawState& draw_state);
 	[[nodiscard]] TableImageSet* TableResolveSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
 	                                             const NativeXprDrawState* draw_state, std::span<const uint32_t> words);
 	[[nodiscard]] bool           TableValidateSet(TableImageSet& set);

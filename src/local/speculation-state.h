@@ -106,7 +106,7 @@ struct Counts {
 	       clean_reads = 0, feedbacks = 0, buffer_ranges = 0, sets = 0, chain_reads = 0, waits = 0, cpu_copies = 0,
 	       late_reads = 0, texel_syncs = 0, pending_buffers = 0, table_ranges = 0, pending_targets = 0, indexed_draws = 0,
 	       scenes = 0, used_pairs = 0, left_clears = 0, journal_reads = 0, journal_words = 0, reloc_refs = 0, reloc_unrel = 0,
-	       covered_waits = 0, read_values = 0, unvalued_reads = 0;
+	       covered_waits = 0, read_values = 0, unvalued_reads = 0, srt_verify = 0;
 };
 
 // spec_pending_buffers (under KYTY_SPECULATE=4 only): a table V#'s range with no
@@ -132,6 +132,11 @@ struct PendingBuffer {
 inline thread_local bool t_pending_ok  = false; // (TableBlocks: a missing buffer may be left pending)
 inline thread_local bool t_pending_hit = false; // (ObtainBufferSpec: it was)
 inline thread_local bool t_no_range    = false; // (spec_reloc_refs: the V#'s lookups note no buffer range; the caller records it)
+// (Mode 4, the GPU thread, Speculation::Before's proposed checks) The segment whose checks run (a worker entry parked on
+// its table pipeline's compile writes only the cells of that segment on: those of segments before it went with their
+// holes), and whether a check before the one running failed (the segment stops: nothing of the running one is done).
+inline thread_local size_t t_check_segment = 0;
+inline thread_local bool   t_checks_failed = false;
 // Relocatable buffer references (KYTY_SPECULATE=4, the mode read as a translation begins: State::reloc_on): the table
 // path's index-buffer bind and indirect draws a worker records as packets that carry the buffer handle and offset in a
 // cell of their own (State::reloc_refs), which the commit rewrites with the range's live buffer when a registration
@@ -631,6 +636,18 @@ struct State {
 	std::vector<PendingTarget> pending_targets; // (spec_commit_targets)
 	bool                       target_failed = false; // (spec_commit_targets: the commit's Before could not acquire one)
 	bool                       images_failed = false; // (spec_worker_images: a set's pending slot not completed)
+	bool                       any_resolve   = false; // (mode 4: a proposed set has a resolve, Before's pass for it)
+	// (Mode 4) The raw SRT words a translation read from the stale clean backing where GPU work had written them into a
+	// buffer (the in-order read is that buffer's readback), and the specialization words whose read failed as the in-order
+	// one fails (`expect_fail`: GPU-written, no clean read on any thread; the lookup went on unspecialized): each checked at
+	// its segment's commit (Speculation::SrtVerifyHolds); one that differs stops the segment (srt_failed).
+	struct SrtVerifyRead {
+		uint64_t address     = 0;
+		uint32_t value       = 0;
+		bool     expect_fail = false;
+	};
+	std::vector<SrtVerifyRead> srt_verify;
+	bool                       srt_failed = false;
 	std::vector<LateRead>        late_reads;
 	const std::atomic<uint64_t>* log_end    = nullptr; // (the effects log's end: Speculation::m_log)
 	bool                         late       = false;   // (ReadWord: the word it read was such a read; late_since before it)
@@ -675,6 +692,12 @@ struct State {
 		std::function<void()>     settle_now;
 		const void*               catalog_owner = nullptr;
 		std::function<bool()>     settle_must_now;
+		// (Mode 4, a worker's capture of colour targets no image existed for: what its commit makes once every check of the
+		// segment passed, before the pending images are completed; false stops the segment. Empty: nothing. With it, read
+		// only before its segment's Before: whether a target `resolve` makes meets [address, address + size), by its desc's
+		// data, metadata range or stencil plane (SegmentWritesRange: the completion's write test).)
+		std::function<bool()>                   resolve;
+		std::function<bool(uint64_t, uint64_t)> resolve_over;
 	};
 	std::vector<ProposedSet> proposed_sets;
 	void SettleProposedSets(size_t committed_segment, bool all) {
@@ -779,7 +802,7 @@ struct State {
 		        late_reads.size(),     texel_syncs.size(),     pending_buffers.size(), table_ranges.size(), pending_targets.size(),
 		        indexed_draws,         scenes,                 used_pairs.size(),      left_clears.size(),
 		        journal_reads.size(),  journal_words.size(),   reloc_refs.size(),  reloc_unrel.size(),
-		        covered_waits,         read_values.size(),     unvalued_reads.size()};
+		        covered_waits,         read_values.size(),     unvalued_reads.size(), srt_verify.size()};
 	}
 	// Its pending guest memory writes or a previous speculation's over the range; the ranges its work or a previous
 	// one's writes.
@@ -1392,6 +1415,7 @@ struct State {
 		covered_waits = std::min(covered_waits, checkpoint.covered_waits);
 		read_values.resize(std::min(read_values.size(), checkpoint.read_values));
 		unvalued_reads.resize(std::min(unvalued_reads.size(), checkpoint.unvalued_reads));
+		srt_verify.resize(std::min(srt_verify.size(), checkpoint.srt_verify));
 		bda_all = checkpoint_bda_all;
 	}
 
@@ -1430,6 +1454,9 @@ struct State {
 		pending_targets.clear();
 		target_failed = false;
 		images_failed = false;
+		any_resolve   = false;
+		srt_verify.clear();
+		srt_failed = false;
 		draw_verifies.clear();
 		indexed_draws = 0;
 		scenes        = 0;

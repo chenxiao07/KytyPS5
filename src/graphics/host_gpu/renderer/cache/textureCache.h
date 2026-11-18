@@ -59,6 +59,26 @@ public:
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false, bool may_fail = false);
 	// (t_read_only; mode 4: a view of an image ResolveOverlap picks gets its base level and layer as FindImage sets them.)
 	[[nodiscard]] ImageId FindImageReadOnly(ImageDesc& desc, bool exact_format);
+	// (Mode 4, a worker's capture of a new draw state: t_read_only with t_read_only_targets) A colour or depth target's image
+	// as FindImage's first lookups find it (the exact registered, current image of the same backing), only one already used
+	// as that kind of target; a colour target with no image on its pages (t_virtual_hit) or one whose in-order FindImage
+	// reuses an existing image (t_adopt_picks), as below; anything else fails (ReadOnlyFail). Nothing is made, bound or
+	// acquired.
+	[[nodiscard]] ImageId FindTargetReadOnly(ImageDesc& desc, bool exact_format);
+	// ... and the attachment view such an image already has for `desc`'s view (no new view), its serial and sample count
+	// checked; false (ReadOnlyFail) else. The acquisition (upload, metadata, the GPU write) stays the commit's.
+	struct TargetView {
+		vk::ImageView view   = nullptr;
+		uint64_t      serial = 0;
+	};
+	[[nodiscard]] bool FindTargetViewReadOnly(ImageId id, const ImageDesc& desc, TargetView& out);
+	// (Mode 4, at a commit, the GPU thread) A colour target a worker's capture found no image for, made and acquired as the
+	// in-order draw makes it (FindImage, then FindRenderTarget, whose PrepareDccClear applies a DCC target's pending clear),
+	// only where that FindImage makes a fresh image with no other image on its pages, or finds the one image of its exact
+	// backing alone there (made since by the GPU thread's own work), and no image's memory is reclaimed meanwhile; else
+	// null, and nothing done but what FindImage did. `desc` as FindImage leaves it; `view` FindRenderTarget's; `serial` the
+	// image's.
+	[[nodiscard]] ImageId AcquireVirtualTargetAtCommit(ImageDesc& desc, vk::ImageView& view, uint64_t& serial);
 	// spec_commit_targets: a speculation's target acquired at its commit, as FindRenderTarget / FindDepthTarget do
 	// (the color DCC clear over the view's layers when `clear`); false: not that image any more, or not safe after.
 	[[nodiscard]] bool AcquireTargetAtCommit(ImageId id, uint64_t serial, uint32_t base_level, uint32_t level_count,
@@ -90,6 +110,12 @@ public:
 	[[nodiscard]] uint64_t ResolutionEpoch() const {
 		return m_resolution_epoch.load(std::memory_order_acquire);
 	}
+	// (Mode 4, a worker's refused capture kept: RenderExecutor::TableWorkerEntry) Moves with any image's registration or
+	// unregistration, new view, or first use as a colour or depth target (g_target_lookup_epoch). A sum of two counters that
+	// only rise.
+	[[nodiscard]] uint64_t CaptureRefusalEpoch() const {
+		return m_resolution_epoch.load(std::memory_order_acquire) + g_target_lookup_epoch.load(std::memory_order_acquire);
+	}
 	// Moves whenever an image's slot is erased (EraseRetired, the only place): an id allocated when it was E is still
 	// allocated while it is E.
 	[[nodiscard]] uint64_t EraseEpoch() const { return m_erase_epoch.load(std::memory_order_acquire); }
@@ -102,6 +128,56 @@ public:
 	// spec_worker_images: a sampled texture not made or not ready may be left to the commit (a hit, no refusal).
 	static inline thread_local bool t_pending_images_ok = false;
 	static inline thread_local bool t_pending_hit       = false;
+	// (Mode 4, a worker's capture: RenderExecutor::WorkerCaptureTargets sets them) FindImage under t_read_only takes the
+	// target lookup (FindTargetReadOnly) for a target's desc. A colour target with no image on any of its pages and no
+	// metadata, or DCC metadata, is a hit (t_virtual_hit, no refusal): the commit makes it (AcquireVirtualTargetAtCommit).
+	// A colour target with no image of its exact backing whose in-order FindImage would REUSE an existing image
+	// (ResolveOverlap's pick: the target a view of a bigger image at its base, or inside one at a level / layer) takes that
+	// image, read only (ResolveOverlapReadOnly: any branch that would free, make, merge or copy refuses), refused when
+	// FindImage would free a guest alias of it (GuestAliasedAt); each such pick is noted (its address, image, serial,
+	// exact_format and the view's level and layer the mirror set) in t_adopt_picks, kept with the captured state, and its
+	// entry's commit check proves it again on the GPU thread (AdoptedTargetCurrent).
+	static inline thread_local bool t_read_only_targets  = false;
+	static inline thread_local bool t_virtual_targets_ok = false;
+	static inline thread_local bool t_virtual_hit        = false;
+	struct AdoptPick {
+		uint64_t address      = 0;
+		ImageId  id           {};
+		uint64_t serial       = 0;
+		bool     exact_format = false;
+		int32_t  view_level = -1, view_layer = -1; // (the mirror's view: -1 where it left desc.view_info as it was)
+	};
+	static inline thread_local bool        t_adopt_targets_ok = false;
+	static thread_local std::vector<AdoptPick> t_adopt_picks; // (defined after the class)
+	// (The GPU thread, an entry's commit check:) the pick still what the in-order FindImage of `requested` would reuse: the
+	// image alive and unchanged (serial), and the same pick with the same view by the same mirror now (staleness judged by
+	// the frame counter then, as the in-order FindImage at that draw), no guest alias.
+	[[nodiscard]] bool AdoptedTargetCurrent(const ImageInfo& requested, const AdoptPick& pick);
+	// (Mode 4) The memory of the no-image targets this thread's captures took in its translation (a speculation's id), from
+	// each capture on: in order the image is there from that draw on (made, then GPU-written by it), so the translation's
+	// later questions over that memory get the in-order answers (SpecVirtualOverlap): a read-only image lookup refused
+	// (FindImageReadOnly, FindTargetReadOnly), an image GPU-written and tracked there (HasGpuWrittenImageOverlap,
+	// HasTrackedDataOverlap, IsRegionImageBacked), a range lookup refusing the packet (FindImageFromRange), the region
+	// GPU-modified (IsRegionGpuModified).
+	struct VirtualRanges {
+		uint64_t                                   spec_id = 0;
+		std::vector<std::pair<uint64_t, uint64_t>> ranges; // [begin, end)
+		void Hold(uint64_t id) {
+			if (id == spec_id) return;
+			ranges.clear();
+			spec_id = id;
+		}
+		[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size) const {
+			for (const auto& r: ranges)
+				if (r.first < address + size && address < r.second) return true;
+			return false;
+		}
+		void Note(uint64_t address, uint64_t size) { ranges.emplace_back(address, address + size); }
+	};
+	static thread_local VirtualRanges t_virtual_ranges; // (defined after the class: its initializers need it complete)
+	// The calling speculation's no-image target memory over the range (a speculation's thread only: the GPU thread captures
+	// none; the global first).
+	[[nodiscard]] static bool SpecVirtualOverlap(uint64_t address, uint64_t size);
 	// The calling speculation's targets its own draws leave to their commits' acquisition (Spec::State::pending_targets,
 	// any segment of the translation: one not GPU-owned or CPU / buffer dirty when drawn, a layered depth target's draw,
 	// which the in-order FindRenderTarget / FindDepthTarget marks GPU-modified at the draw): whether one is over the range;
@@ -240,8 +316,9 @@ public:
 	enum class ReadOnlyBufferOverlap { None, CpuSampled, Unsafe };
 	[[nodiscard]] ReadOnlyBufferOverlap ClassifyReadOnlyBufferOverlap(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
-	// Any image over the range's bytes, registered, GPU-modified or not (spec_nofault_journal: Memory::TryReadGuestNoFault),
-	// from one look under the image lock.
+	// Any image over the range's bytes, registered, GPU-modified or not, or a no-image target the calling speculation's
+	// capture leaves to its commit (spec_nofault_journal: Memory::TryReadGuestNoFault; Memory::SrtVerifyEligible), from one
+	// look under the image lock.
 	[[nodiscard]] bool IsRegionImageBacked(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
@@ -464,8 +541,13 @@ private:
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ResolveBlockTexelOverlap(const ImageInfo& requested, ImageId cached_id);
-	// (Mode 4, FindImageReadOnly) ResolveOverlap's pick over the candidates, read only; caller holds m_lock.
-	[[nodiscard]] ImageId       ResolveOverlapReadOnly(ImageDesc& desc, bool exact_format, const ImageIds& candidates);
+	// (Mode 4, FindImageReadOnly) ResolveOverlap's pick over the candidates, read only; caller holds m_lock. (`view`: the
+	// pick's view level and layer as it set them in desc.view_info, -1 each where it left them.)
+	[[nodiscard]] ImageId       ResolveOverlapReadOnly(ImageDesc& desc, bool exact_format, const ImageIds& candidates,
+	                                                   std::pair<int32_t, int32_t>* view = nullptr);
+	// (Mode 4) FindImage would free a guest-texture alias of the image `id` names when bound for writing (FreeGuestAliases'
+	// own test, read only); caller holds m_lock.
+	[[nodiscard]] bool          GuestAliasedAt(ImageId id);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	// (`window`: mode 4's UploadWindow may open: FindTexture's, FindRenderTarget's, FindDepthTarget's, UpdateImage's.)
 	void                        RefreshImage(ImageId id, bool window = false);
@@ -593,6 +675,7 @@ private:
 	uint64_t                                          m_logged_private       = 0;
 	bool                                              m_logged_short_of_ram  = false;
 	uint64_t         m_gc_tick                = 0;
+	std::atomic<uint64_t> m_reclaims {0}; // ReclaimImageMemory's calls (AcquireVirtualTargetAtCommit's test; mode 4)
 	TickClock        m_tick_clock;                 // the collectors count ages in time
 	uint64_t         m_scene_generation       = 0; // RetireStaleImages: the world the game is in (SceneTags), entered
 	uint64_t         m_scene_tick             = 0; // at this tick
@@ -643,6 +726,9 @@ private:
 	friend class BufferCache;
 	friend class RenderExecutor;
 };
+
+inline thread_local TextureCache::VirtualRanges          TextureCache::t_virtual_ranges;
+inline thread_local std::vector<TextureCache::AdoptPick> TextureCache::t_adopt_picks;
 
 } // namespace Libs::Graphics
 

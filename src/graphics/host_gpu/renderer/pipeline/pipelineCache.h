@@ -313,6 +313,19 @@ public:
 	void CommitAdopted(AdoptedCommit& commit);
 	// (Whether CreatePrivateGraphicsPipeline may make one here: the first build is PipelineBuild::Fast.)
 	[[nodiscard]] bool PrivateBuildsAllowed() const;
+	// (TableWorkerEntry, mode 4) A table pipeline a worker entry met still compiling, held for the entry's commit: the
+	// compile's job and its key (TryCreateGraphicsPipelineWorker's `waiting` names the job). ParkCompiling (a worker, no
+	// other lock held): the job `waiting` names, while pending, with `layouts` given the layouts that pipeline gets
+	// (SharedGraphicsLayouts of the job's own inputs: the shared ones for its bindings), and the job pushed again on the
+	// table workers' park lane (taken first; whichever push starts first builds it); null when the job is not pending any
+	// more. ResolveParked (the GPU thread, at the commit): the pipeline the in-order lookup of the key gives now
+	// (TryCreateGraphicsPipeline's own steps: the one in memory, else the finished job's put in), null while the job is not
+	// done or when the key is in neither (dropped). ParkedDone: the job's compile finished.
+	struct ParkedPipeline;
+	[[nodiscard]] std::shared_ptr<ParkedPipeline> ParkCompiling(const std::shared_ptr<const std::atomic<bool>>& waiting,
+	                                                            Pipeline&                                       layouts);
+	[[nodiscard]] Pipeline*   ResolveParked(const ParkedPipeline& parked);
+	[[nodiscard]] static bool ParkedDone(const ParkedPipeline& parked);
 	Pipeline& CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	                                const ShaderProgram&          compute_program);
 	// The last GetGraphicsPrograms or GetComputeProgram in table mode found a program a worker still translates
@@ -673,6 +686,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 // The guest memory readers resource materialization reads through (clean reads: what the GPU wrote is synchronized
 // first), for the table path's address probes (TablePlan::IndirectImage).
 void MaterializationReaders(ShaderRecompiler::IR::SrtRuntime& runtime);
+// (Mode 4, a speculation's commit: the GPU thread only) A raw SRT word as the GPU thread's own lookup reads it (a
+// read-watched page's fault reads the bytes back); whether a specialization word reads clean as that lookup reads it
+// (ReadShaderGuestMemory: a GPU-written one does not).
+[[nodiscard]] uint32_t ReadSrtWordInOrder(uint64_t address);
+[[nodiscard]] bool     ReadSpecializationWordInOrder(uint64_t address);
 // KYTY_PIPELINE_KEY_LOG (diagnostic): a PIPEKEY line with the driver key of each pipeline the static store did not
 // hold (the precompile: of each it makes) and its modules' shader and SPIR-V hashes.
 bool PipelineKeyLog();
@@ -694,6 +712,10 @@ void NotePipelineKeyModule(vk::ShaderModule module, uint64_t shader_hash, uint64
 // The descriptor set and pipeline layouts the pipelines share (one pair per binding set, shaders.cpp): destroyed after
 // every pipeline that uses them.
 void DestroySharedLayouts(vk::Device device);
+// (Mode 4, PipelineCache::ParkCompiling) The layouts (and uses_push_descriptors, native_bindings) CreatePipelineInternal
+// gives a graphics pipeline of these inputs, set in `pipeline` without making the pipeline: its bindings' shared ones.
+void SharedGraphicsLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, const ShaderVertexInputInfo& vs_input_info,
+                           const ShaderPixelInputInfo* ps_input_info, bool native_bindings);
 // KYTY_PIPELINE_SOURCE_LOG (diagnostic): a PIPESRC line for each pipeline made (its kind, identity, whether the static
 // cache gave it, its build and time; from a cache blob: the blob's size and the microseconds of its read, of the cache
 // made of it and of the driver's creation) and a PIPESPV line (its SPIR-V size and the microseconds before its

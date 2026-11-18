@@ -599,6 +599,21 @@ static void SharedLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	g_shared_layouts.emplace(key, std::move(shared));
 }
 
+// (Mode 4, PipelineCache::ParkCompiling) CreatePipelineInternal's layout step for a graphics pipeline (its stages'
+// bindings, the shared layouts for them), with no pipeline made: the same bindings, so the same shared layouts its build
+// takes.
+void SharedGraphicsLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, const ShaderVertexInputInfo& vs_input_info,
+                           const ShaderPixelInputInfo* ps_input_info, bool native_bindings) {
+	EXIT_IF(!vs_input_info.stage || (ps_input_info != nullptr && !ps_input_info->stage));
+	const bool mesh         = vs_input_info.stage.program->stage == ShaderType::Mesh;
+	const auto vertex_stage = mesh ? vk::ShaderStageFlagBits::eMeshEXT : vk::ShaderStageFlagBits::eVertex;
+	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
+	AddLayoutBindings(descriptor_bindings, *vs_input_info.stage.program, vertex_stage, native_bindings);
+	if (ps_input_info != nullptr)
+		AddLayoutBindings(descriptor_bindings, *ps_input_info->stage.program, vk::ShaderStageFlagBits::eFragment, native_bindings);
+	SharedLayouts(graphics, pipeline, descriptor_bindings, native_bindings, vertex_stage | vk::ShaderStageFlagBits::eFragment);
+}
+
 void DestroySharedLayouts(vk::Device device) {
 	std::lock_guard lock(g_shared_layouts_mutex);
 	for (const auto& [key, shared]: g_shared_layouts) {

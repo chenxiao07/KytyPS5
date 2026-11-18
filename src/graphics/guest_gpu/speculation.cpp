@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h" // (spec_depth_layers2: htile_load_decision)
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h" // (mode 4: ReadSrtWordInOrder, ReadSpecializationWordInOrder)
 #include "kernel/memory.h" // (GuardedCopy: IsUniqueGuestBackingRangeAcrossMappings)
 #include "async-upload.h"
 #include "draw-state-observer.h"
@@ -1436,6 +1437,32 @@ const char* Speculation::RelocPatch(Result& result, size_t index) {
 static bool SegmentWritesRange(const Spec::State& state, size_t index, const Spec::Counts& from, const Spec::Counts& to,
                                uint64_t address, uint64_t size); // (below)
 
+// (Mode 4) The SRT words a segment's translation read stale from a buffer GPU work wrote (their value kept) or found failing
+// as in order (expect_fail: GPU-written, no clean read), read now as the GPU thread's own lookup reads them; false at the
+// first that differs: a word read since unmapped, a value changed, or an expected failure that now reads clean (the
+// in-order lookup would have specialized). Exact: every use the translation made of a word (the specialization it chose,
+// an address it followed, the words it wrote) is a function of its value or of the read's failure, and an equal answer
+// at the commit is the in-order lookup's answer at the draw: nothing of the segment before the draw writes such a word
+// (its own writes, the written set and the journal, refuse the note; an image over the word refuses it too, as an image
+// write is noted only at its commit), and the commits and holes before the segment have run. The commit's reads are the
+// readbacks the hole's own lookups make; nothing waits for a worker. Asked twice: first in Before (a mismatch stops the
+// segment before its preparation), then after Before and the checks after it, before the splice (Before's own syncs,
+// readbacks, texel copies, host writes and completions written back may have changed a word).
+static bool SrtVerifyHolds(const Spec::State& state, size_t from, size_t to) {
+	for (size_t i = from; i < to; ++i) {
+		const auto& read = state.srt_verify[i];
+		if (read.expect_fail) {
+			if (ReadSpecializationWordInOrder(read.address)) return false;
+			continue;
+		}
+		// (Unmapped since: not the word read; never read raw here.)
+		if (!Libs::LibKernel::Memory::IsFullyMapped(read.address, sizeof(read.value)) ||
+		    ReadSrtWordInOrder(read.address) != read.value)
+			return false;
+	}
+	return true;
+}
+
 Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcessor& cp) {
 	m_renderer.GetBufferCache().ServeAhead(); // (spec_buffer_ahead: the ranges speculations found no buffer over)
 	auto&       scheduler = m_renderer.GetCommandScheduler();
@@ -1857,6 +1884,16 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 			return ++m_stop_reasons["commit: a pending target not acquired"], Progress::Stopped;
 		if (std::exchange(result.state.images_failed, false)) // (spec_worker_images)
 			return ++m_stop_reasons["commit: a pending image not completed"], Progress::Stopped;
+		// (Mode 4: the SRT words its translation read stale, again after Before and the checks after it: what Before did
+		// may have changed one (SrtVerifyHolds); the splice follows with no other work.)
+		if (const auto sfrom = index == 0 ? size_t {0} : state.closed[index - 1].end.srt_verify,
+		    sto = state.closed[index].end.srt_verify;
+		    !result.state.srt_failed && sto > sfrom) {
+			const RenderLockGuard lock(m_renderer.GetMutex()); // (as Before's first pass)
+			if (!SrtVerifyHolds(state, sfrom, sto)) result.state.srt_failed = true;
+		}
+		if (std::exchange(result.state.srt_failed, false))
+			return ++m_stop_reasons["commit: an SRT word read stale changed"], Progress::Stopped;
 		// spec_pending_buffers / spec_reloc_refs: the table V# entries, after Before's registrations. A pending one, one
 		// Before had to obtain, and (spec_reloc_refs) one with a buffer registered or unregistered over its range since
 		// its proof are looked up as they are now and written into the block; the others are left as they are (no
@@ -1942,8 +1979,10 @@ static bool ImageGoneInBefore(TextureCache& textures, const Image& image, uint64
 // applies after a pending slot's completion: the ranges its GPU work writes (written: the buffers its shaders write;
 // invalidated: the image-invalidating GPU writes), its guest memory writes (the journal, made in After: labels,
 // WRITE_DATA words, copy destinations), the images its own work writes (Segment::images, ImageUse::writes: a colour or
-// depth / stencil target, a storage image, a transfer, a clear; by the image's data, metadata range or stencil plane) and
-// the targets its Before acquires after the completion (State::pending_targets: an upload or a clear).
+// depth / stencil target, a storage image, a transfer, a clear; by the image's data, metadata range or stencil plane), the
+// colour targets a worker's capture left to this Before, made before the completion (ProposedSet::resolve_over: no image
+// entry holds them) and the targets its Before acquires after the completion (State::pending_targets: an upload or a
+// clear).
 static bool SegmentWritesRange(const Spec::State& state, size_t index, const Spec::Counts& from, const Spec::Counts& to,
                                uint64_t address, uint64_t size) {
 	if (size == 0) return false;
@@ -1964,6 +2003,10 @@ static bool SegmentWritesRange(const Spec::State& state, size_t index, const Spe
 	for (const auto& use: state.closed[index].images)
 		if (use.writes != 0 && use.image != nullptr && use.image->serial == use.serial && image_over(use.image->info))
 			return true;
+	if (state.any_resolve)
+		for (const auto& proposed: state.proposed_sets)
+			if (proposed.segment == index && proposed.resolve && proposed.resolve_over && proposed.resolve_over(address, size))
+				return true;
 	for (size_t k = from.pending_targets; k < std::min(to.pending_targets, state.pending_targets.size()); ++k) {
 		const auto& target = state.pending_targets[k];
 		if (target.image != nullptr && target.image->serial == target.serial && image_over(target.image->info)) return true;
@@ -1988,6 +2031,12 @@ void Speculation::Before(Result& result, size_t index) {
 	// (their CPU-dirty pages uploaded, then GPU-owned), those it reads made current, its BDA reads prepared, and each
 	// image where the work found it.
 	RenderLockGuard lock(m_renderer.GetMutex());
+	// (Mode 4: the SRT words its translation read stale, read as the in-order lookups read them, first: a mismatch stops
+	// the segment (the caller tests srt_failed), nothing of Before's preparation made for it.)
+	if (to.srt_verify > from.srt_verify && !SrtVerifyHolds(state, from.srt_verify, to.srt_verify)) {
+		state.srt_failed = true;
+		return;
+	}
 	// Its images as they are before anything here can erase or unregister one (the last loop's ImageGoneInBefore).
 	const auto                      erase_epoch = textures.EraseEpoch();
 	std::vector<ImageAtBeforeStart> images_at_start;
@@ -2082,11 +2131,25 @@ void Speculation::Before(Result& result, size_t index) {
 	// the sets its worker proposed in this segment, or handed on by one re-run as a hole (bound by the replay after this)
 	// still current: the BDA page table's
 	// generation theirs, their images the ones they were built with. One not stops the segment.
-	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4)
+	// (A worker entry parked on its table pipeline's compile writes the cells of this segment on, t_check_segment, and does
+	// nothing once a check before it failed, t_checks_failed.) Then what the proposals make at their commit (a capture's
+	// colour targets no image existed for: their images made, ProposedSet::resolve), only once every check passed, up to
+	// the first that cannot (the segment stops: nothing more made).
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+		Spec::t_check_segment = index;
 		for (const auto& proposed: state.proposed_sets)
 			if (proposed.segment == index && proposed.check) {
+				Spec::t_checks_failed = state.images_failed;
 				if (!proposed.check()) state.images_failed = true;
 			}
+		Spec::t_checks_failed = false;
+		if (!state.images_failed && state.any_resolve)
+			for (const auto& proposed: state.proposed_sets)
+				if (proposed.segment == index && proposed.resolve && !proposed.resolve()) {
+					state.images_failed = true;
+					break;
+				}
+	}
 	// (A set whose pending slots' memory the segment writes stopped it before this: the commit's checks before Before.)
 	for (auto& proposed: state.proposed_sets)
 		if (proposed.segment == index && proposed.complete) {
