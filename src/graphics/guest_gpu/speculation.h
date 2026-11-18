@@ -241,7 +241,9 @@ private:
 	// Why the work of the segment no longer holds (a buffer or image it used registered over, a mapping changed), or
 	// null.
 	// (skip_registered: the registrations over its buffer ranges not looked at: RelocEligible did.)
-	[[nodiscard]] const char* Changed(const Result& result, size_t index, bool skip_registered = false) const;
+	// (`since`: the epochs to check from instead of the result's: Changed's stamps, mode 4, the call after Before.)
+	[[nodiscard]] const char* Changed(const Result& result, size_t index, bool skip_registered = false,
+	                                  const Epochs* since = nullptr) const;
 	// KYTY_SPECULATE=4 (Spec::State::reloc_on): whether a segment Changed() stopped with `why` passes with its
 	// relocatable buffer references patched: each range a registration moved over is covered whole by them, each resolves
 	// to one live registered buffer now, and no other buffer reference of the segment has a range a registration moved

@@ -1174,7 +1174,7 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 	return outcome;
 }
 
-const char* Speculation::Changed(const Result& result, size_t index, bool skip_registered) const {
+const char* Speculation::Changed(const Result& result, size_t index, bool skip_registered, const Epochs* since) const {
 	extern thread_local bool t_unmap_list_site; // (spec_unmap_list: its checks share one `since`)
 	struct ListSite {
 		ListSite() { t_unmap_list_site = true; }
@@ -1183,14 +1183,34 @@ const char* Speculation::Changed(const Result& result, size_t index, bool skip_r
 	auto&       buffers  = m_renderer.GetBufferCache();
 	auto&       textures = m_renderer.GetTextureCache();
 	const auto& state    = result.state;
-	const auto& epochs   = result.epochs;
+	const auto& epochs   = since != nullptr ? *since : result.epochs; // (Changed's stamps: the first call's)
 	const auto& segment  = state.closed[index];
 	const auto  from     = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
 	// (Memory mapped since changes nothing it used; memory unmapped under what it read or uses does.)
 	auto&      resources = m_renderer.GetGpuResources();
 	const bool mapping   = resources.MappingEpoch() != epochs.mapping;
-	// (Nothing registered, released or unmapped since it began, mostly: no range or image to look at.)
-	if (mapping || buffers.RegistrationEpoch() != epochs.buffers)
+	// Changed's stamps (mode 4): only when the mapping epoch moved, the hull of the segment's buffer ranges, table
+	// ranges, clean and late reads (one pass, here: nothing on the worker). When the merged unmap list (the one the per-item
+	// tests below read inside Changed, for the same `since`) says no unmap since meets the hull, it says so of every item
+	// inside it (it rounds a range out to granules: a superset range for the hull), so each per-item unmap test would pass:
+	// skipped. The list unable to answer (-1) or a hit: the per-item tests as before, the same first failure. The images keep
+	// theirs (not in the hull).
+	bool unmap_items = mapping;
+	if (mapping && Spec::ChangedStampsOn()) {
+		uint64_t   low = UINT64_MAX, high = 0;
+		const auto hull = [&](const auto& list, size_t first, size_t last) {
+			for (size_t i = first; i < last; ++i) low = std::min(low, list[i].begin), high = std::max(high, list[i].end);
+		};
+		hull(state.buffer_ranges, from.buffer_ranges, segment.end.buffer_ranges);
+		hull(state.table_ranges, from.table_ranges, segment.end.table_ranges);
+		hull(state.clean_reads, from.clean_reads, segment.end.clean_reads);
+		hull(state.late_reads, from.late_reads, segment.end.late_reads);
+		unmap_items = low < high && resources.UnmappedSinceListOnly(epochs.mapping, low, high - low) != 0;
+		LiveCounters::Add(unmap_items ? LiveCounters::SpecChangedHullHits : LiveCounters::SpecChangedHullSkips);
+	}
+	// (Nothing registered, released or unmapped since it began, mostly: no range or image to look at. Changed's stamps: nor
+	// when the hull skipped the unmap tests and nothing was registered.)
+	if (unmap_items || buffers.RegistrationEpoch() != epochs.buffers)
 		for (size_t i = from.buffer_ranges; i < segment.end.buffer_ranges; ++i) {
 			const auto& range = state.buffer_ranges[i];
 			if (!skip_registered && buffers.RegisteredSince(range.begin, range.end - range.begin, epochs.buffers)) {
@@ -1209,20 +1229,21 @@ const char* Speculation::Changed(const Result& result, size_t index, bool skip_r
 				if (!exact_on || buffers.RegisteredSinceExact(range.begin, range.end - range.begin, epochs.buffers))
 					return "commit: buffers registered";
 			}
-			if (mapping && resources.UnmappedSince(epochs.mapping, range.begin, range.end - range.begin))
+			if (unmap_items && resources.UnmappedSince(epochs.mapping, range.begin, range.end - range.begin))
 				return "commit: memory unmapped";
 		}
 	if (mapping) {
 		// (spec_pending_buffers / spec_reloc_refs: the table V# entries, noted as no buffer range, unmapped as any.)
-		for (size_t i = from.table_ranges; i < segment.end.table_ranges; ++i) {
+		// (Changed's stamps: none of the three lists when the hull was met by no unmap.)
+		for (size_t i = unmap_items ? from.table_ranges : segment.end.table_ranges; i < segment.end.table_ranges; ++i) {
 			const auto& range = state.table_ranges[i];
 			if (resources.UnmappedSince(epochs.mapping, range.begin, range.end - range.begin)) return "commit: memory unmapped";
 		}
-		for (size_t i = from.clean_reads; i < segment.end.clean_reads; ++i) {
+		for (size_t i = unmap_items ? from.clean_reads : segment.end.clean_reads; i < segment.end.clean_reads; ++i) {
 			const auto& read = state.clean_reads[i];
 			if (resources.UnmappedSince(epochs.mapping, read.begin, read.end - read.begin)) return "commit: memory unmapped";
 		}
-		for (size_t i = from.late_reads; i < segment.end.late_reads; ++i) {
+		for (size_t i = unmap_items ? from.late_reads : segment.end.late_reads; i < segment.end.late_reads; ++i) {
 			const auto& read = state.late_reads[i];
 			if (resources.UnmappedSince(epochs.mapping, read.begin, read.end - read.begin)) return "commit: memory unmapped";
 		}
@@ -1254,7 +1275,13 @@ const char* Speculation::Changed(const Result& result, size_t index, bool skip_r
 	static auto& exact_image = LiveSwitch::Find("spec_exact_image_stop", -1);
 	const auto   exact_v     = exact_image.load(std::memory_order_relaxed);
 	const bool   exact_on    = exact_v > 0 || (exact_v < 0 && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4);
+	// Changed's stamps (mode 4): StillResolvedExact answered from the image's overlap epoch, when every
+	// registration since the epoch was stamped and the log reaches back to it (TextureCache::OverlapStampsCover): the same
+	// answer, image by image (StillResolvedStamped). Without exact_on (StillResolved's page stamps) the per-item test stays.
+	const bool   stamped     = exact_on && Spec::ChangedStampsOn() && textures.OverlapStampsCover(epochs.images);
+	if (stamped) LiveCounters::Add(LiveCounters::SpecChangedImageStamped);
 	const auto   resolved    = [&](const auto& image, uint64_t serial) {
+		if (stamped) return TextureCache::StillResolvedStamped(image, serial, epochs.images);
 		return exact_on ? textures.StillResolvedExact(image, serial, epochs.images)
 		                : textures.StillResolved(image, serial, epochs.images);
 	};
@@ -1520,6 +1547,22 @@ static bool SegmentWaitsHold(const Spec::State& state, size_t from, size_t to) {
 		if (!TestWaitRegMemValue(value, wait.reference, wait.mask, wait.function)) return false;
 	}
 	return true;
+}
+
+// Changed's stamps, the call after Before from the first call's epochs: what the strictness of Changed()'s checks hangs
+// on (live spec_exact_reg_stop, spec_exact_image_stop, and the mode, which redo_level_precise and both exact checks read).
+// The first call's epochs are taken only while these are as they were at it: a rule changed between the two calls applies
+// to the whole span, (start, now], not only to (checked, now].
+struct ChangedRules {
+	int64_t  exact_reg = 0, exact_image = 0;
+	uint32_t mode = 0;
+	bool     operator==(const ChangedRules&) const = default;
+};
+[[nodiscard]] static ChangedRules CurrentChangedRules() {
+	static auto& exact_reg   = LiveSwitch::Find("spec_exact_reg_stop", -1);
+	static auto& exact_image = LiveSwitch::Find("spec_exact_image_stop", -1);
+	return {exact_reg.load(std::memory_order_relaxed), exact_image.load(std::memory_order_relaxed),
+	        kyty_local_speculate_mode.load(std::memory_order_relaxed)};
 }
 
 Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcessor& cp) {
@@ -1873,6 +1916,10 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		// (A segment stopped only for registrations over ranges its relocatable references cover passes; they are
 		// patched after its Before.)
 		bool        reloc       = false;
+		// (Changed's stamps, mode 4: the epochs this first call checks up to; nothing runs between the read and it.)
+		const bool  c2          = Spec::ChangedStampsOn();
+		const auto  checked     = c2 ? CurrentEpochs() : Epochs {};
+		const auto  rules       = c2 ? CurrentChangedRules() : ChangedRules {}; // (the rules it checks by)
 		const char* changed_why = Changed(result, index);
 		if (changed_why != nullptr && RelocEligible(result, index, changed_why)) {
 			changed_why = Changed(result, index, true);
@@ -1933,13 +1980,26 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		Before(result, index);
 		// (Its preparation registers what the work did not find registered (BDA ranges): a buffer merged away under
 		// the recorded work leaves it reading a destroyed one. The work after it is translated in order.)
-		if (CurrentEpochs() != prepared)
-			if (const char* prepared_why = Changed(result, index)) {
+		// Changed's stamps (mode 4): when the first call passed with no relocation, it proved no change over the
+		// segment's items in (start, checked]; this call then checks (checked, now] only, and the two together are
+		// (start, now], the same answer: every test is a "latest epoch over the item past `since`" (region and granule
+		// registrations, unmap granules or the unmap list, image pages) or the state now (liveness, serials, registered),
+		// and each such epoch only rises. The one test that is not, StillResolvedExact's refusal when the registration log
+		// no longer reaches back, is kept: the first call's epochs only while the log reaches the start. RelocEligible keeps
+		// the result's own epochs. A rule changed since the first call (CurrentChangedRules): the result's epochs too.
+		if (CurrentEpochs() != prepared) {
+			const Epochs* since = c2 && !reloc && CurrentChangedRules() == rules &&
+			                              m_renderer.GetTextureCache().RegistrationLogReaches(result.epochs.images)
+			                          ? &checked
+			                          : nullptr;
+			if (since != nullptr) LiveCounters::Add(LiveCounters::SpecChangedFromChecked);
+			if (const char* prepared_why = Changed(result, index, false, since)) {
 				// (Before's own registrations over its relocatable references: the same rule.)
-				if (!RelocEligible(result, index, prepared_why) || Changed(result, index, true) != nullptr)
+				if (!RelocEligible(result, index, prepared_why) || Changed(result, index, true, since) != nullptr)
 					return ++m_stop_reasons["commit: preparation registered buffers"], Progress::Stopped;
 				reloc = true;
 			}
+		}
 		// Its relocatable references written as they resolve now (after Before's registrations; the joins' copies are in
 		// the open buffer, which SubmitRecorded submits before the segment's work).
 		if (const char* why = reloc ? RelocPatch(result, index) : nullptr) return ++m_stop_reasons[why], Progress::Stopped;

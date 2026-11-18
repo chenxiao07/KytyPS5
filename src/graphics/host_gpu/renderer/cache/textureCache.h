@@ -107,6 +107,27 @@ public:
 	// spec_exact_image_stop (GPU thread): as StillResolved, the pages' stamps refined by the registration log's exact ranges:
 	// no image registered or unregistered over the image's bytes since `epoch` (false when the log does not reach back).
 	[[nodiscard]] bool StillResolvedExact(const Image& image, uint64_t serial, uint64_t epoch) const;
+	// (GPU thread, as StillResolvedExact) Whether the registration log reaches back to `epoch`: StillResolvedExact's own
+	// test, which refuses an image whose pages moved when it does not.
+	[[nodiscard]] bool RegistrationLogReaches(uint64_t epoch) const {
+		return m_registration_log.empty() || m_registration_log.front().epoch <= epoch + 1;
+	}
+	// Changed's stamps (mode 4, GPU thread): every registration and unregistration after `epoch` was stamped into the images
+	// over its bytes (one run of stamps made under mode 4, none made in another mode since), and the log reaches back to
+	// `epoch` (so StillResolvedExact would not refuse for the reach alone). Then StillResolvedStamped answers as
+	// StillResolvedExact.
+	[[nodiscard]] bool OverlapStampsCover(uint64_t epoch) const {
+		// (The latest stamp first, then the run's start StampOverlaps stored before it.)
+		const auto now = m_resolution_epoch.load(std::memory_order_acquire);
+		if (m_overlap_last.load(std::memory_order_acquire) != now) return false;
+		const auto from = m_overlap_from.load(std::memory_order_acquire);
+		return from != UINT64_MAX && from <= epoch + 1 && RegistrationLogReaches(epoch);
+	}
+	// StillResolvedExact's answer, with OverlapStampsCover(epoch): an entry after `epoch` overlapped the image's bytes
+	// exactly when its overlap epoch is past `epoch`.
+	[[nodiscard]] static bool StillResolvedStamped(const Image& image, uint64_t serial, uint64_t epoch) {
+		return image.serial == serial && image.registered && image.overlap_epoch.load(std::memory_order_acquire) <= epoch;
+	}
 	[[nodiscard]] uint64_t ResolutionEpoch() const {
 		return m_resolution_epoch.load(std::memory_order_acquire);
 	}
@@ -704,6 +725,11 @@ private:
 		uint64_t epoch = 0, begin = 0, end = 0;
 	};
 	std::vector<RegistrationEntry> m_registration_log;
+	// Changed's stamps (mode 4): the epoch of the first registration stamped into the images in the run of stamps made under
+	// mode 4 (UINT64_MAX: none), and the latest stamped. A registration made in another mode (a live KYTY_SPECULATE change)
+	// leaves m_overlap_last behind the resolution epoch (no cover), and the next stamp starts a new run.
+	std::atomic<uint64_t> m_overlap_from {UINT64_MAX}, m_overlap_last {0};
+	void                  StampOverlaps(const Image& image, uint64_t epoch);
 	[[nodiscard]] bool RegistrationsOverlapSince(uint64_t address, uint64_t size, uint64_t epoch, bool& known) const;
 	// FindTexture's PrepareDccClear with this view's metadata would change only the fields a color target binding
 	// fills (its clear word: no reader but the comparison that moves the meta epoch): the image's DCC surface is the

@@ -85,6 +85,12 @@ public:
 	// Whether memory in [vaddr, vaddr + size) was unmapped after mapping epoch `epoch` (by 16 KiB
 	// granule). GPU thread, as UnmapMemory.
 	[[nodiscard]] bool UnmappedSince(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept;
+	// Changed's stamps (inside Changed, mode 4: the list UnmappedSince's per-item tests read there):
+	// UnmappedSince's answer from the merged unmap list only, 1 or 0; -1 when the list cannot answer (no granule walk).
+	[[nodiscard]] int UnmappedSinceListOnly(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept {
+		if (size == 0 || m_unmap_latest <= epoch) return 0;
+		return UnmappedSinceByList(epoch, vaddr, size);
+	}
 
 	bool PrepareBdaReadRanges(std::span<const GuestRange> ranges);
 	// (KYTY_SPECULATE=4: EnsureBdaReadable for the ranges not known held at the registration epoch that stands.)

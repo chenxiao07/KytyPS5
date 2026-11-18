@@ -792,9 +792,28 @@ bool TextureCache::RecentlyFailed(const ImageInfo& info) const {
 void TextureCache::StampRegistrationPages(const Image& image, uint64_t epoch) {
 	if (m_registration_log.size() >= 8192) m_registration_log.erase(m_registration_log.begin(), m_registration_log.begin() + 4096);
 	m_registration_log.push_back({epoch, image.info.data.address, image.info.data.End()});
+	if (Spec::ChangedStampsOn()) StampOverlaps(image, epoch); // (Changed's stamps: mode 4 only)
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) return;
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) m_registration_pages[page] = epoch;
+}
+
+// Changed's stamps (mode 4): the log entry just made stamped into the images over its bytes: the image itself, and
+// every registered image FindImagesInRegion(.., false) finds over them (Image::Overlaps' byte test, ImageRangeOverlaps: the
+// log test's own predicate in StillResolvedExact). An image not registered at an entry is registered after it, and its own
+// registration stamps a later epoch. So, while every entry after an epoch was stamped (OverlapStampsCover), an image's
+// overlap epoch is past it exactly when an entry after it overlaps the image's bytes. A stamp after a registration made in
+// another mode (m_overlap_last behind) starts a new run.
+void TextureCache::StampOverlaps(const Image& image, uint64_t epoch) {
+	const auto stamp = [epoch](const Image& over) {
+		auto seen = over.overlap_epoch.load(std::memory_order_relaxed);
+		while (seen < epoch && !over.overlap_epoch.compare_exchange_weak(seen, epoch, std::memory_order_acq_rel)) {}
+	};
+	stamp(image);
+	for (const auto other: FindImagesInRegion(image.info.data.address, image.info.data.size, false))
+		if (const auto* found = m_slot_images.try_get(other)) stamp(*found);
+	if (m_overlap_last.load(std::memory_order_relaxed) + 1 != epoch) m_overlap_from.store(epoch, std::memory_order_release);
+	m_overlap_last.store(epoch, std::memory_order_release);
 }
 
 bool TextureCache::RegistrationsOverlapSince(uint64_t address, uint64_t size, uint64_t epoch, bool& known) const {

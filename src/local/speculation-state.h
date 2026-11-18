@@ -383,6 +383,16 @@ inline int64_t CommitVerifyEvery() {
 	const auto   value = stop.load(std::memory_order_relaxed);
 	return value > 0 || (value < 0 && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4);
 }
+// Changed's stamps (KYTY_SPECULATE=4 only): Speculation::Changed()'s per-item tests answered from stamps, each only where
+// the per-item test would answer "unchanged" too (every refusal kept): an image's StillResolvedExact from its overlap
+// epoch (Image::overlap_epoch, kept by TextureCache::StampRegistrationPages); the unmap tests of the segment's buffer
+// ranges, table ranges, clean and late reads skipped when the merged unmap list says no unmap since meets their one hull
+// (made in Changed, on the GPU thread, only when an unmap moved the mapping epoch); the call after Before checks from the
+// epochs read just before the first call, when that passed. (A range answered by its live buffer is not one of them: it
+// passes ranges the region and granule tests refuse.) Other modes: none of it, the overlap stamps not kept either.
+[[nodiscard]] inline bool ChangedStampsOn() {
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+}
 // KYTY_SPEC_COPY_IMAGE_REFUSE (live spec_copy_image_refuse; the same rule): a speculation's copy (journaled or on the GPU)
 // or GPU fill over image memory is refused (BufferCache::CopyBuffer, FillBuffer: a hole when its packet is a dispatch's
 // linear copy; at a DMA_DATA or COPY_DATA packet, which is no hole, the speculation ends), and so is a worker binding an

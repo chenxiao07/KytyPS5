@@ -421,6 +421,9 @@ public:
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
+	// Changed's stamps (mode 4): the latest resolution epoch of a registration or unregistration over its bytes (its own
+	// too), kept while KYTY_SPECULATE is 4 (TextureCache::StampRegistrationPages).
+	mutable std::atomic<uint64_t> overlap_epoch {0};
 	bool             guest_alias    = false; // TextureCache::GuestTexture: another view of its memory is an image too
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
