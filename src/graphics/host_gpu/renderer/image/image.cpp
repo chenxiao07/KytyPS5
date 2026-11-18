@@ -189,6 +189,7 @@ Spec::ImageEntry* Image::SpeculativeEntry() {
 		entry->sample_hi             = 0;
 		entry->sample_other          = false;
 		entry->writes                = 0;
+		entry->not_sampled           = false;
 		spec->used.push_back(found->second);
 	}
 	return entry;
@@ -215,6 +216,9 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 		} else {
 			entry->sample_other = true;
 		}
+		if (destination_layout != vk::ImageLayout::eShaderReadOnlyOptimal ||
+		    destination_access != vk::AccessFlags2 {vk::AccessFlagBits2::eShaderRead})
+			entry->not_sampled = true; // (Spec::ImageUse::not_sampled)
 		// (Its write accesses, by kind: Spec::ImageUse::writes.)
 		using Access = vk::AccessFlagBits2;
 		if (static_cast<bool>(destination_access & (Access::eColorAttachmentWrite | Access::eDepthStencilAttachmentWrite)))

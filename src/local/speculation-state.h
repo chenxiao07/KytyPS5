@@ -377,6 +377,9 @@ struct ImageUse {
 	// Its segment's Before left the image's state as it was (no restore), and After leaves it too (no left state
 	// written): a use with no barrier recorded, found wholly Undefined (Speculation::Before's restore loop).
 	bool                          keep_state = false;
+	// Any access of the segment's not a shader read in the shader-read-only layout (Image::GetBarriers): an image a set of
+	// the segment completed in its Before is restored only when the replay keeps it in that layout.
+	bool                          not_sampled = false;
 };
 
 // The 64 KiB granules ranges were added over, hashed into 4096 bits, and up to BigRanges ranges over 64 granules or
@@ -487,6 +490,7 @@ struct ImageEntry {
 	uint64_t                      found_validity  = 0;
 	bool                          found_stencil_modified = false; // (spec_copy_image_refuse)
 	uint8_t                       writes = 0; // (the open segment's write accesses: ImageUse::writes)
+	bool                          not_sampled = false; // (ImageUse::not_sampled)
 };
 
 // (spec_predict_dcc=3.) The fast clears speculations' holes will consume, by surface and slice, until that speculation
@@ -589,12 +593,14 @@ struct State {
 		// completion uploads from: each pending slot's own desc range (data, metadata range, stencil plane) and every
 		// image over the slot's bytes as FindImage would meet them (TextureCache::ImagesOverWritten).)
 		std::function<bool(const std::function<bool(uint64_t, uint64_t)>&)> pending_written;
-		// (spec_set_cpu_dirty_stop off: the images `complete` made its pending slots', each as it was then (its serial), and
-		// the set's descriptor set handle as State::sets notes it, for the commits of later segments that bind the set.)
+		// (The images `complete` made its pending slots', each as it was then (its serial), the set's descriptor set handle
+		// as State::sets notes it and the layout it transited each to: its segment's Before restores them only as the
+		// replay binds them; the commits of later segments that bind the set test them, spec_set_cpu_dirty_stop off.)
 		struct Completed {
-			const Image* image  = nullptr;
-			uint64_t     serial = 0;
-			uint64_t     set    = 0;
+			const Image*    image  = nullptr;
+			uint64_t        serial = 0;
+			uint64_t        set    = 0;
+			vk::ImageLayout layout = vk::ImageLayout::eUndefined;
 		};
 		std::vector<Completed> completed;
 		std::function<bool()>     check; // (spec_proposed_check: still current at its segment's commit)
@@ -1338,7 +1344,7 @@ struct State {
 			                          std::move(entry.found_subresources), entry.subresources, entry.found_group,
 			                          entry.group, entry.found_buffer_modified, entry.sample_lo, entry.sample_hi,
 			                          entry.sample_other, entry.found_cpu_dirty, entry.found_validity,
-			                          entry.found_stencil_modified, entry.writes});
+			                          entry.found_stencil_modified, entry.writes, false, entry.not_sampled});
 			entry.used = false;
 		}
 		used.clear();

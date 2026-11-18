@@ -1777,6 +1777,57 @@ void Speculation::Before(Result& result, size_t index) {
 	//   from Undefined (discard; or Image::Transit's zero clear, which in order the defined image never gets): no state
 	//   the restore could reach gives the in-order contents. A stop is exact: the image keeps its state and contents, and
 	//   the in-order path runs the segment's packets again.
+	// And a use whose image a set of this segment's completed above (ProposedSet::completed, segment == index:
+	// TableCompletePendingImages left it in the slot's layout Lc, the replay binds it so). RestoreState(found) would move
+	// it back over the completion's layout, under the binding. In order the set's build transits it at its draw, as the
+	// completion did:
+	// - a use with no barrier recorded (a refused draw's TableEarlyEntry: none of the segment's commands names its layout,
+	//   and the refused draw is a hole run after the commit): no restore, and After leaves its state (keep_state), as the
+	//   Undefined form above; exact, the state the completion left is the in-order one. Only while the image is still
+	//   whole in the layout of every completion of it (two in different layouts: never kept) with the completion's access
+	//   (shader read): anything of this Before after the completion that moved it (a pending target's acquisition of the
+	//   same image) stops the segment instead;
+	// - any other: the replay binds the completed set's descriptor (written in Lc) wherever the segment's own barriers
+	//   have the image then (its draw made no transition: its TableTransit ran before the completion added it), where in
+	//   order the set's build puts it in Lc. Restored (no stop) only when the image is in Lc at every point of the replay
+	//   whatever the order: every completion of it in this segment in the shader-read-only layout (a sampled colour slot,
+	//   not a depth one's), `found` in that layout (whole, or at every found subresource; RestoreState makes it `found`
+	//   whatever the state now) and every access of the segment a shader read in it (not_sampled clear); else the segment
+	//   stops before the splice (target_failed), its restore not made.
+	struct CompletedNow {
+		const Image*    image  = nullptr;
+		uint64_t        serial = 0;
+		vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+	};
+	std::vector<CompletedNow> completed_now;
+	for (const auto& proposed: state.proposed_sets)
+		if (proposed.segment == index)
+			for (const auto& slot: proposed.completed) completed_now.push_back({slot.image, slot.serial, slot.layout});
+	// Two completions of one image (the same object and serial) in different layouts: one barrier state cannot hold both
+	// (two sets of this segment completing it, a colour slot's ShaderReadOnly and a depth slot's DepthStencilReadOnly:
+	// TableCompletePendingImages transits it once for each, and the replay binds both descriptors with it in the last
+	// one's layout). Among this segment's completions, and those of an earlier segment's set this segment binds (its
+	// handle among the segment's sets: spec_set_cpu_dirty_stop off only). Whether or not the segment's images hold it (with
+	// no use of it the loop below never meets it): the segment stops before the splice (target_failed).
+	if (!completed_now.empty() && !state.target_failed && !state.images_failed) {
+		const auto bound_begin = state.sets.begin() + static_cast<ptrdiff_t>(from.sets);
+		const auto bound_end   = state.sets.begin() + static_cast<ptrdiff_t>(to.sets);
+		for (const auto& c: completed_now) {
+			const auto other_layout = [&](const auto& s) { return s.image == c.image && s.serial == c.serial && s.layout != c.layout; };
+			bool       conflict     = std::ranges::any_of(completed_now, other_layout);
+			for (const auto& proposed: state.proposed_sets) {
+				if (conflict) break;
+				if (proposed.segment >= index || proposed.completed.empty() ||
+				    std::find(bound_begin, bound_end, proposed.completed.front().set) == bound_end)
+					continue;
+				conflict = std::ranges::any_of(proposed.completed, other_layout);
+			}
+			if (conflict) {
+				state.target_failed = true;
+				break;
+			}
+		}
+	}
 	const bool erased = textures.EraseEpoch() != erase_epoch;
 	for (size_t i = 0; i < segment.images.size(); ++i) {
 		auto& use      = state.closed[index].images[i];
@@ -1810,6 +1861,31 @@ void Speculation::Before(Result& result, size_t index) {
 				}
 			}
 			if (now_defined) {
+				state.target_failed = true;
+				continue;
+			}
+		}
+		const auto this_image = [&](const CompletedNow& c) { return c.image == use.image && c.serial == use.serial; };
+		if (!completed_now.empty() && std::ranges::any_of(completed_now, this_image)) {
+			if (use.sample_lo == UINT32_MAX && !use.sample_other) {
+				bool kept = false; // (still whole in the layout of every completion of it, with the completion's access)
+				{
+					const Image::StateLock lock(*use.image);
+					const auto&            now = use.image->backing.state;
+					kept = use.image->backing.subresource_states.empty() &&
+					       now.access_mask == vk::AccessFlags2 {vk::AccessFlagBits2::eShaderRead} &&
+					       std::ranges::all_of(completed_now, [&](const CompletedNow& c) { return !this_image(c) || c.layout == now.layout; });
+				}
+				if (kept) use.keep_state = true;
+				else state.target_failed = true;
+				continue;
+			}
+			constexpr auto sro    = vk::ImageLayout::eShaderReadOnlyOptimal;
+			const bool     lc_sro = std::ranges::all_of(completed_now, [&](const CompletedNow& c) { return !this_image(c) || c.layout == sro; });
+			const bool     found_sro = use.found_subresources.empty()
+			                               ? use.found.layout == sro
+			                               : std::ranges::all_of(use.found_subresources, [&](const auto& s) { return s.layout == sro; });
+			if (!lc_sro || use.not_sampled || !found_sro) {
 				state.target_failed = true;
 				continue;
 			}

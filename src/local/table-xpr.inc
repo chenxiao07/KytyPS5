@@ -1155,19 +1155,18 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				                               TableKeepAside(holder);
 			                               }});
 			if (!raw->pending_images.empty()) {
-				// (spec_set_cpu_dirty_stop off: the images it completes, each with its serial, and the set's handle, for the
-				// commits of later segments that bind it: Speculation::CommitSegments' reuse test.)
+				// (The images it completes, each with its serial and the slot's layout, and the set's handle: for its segment's
+				// Before, and spec_set_cpu_dirty_stop off for the commits of later segments that bind it, CommitSegments'
+				// reuse test.)
 				spec->proposed_sets.back().complete = [owner, raw, spec, index = spec->proposed_sets.size() - 1] {
 					const auto first = raw->images.size();
 					const bool ok    = owner->TableCompletePendingImages(*raw);
-					if (!Spec::SetCpuDirtyStopOn()) {
-						auto&      textures  = owner->m_context.GetTextureCache();
-						auto&      completed = spec->proposed_sets[index].completed;
-						const auto handle    = reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(raw->set));
-						for (size_t i = first; i < raw->images.size(); ++i)
-							if (const auto* image = textures.TryGetImage(raw->images[i].id))
-								completed.push_back({image, raw->images[i].serial, handle});
-					}
+					auto&      textures  = owner->m_context.GetTextureCache();
+					auto&      completed = spec->proposed_sets[index].completed;
+					const auto handle    = reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(raw->set));
+					for (size_t i = first; i < raw->images.size(); ++i)
+						if (const auto* image = textures.TryGetImage(raw->images[i].id))
+							completed.push_back({image, raw->images[i].serial, handle, raw->images[i].layout});
 					return ok;
 				};
 				// (The memory its completion uploads from, for the commit's test before it against the committing segment's
