@@ -739,6 +739,9 @@ struct State {
 	// Set by the GPU thread when it would rather translate the rest itself (Speculation::CommitReady): the translation
 	// stops at its next packet. Null: never.
 	const std::atomic<bool>* cancel = nullptr;
+	// (Mode 4) set when it sees `cancel` (ProcessPm4Spec's poll; Speculation::Translator::cancel_seen): the GPU thread's
+	// spin goes on through the tail. Null: none.
+	std::atomic<bool>* cancel_seen = nullptr;
 	RangeSet                  chain_journal, chain_written;
 	// (spec_inherit_lazy) The chain Inherit merged, from `previous` on, and whether Inherit ran since Clear: the next
 	// state's Inherit takes this one's union when its chain beyond this one is still these, in order.

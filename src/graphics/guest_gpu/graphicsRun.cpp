@@ -2879,6 +2879,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			// (Between packets, nothing of this one recorded: what is translated so far is committed, the rest is taken the
 			// normal way.)
 			if (spec->cancel != nullptr && spec->cancel->load(std::memory_order_relaxed)) {
+				if (spec->cancel_seen != nullptr) spec->cancel_seen->store(true, std::memory_order_release); // (CommitReady's spin)
 				if (spec->light_unmarked) // (packet_light)
 					spec->Mark(LocalVulkanRecording::RecordedWrites()), spec->light_unmarked = false;
 				Spec::Stop("cancelled: the GPU thread came for it");

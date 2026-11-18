@@ -204,6 +204,9 @@ private:
 		Result*                                    current     = nullptr;
 		// The GPU thread's request that the translation going on stop (Spec::State::cancel); when it began (under m_mutex).
 		std::atomic<bool>                          cancel {false};
+		// (Mode 4: set when its translation saw `cancel`, Spec::State::cancel_seen; CommitReady's spin goes on through the
+		// tail then.)
+		std::atomic<bool>                          cancel_seen {false};
 		uint64_t                                   began_ns = 0;
 		uint64_t                                   since       = 0;
 	};
@@ -304,6 +307,8 @@ private:
 	std::vector<std::unique_ptr<Translator>> m_translators;
 	bool                                     m_pass_thread = false; // (KYTY_SPEC_PASS_THREAD: the last of m_translators)
 	std::deque<std::unique_ptr<Result>>      m_ahead;     // translated ahead (under m_mutex in mode 4)
+	// (Mode 4) moved by every worker's push into m_ahead (written under m_mutex: no locked add): CommitReady's spin.
+	std::atomic<uint64_t>                    m_ahead_gen {0};
 	std::unique_ptr<Result>                  m_blocked;   // a commit waiting at a wait hole
 	std::unique_ptr<CommandProcessor>        m_chain;     // mode 3: the state the next one ahead starts from
 	static constexpr size_t                  MaxAhead = 8;

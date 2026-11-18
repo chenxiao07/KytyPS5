@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <immintrin.h> // (_mm_pause: CommitReady's spin)
 #include <string>
 #include <thread>
 #include <vector>
@@ -397,10 +398,13 @@ static const std::string& PassCpus() {
 // (3 P-cores, workers on 3-5: 0-1 and the E-cores left, one performance core). Back to 0, or out of mode 4: the mask it
 // had. Taken at the next flip after a change (the switch's, speculate_cpu_mask's); the GPU thread calls it at each
 // guest flip in mode 4 (CommandProcessor::Flip) and once on a live `mode 0` (GuestGpu::ThreadRun), to restore.
+// (Whether the GPU thread runs apart from the workers' cores now: the mask above applied. The GPU thread's own.)
+static std::atomic<bool> g_gpu_apart {false};
 void Speculation::GpuThreadAffinityAtFlip() {
 	static uint64_t original = 0; // (the GPU thread's mask before it was changed; 0: not changed)
 	static int64_t  seen     = 0;
 	const auto      restore  = [](const char* why) {
+		g_gpu_apart.store(false, std::memory_order_relaxed);
 		if (original == 0) return;
 		const bool done = LocalPlatform::SetCurrentThreadAffinity(original);
 		std::printf("Speculation: GPU thread mask 0x%llx %s (spec_gpu_affinity: %s)\n", static_cast<unsigned long long>(original),
@@ -414,6 +418,7 @@ void Speculation::GpuThreadAffinityAtFlip() {
 			original = 0; // (tried once: a refused restore is said, not retried)
 			std::fflush(stdout);
 		}
+		g_gpu_apart.store(false, std::memory_order_relaxed);
 		seen = 0;
 		return;
 	}
@@ -449,6 +454,7 @@ void Speculation::GpuThreadAffinityAtFlip() {
 		return;
 	}
 	if (original == 0) original = current;
+	g_gpu_apart.store(true, std::memory_order_relaxed);
 	std::printf("Speculation: GPU thread mask 0x%llx -> 0x%llx (%u performance cores), off the cores of the workers' 0x%llx "
 	            "(spec_gpu_affinity)\n",
 	            static_cast<unsigned long long>(current), static_cast<unsigned long long>(wanted), cores,
@@ -551,6 +557,7 @@ void Speculation::AheadRun(Translator& translator) {
 		translator.since             = ++m_clock; // (before `previous` can be retired: it is not reused meanwhile)
 		translator.began_ns          = NowNs();
 		translator.cancel.store(false, std::memory_order_relaxed);
+		translator.cancel_seen.store(false, std::memory_order_relaxed);
 		const auto         job       = work->job;
 		const auto         which     = work->pass;
 		auto               start     = std::move(chunk.start);
@@ -589,13 +596,25 @@ void Speculation::AheadRun(Translator& translator) {
 		}
 		translator.translating = 0;
 		m_ahead.push_back(std::move(result));
+		m_ahead_gen.store(m_ahead_gen.load(std::memory_order_relaxed) + 1, std::memory_order_release); // (under m_mutex)
 		m_ahead_wake.notify_all();
 	}
 }
 
+// (Mode 4, the GPU thread kept off the workers' cores: KYTY_SPEC_GPU_AFFINITY in effect, GpuThreadAffinityAtFlip.)
+// CommitReady's spin before its cancel wait. Its bounds are pause counts, not times: before the worker has seen the
+// flag (its packet in flight: a short one ends within them, a long one goes to the sleep), and in its tail (bounded work
+// of its own: a backstop only). A pause costs ~10-140+ cycles by CPU (~140 on a recent Intel P-core): 1024 pauses are
+// ~3-40 us, 8192 ~25-350 us. Only with the GPU thread apart: its spin burns its own core, none a worker runs on.
+static bool CancelSpinOn() {
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && g_gpu_apart.load(std::memory_order_relaxed);
+}
+static constexpr uint32_t CancelSpinUnseen = 1024, CancelSpinTail = 8192;
+
 Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& job, uint32_t chunk, Pm4Execution& execution,
                                               std::optional<Pm4Execution>& end) {
 	std::unique_ptr<Result> result;
+	Translator*             spin_translator = nullptr; // (CancelSpinOn: the worker this call cancelled)
 	{
 		std::unique_lock lock(m_mutex);
 		// Where the chunk ends (the rest of it the normal way, up to there, when there is none for it or its commit
@@ -681,13 +700,33 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 						if (translator->translating == job.serial && translator->translating_chunk == chunk &&
 						    NowNs() - translator->began_ns < static_cast<uint64_t>(us) * 1000u &&
 						    !translator->cancel.exchange(true, std::memory_order_relaxed))
-							++m_cancelled;
+							++m_cancelled, spin_translator = translator.get();
 				++m_waits_for_ahead;
 				const auto waited = NowNs();
 				// (KYTY_SPECULATE_FLUSH_EVERY: the commits held go before waiting on a speculation's thread.)
 				if (FlushEvery() > 1) {
 					lock.unlock();
 					m_renderer.GetCommandScheduler().FlushRecorded();
+					lock.lock();
+				}
+				// (CancelSpinOn: the cancelled worker's stop waited for by a spin on the pushes' generation before the
+				// sleep: while it has not seen the flag, CancelSpinUnseen pauses (its packet's poll not reached: a long
+				// packet sleeps as before); once it has (its tail: the refusal, the segment's close, the end state, the
+				// push), up to CancelSpinTail. Guest commands queued for this thread (KYTY_SERVE_IN_WAITS 4) end it too:
+				// the wait below serves them. Exact: it changes only how this thread waits; the lock is taken again and
+				// translating() decides, as the wait below does. A push of another worker ends the spin as well, and the
+				// predicate then sends it to the wait. The worker is taken whatever the switch: never spun on stale.)
+				if (auto* const spinning = std::exchange(spin_translator, nullptr);
+				    spinning != nullptr && CancelSpinOn() && translating()) {
+					const auto gen   = m_ahead_gen.load(std::memory_order_acquire);
+					const bool serve = (GuestGpu::ServeInWaits() & 4u) != 0;
+					lock.unlock();
+					for (uint32_t spins = 0; m_ahead_gen.load(std::memory_order_acquire) == gen; ++spins) {
+						if (spins >= (spinning->cancel_seen.load(std::memory_order_acquire) ? CancelSpinTail : CancelSpinUnseen) ||
+						    (serve && (spins & 63u) == 63u && GuestGpu::CommandsPending()))
+							break;
+						_mm_pause();
+					}
 					lock.lock();
 				}
 				// (KYTY_SERVE_IN_WAITS 4: the guest commands queued for this thread run while it waits.)
@@ -883,6 +922,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	r.state.table_upload  = translator.table_upload.get();
 	r.state.shader_upload = translator.shader_upload.get();
 	r.state.cancel        = &translator.cancel;
+	r.state.cancel_seen   = &translator.cancel_seen;
 	{
 		// (Linked under the lock: one committed or dropped since it was chosen is not; Finish unlinks the others.)
 		std::lock_guard lock(m_mutex);
