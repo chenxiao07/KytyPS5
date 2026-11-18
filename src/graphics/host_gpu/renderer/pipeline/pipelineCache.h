@@ -345,6 +345,9 @@ public:
 	// A program entry that still holds its warm code is compared on the code copied before the lock only (params.code_unread
 	// clear), the entry left as it is; not copied, or another code: empty.
 	static inline thread_local bool t_find_only = false;
+	// KYTY_SPEC_PAIR_PUSH_FIT: this thread's last table-mode GetGraphicsPrograms returned the retry's pair (the pixel
+	// program's reduced form); its caller marks the pair (TablePair::push_fit, spec_pair_push_fit_draws_n).
+	static inline thread_local bool t_push_fit_taken = false;
 	// With t_find_only, a program whose permutation is not in memory but whose module the prefetch holds DONE is adopted
 	// here as the GPU thread's normal draw adopts it (under m_mutex: the permutation published), but NOT recorded: it is kept
 	// unrecorded (ProgramCache::unrecorded) and recorded by the first in-order lookup that finds it, or by the commit of an

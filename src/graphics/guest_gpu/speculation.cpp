@@ -2890,6 +2890,9 @@ Speculation::HoleRun Speculation::RunHole(Result& result, CommandProcessor& cp, 
 		return HoleRun::Blocked;
 	}
 	++m_holes_run;
+	// (spec_pair_refused_holes_n: the lab's 'table: pair refused' hole kind (its holes table's rows by Hole::reason), a hole
+	// run whose refusal is the pair's; whatever KYTY_SPEC_PAIR_PUSH_FIT / _DENSE_INDIRECT say.)
+	if (hole.reason == Spec::TablePairRefusedText) LiveCounters::Add(LiveCounters::SpecPairRefusedHolesN);
 	// The work after it assumed it changed no processor state but its registers' (they are the same). (What it wrote
 	// and retired: Spec::Effects, checked before each segment.)
 	if (!cp.SameDrawState(state)) return ++m_stop_reasons["commit: a hole changed the draw state"], HoleRun::Changed;

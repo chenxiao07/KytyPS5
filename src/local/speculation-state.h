@@ -1637,6 +1637,10 @@ inline thread_local State* t_record = nullptr;
 	return On() ? t_record : nullptr;
 }
 
+// The table path's refusal of a draw whose pair (vertex and pixel table programs) is refused: one object (an inline
+// constexpr array: one address in every translation unit), so a hole's reason is told by its pointer
+// (spec_pair_refused_holes_n, Speculation::RunHole).
+inline constexpr char TablePairRefusedText[] = "table: pair refused";
 inline void Refuse(const char* why) noexcept {
 	if (!On()) return;
 	if (t_state != nullptr && t_state->refused == nullptr) t_state->refused = why;

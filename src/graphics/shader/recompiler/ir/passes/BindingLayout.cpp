@@ -106,8 +106,10 @@ std::vector<uint32_t> TableLiveUserData(const Program& program) {
 
 // KYTY_TABLE_DEAD_USER_DATA: a table mode layout whose shader data do not fit the push constants from `start` laid out
 // with TableLiveUserData's registers alone (the offsets after them follow: memory_offset_dword, and the push data start
-// for the new size). Fits or exits as the plain rule does, with the counts.
-void RetryTableUserData(const Program& program, BindingLayout& next, uint32_t start) {
+// for the new size). Fits or exits as the plain rule does, with the counts. (KYTY_SPEC_PAIR_PUSH_FIT's reduced form takes
+// the same layout, fitting or not, its line named by `what`.)
+void RetryTableUserData(const Program& program, BindingLayout& next, uint32_t start,
+                        const char* what = "dead user data left out") {
 	const auto plain           = static_cast<uint32_t>(next.user_data_registers.size());
 	next.user_data_registers   = TableLiveUserData(program);
 	next.memory_offset_dword   = static_cast<uint32_t>(next.user_data_registers.size());
@@ -115,8 +117,7 @@ void RetryTableUserData(const Program& program, BindingLayout& next, uint32_t st
 	const auto reduced         = static_cast<uint32_t>(next.user_data_registers.size());
 	if (!next.UsesPushData()) {
 		EXIT("shader binding layout failed: %s (reduced %u -> %u, cursor %u, needs %u of %u)",
-		     "table mode user data do not fit the push constants", plain, reduced, start, next.ShaderDataDwords(),
-		     PushData::DwordCount);
+		     TablePushOverflowText, plain, reduced, start, next.ShaderDataDwords(), PushData::DwordCount);
 		std::abort();
 	}
 	const char* stage = program.stage == ShaderType::Vertex  ? "VS"
@@ -125,7 +126,7 @@ void RetryTableUserData(const Program& program, BindingLayout& next, uint32_t st
 	                                                         : "CS";
 	static std::atomic<uint32_t> reports {0};
 	if (reports.fetch_add(1, std::memory_order_relaxed) < 200)
-		std::printf("Table: dead user data left out: %s 0x%016" PRIx64 " registers %u -> %u, cursor %u, needs %u of %u\n",
+		std::printf("Table: %s: %s 0x%016" PRIx64 " registers %u -> %u, cursor %u, needs %u of %u\n", what,
 		            stage, program.shader_hash, plain, reduced, start, next.ShaderDataDwords(), PushData::DwordCount);
 }
 
@@ -470,7 +471,7 @@ void EnterTableMode(Program& program) {
 }
 
 void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool enable_lod_stats,
-                      bool table_dead_user_data) {
+                      bool table_dead_user_data, bool table_reduce_user_data) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
 		                                             ? "shader info is not ready"
@@ -551,11 +552,15 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool ena
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}
 
+	// KYTY_SPEC_PAIR_PUSH_FIT: the reduced form asked (table mode only), whether the plain layout fits or not (a reduced
+	// layout that fits is left alone by the rule below; one that does not exits there as here).
+	if (program.table_mode && table_reduce_user_data && next.ShaderDataDwords() != 0)
+		RetryTableUserData(program, next, push_data_start_dword, "pair push fit: user data reduced");
 	// (Only a table mode layout the plain rule above left without push data: one that fits is not changed.)
 	if (program.table_mode && table_dead_user_data && next.ShaderDataDwords() != 0 && !next.UsesPushData())
 		RetryTableUserData(program, next, push_data_start_dword);
 	if (next.ShaderDataDwords() != 0 && !next.UsesPushData()) {
-		if (program.table_mode) BindingFail("table mode user data do not fit the push constants");
+		if (program.table_mode) BindingFail(TablePushOverflowText);
 		AddBinding(next, DescriptorBindingKind::ShaderData);
 	}
 

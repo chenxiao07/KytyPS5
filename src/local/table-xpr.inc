@@ -239,6 +239,7 @@ struct RenderExecutor::TablePair {
 	// program is translated for it (ShaderVertexInputInfo::start_instance_sgpr).
 	int32_t                                                     start_instance = -1;
 	bool                                                        refused  = false;
+	bool push_fit = false; // KYTY_SPEC_PAIR_PUSH_FIT: its programs the retry's (the reduced pixel form): spec_pair_push_fit_draws_n
 	const char* special = nullptr; // a dispatch's: the normal path's special path that takes it (refused)
 	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> programs {}; // vertex, pixel (null: inactive)
 	std::array<std::vector<Run>, 2>                             runs;
@@ -949,7 +950,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		const auto write = CatalogWrite();
 		TableReset(pair);
 	}
-	if (pair.refused) return Spec::Refuse("table: pair refused"), TableResult::Native;
+	if (pair.refused) return Spec::Refuse(Spec::TablePairRefusedText), TableResult::Native;
 	// KYTY_FRAMEGEN: the frame's first G-buffer draw goes the normal way (or a native record's), whose hook reads the
 	// camera from its constants (a speculation's thread leaves them all to the GPU thread's).
 	if (FrameGen::Enabled() && pair.programs[0] != nullptr &&
@@ -3415,6 +3416,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	auto&       cache  = *m_native_xpr;
 	const auto& sh     = buffer.GetShaders();
 	const auto  stages = pair.programs[1] != nullptr ? 2u : 1u;
+	if (pair.push_fit) [[unlikely]] LiveCounters::Add(LiveCounters::SpecPairPushFitDraws); // (KYTY_SPEC_PAIR_PUSH_FIT's row)
 	const std::array<std::span<const uint32_t>, 2> user_data {std::span<const uint32_t> {sh.GetVs().gs_user_sgpr.value},
 	                                                          std::span<const uint32_t> {sh.GetPs().ps_user_sgpr.value}};
 	// (The index buffer's held entry, a cold line of a 320 KiB table, loads while the tables are evaluated.)
@@ -4026,6 +4028,7 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 		{
 			const auto write = CatalogWrite();
 			pair->programs   = programs;
+			pair->push_fit   = PipelineCache::t_push_fit_taken; // (the lookup above)
 			TableRuns(*pair);
 			TableScoutPublish(*pair);
 		}
@@ -4820,6 +4823,7 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(Comm
 	// (An entry a worker made that is not in the catalog yet, before one of its own: TableEntryOverlay.)
 	if (const auto drawn = TableEntryOverlay(buffer, existing, commands, index_base, index_bytes, index_type, direct)) return *drawn;
 	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> programs_held {};
+	bool push_fit_held = false; // (KYTY_SPEC_PAIR_PUSH_FIT: a new pair's programs the retry's: TablePair::push_fit)
 	std::array<uint32_t, 2>                                        portable {};
 	TableVariant*                                                  stored_variant = nullptr;
 	if (existing != nullptr) {
@@ -5015,7 +5019,7 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(Comm
 			parked          = pipelines.ParkCompiling(compiling, *parked_stand_in);
 			if (parked == nullptr) parked_stand_in.reset();
 		}
-		if (existing == nullptr) programs_held = {vertex, pixel};
+		if (existing == nullptr) programs_held = {vertex, pixel}, push_fit_held = PipelineCache::t_push_fit_taken;
 		// (The normal pipeline made privately only now, the table gates passed: a refused entry makes none. Not made because
 		// the cache has the key by now (made meanwhile): found, the records alone committed. A parked entry's too.)
 		if (want_private && table_mode && (pipeline != nullptr || parked != nullptr)) {
@@ -5128,6 +5132,7 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(Comm
 		pair.ps             = ps_address;
 		pair.start_instance = start_instance;
 		pair.programs       = programs_held;
+		pair.push_fit       = push_fit_held;
 		TableRuns(pair);
 		pair.variants.push_back(h.variant);
 		pair.Generation(Role()) = generation; // (its programs are those of the code at its addresses as of the lookups)

@@ -814,7 +814,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	ir.unfused_mad = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureUnfusedMad) != 0;
 	ir.amd_barycentrics = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureAmdBarycentrics) != 0;
 	IR::AllocateBindings(ir, push_data_start_dword, options.enable_lod_stats,
-	                     options.table_mode && options.table_dead_user_data);
+	                     options.table_mode && options.table_dead_user_data,
+	                     options.table_mode && options.table_reduce_user_data);
 	DumpShaderIr(options, ir);
 	Spirv::AnalyzeProgramRequirements(ir);
 	std::string ir_dump;

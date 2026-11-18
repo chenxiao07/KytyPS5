@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
 #include "resource-plan-serial.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -575,6 +576,33 @@ static bool TableDeadUserDataOn() {
 	return on.load(std::memory_order_relaxed) != 0;
 }
 
+// KYTY_SPEC_PAIR_PUSH_FIT (live spec_pair_push_fit; mode-toggle row {1, 0}: on under KYTY_SPECULATE=4): a table pair whose vertex program is
+// refused because its shader data do not fit the push constants after its pixel program's (the pixel stage's push data
+// come first, GetGraphicsPrograms; Demon's Souls' VS 0xb2f062027869d4ee after PS 0x4d86d2e2bb1b49cd: cursor 32, needs 2,
+// ~4 'table: pair refused' holes a frame) takes its pixel program's REDUCED table form (CompileOptions::
+// table_reduce_user_data: TableLiveUserData's registers alone, KYTY_TABLE_DEAD_USER_DATA's layout, laid out whether the
+// plain one fits or not) and its vertex program at the cursor after that, when that cursor is earlier. The reduced form is
+// a permutation of its own (Permutation::table_reduced), found only by a lookup asking for it (GetGraphicsPrograms' retry),
+// never by a plain one (Get, the ahead paths, TableFormatOnlyBuffers); and a refusal for push constants is taken as the
+// refusal at its own cursor only (Permutation::table_overflow_cursor; a refused permutation otherwise matches any cursor),
+// in Get's find and the ahead paths (AheadJob, AheadPermutation). So a vertex program refused for push constants at one
+// cursor is compiled at every other cursor it is met at (with the switch off the first refusal stood for all cursors, the
+// result depending on which cursor came first): that VS's modules at those cursors are new too (counted:
+// spec_pair_push_fit_other_cursor). Every other program and pair is looked up and compiled as with the switch off (the
+// same SPIR-V, the same pipeline keys); the new modules are the pixel program's reduced form and those vertex programs'
+// at new cursors, for pairs refused today (their pipelines are new keys; nothing on disk records table programs).
+static bool PairPushFitOn() {
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return false;
+	static auto& on = LiveSwitch::Find("spec_pair_push_fit", ModeToggle::Default("spec_pair_push_fit"));
+	return on.load(std::memory_order_relaxed) != 0;
+}
+// (A refused permutation passed over by a lookup at `cursor` with the switch on: a refusal for push constants made at
+// another cursor.)
+template <typename P>
+static bool OverflowElsewhere(const P& p, uint32_t cursor, bool push_fit) {
+	return push_fit && !p.handle && p.table_overflow_cursor != UINT32_MAX && p.table_overflow_cursor != cursor;
+}
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -594,6 +622,10 @@ struct PipelineCache::ProgramCache {
 		// (Mode 4, under the cache's m_mutex) A table permutation published ahead (AheadPermutation) that no lookup has
 		// found yet: no draw holds it (every pointer a draw holds comes from a lookup, which clears it). DropAheadUnmet.
 		bool ahead_unmet = false;
+		// KYTY_SPEC_PAIR_PUSH_FIT: a table permutation in the reduced form (found only by a lookup asking for it); and a table
+		// refusal because the shader data did not fit the push constants: the cursor it was refused at (UINT32_MAX: none).
+		bool     table_reduced         = false;
+		uint32_t table_overflow_cursor = UINT32_MAX;
 	};
 
 	// A permutation the prefetch translated, its SPIR-V in the prefetch's scratch file: zstd-compressed (spirv_bytes,
@@ -613,6 +645,7 @@ struct PipelineCache::ProgramCache {
 	struct TableJob {
 		ShaderRecompiler::IR::ResourceSpecialization   specialization;
 		uint32_t                                       push_data_cursor = 0;
+		bool                                           table_reduced    = false; // KYTY_SPEC_PAIR_PUSH_FIT's reduced form
 		std::vector<uint32_t>                          code, back_code, user_data;
 		ShaderVertexInputInfo                          vertex;
 		ShaderPixelInputInfo                           pixel;
@@ -1094,6 +1127,10 @@ struct PipelineCache::ProgramCache {
 	void UncountPermutations(ShaderType stage, size_t removed) {
 		if (permutations_counted) permutation_counts[static_cast<size_t>(stage)] -= removed;
 	}
+	// KYTY_SPEC_PAIR_PUSH_FIT (switch on only): this thread's last table lookup (Get) returned the refusal made at its own
+	// cursor because the shader data did not fit the push constants. Cleared by GetGraphicsPrograms before the vertex
+	// lookup it reads it after.
+	static inline thread_local bool t_push_overflow = false;
 	void                                      ClearTable() noexcept {
 		if (Spec::On()) {
 			t_table_pending = false;
@@ -2611,9 +2648,11 @@ struct PipelineCache::ProgramCache {
 
 	template <typename InputInfo>
 	// `table_mode`: the permutation compiled in table mode (ShaderRecompiler::IR::EnterTableMode), empty
-	// when the program does not allow it.
+	// when the program does not allow it. `table_reduced` (table mode, KYTY_SPEC_PAIR_PUSH_FIT's retry only): its reduced
+	// form (CompileOptions::table_reduce_user_data), a permutation of its own.
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                  uint32_t& push_data_cursor, bool table_mode = false, uint32_t table_portable = 0) {
+	                  uint32_t& push_data_cursor, bool table_mode = false, uint32_t table_portable = 0,
+	                  bool table_reduced = false) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.mesh.threads_num[0] != 0 ? ShaderType::Mesh : ShaderType::Vertex;
@@ -2787,10 +2826,18 @@ struct PipelineCache::ProgramCache {
 				return layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
 				    push_data_cursor, layout.ShaderDataDwords());
 			};
+			// (KYTY_SPEC_PAIR_PUSH_FIT: the reduced form found by a lookup asking for it alone; a refusal for push constants
+			// made at another cursor passed over, so this cursor's own lookup is made.)
+			const bool push_fit         = table_mode && PairPushFitOn();
 			const auto find_permutation = [&] { return std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
-				        return candidate.table_mode == table_mode && compatible_push_data(candidate) &&
-				               candidate.specialization == active_specialization;
+				        if (!(candidate.table_mode == table_mode && compatible_push_data(candidate) &&
+				              candidate.specialization == active_specialization && candidate.table_reduced == table_reduced))
+					        return false;
+				        if (push_fit && candidate.table_overflow_cursor != UINT32_MAX &&
+				            candidate.table_overflow_cursor != push_data_cursor) [[unlikely]]
+					        return LiveCounters::Add(LiveCounters::SpecPairPushFitOtherCursor), false;
+				        return true;
 			        }); };
 			// A borrowed specialization comes from the guard: the permutation it
 			// selected under the same publication is still the right one.
@@ -2807,7 +2854,10 @@ struct PipelineCache::ProgramCache {
 			}
 			if (const auto permutation = find_permutation();
 			    permutation != entry->second.permutations.end()) {
-				if (!permutation->handle) return {}; // table mode refused
+				if (!permutation->handle) { // table mode refused
+					if (push_fit && permutation->table_overflow_cursor == push_data_cursor) t_push_overflow = true;
+					return {};
+				}
 				// (Mode 4: a table permutation published ahead, found by its first lookup: a draw holds it from here on.)
 				if (permutation->ahead_unmet) [[unlikely]] permutation->ahead_unmet = false;
 				// Only a borrowed result certifies this exact guard publication.
@@ -2869,19 +2919,22 @@ struct PipelineCache::ProgramCache {
 			if (entry == programs.end()) return {};
 			auto&      jobs  = entry->second.table_jobs;
 			const auto found = std::ranges::find_if(jobs, [&](const auto& job) {
-				return job->push_data_cursor == push_data_cursor && job->specialization == table_specialization;
+				return job->push_data_cursor == push_data_cursor && job->specialization == table_specialization &&
+				       job->table_reduced == table_reduced;
 			});
 			if (found == jobs.end()) {
 				if (params.code_unread) return UnreadCode();
 				auto job              = std::make_shared<TableJob>();
 				job->specialization   = table_specialization;
 				job->push_data_cursor = push_data_cursor;
+				job->table_reduced    = table_reduced;
 				job->code.assign(params.code.begin(), params.code.end());
 				job->back_code.assign(params.back_code.begin(), params.back_code.end());
 				job->user_data         = params.user_data;
 				job->options           = options;
 				job->options.table_mode = true;
 				job->options.table_dead_user_data = TableDeadUserDataOn();
+				job->options.table_reduce_user_data = table_reduced;
 				job->options.user_data = job->user_data;
 				job->options.back_code = job->back_code;
 				job->options.input_info = {};
@@ -2928,10 +2981,18 @@ struct PipelineCache::ProgramCache {
 				if (reports.fetch_add(1, std::memory_order_relaxed) < 200)
 					std::printf("Table: %s 0x%016llx: %s", label, static_cast<unsigned long long>(params.hash),
 					            job->refused.c_str());
+				// (KYTY_SPEC_PAIR_PUSH_FIT: a refusal for push constants is this cursor's alone. Noted with the switch on, so
+				// a refusal made before it was turned on matches any cursor, as with it off.)
+				if (PairPushFitOn() && job->refused.find(ShaderRecompiler::IR::TablePushOverflowText) != std::string::npos)
+					permutation.table_overflow_cursor = job->push_data_cursor;
 			}
+			permutation.table_reduced = job->table_reduced;
 			const auto& stored = entry->second.permutations.emplace_back(std::move(permutation));
 			CountPermutations(stage, 1);
-			if (!stored.handle) return {};
+			if (!stored.handle) {
+				if (stored.table_overflow_cursor == push_data_cursor) t_push_overflow = true; // (set with the switch on only)
+				return {};
+			}
 			if (TableFormatIndexOn()) // (TableFormatOnlyBuffers' index: KYTY_TABLE_FORMAT_INDEX only, mode 0 as before)
 				by_program.try_emplace(&stored.program, std::pair {&entry->second, &stored});
 			publish_stage(stored.program);
@@ -3431,10 +3492,15 @@ struct PipelineCache::ProgramCache {
 		if (entry == programs.end() || entry->second.source_digest != seed.digest) return nullptr;
 		auto& source               = entry->second;
 		auto  table_specialization = AheadSpecialization(seed);
+		// (KYTY_SPEC_PAIR_PUSH_FIT's reduced forms are not the plain program's: passed over; so is a refusal for push
+		// constants made at another cursor, as Get's find passes it over.)
 		for (const auto& job: source.table_jobs)
-			if (job->push_data_cursor == cursor && job->specialization == table_specialization) return nullptr;
+			if (job->push_data_cursor == cursor && job->specialization == table_specialization && !job->table_reduced)
+				return nullptr;
+		const bool push_fit = PairPushFitOn();
 		for (const auto& p: source.permutations)
-			if (p.table_mode && p.specialization == table_specialization &&
+			if (p.table_mode && !p.table_reduced && !OverflowElsewhere(p, cursor, push_fit) &&
+			    p.specialization == table_specialization &&
 			    p.program.bindings.push_data_start_dword ==
 			        ShaderRecompiler::IR::PushData::StartFor(cursor, p.program.bindings.ShaderDataDwords()))
 				return nullptr;
@@ -3518,7 +3584,7 @@ struct PipelineCache::ProgramCache {
 		auto&      source               = entry->second;
 		const auto table_specialization = AheadSpecialization(seed);
 		const auto found                = std::ranges::find_if(source.table_jobs, [&](const auto& job) {
-            return job->push_data_cursor == cursor && job->specialization == table_specialization;
+            return job->push_data_cursor == cursor && job->specialization == table_specialization && !job->table_reduced;
         });
 		if (found != source.table_jobs.end()) {
 			const auto job = *found;
@@ -3537,8 +3603,10 @@ struct PipelineCache::ProgramCache {
 			if (TableFormatIndexOn()) by_program.try_emplace(&stored.program, std::pair {&source, &stored});
 			return &stored;
 		}
+		const bool push_fit = PairPushFitOn(); // (a refusal for push constants made at another cursor: passed over)
 		for (auto& p: source.permutations)
-			if (p.table_mode && p.specialization == table_specialization &&
+			if (p.table_mode && !p.table_reduced && !OverflowElsewhere(p, cursor, push_fit) &&
+			    p.specialization == table_specialization &&
 			    p.program.bindings.push_data_start_dword ==
 			        ShaderRecompiler::IR::PushData::StartFor(cursor, p.program.bindings.ShaderDataDwords()))
 				return p.handle ? &p : nullptr;
@@ -3699,7 +3767,7 @@ struct PipelineCache::ProgramCache {
 			if (entry == programs.end() || entry->second.source_digest != pixel.digest) continue;
 			const auto table_specialization = AheadSpecialization(pixel);
 			for (const auto& p: entry->second.permutations) {
-				if (!p.table_mode || !p.handle || p.specialization != table_specialization ||
+				if (!p.table_mode || p.table_reduced || !p.handle || p.specialization != table_specialization ||
 				    p.program.bindings.push_data_start_dword !=
 				        ShaderRecompiler::IR::PushData::StartFor(0, p.program.bindings.ShaderDataDwords()))
 					continue;
@@ -5738,6 +5806,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     std::array<uint32_t, 2> table_portable) {
 	LiveCensus::Scope census(LiveCensus::GraphicsPrograms, 0);
 	m_program_cache->ClearTable();
+	// (spec_pair_push_fit_draws_n's mark: cleared first, so no way out (PrepareUnread, an adopt-only miss) leaves the last
+	// lookup's.)
+	if (table_mode) t_push_fit_taken = false;
 	// Reused per thread: every normal-path draw prepares both (their user data were new vectors).
 	thread_local ShaderParams vertex_params, pixel_params;
 	std::optional<ShaderHashNoFaultScope> no_fault; // (PrepareNoFault)
@@ -5800,7 +5871,38 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		// is not looked up at a cursor the draw does not have (it would be adopted for it). The caller refuses the draw.)
 		if (!result.pixel && g_find_only_users.load(std::memory_order_relaxed) != 0 && t_find_only && t_adopt_only) return result;
 	}
+	// KYTY_SPEC_PAIR_PUSH_FIT (PairPushFitOn): a table vertex program refused at this cursor because its shader data do not
+	// fit after the pixel program's: the pixel program's reduced form looked up (made by a table job as any table program;
+	// pending: the caller waits as for any), and, its data ending earlier, the vertex program at the cursor after it. Both
+	// found: the pair's programs; else the plain result, as with the switch off (the pixel stage's program put back). The
+	// same inputs give the same programs on every call (TableStore's, a worker's, a set's), as each lookup does.
+	const bool push_fit = table_mode && pixel_active && result.pixel && PairPushFitOn();
+	if (push_fit) ProgramCache::t_push_overflow = false;
 	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor, table_mode, table_portable[0]);
+	if (push_fit && !result.vertex && ProgramCache::t_push_overflow) [[unlikely]] {
+		ProgramCache::t_push_overflow = false;
+		const auto* const plain_pixel = pixel_info.stage.program;
+		const uint32_t    refused_at  = push_data_cursor; // (where the plain pixel program's data end)
+		uint32_t          cursor      = mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
+		const auto reduced = m_program_cache->Get(pixel_params, pixel_info, cursor, true, table_portable[1], true);
+		if (!reduced) {
+			pixel_info.stage.program = plain_pixel;
+			LiveCounters::Add(m_program_cache->Pending() ? LiveCounters::SpecPairPushFitPending
+			                                             : LiveCounters::SpecPairPushFitPsRefused);
+		} else if (cursor >= refused_at) {
+			pixel_info.stage.program = plain_pixel;
+			LiveCounters::Add(LiveCounters::SpecPairPushFitNoGain);
+		} else if (auto vertex = m_program_cache->Get(vertex_params, vertex_info, cursor, true, table_portable[0]); vertex) {
+			result.pixel  = reduced;
+			result.vertex = vertex;
+			LiveCounters::Add(LiveCounters::SpecPairPushFitTaken);
+			t_push_fit_taken = true;
+		} else {
+			pixel_info.stage.program = plain_pixel;
+			LiveCounters::Add(m_program_cache->Pending() ? LiveCounters::SpecPairPushFitPending
+			                                             : LiveCounters::SpecPairPushFitVsRefused);
+		}
+	}
 	return result;
 }
 
@@ -5842,6 +5944,7 @@ uint32_t PipelineCache::TableFormatOnlyBuffers(const void* want, const void* got
 			}
 	}
 	if (mw == nullptr || mg == nullptr || kw != kg || !mw->table_mode || !mg->table_mode ||
+	    mw->table_reduced != mg->table_reduced || // (KYTY_SPEC_PAIR_PUSH_FIT: a reduced form and a plain one: other layouts)
 	    mw->program.bindings.push_data_start_dword != mg->program.bindings.push_data_start_dword)
 		return UINT32_MAX;
 	const auto& a = mw->specialization;
