@@ -816,8 +816,10 @@ struct PipelineCache::ProgramCache {
 			uint32_t                                          first_record = UINT32_MAX; // (by_record's index of it)
 			std::vector<uint32_t>                             records;
 			std::atomic<uint8_t>                              state {Pending};
-			std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
-			std::vector<PrefetchedModule>                     modules;
+			// (Held apart: most groups' plans are in the scratch file, and an empty optional took a ResourcePlan's 520
+			// bytes in each group, ~10 MiB of the ~20,000 groups' 14 MiB.)
+			std::unique_ptr<ShaderRecompiler::IR::ResourcePlan> plan;
+			std::vector<PrefetchedModule>                       modules;
 			// The plan in the scratch file instead (zstd-compressed ResourcePlanSerial bytes): `plan` stays empty until
 			// the game takes the group over (LoadSpilledPlan). Its linear SRT plan stays here where PrefetchKeepsLinear:
 			// rebuilding it (its code generated) took up to ~1 ms of the render thread's per plan; the plan's values ~0.2.
@@ -944,6 +946,7 @@ struct PipelineCache::ProgramCache {
 		std::array<uint64_t, PrefetchMemoryParts> n {};
 		n[MemGroup] = sizeof(group) + Capacity(group.records) + Capacity(group.modules);
 		if (group.plan) {
+			n[MemGroup] += sizeof(*group.plan);
 			const auto& plan = *group.plan;
 			for (const auto& inst: plan.value_storage)
 				n[MemPlanValues] += sizeof(inst) + 2 * sizeof(void*) + inst.NumArgs() * sizeof(ShaderRecompiler::IR::Value) +
@@ -1775,7 +1778,7 @@ struct PipelineCache::ProgramCache {
 	}
 	// The plan SpillPlan wrote, back in the group (render thread, the group taken over); false when it cannot be read.
 	bool LoadSpilledPlan(Prefetch::Group& group) {
-		if (group.plan || group.plan_bytes == 0) return group.plan.has_value();
+		if (group.plan || group.plan_bytes == 0) return group.plan != nullptr;
 		const auto begin = std::chrono::steady_clock::now();
 		std::vector<char>    packed(group.plan_bytes);
 		std::vector<uint8_t> bytes(group.plan_raw);
@@ -1799,7 +1802,7 @@ struct PipelineCache::ProgramCache {
 			if (linear != (group.plan_linear != nullptr)) return false;
 			plan.linear_srt = std::move(group.plan_linear);
 		}
-		group.plan.emplace(std::move(plan));
+		group.plan = std::make_unique<ShaderRecompiler::IR::ResourcePlan>(std::move(plan));
 		const auto end = std::chrono::steady_clock::now();
 		prefetch->plan_read_ms += std::chrono::duration<double, std::milli>(read - begin).count();
 		prefetch->plan_values_ms += std::chrono::duration<double, std::milli>(values - read).count();
@@ -1830,7 +1833,8 @@ struct PipelineCache::ProgramCache {
 				Common::RecoverableExitScope recoverable;
 				auto translated = ShaderRecompiler::TranslateProgram(record.code, options);
 				if (!group.plan)
-					group.plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program, PrefetchBuildsLinear()));
+					group.plan = std::make_unique<ShaderRecompiler::IR::ResourcePlan>(
+					    ShaderRecompiler::IR::ExtractResourcePlan(translated.program, PrefetchBuildsLinear()));
 				ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, record.specialization);
 				auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, record.specialization,
 				                                               record.push_cursor);
