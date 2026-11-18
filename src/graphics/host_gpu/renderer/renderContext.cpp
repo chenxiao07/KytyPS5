@@ -87,6 +87,7 @@ void RenderContext::ShutdownGpu() {
 		m_gpu->Shutdown();
 		m_gpu.reset();
 	}
+	RenderExecutor::SettleClear(); // (mode 4's settle parts still waiting, before the device goes)
 	if (m_video_out != nullptr) {
 		if (m_command_scheduler.Active()) {
 			m_command_scheduler.Finish();

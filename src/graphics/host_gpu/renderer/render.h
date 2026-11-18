@@ -13,6 +13,7 @@
 #include "live-switch.h"
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -452,6 +453,18 @@ public:
 	// changed it since (TableXpr::epoch; table-xpr.inc).
 	void ForgetStaleCatalog();
 	static constexpr uint32_t Roles = 13; // (the GPU thread, Spec::MaxPacketSlots speculation threads)
+	// (Mode 4, the GPU thread) A segment's commit settles each proposal's catalog part under its owner's catalog write
+	// taken with a try-lock (SettleOrQueue; `owner`: the proposal's catalog owner, Spec::State::ProposedSet::catalog_owner,
+	// null: run at once, its own writes taken); held by a worker's read, or a part already waiting, the part waits in a list
+	// of the GPU thread's, in order, run at the next commit's try that succeeds (SettleDrain(false)) and under a write that
+	// waits (SettleDrain(true)) at each guest flip, before a sweep of the catalog (TableSweepPairs), before a live mode 0,
+	// and where a settle must not wait past its commit. table-xpr.inc.
+	static void SettleOrQueue(const void* owner, std::function<void()> work);
+	static void SettleDrain(bool blocking);
+	// (The renderer's teardown, the GPU thread stopped, the device still there: the parts still waiting dropped, so none
+	// outlives the device in the static list.)
+	static void SettleClear();
+	static inline std::atomic<uint32_t> s_settle_pending_n {0}; // (the parts waiting)
 
 private:
 	// Table draws (src/local/table-xpr.inc).
@@ -474,6 +487,9 @@ private:
 	// The catalog's owner changes its pairs and dispatches, image sets, draw states and compute clears under its lock
 	// exclusively (CatalogWrite); another executor reads them under it shared (CatalogRead, on its own thread).
 	mutable std::shared_mutex m_catalog_mutex;
+	// (The GPU thread: the catalog whose write a settle part runs under, held for it by SettleOrQueue / SettleDrain; null:
+	// none.)
+	static inline thread_local const std::shared_mutex* t_settle_held = nullptr;
 	// catalog_writer_first (under KYTY_SPECULATE=4, the only mode with readers): the owner raises this while it waits for
 	// the lock exclusively, and a worker waits for it to fall before its table try takes the lock shared. std::shared_mutex gives a waiting writer no priority: in an
 	// area transition the workers' table tries, taking it shared in turns, held the owner's writes 123-193 us each.
@@ -484,6 +500,9 @@ private:
 	// (Outside KYTY_SPECULATE=4 no other executor reads the catalog: no lock. The mode changes only between submissions.)
 	[[nodiscard]] std::unique_lock<std::shared_mutex> CatalogWrite() const {
 		if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return std::unique_lock<std::shared_mutex>();
+		// (A settle part run with this catalog's write held for it, SettleOrQueue / SettleDrain: no second take.)
+		if (t_settle_held == &m_catalog_mutex) [[unlikely]]
+			return std::unique_lock<std::shared_mutex>();
 		std::unique_lock lock(m_catalog_mutex, std::try_to_lock);
 		if (!lock.owns_lock()) {
 			const bool first = CatalogWriterFirst();
@@ -540,6 +559,7 @@ private:
 	                                                          const NativeXprDirectDraw* direct);
 	[[nodiscard]] bool TableEntryCheck(const TableEntryHolder& holder);
 	void               TableEntrySettle(const std::shared_ptr<TableEntryHolder>& holder, bool commit);
+	void               TableEntrySettleInOrder(TableEntryHolder& holder);
 	void               TableRetireEntryOrphans();
 	[[nodiscard]] TableImageSet* TableResolveSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
 	                                             const NativeXprDrawState* draw_state, std::span<const uint32_t> words);

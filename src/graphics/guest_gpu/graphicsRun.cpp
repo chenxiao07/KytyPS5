@@ -1581,6 +1581,7 @@ void GuestGpu::ThreadRun(void* data) {
 		// first, so a thread still translating would otherwise take the normal path. No packet runs in between: this is
 		// the GPU thread between submissions.)
 		if (want == 0) {
+			RenderExecutor::SettleDrain(true); // (the commits' catalog parts still waiting, under mode 4's catalog writes)
 			kyty_local_speculate_mode.store(0, std::memory_order_relaxed);
 			Speculation::GpuThreadAffinityAtFlip(); // (KYTY_SPEC_GPU_AFFINITY: the GPU thread's mask given back, if changed)
 		}
@@ -4296,9 +4297,12 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 void CommandProcessor::Flip() {
 	LiveControl::Flip();
 	FrameCapture::OnFlip();
-	// (KYTY_SPEC_GPU_AFFINITY, mode 4: the GPU thread's CPUs without the workers' cores, taken here after a change.)
-	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && GuestGpu::IsGpuThread())
+	// (KYTY_SPEC_GPU_AFFINITY, mode 4: the GPU thread's CPUs without the workers' cores, taken here after a change. The
+	// commits' catalog parts still waiting run here under a write that waits: none waits past its frame.)
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && GuestGpu::IsGpuThread()) {
 		Speculation::GpuThreadAffinityAtFlip();
+		if (RenderExecutor::s_settle_pending_n.load(std::memory_order_relaxed) != 0) RenderExecutor::SettleDrain(true);
+	}
 	CheckBuffer();
 	// (As a CPU flip's preparation does: optimized builds in place, idle shader plans out of memory.)
 	m_renderer.GetPipelineCache().PromoteFinished();

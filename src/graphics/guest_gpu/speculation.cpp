@@ -2281,8 +2281,23 @@ void Speculation::After(Result& result, size_t index) {
 	const auto& segment  = state.closed[index];
 	const auto  from     = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
 	const auto& to       = segment.end;
-	// spec_worker_sets: the image sets it built up to this segment, into the catalog (the owner's, under its write).
-	if (!state.proposed_sets.empty()) state.SettleProposedSets(index, false);
+	// spec_worker_sets: the image sets it built up to this segment, into the catalog (the owner's, under its write). Each
+	// proposal SettleProposedSets would settle, in its order: its in-order part now, the rest under its owner's catalog write
+	// had with a try-lock, else queued behind the ones waiting (RenderExecutor::SettleOrQueue); one that retires a set never
+	// waits past its commit (those waiting and it run now, under a write that waits); then the ones waiting while the tries
+	// succeed.
+	if (!state.proposed_sets.empty()) {
+		for (auto& proposed: state.proposed_sets) {
+			if (proposed.settled || proposed.segment > index) continue;
+			proposed.settled = true;
+			if (proposed.settle_now) proposed.settle_now();
+			const bool must_now = proposed.settle_must_now && proposed.settle_must_now();
+			RenderExecutor::SettleOrQueue(proposed.catalog_owner, [settle = proposed.settle] { settle(true); });
+			if (must_now && RenderExecutor::s_settle_pending_n.load(std::memory_order_relaxed) != 0)
+				RenderExecutor::SettleDrain(true);
+		}
+		RenderExecutor::SettleDrain(false);
+	}
 	// What its thread could not note for the presenter (Spec::State::scenes): its indexed draws and its TAA dispatch,
 	// noted here, where the GPU thread would have run them, before the flip after them takes them (FrameGen::TakeScene).
 	// (A segment not committed is not here: its packets are translated again the normal way, which notes them.)

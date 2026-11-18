@@ -664,6 +664,13 @@ struct State {
 		std::vector<Completed> completed;
 		std::function<bool()>     check; // (spec_proposed_check: still current at its segment's commit)
 		std::function<void()>     on_hole; // (its segment re-run as a hole, the GPU thread: what must not move to the next one)
+		// (Its commit's settle, Speculation::After: what must run at once, in order (settle_now: an entry's records, pipeline
+		// and metadata notes; empty: nothing), the catalog's owner whose write the rest takes (RenderExecutor, opaque here;
+		// null: settled at once, as before), and whether that rest must not wait past its commit (settle_must_now: it
+		// retires a set; empty: it may wait).)
+		std::function<void()>     settle_now;
+		const void*               catalog_owner = nullptr;
+		std::function<bool()>     settle_must_now;
 	};
 	std::vector<ProposedSet> proposed_sets;
 	void SettleProposedSets(size_t committed_segment, bool all) {

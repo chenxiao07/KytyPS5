@@ -571,6 +571,7 @@ struct RenderExecutor::TableEntryHolder {
 	// pipeline key is built from: the base state's inputs.)
 	bool                                                      reuse_checked = false;
 	std::shared_ptr<const NativeXprDrawState::PipelineInputs> inputs;
+	bool                                                      meta_noted = false; // (TableEntrySettleInOrder done)
 };
 // (Mode 4) Holders not published whole, kept until no speculation translates or has a result unfinished (TableSweepPairs): a
 // draw recorded with them, and the proposals settled after theirs (their sets, into a new pair's node), may still refer to
@@ -592,7 +593,10 @@ void RenderExecutor::TableSweepPairs() {
 	// (Put off while a speculation translates or has a result unfinished: tried at every call until done. Checked again
 	// under the lock: a translation counted after it reads the catalog after the sweep, and sees its epoch.)
 	if (kyty_local_speculations_live.load(std::memory_order_seq_cst) != 0) return;
-	if (g_entry_orphans_n.load(std::memory_order_relaxed) != 0) TableRetireEntryOrphans(); // (mode 4's only)
+	// (Mode 4's only: the commits' catalog parts still waiting run first, they may name pairs the sweep frees; then the
+	// entries' orphans.)
+	if (s_settle_pending_n.load(std::memory_order_relaxed) != 0) SettleDrain(true);
+	if (g_entry_orphans_n.load(std::memory_order_relaxed) != 0) TableRetireEntryOrphans();
 	table->pairs_swept = frame;
 	if (table->pairs.size() + table->dispatches.size() <= TableXpr::PairsKept) return;
 	const auto write = CatalogWrite();
@@ -1254,6 +1258,13 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				                               }
 				                               TableKeepAside(holder);
 			                               }});
+			// (Its commit's settle is all catalog part, under the owner's write; one that retires a set (a revalidated set
+			// replacing its slot's, the unpublished one of a set with pending images, read as the settle reads it) runs at
+			// its commit.)
+			spec->proposed_sets.back().catalog_owner   = owner;
+			spec->proposed_sets.back().settle_must_now = [holder, replaces] {
+				return replaces || (*holder && !(*holder)->pending_images.empty());
+			};
 			if (!raw->pending_images.empty()) {
 				// (The images it completes, each with its serial and the slot's layout, and the set's handle: for its segment's
 				// Before, and spec_set_cpu_dirty_stop off for the commits of later segments that bind it, CommitSegments'
@@ -4461,6 +4472,9 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(Comm
 	// (Its segment re-run as a hole drew the draw in order, maybe through the table without a normal lookup: what its commit
 	// would do for the draw is not done at a later segment's (records, private pipeline dropped here).)
 	if (raw->adopted != nullptr) spec->proposed_sets.back().on_hole = [raw] { raw->adopted.reset(); };
+	// (Its commit's settle: the in-order part at once, the catalog part when the owner's write is had.)
+	spec->proposed_sets.back().settle_now    = [owner, raw] { owner->TableEntrySettleInOrder(*raw); };
+	spec->proposed_sets.back().catalog_owner = owner;
 	return draw(h);
 }
 
@@ -4477,10 +4491,93 @@ bool RenderExecutor::TableEntryCheck(const TableEntryHolder& h) {
 	return NativeXprTargetsCurrent(*h.drawn_state);
 }
 
+// (Mode 4) The commit's settle never waits for the workers' reads of the catalog: a proposal's catalog part runs under its
+// owner's write had with a try-lock; else it waits in g_settle_pending (the GPU thread's alone, in order: a part waits
+// while one before it does). The list runs at the next commit's settle while its tries succeed (SettleDrain(false)), and
+// under a write that waits (SettleDrain(true): the writer-first gate raised, as any write) at each guest flip
+// (CommandProcessor::Flip), before a sweep of the catalog (TableSweepPairs, which may free the pairs a waiting part
+// names), before a live mode 0, and after a settle that must not wait past its commit. A part runs with its owner's write
+// held for it (t_settle_held): its own CatalogWrite calls take nothing more. What a waiting part holds (the holder, the
+// set) its closure holds. Late publishing is safe by the checks each part makes under its write: a new pair only while
+// the catalog has none for its key, a variant only into a pair whose programs are the entry's and that is not refused or
+// respecialized, a state only while the key has none, an image set only while the catalog's epoch is the one it was built
+// under and its slot empty; else kept, as before.
+struct SettlePendingPart {
+	const RenderExecutor* owner = nullptr;
+	std::function<void()> work;
+};
+static std::vector<SettlePendingPart> g_settle_pending; // (the GPU thread's; a short list, taken from its front)
+
+void RenderExecutor::SettleOrQueue(const void* owner_opaque, std::function<void()> work) {
+	const auto* owner = static_cast<const RenderExecutor*>(owner_opaque);
+	if (owner == nullptr) return work();
+	if (g_settle_pending.empty()) {
+		std::unique_lock<std::shared_mutex> lock(owner->m_catalog_mutex, std::try_to_lock);
+		if (lock.owns_lock()) {
+			t_settle_held = &owner->m_catalog_mutex;
+			struct Release {
+				~Release() { t_settle_held = nullptr; }
+			} release;
+			work();
+			return;
+		}
+	}
+	g_settle_pending.push_back({owner, std::move(work)});
+	s_settle_pending_n.store(static_cast<uint32_t>(g_settle_pending.size()), std::memory_order_relaxed);
+}
+
+void RenderExecutor::SettleDrain(bool blocking) {
+	while (!g_settle_pending.empty()) {
+		const auto* owner = g_settle_pending.front().owner;
+		std::unique_lock<std::shared_mutex> lock;
+		if (blocking) {
+			lock = owner->CatalogWrite(); // (outside mode 4 an empty lock: no reader then)
+		} else {
+			lock = std::unique_lock<std::shared_mutex>(owner->m_catalog_mutex, std::try_to_lock);
+			if (!lock.owns_lock()) return;
+		}
+		t_settle_held = &owner->m_catalog_mutex;
+		struct Release {
+			~Release() { t_settle_held = nullptr; }
+		} release;
+		// (Every waiting part of this owner at the front, in order, under the one write.)
+		while (!g_settle_pending.empty() && g_settle_pending.front().owner == owner) {
+			auto part = std::move(g_settle_pending.front());
+			g_settle_pending.erase(g_settle_pending.begin());
+			s_settle_pending_n.store(static_cast<uint32_t>(g_settle_pending.size()), std::memory_order_relaxed);
+			part.work();
+		}
+	}
+}
+
+void RenderExecutor::SettleClear() {
+	if (g_settle_pending.empty()) return;
+	g_settle_pending.clear();
+	s_settle_pending_n.store(0, std::memory_order_relaxed);
+}
+
 static void TableEntryOrphan(const std::shared_ptr<RenderExecutor::TableEntryHolder>& holder) {
 	const std::lock_guard lock(g_entry_orphans_mutex);
 	g_entry_orphans.push_back(holder);
 	g_entry_orphans_n.store(static_cast<uint32_t>(g_entry_orphans.size()), std::memory_order_relaxed);
+}
+
+// (Mode 4) What an entry's commit does in order, before its catalog part (Speculation::After runs it at the commit, the
+// catalog part when the owner's write is had: SettleOrQueue): what the in-order draw would have done for this draw, which
+// the commit spares it, in stream order: the records, then the normal pipeline and its recipe (published whole or not:
+// the draw is committed; the cache's m_mutex only, no other lock held); then, unless poisoned, the metadata notes of a
+// derived state's targets (as NativeXprCaptureState notes its own). Once each.
+void RenderExecutor::TableEntrySettleInOrder(TableEntryHolder& h) {
+	if (h.adopted != nullptr) {
+		m_context.GetPipelineCache().CommitAdopted(*h.adopted);
+		h.adopted.reset();
+	}
+	if (h.meta_noted || h.poisoned.load(std::memory_order_relaxed)) return;
+	h.meta_noted = true;
+	if (h.state != nullptr) {
+		auto& textures = m_context.GetTextureCache();
+		for (const auto& target: h.state->targets) textures.NoteMetaUse(target.metadata, target.id.index);
+	}
 }
 
 // (Mode 4) At the entry's segment's commit (`commit`; false: never committed), the GPU thread, under the owner's write:
@@ -4490,18 +4587,8 @@ void RenderExecutor::TableEntrySettle(const std::shared_ptr<TableEntryHolder>& h
 	auto& h = *holder;
 	// (Never committed: its records and private pipeline go (destroyed here, on the GPU thread).)
 	if (!commit) return h.adopted.reset(), TableEntryOrphan(holder);
-	// (What the in-order draw would have done for this draw, which the commit spares it, in stream order: the records, then
-	// the normal pipeline and its recipe. Published whole or not: the draw is committed. The cache's m_mutex only, no other
-	// lock held.)
-	if (h.adopted != nullptr) {
-		m_context.GetPipelineCache().CommitAdopted(*h.adopted);
-		h.adopted.reset();
-	}
+	TableEntrySettleInOrder(h); // (done at the commit already when the rest waited: SettleOrQueue)
 	if (h.poisoned.load(std::memory_order_relaxed)) return TableEntryOrphan(holder);
-	if (h.state != nullptr) {
-		auto& textures = m_context.GetTextureCache(); // (as NativeXprCaptureState notes its targets)
-		for (const auto& target: h.state->targets) textures.NoteMetaUse(target.metadata, target.id.index);
-	}
 	bool whole = true;
 	{
 		const auto write = CatalogWrite();
