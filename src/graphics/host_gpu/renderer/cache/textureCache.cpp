@@ -3503,6 +3503,31 @@ vk::ImageView TextureCache::FindTextureReadOnly(ImageId id, const ImageDesc& des
 	return view;
 }
 
+int TextureCache::MetadataBindNoopLocked(const Image& image, const ImageDesc& desc) const {
+	// (FindTexture's metadata step is PrepareDccClear: on an image without metadata, a view without DCC changes nothing.)
+	if (!image.info.HasMetadata() && desc.info.metadata.kind != ImageMetadataKind::Dcc) return 0;
+	if (image.info.IsDepth() || desc.info.IsDepth() || image.depth_id || image.info.IsVolume() || desc.info.IsVolume())
+		return 1;
+	if (!(image.info.metadata == desc.info.metadata)) return 2;
+	const auto& meta  = desc.info.metadata;
+	const auto  found = m_surface_metas.find(meta.range.address);
+	if (meta.kind == ImageMetadataKind::Dcc && (found == m_surface_metas.end() || found->second.type != MetaDataInfo::Type::Dcc))
+		return 3;
+	if (found != m_surface_metas.end()) {
+		const uint32_t first = desc.view_info.base_layer, count = desc.view_info.layer_count;
+		if (first >= 32 || count == 0 || count > 32 - first) return 4; // (past the mask's layers: taken as cleared)
+		const uint32_t mask = count == 32 ? ~0u : ((1u << count) - 1u) << first;
+		if ((found->second.clear_mask & mask) != 0) return 4;
+	}
+	return 0;
+}
+
+bool TextureCache::MetadataBindNoop(ImageId id, const ImageDesc& desc) {
+	std::scoped_lock lock {m_lock};
+	const auto*      image = m_slot_images.try_get(id);
+	return image != nullptr && MetadataBindNoopLocked(*image, desc) == 0;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool may_fail) {
 	if (ReadOnly()) return FindImageReadOnly(desc, exact_format);
 	size_t         slow_candidates = 0;

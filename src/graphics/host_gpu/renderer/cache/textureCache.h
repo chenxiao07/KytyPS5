@@ -142,6 +142,15 @@ public:
 	                                  vk::Format format = vk::Format::eUndefined, uint32_t* count = nullptr);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindTextureReadOnly(ImageId id, const ImageDesc& desc); // (t_read_only)
+	// 0 when FindTexture of `desc` on `image` leaves the metadata state as it is: on an image without metadata a view
+	// without DCC (PrepareDccClear changes nothing); else a colour, non-volume image with no depth association, whose
+	// metadata is the view's (no adoption: PrepareDccClear's validity and serial move, MoveMeta), a DCC one's entry
+	// already there and classified DCC (no insert, no PendingDcc promotion), and no clear pending over the view's layers
+	// (no ClearImage). Else why not: 1 depth / volume / associated, 2 another metadata, 3 no DCC entry, 4 a clear
+	// pending. Caller holds m_lock.
+	[[nodiscard]] int MetadataBindNoopLocked(const Image& image, const ImageDesc& desc) const;
+	// ... taking the lock (the commit's TableCompletePendingImages, the GPU thread).
+	[[nodiscard]] bool MetadataBindNoop(ImageId id, const ImageDesc& desc);
 	// Whether FindTexture with `desc` uploads anything first: guest bytes the CPU wrote, a GPU buffer write over them or
 	// over the stencil plane. A sampled view of a texture whose levels below it stay dirty (RefreshTextureLevels) needs
 	// its own levels' bytes only. Caller holds no lock (the render thread's images).

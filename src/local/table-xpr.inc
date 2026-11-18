@@ -106,6 +106,10 @@ struct RenderExecutor::TableImageSet {
 		vk::DescriptorType      type    = vk::DescriptorType::eSampledImage;
 		TextureCache::ImageDesc desc;
 		vk::ImageLayout         layout  = vk::ImageLayout::eShaderReadOnlyOptimal;
+		// Its view has metadata: the commit re-tests FindTexture's metadata step before it (MetadataBindNoop; the segment
+		// stops when the step would change anything: an image found without the view's metadata would have it adopted in
+		// Before) and notes the use as the owner's build does (NoteMetaUse).
+		bool                    metadata = false;
 	};
 	std::vector<PendingImage> pending_images;
 	// A speculation's proposal (spec_worker_sets): the Spec::State::id of the translation that built it (0: the owner's),
@@ -1007,6 +1011,9 @@ bool RenderExecutor::TableCompletePendingImages(TableImageSet& set) {
 		auto       desc    = pending.desc;
 		const auto id      = textures.FindImage(desc, false, true); // (may fail: no memory for it, a refusal)
 		if (!id) continue;
+		// (Its view with metadata: FindTexture's metadata step still a no-op here, the in-order point before the work,
+		// else the slot fails and the segment stops.)
+		if (pending.metadata && !textures.MetadataBindNoop(id, desc)) continue;
 		const auto view = textures.FindTexture(id, desc);
 		if (!view) continue;
 		auto& image = textures.GetImage(id);
@@ -1033,6 +1040,8 @@ bool RenderExecutor::TableCompletePendingImages(TableImageSet& set) {
 		dep.range  = range;
 		dep.desc   = desc;
 		set.image_ids.push_back(id);
+		// (Its view's metadata noted as the owner's build notes a dep's, KYTY_TABLE_SERIALS.)
+		if (pending.metadata) textures.NoteMetaUse(desc.info.metadata.range.address, id.index);
 		++done;
 	}
 	if (!writes.empty())
@@ -1451,7 +1460,8 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 						const auto& desc = *bound.pending_desc;
 						set->pending_images.push_back({item.write.dstBinding, element, item.write.descriptorType, desc,
 						                               desc.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-						                                                   : vk::ImageLayout::eShaderReadOnlyOptimal});
+						                                                   : vk::ImageLayout::eShaderReadOnlyOptimal,
+						                               desc.info.HasMetadata()});
 					}
 					image_infos.push_back(MakeImageInfo(bound, occurrences.at(resource)++));
 					++element;
