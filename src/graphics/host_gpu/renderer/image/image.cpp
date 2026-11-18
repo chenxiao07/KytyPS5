@@ -188,6 +188,7 @@ Spec::ImageEntry* Image::SpeculativeEntry() {
 		entry->sample_lo             = UINT32_MAX; // (redo_level_precise: the segment's accesses, from its first)
 		entry->sample_hi             = 0;
 		entry->sample_other          = false;
+		entry->writes                = 0;
 		spec->used.push_back(found->second);
 	}
 	return entry;
@@ -214,6 +215,14 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 		} else {
 			entry->sample_other = true;
 		}
+		// (Its write accesses, by kind: Spec::ImageUse::writes.)
+		using Access = vk::AccessFlagBits2;
+		if (static_cast<bool>(destination_access & (Access::eColorAttachmentWrite | Access::eDepthStencilAttachmentWrite)))
+			entry->writes |= Spec::ImageUse::WriteTarget;
+		if (static_cast<bool>(destination_access & (Access::eShaderWrite | Access::eShaderStorageWrite)))
+			entry->writes |= Spec::ImageUse::WriteStorage;
+		if (static_cast<bool>(destination_access & (Access::eTransferWrite | Access::eHostWrite | Access::eMemoryWrite)))
+			entry->writes |= Spec::ImageUse::WriteOther;
 	}
 	const bool partial =
 	    range && (range->base_level != 0 || range->level_count != info.resources.levels ||

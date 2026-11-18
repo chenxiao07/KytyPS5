@@ -159,6 +159,10 @@ public:
 	[[nodiscard]] int MetadataBindNoopLocked(const Image& image, const ImageDesc& desc) const;
 	// ... taking the lock (the commit's TableCompletePendingImages, the GPU thread).
 	[[nodiscard]] bool MetadataBindNoop(ImageId id, const ImageDesc& desc);
+	// A speculation's commit, before a pending slot's completion (read only): whether `written` holds a part of one of the
+	// images over [address, address + size) (the in-order FindImage's candidates, FindImagesInRegion(.., false)): its
+	// data, its metadata range (HasMetadata) or its stencil plane (HasStencil).
+	[[nodiscard]] bool ImagesOverWritten(uint64_t address, uint64_t size, const std::function<bool(uint64_t, uint64_t)>& written);
 	// Whether FindTexture with `desc` uploads anything first: guest bytes the CPU wrote, a GPU buffer write over them or
 	// over the stencil plane. A sampled view of a texture whose levels below it stay dirty (RefreshTextureLevels) needs
 	// its own levels' bytes only. Caller holds no lock (the render thread's images).

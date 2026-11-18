@@ -1161,6 +1161,9 @@ static bool CommitVerifyDue() {
 	return every > 0 && ++count % static_cast<uint64_t>(every) == 0;
 }
 
+static bool SegmentWritesRange(const Spec::State& state, size_t index, const Spec::Counts& from, const Spec::Counts& to,
+                               uint64_t address, uint64_t size); // (below)
+
 Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcessor& cp) {
 	m_renderer.GetBufferCache().ServeAhead(); // (spec_buffer_ahead: the ranges speculations found no buffer over)
 	auto&       scheduler = m_renderer.GetCommandScheduler();
@@ -1346,6 +1349,36 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 				              state.sets.begin() + static_cast<ptrdiff_t>(to.sets), retired) !=
 				    state.sets.begin() + static_cast<ptrdiff_t>(to.sets))
 					return ++m_stop_reasons["commit: a hole retired a set"], Progress::Stopped;
+			// spec_set_cpu_dirty_stop off: the guards that keep a set with pending slots an earlier segment proposed from
+			// being bound again (TableResolveSet, TableTransit, TableValidateSet) are off, so this segment may bind a set an
+			// earlier segment's commit completed (its Before, before this segment's writes). Each completed slot's image
+			// (its data, metadata range, stencil plane) is tested against this segment's writes, the whole segment
+			// (SegmentWritesRange: its Before applies them after these checks, its replay and After after that): one written
+			// stops it, as one no longer the image completed (erased, or its serial moved: its memory unknown). Only the sets
+			// it binds (State::sets; ProposedSet::completed, recorded with the switch off).
+			if (!Spec::SetCpuDirtyStopOn() && to.sets > from.sets) {
+				auto&      textures    = m_renderer.GetTextureCache();
+				const auto bound_begin = state.sets.begin() + static_cast<ptrdiff_t>(from.sets);
+				const auto bound_end   = state.sets.begin() + static_cast<ptrdiff_t>(to.sets);
+				const auto written     = [&](uint64_t address, uint64_t size) {
+					return SegmentWritesRange(state, index, from, to, address, size);
+				};
+				for (const auto& proposed: state.proposed_sets) {
+					if (proposed.segment >= index || proposed.completed.empty() ||
+					    std::find(bound_begin, bound_end, proposed.completed.front().set) == bound_end)
+						continue;
+					for (const auto& slot: proposed.completed) {
+						if (!textures.LiveImageId(*slot.image) || slot.image->serial != slot.serial)
+							return ++m_stop_reasons["commit: a completed pending image moved"], Progress::Stopped;
+						const auto& info = slot.image->info;
+						if (written(info.data.address, info.data.size) ||
+						    (info.HasMetadata() && written(info.metadata.range.address, info.metadata.range.size)) ||
+						    (info.HasStencil() && written(info.stencil.address, info.stencil.size)))
+							return ++m_stop_reasons["commit: a completed pending image's memory written by its segment"],
+							       Progress::Stopped;
+					}
+				}
+			}
 			if (effects.stamped) {
 				if (any_since)
 					for (size_t i = from.cpu_copies; i < to.cpu_copies; ++i) {
@@ -1476,6 +1509,41 @@ static bool ImageGoneInBefore(TextureCache& textures, const Image& image, uint64
 	return image.serial != serial || (at_start.registered && !image.registered);
 }
 
+// Whether segment `index`'s work (its counts [from, to)) writes [address, address + size), by what its commit's Before
+// applies after a pending slot's completion: the ranges its GPU work writes (written: the buffers its shaders write;
+// invalidated: the image-invalidating GPU writes), its guest memory writes (the journal, made in After: labels,
+// WRITE_DATA words, copy destinations), the images its own work writes (Segment::images, ImageUse::writes: a colour or
+// depth / stencil target, a storage image, a transfer, a clear; by the image's data, metadata range or stencil plane) and
+// the targets its Before acquires after the completion (State::pending_targets: an upload or a clear).
+static bool SegmentWritesRange(const Spec::State& state, size_t index, const Spec::Counts& from, const Spec::Counts& to,
+                               uint64_t address, uint64_t size) {
+	if (size == 0) return false;
+	const auto meets = [&](uint64_t begin, uint64_t bytes) { return bytes != 0 && begin < address + size && address < begin + bytes; };
+	const auto over  = [&](const std::vector<Spec::Range>& list, size_t a, size_t b) {
+		for (size_t k = a; k < std::min(b, list.size()); ++k)
+			if (list[k].begin < address + size && address < list[k].end) return true;
+		return false;
+	};
+	if (over(state.written, from.written, to.written) || over(state.invalidated, from.invalidated, to.invalidated)) return true;
+	for (size_t k = from.writes; k < std::min(to.writes, state.writes.size()); ++k)
+		if (meets(state.writes[k].address, state.writes[k].size)) return true;
+	const auto image_over = [&](const ImageInfo& info) {
+		return meets(info.data.address, info.data.size) ||
+		       (info.HasMetadata() && meets(info.metadata.range.address, info.metadata.range.size)) ||
+		       (info.HasStencil() && meets(info.stencil.address, info.stencil.size));
+	};
+	for (const auto& use: state.closed[index].images)
+		if (use.writes != 0 && use.image != nullptr && use.image->serial == use.serial && image_over(use.image->info))
+			return true;
+	for (size_t k = from.pending_targets; k < std::min(to.pending_targets, state.pending_targets.size()); ++k) {
+		const auto& target = state.pending_targets[k];
+		if (target.image != nullptr && target.image->serial == target.serial && image_over(target.image->info)) return true;
+		if (target.depth_desc && image_over(static_cast<const TextureCache::ImageDesc*>(target.depth_desc.get())->info))
+			return true;
+	}
+	return false;
+}
+
 void Speculation::Before(Result& result, size_t index) {
 	const Spec::EffectSourceScope source(Spec::EffectSource::Commit);
 	auto&       resources = m_renderer.GetGpuResources();
@@ -1590,9 +1658,17 @@ void Speculation::Before(Result& result, size_t index) {
 			if (proposed.segment == index && proposed.check) {
 				if (!proposed.check()) state.images_failed = true;
 			}
+	// A completion uploads its images' bytes, metadata and stencil plane now, before the segment's own writes over them
+	// execute (the replay, After), and leaves them clean: in order a write before the bind is uploaded after it, and one
+	// after the bind marks the image again. So a set whose pending slots' memory the segment writes (the whole segment:
+	// SegmentWritesRange) is not completed, and the segment stops.
+	const auto segment_writes = [&](uint64_t address, uint64_t size) {
+		return SegmentWritesRange(state, index, from, to, address, size);
+	};
 	for (auto& proposed: state.proposed_sets)
 		if (proposed.segment == index && proposed.complete) {
-			if (!proposed.complete()) state.images_failed = true;
+			if ((proposed.pending_written && proposed.pending_written(segment_writes)) || !proposed.complete())
+				state.images_failed = true;
 			proposed.complete = nullptr;
 		}
 	// spec_commit_targets: the targets it left to its commit, acquired as the normal path does at the draw, before their

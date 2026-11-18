@@ -369,6 +369,11 @@ struct ImageUse {
 	bool                          found_cpu_dirty = false; // (Image::IsCpuDirty, maybe-dirty too, when the segment found it)
 	uint64_t                      found_validity  = 0;     // (Image::validity then, read before it)
 	bool                          found_stencil_modified = false; // (Image::IsStencilModified then: spec_copy_image_refuse)
+	// The write accesses among the segment's accesses to it (Image::GetBarriers, every transition): WriteTarget a colour
+	// or depth / stencil attachment write, WriteStorage a shader (storage) write, WriteOther any other write (a transfer:
+	// a copy, a clear, an upload; a host or memory write). Its commit's pending-slot test reads them.
+	static constexpr uint8_t      WriteTarget = 1, WriteStorage = 2, WriteOther = 4;
+	uint8_t                       writes = 0;
 };
 
 // The 64 KiB granules ranges were added over, hashed into 4096 bits, and up to BigRanges ranges over 64 granules or
@@ -478,6 +483,7 @@ struct ImageEntry {
 	bool                          found_cpu_dirty = false; // (spec_set_cpu_dirty_stop)
 	uint64_t                      found_validity  = 0;
 	bool                          found_stencil_modified = false; // (spec_copy_image_refuse)
+	uint8_t                       writes = 0; // (the open segment's write accesses: ImageUse::writes)
 };
 
 // (spec_predict_dcc=3.) The fast clears speculations' holes will consume, by surface and slice, until that speculation
@@ -576,6 +582,18 @@ struct State {
 		bool                      settled = false;
 		std::function<void(bool)> settle;
 		std::function<bool()>     complete; // (spec_worker_images: its pending slots, at its segment's commit; empty: none)
+		// (With `complete`, read only, at its segment's commit before it: whether `written` holds any of the memory its
+		// completion uploads from: each pending slot's own desc range (data, metadata range, stencil plane) and every
+		// image over the slot's bytes as FindImage would meet them (TextureCache::ImagesOverWritten).)
+		std::function<bool(const std::function<bool(uint64_t, uint64_t)>&)> pending_written;
+		// (spec_set_cpu_dirty_stop off: the images `complete` made its pending slots', each as it was then (its serial), and
+		// the set's descriptor set handle as State::sets notes it, for the commits of later segments that bind the set.)
+		struct Completed {
+			const Image* image  = nullptr;
+			uint64_t     serial = 0;
+			uint64_t     set    = 0;
+		};
+		std::vector<Completed> completed;
 		std::function<bool()>     check; // (spec_proposed_check: still current at its segment's commit)
 	};
 	std::vector<ProposedSet> proposed_sets;
@@ -1317,7 +1335,7 @@ struct State {
 			                          std::move(entry.found_subresources), entry.subresources, entry.found_group,
 			                          entry.group, entry.found_buffer_modified, entry.sample_lo, entry.sample_hi,
 			                          entry.sample_other, entry.found_cpu_dirty, entry.found_validity,
-			                          entry.found_stencil_modified});
+			                          entry.found_stencil_modified, entry.writes});
 			entry.used = false;
 		}
 		used.clear();

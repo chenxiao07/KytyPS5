@@ -3528,6 +3528,19 @@ bool TextureCache::MetadataBindNoop(ImageId id, const ImageDesc& desc) {
 	return image != nullptr && MetadataBindNoopLocked(*image, desc) == 0;
 }
 
+bool TextureCache::ImagesOverWritten(uint64_t address, uint64_t size,
+                                     const std::function<bool(uint64_t, uint64_t)>& written) {
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto& info = m_slot_images[id].info;
+		if (written(info.data.address, info.data.size) ||
+		    (info.HasMetadata() && written(info.metadata.range.address, info.metadata.range.size)) ||
+		    (info.HasStencil() && written(info.stencil.address, info.stencil.size)))
+			return true;
+	}
+	return false;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool may_fail) {
 	if (ReadOnly()) return FindImageReadOnly(desc, exact_format);
 	size_t         slow_candidates = 0;

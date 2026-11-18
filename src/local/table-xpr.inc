@@ -1154,8 +1154,39 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				                               }
 				                               TableKeepAside(holder);
 			                               }});
-			if (!raw->pending_images.empty())
-				spec->proposed_sets.back().complete = [owner, raw] { return owner->TableCompletePendingImages(*raw); };
+			if (!raw->pending_images.empty()) {
+				// (spec_set_cpu_dirty_stop off: the images it completes, each with its serial, and the set's handle, for the
+				// commits of later segments that bind it: Speculation::CommitSegments' reuse test.)
+				spec->proposed_sets.back().complete = [owner, raw, spec, index = spec->proposed_sets.size() - 1] {
+					const auto first = raw->images.size();
+					const bool ok    = owner->TableCompletePendingImages(*raw);
+					if (!Spec::SetCpuDirtyStopOn()) {
+						auto&      textures  = owner->m_context.GetTextureCache();
+						auto&      completed = spec->proposed_sets[index].completed;
+						const auto handle    = reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(raw->set));
+						for (size_t i = first; i < raw->images.size(); ++i)
+							if (const auto* image = textures.TryGetImage(raw->images[i].id))
+								completed.push_back({image, raw->images[i].serial, handle});
+					}
+					return ok;
+				};
+				// (The memory its completion uploads from, for the commit's test before it against the committing segment's
+				// writes (Speculation::Before): each pending slot's own desc range, metadata and stencil plane, and the images
+				// over the slot's bytes as FindImage would meet them. Read only, the GPU thread.)
+				spec->proposed_sets.back().pending_written =
+				    [owner, raw](const std::function<bool(uint64_t, uint64_t)>& written) {
+					    auto& textures = owner->m_context.GetTextureCache();
+					    for (const auto& pending: raw->pending_images) {
+						    const auto& info = pending.desc.info;
+						    if (written(info.data.address, info.data.size) ||
+						        (info.HasMetadata() && written(info.metadata.range.address, info.metadata.range.size)) ||
+						        (info.HasStencil() && written(info.stencil.address, info.stencil.size)) ||
+						        textures.ImagesOverWritten(info.data.address, info.data.size, written))
+							    return true;
+					    }
+					    return false;
+				    };
+			}
 			// (spec_proposed_check: what TableValidateSet's first steps ask, at the commit: the BDA page table's generation
 			// the set's, and each image the one it was built with.)
 			spec->proposed_sets.back().check = [owner, raw] {
