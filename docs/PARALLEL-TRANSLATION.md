@@ -80,6 +80,7 @@ switch acts only in mode 4. A verify switch N checks every Nth use against the p
 | speculate_flush_every | a commit's held buffers flushed every Nth commit | - | 8 | |
 | speculate_keep_pass | a segment that recorded nothing keeps the open render pass | - | 1 | |
 | serve_in_waits (changed) | guest commands served while the render thread waits (bits); mode 4 adds 2 and 4 | 1 | 7 | |
+| spec_gpu_affinity | the GPU thread's CPUs less every core the workers run on (SMT siblings with them), set at the next flip and given back out of mode 4; not changed where fewer than 2 performance cores would be left (the log says why) | - | 1 | |
 | **The write guard** | | | | |
 | KYTY_WRITE_GUARD (changed in mode 4) | a guest write lands at once, hidden from the game until older uploads are done (off in mode 0 as upstream: the protection churn behind #5 / #50) | 0 | 1 | |
 | write_guard_spec | the guard in mode 4 too | - | 1 | |

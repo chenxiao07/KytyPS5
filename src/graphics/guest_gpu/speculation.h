@@ -114,6 +114,9 @@ public:
 	// commits).
 	[[nodiscard]] Spec::EffectsLog& Log() noexcept { return m_log; }
 	[[nodiscard]] static uint64_t NowNs() noexcept;
+	// The GPU thread (KYTY_SPEC_GPU_AFFINITY, live spec_gpu_affinity; on under KYTY_SPECULATE=4): its CPUs without the
+	// speculation workers' cores, taken at a guest flip in mode 4 and given back out of it (speculation.cpp).
+	static void GpuThreadAffinityAtFlip();
 
 private:
 	// A packet left to the commit (Spec::State::closed: it follows the segment of its index), why, and the

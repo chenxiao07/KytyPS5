@@ -1450,7 +1450,10 @@ void GuestGpu::ThreadRun(void* data) {
 		// (Mode 0 once no speculation thread is left: Spec::Current(), the recorder and executor accessors read the global
 		// first, so a thread still translating would otherwise take the normal path. No packet runs in between: this is
 		// the GPU thread between submissions.)
-		if (want == 0) kyty_local_speculate_mode.store(0, std::memory_order_relaxed);
+		if (want == 0) {
+			kyty_local_speculate_mode.store(0, std::memory_order_relaxed);
+			Speculation::GpuThreadAffinityAtFlip(); // (KYTY_SPEC_GPU_AFFINITY: the GPU thread's mask given back, if changed)
+		}
 		std::printf("Mode: KYTY_SPECULATE=%d (live)\n", want);
 		std::fflush(stdout);
 		Loader::DemonsSoulsWarp::ShowNotice(want == 4 ? "Mode 4 (speculation on)" : "Mode 0 (speculation off)", 3);
@@ -4122,6 +4125,9 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 void CommandProcessor::Flip() {
 	LiveControl::Flip();
 	FrameCapture::OnFlip();
+	// (KYTY_SPEC_GPU_AFFINITY, mode 4: the GPU thread's CPUs without the workers' cores, taken here after a change.)
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && GuestGpu::IsGpuThread())
+		Speculation::GpuThreadAffinityAtFlip();
 	CheckBuffer();
 	// (As a CPU flip's preparation does: optimized builds in place, idle shader plans out of memory.)
 	m_renderer.GetPipelineCache().PromoteFinished();

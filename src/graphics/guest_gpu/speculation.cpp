@@ -383,6 +383,76 @@ static const std::string& PassCpus() {
 	return cpus;
 }
 
+// KYTY_SPEC_GPU_AFFINITY (live spec_gpu_affinity; on under KYTY_SPECULATE=4, nothing done in mode 0): the GPU thread kept
+// off the physical cores the speculation workers run on, still free over the rest of its own: its mask as set today
+// (KYTY_RENDER_CPUS, or the process's) less every logical CPU of a core that holds a CPU of the workers' set (the live
+// speculate_cpu_mask, else SpeculationCpus; SMT siblings with it: LocalPlatform::CoresOf). On an 8 P-core + 16 E-core
+// part (GPU thread on CPUs 2-15, workers 8-15) about half the boots ran with the GPU thread's and the workers' work
+// 20-45 % slower; with the GPU thread on 2-7, 3 of 3 were fast. Not done (said at each change) where the workers have no
+// CPU list, or where what is left would hold fewer than two physical performance cores (SMT siblings one core, E-cores
+// none: LocalPlatform::PerformanceCoresIn): a small CPU, or one whose workers take most of it, keeps today's mask
+// (3 P-cores, workers on 3-5: 0-1 and the E-cores left, one performance core). Back to 0, or out of mode 4: the mask it
+// had. Taken at the next flip after a change (the switch's, speculate_cpu_mask's); the GPU thread calls it at each
+// guest flip in mode 4 (CommandProcessor::Flip) and once on a live `mode 0` (GuestGpu::ThreadRun), to restore.
+void Speculation::GpuThreadAffinityAtFlip() {
+	static uint64_t original = 0; // (the GPU thread's mask before it was changed; 0: not changed)
+	static int64_t  seen     = 0;
+	const auto      restore  = [](const char* why) {
+		if (original == 0) return;
+		const bool done = LocalPlatform::SetCurrentThreadAffinity(original);
+		std::printf("Speculation: GPU thread mask 0x%llx %s (spec_gpu_affinity: %s)\n", static_cast<unsigned long long>(original),
+		            done ? "restored" : "NOT restored", why);
+		if (done) original = 0;
+	};
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) {
+		// (Out of mode 4: the mask back, and applied again on the return to 4.)
+		if (original != 0) {
+			restore("mode not 4");
+			original = 0; // (tried once: a refused restore is said, not retried)
+			std::fflush(stdout);
+		}
+		seen = 0;
+		return;
+	}
+	static auto&   on        = LiveSwitch::Find("spec_gpu_affinity", ModeToggle::Default("spec_gpu_affinity"));
+	static auto&   live_cpus = LiveSwitch::Find("speculate_cpu_mask", 0);
+	static int64_t seen_cpus = 0;
+	const int64_t  value     = on.load(std::memory_order_relaxed);
+	const int64_t  cpus      = live_cpus.load(std::memory_order_relaxed);
+	if (value == seen && (value == 0 || cpus == seen_cpus)) return;
+	seen      = value;
+	seen_cpus = cpus;
+	if (value == 0) {
+		restore("off");
+		std::fflush(stdout);
+		return;
+	}
+	const uint64_t workers = cpus != 0 ? static_cast<uint64_t>(cpus) : LocalPlatform::CpuListMask(SpeculationCpus().first.c_str());
+	const uint64_t current = original != 0 ? original : LocalPlatform::CurrentThreadAffinity();
+	const uint64_t wanted  = current & ~LocalPlatform::CoresOf(workers); // (whole cores: the workers' SMT siblings too)
+	const uint32_t cores   = LocalPlatform::PerformanceCoresIn(wanted);
+	const char*    refused = workers == 0        ? "the workers have no CPU list"
+	                         : current == 0      ? "the GPU thread's mask is not known"
+	                         : wanted == current ? "the GPU thread's CPUs and the workers' are apart already"
+	                         : cores < 2         ? "fewer than 2 performance cores would be left to the GPU thread"
+	                                             : nullptr;
+	if (refused == nullptr && !LocalPlatform::SetCurrentThreadAffinity(wanted)) refused = "the OS refused the mask";
+	if (refused != nullptr) {
+		std::printf("Speculation: GPU thread affinity not changed: %s (mask 0x%llx, workers 0x%llx, %u performance cores "
+		            "left; spec_gpu_affinity)\n",
+		            refused, static_cast<unsigned long long>(current), static_cast<unsigned long long>(workers), cores);
+		restore(refused);
+		std::fflush(stdout);
+		return;
+	}
+	if (original == 0) original = current;
+	std::printf("Speculation: GPU thread mask 0x%llx -> 0x%llx (%u performance cores), off the cores of the workers' 0x%llx "
+	            "(spec_gpu_affinity)\n",
+	            static_cast<unsigned long long>(current), static_cast<unsigned long long>(wanted), cores,
+	            static_cast<unsigned long long>(workers));
+	std::fflush(stdout);
+}
+
 void Speculation::AheadRun(Translator& translator) {
 	LocalPlatform::SetThreadName(translator.pass_only ? "Kyty.SpecPass" : "Kyty.Speculation");
 	// (Worker packets, live spec_worker_packets: its segments recorded as packets, spliced at commit. Armed only
