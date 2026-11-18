@@ -440,28 +440,46 @@ private:
     static std::vector<std::span<const uint32_t>> Views(const std::vector<std::vector<uint32_t>>& entries) {
         return std::vector<std::span<const uint32_t>>(entries.begin(), entries.end());
     }
-    // (Each record as Words writes it: its size, then its words.)
+    // (Each list's count, then each record as Words writes it: its size, then its words.) The checksum is taken in a
+    // first pass over the views and the words written in a second, from where the cache holds them: no copy of the
+    // whole recording at each save (~100 MB for a game played through, every few seconds while new shaders come).
     bool SaveSnapshot(const std::vector<std::span<const uint32_t>>& saved,
                       const std::vector<std::span<const uint32_t>>& saved_pipelines) {
-        Writer writer;
+        uint64_t total_words = 0;
         for (const auto* entries : {&saved, &saved_pipelines}) {
-            uint32_t count = uint32_t(entries->size()); writer(count);
+            total_words += 1;
             for (const auto record : *entries) {
-                uint32_t size = uint32_t(record.size()); writer(size);
                 if (record.size() > 1024 * 1024) return false;
-                writer.words.insert(writer.words.end(), record.begin(), record.end());
-                if (writer.words.size() * 4 > MaxBytes - identity.size() - 8) return false;
+                total_words += 1 + record.size();
+                if (total_words * 4 > MaxBytes - identity.size() - 8) return false;
             }
         }
+        const auto each_part = [&](auto&& sink) {
+            for (const auto* entries : {&saved, &saved_pipelines}) {
+                const uint32_t count = uint32_t(entries->size());
+                sink(&count, sizeof(count));
+                for (const auto record : *entries) {
+                    const uint32_t size = uint32_t(record.size());
+                    sink(&size, sizeof(size));
+                    sink(record.data(), record.size() * 4);
+                }
+            }
+        };
+        XXH3_state_t* state = XXH3_createState();
+        if (state == nullptr || XXH3_64bits_reset(state) != XXH_OK) return XXH3_freeState(state), false;
+        bool hashed = true;
+        each_part([&](const void* data, size_t bytes) { hashed = hashed && XXH3_64bits_update(state, data, bytes) == XXH_OK; });
+        const uint64_t checksum = XXH3_64bits_digest(state);
+        XXH3_freeState(state);
+        if (!hashed) return false;
         std::error_code ec;
         if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path(), ec);
         if (ec) return false;
         auto temporary = path; temporary += ".tmp";
         std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-        const auto bytes = writer.words.size() * 4;
-        const uint64_t checksum = XXH3_64bits(writer.words.data(), bytes);
         file.write(identity.data(), identity.size()); file.write(reinterpret_cast<const char*>(&checksum), 8);
-        file.write(reinterpret_cast<const char*>(writer.words.data()), bytes); file.close();
+        each_part([&](const void* data, size_t bytes) { file.write(static_cast<const char*>(data), std::streamsize(bytes)); });
+        file.close();
         if (!file) return false;
         std::filesystem::rename(temporary, path, ec);
         return !ec;
