@@ -1764,13 +1764,55 @@ void Speculation::Before(Result& result, size_t index) {
 	// (With spec_set_cpu_dirty_stop on, Changed stops the segment first at an image already unregistered when it ran.)
 	// (Was an EXIT_IF on the serial alone; then registered-or-null-image too, which stopped ~0.9 segments a frame on the
 	// 1-3 walk in mode 4 for images merely unregistered before Before: 9,701 "a pending target not acquired" stops.)
+	// A use found Undefined (whole, or a subresource) where the image's state now is defined: a hole before this segment
+	// in order (the overlay never sees one), or this Before's own completion or acquisition, defined it after the
+	// segment's thread looked. The restore would record a barrier back to Undefined (invalid usage, the contents
+	// discarded) and After would leave the image Undefined, so the next in-order Transit zeroes it. So:
+	// - a use the segment recorded no barrier on (no Image::GetBarriers call: sample_lo still UINT32_MAX, sample_other
+	//   clear; the entry a refused draw's TableEarlyEntry left), found wholly Undefined: no restore, and After leaves its
+	//   state (keep_state). Exact: none of the segment's commands names the image's layout (each transition is a
+	//   GetBarriers call, which marks the entry), and in order the segment does nothing to its state (the refused draw is a
+	//   hole, run in order after the commit), so the in-order state is the one it has now.
+	// - any other: the segment stops before the splice (target_failed), its restore not made. Its recorded barriers start
+	//   from Undefined (discard; or Image::Transit's zero clear, which in order the defined image never gets): no state
+	//   the restore could reach gives the in-order contents. A stop is exact: the image keeps its state and contents, and
+	//   the in-order path runs the segment's packets again.
 	const bool erased = textures.EraseEpoch() != erase_epoch;
 	for (size_t i = 0; i < segment.images.size(); ++i) {
-		const auto& use = segment.images[i];
+		auto& use      = state.closed[index].images[i];
+		use.keep_state = false;
 		if (ImageGoneInBefore(textures, *use.image, use.serial, images_at_start[i], erased)) {
 			state.target_failed = true;
 			LiveCounters::Add(LiveCounters::SpecImageGoneInBeforeN);
 			continue;
+		}
+		const auto undefined   = [](const VulkanImageState& s) { return s.layout == vk::ImageLayout::eUndefined; };
+		const bool whole_undef = use.found_subresources.empty() && undefined(use.found);
+		if (whole_undef || std::ranges::any_of(use.found_subresources, undefined)) {
+			if (use.sample_lo == UINT32_MAX && !use.sample_other && whole_undef) {
+				use.keep_state = true;
+				continue;
+			}
+			bool now_defined = false; // (at an index found Undefined: the backing's state there now)
+			{
+				const Image::StateLock lock(*use.image);
+				const auto&            now   = use.image->backing.subresource_states;
+				const uint32_t         count = use.image->info.resources.levels * use.image->info.resources.layers;
+				if (use.found_subresources.empty() && now.empty()) {
+					now_defined = !undefined(use.image->backing.state);
+				} else {
+					// (Either side whole: its one state at every index.)
+					for (uint32_t k = 0; k < count && !now_defined; ++k) {
+						const auto& found_k = k < use.found_subresources.size() ? use.found_subresources[k] : use.found;
+						const auto& now_k   = k < now.size() ? now[k] : use.image->backing.state;
+						now_defined         = undefined(found_k) && !undefined(now_k);
+					}
+				}
+			}
+			if (now_defined) {
+				state.target_failed = true;
+				continue;
+			}
 		}
 		use.image->RestoreState(use.found, use.found_subresources, scheduler.Current().Handle());
 	}
@@ -1805,6 +1847,11 @@ void Speculation::After(Result& result, size_t index) {
 	}
 	for (auto& use: state.closed[index].images) {
 		const Image::StateLock lock(*use.image);
+		// (A use Before did not restore keeps the state it has, its in-order state: see Before's restore loop.)
+		if (use.keep_state) {
+			MoveImageStateEpoch(use.image);
+			continue;
+		}
 		use.image->backing.state              = use.left;
 		use.image->backing.subresource_states = std::move(use.left_subresources);
 		use.image->transit_group              = use.left_group;

@@ -374,6 +374,9 @@ struct ImageUse {
 	// a copy, a clear, an upload; a host or memory write). Its commit's pending-slot test reads them.
 	static constexpr uint8_t      WriteTarget = 1, WriteStorage = 2, WriteOther = 4;
 	uint8_t                       writes = 0;
+	// Its segment's Before left the image's state as it was (no restore), and After leaves it too (no left state
+	// written): a use with no barrier recorded, found wholly Undefined (Speculation::Before's restore loop).
+	bool                          keep_state = false;
 };
 
 // The 64 KiB granules ranges were added over, hashed into 4096 bits, and up to BigRanges ranges over 64 granules or
