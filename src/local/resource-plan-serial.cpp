@@ -22,7 +22,7 @@ constexpr uint32_t Magic   = 0x324c5052u; // "RPL2"
 // A field added to one of these types must be added here too (Save, Load and Same). The sizes are the 64-bit Windows
 // build's (Microsoft's STL; libstdc++'s containers have other sizes: the Linux build checks nothing here).
 #if defined(_MSC_VER) || defined(_WIN32)
-static_assert(sizeof(void*) != 8 || sizeof(IR::ResourcePlan) == 520, "ResourcePlan changed: update resource-plan-serial");
+static_assert(sizeof(void*) != 8 || sizeof(IR::ResourcePlan) == 536, "ResourcePlan changed: update resource-plan-serial");
 static_assert(sizeof(void*) != 8 || sizeof(IR::ShaderInfo) == 192, "ShaderInfo changed: update resource-plan-serial");
 static_assert(sizeof(void*) != 8 || sizeof(IR::ImageResource) == 88, "ImageResource changed: update resource-plan-serial");
 static_assert(sizeof(void*) != 8 || sizeof(IR::StageInput) == 56, "StageInput changed: update resource-plan-serial");
@@ -303,6 +303,7 @@ bool Load(std::span<const uint8_t> bytes, IR::ResourcePlan& plan, bool* defer_li
 		return false;
 	std::vector<IR::Inst*> insts;
 	insts.reserve(count);
+	plan.value_storage.reserve(count); // (one block: IR::PlanValues)
 	for (uint32_t i = 0; i < count; ++i) {
 		IR::ValueOpcode opcode {};
 		uint64_t        flags = 0;
