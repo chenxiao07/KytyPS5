@@ -1,6 +1,6 @@
 --- a/include/zarchive/zarchivecommon.h
 +++ b/include/zarchive/zarchivecommon.h
-@@ -256,7 +256,7 @@
+@@ -256,7 +256,7 @@ namespace _ZARCHIVE
  
  			bool IsWithinValidRange(uint64_t fileSize) const
  			{
@@ -9,9 +9,59 @@
  			}
  		};
  
+--- a/include/zarchive/zarchivereader.h
++++ b/include/zarchive/zarchivereader.h
+@@ -8,6 +8,7 @@
+ 
+ #include <filesystem>
+ #include <fstream>
++#include <memory>
+ 
+ #include "zarchivecommon.h"
+ 
+@@ -27,6 +28,9 @@ public:
+ 	};
+ 
+ 	static ZArchiveReader* OpenFromFile(const std::filesystem::path& path);
++	// Another reader of the same archive (its own file stream and block cache) that shares this one's offset records,
++	// names and file tree, read-only once opened, instead of a copy of them (Kyty: one reader per read lane).
++	ZArchiveReader* OpenSharing(const std::filesystem::path& path) const;
+ 
+ 	~ZArchiveReader();
+ 
+@@ -60,7 +64,14 @@ private:
+ 	CacheBlock* m_lruChainLast;
+ 	std::unordered_map<uint64_t, CacheBlock*> m_blockLookup;
+ 
+-	ZArchiveReader(std::ifstream&& file, std::vector<_ZARCHIVE::CompressionOffsetRecord>&& offsetRecords, std::vector<uint8_t>&& nameTable, std::vector<_ZARCHIVE::FileDirectoryEntry>&& fileTree, uint64_t compressedDataOffset, uint64_t compressedDataSize);
++	struct SharedTables
++	{
++		std::vector<_ZARCHIVE::CompressionOffsetRecord> offsetRecords;
++		std::vector<uint8_t> nameTable;
++		std::vector<_ZARCHIVE::FileDirectoryEntry> fileTree;
++	};
++
++	ZArchiveReader(std::ifstream&& file, std::shared_ptr<SharedTables> tables, uint64_t compressedDataOffset, uint64_t compressedDataSize);
+ 
+ 	CacheBlock* GetCachedBlock(uint64_t blockIndex);
+ 	CacheBlock* RecycleLRUBlock(uint64_t newBlockIndex);
+@@ -73,9 +84,10 @@ private:
+ 	static std::string_view GetName(const std::vector<uint8_t>& nameTable, uint32_t nameOffset);
+ 
+ 	std::ifstream m_file;
+-	std::vector<_ZARCHIVE::CompressionOffsetRecord> m_offsetRecords;
+-	std::vector<uint8_t> m_nameTable;
+-	std::vector<_ZARCHIVE::FileDirectoryEntry> m_fileTree;
++	std::shared_ptr<SharedTables> m_tables; // (before the references into it)
++	std::vector<_ZARCHIVE::CompressionOffsetRecord>& m_offsetRecords;
++	std::vector<uint8_t>& m_nameTable;
++	std::vector<_ZARCHIVE::FileDirectoryEntry>& m_fileTree;
+ 	uint64_t m_compressedDataOffset;
+ 	uint64_t m_compressedDataSize;
+ 	uint64_t m_blockCount;
 --- a/src/zarchivereader.cpp
 +++ b/src/zarchivereader.cpp
-@@ -14,6 +14,7 @@
+@@ -14,6 +14,7 @@ static uint64_t _ifstream_getFileSize(std::ifstream& file)
  
  static bool _ifstream_readBytes(std::ifstream& file, uint64_t offset, void* buffer, uint32_t size)
  {
@@ -19,7 +69,7 @@
  	file.seekg(offset, std::ios_base::beg);
  	file.read((char*)buffer, size);
  	return file.gcount() == size;
-@@ -80,9 +81,27 @@
+@@ -80,18 +81,49 @@ ZArchiveReader* ZArchiveReader::OpenFromFile(const std::filesystem::path& path)
  	// verify file tree
  	if (fileTree[0].IsFile())
  		return nullptr; // first entry must be root directory
@@ -49,7 +99,32 @@
  	// read meta data
  	// todo
  
-@@ -238,7 +257,7 @@
+-	ZArchiveReader* cfs = new ZArchiveReader(std::move(file), std::move(offsetRecords), std::move(nameTable), std::move(fileTree), footer.sectionCompressedData.offset, footer.sectionCompressedData.size);
++	auto tables = std::make_shared<SharedTables>();
++	tables->offsetRecords = std::move(offsetRecords);
++	tables->nameTable = std::move(nameTable);
++	tables->fileTree = std::move(fileTree);
++	ZArchiveReader* cfs = new ZArchiveReader(std::move(file), std::move(tables), footer.sectionCompressedData.offset, footer.sectionCompressedData.size);
+ 	return cfs;
+ }
+ 
+-ZArchiveReader::ZArchiveReader(std::ifstream&& file, std::vector<_ZARCHIVE::CompressionOffsetRecord>&& offsetRecords, std::vector<uint8_t>&& nameTable, std::vector<_ZARCHIVE::FileDirectoryEntry>&& fileTree, uint64_t compressedDataOffset, uint64_t compressedDataSize) :
+-	m_file(std::move(file)), m_offsetRecords(std::move(offsetRecords)), m_nameTable(std::move(nameTable)), m_fileTree(std::move(fileTree)),
++ZArchiveReader* ZArchiveReader::OpenSharing(const std::filesystem::path& path) const
++{
++	std::ifstream file;
++	file.open(path, std::ios_base::in | std::ios_base::binary);
++	if (!file.is_open())
++		return nullptr;
++	return new ZArchiveReader(std::move(file), m_tables, m_compressedDataOffset, m_compressedDataSize);
++}
++
++ZArchiveReader::ZArchiveReader(std::ifstream&& file, std::shared_ptr<SharedTables> tables, uint64_t compressedDataOffset, uint64_t compressedDataSize) :
++	m_file(std::move(file)), m_tables(std::move(tables)), m_offsetRecords(m_tables->offsetRecords), m_nameTable(m_tables->nameTable), m_fileTree(m_tables->fileTree),
+ 	m_compressedDataOffset(compressedDataOffset), m_compressedDataSize(compressedDataSize)
+ {
+ 	m_blockCount = (uint64_t)m_offsetRecords.size() * _ZARCHIVE::ENTRIES_PER_OFFSETRECORD;
+@@ -238,7 +270,7 @@ uint64_t ZArchiveReader::ReadFromFile(ZArchiveNodeHandle nodeHandle, uint64_t of
  		uint32_t stepSize = std::min<uint32_t>(remainingBytes, _ZARCHIVE::COMPRESSED_BLOCK_SIZE - blockOffset);
  		CacheBlock* block = GetCachedBlock(blockIdx);
  		if (!block)
@@ -58,7 +133,7 @@
  		std::memcpy(bufferU8, block->data + blockOffset, stepSize);
  		rawReadOffset += stepSize;
  		remainingBytes -= stepSize;
-@@ -325,14 +344,18 @@
+@@ -325,14 +357,18 @@ bool ZArchiveReader::LoadBlock(CacheBlock* block)
  	// determine offset and size of compressed block
  	auto& record = m_offsetRecords[recordIndex];
  	uint64_t offset = record.baseOffset;
@@ -80,7 +155,7 @@
  		return false;
  	offset += m_compressedDataOffset;
  	if (compressedSize == _ZARCHIVE::COMPRESSED_BLOCK_SIZE)
-@@ -350,7 +373,7 @@
+@@ -350,7 +386,7 @@ bool ZArchiveReader::LoadBlock(CacheBlock* block)
  // returns empty view on failure
  std::string_view ZArchiveReader::GetName(const std::vector<uint8_t>& nameTable, uint32_t nameOffset)
  {
@@ -89,7 +164,7 @@
  		return "";
  	// parse header
  	uint16_t nameLength = nameTable[nameOffset] & 0x7F;
-@@ -359,7 +382,7 @@
+@@ -359,7 +395,7 @@ std::string_view ZArchiveReader::GetName(const std::vector<uint8_t>& nameTable,
  		// extended 2-byte length
  		if (nameOffset + 1 >= nameTable.size())
  			return "";

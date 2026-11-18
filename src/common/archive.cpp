@@ -78,12 +78,12 @@ public:
 
 	uint64_t Read(uint32_t lane, uint64_t id, uint64_t offset, uint32_t size, void* data) override {
 		// ZArchiveReader serializes the calls on its stream and block cache: the lanes after the first read with
-		// readers of their own (opened on a lane's first read; the first one's if that fails).
+		// readers of their own (opened on a lane's first read; the first one's if that fails). They share the first
+		// one's tables (names, file tree, offset records: ~15 MB for a whole game, read-only once opened), each with
+		// its own stream and block cache (3rdparty/patches/zarchive-reader.patch, OpenSharing).
 		auto* reader = m_reader.get();
 		if (lane != 0 && lane < Lanes) {
-			std::call_once(m_lane_opened[lane], [&] {
-				m_lane_readers[lane].reset(ZArchiveReader::OpenFromFile(m_path));
-			});
+			std::call_once(m_lane_opened[lane], [&] { m_lane_readers[lane].reset(m_reader->OpenSharing(m_path)); });
 			if (m_lane_readers[lane] != nullptr) {
 				reader = m_lane_readers[lane].get();
 			}

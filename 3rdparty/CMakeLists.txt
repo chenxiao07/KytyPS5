@@ -29,7 +29,9 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(xbyak zydis)
 
 # ZArchive (.zar): random-access reads of compressed game dumps (upstream's pinned revisions and reader patch). The
-# library and its zstd dependency; zarchive_tool (not built by default) packs a game folder into a .zar.
+# library and its zstd dependency; zarchive_tool (not built by default) packs a game folder into a .zar. The fetch
+# is named after the patch's revision (zarchive_reader2: the read lanes share one reader's tables), so a build
+# directory made with an earlier patch fetches the source again instead of keeping the old patch applied.
 set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
@@ -44,7 +46,7 @@ FetchContent_Declare(
 	SOURCE_SUBDIR build/cmake
 )
 FetchContent_Declare(
-	zarchive_source
+	zarchive_reader2
 	GIT_REPOSITORY https://github.com/Exzap/ZArchive.git
 	GIT_TAG d2c717730092c7bf8cbb033b12fd4001b7c4d932
 	GIT_SHALLOW FALSE
@@ -52,7 +54,7 @@ FetchContent_Declare(
 		"${CMAKE_CURRENT_SOURCE_DIR}/patches/zarchive-reader.patch"
 	SOURCE_SUBDIR kyty-library-only
 )
-FetchContent_MakeAvailable(zstd zarchive_source)
+FetchContent_MakeAvailable(zstd zarchive_reader2)
 
 # Opus: the DualSense's Bluetooth link carries the pad speaker as Opus packets inside HID reports (there is no
 # USB audio endpoint over Bluetooth), so src/libs/dualSenseBluetooth.cpp encodes them with this.
@@ -87,12 +89,12 @@ if(KYTY_MIMALLOC)
 endif()
 
 add_library(zarchive STATIC
-	"${zarchive_source_SOURCE_DIR}/src/zarchivereader.cpp"
-	"${zarchive_source_SOURCE_DIR}/src/zarchivewriter.cpp"
-	"${zarchive_source_SOURCE_DIR}/src/sha_256.c"
+	"${zarchive_reader2_SOURCE_DIR}/src/zarchivereader.cpp"
+	"${zarchive_reader2_SOURCE_DIR}/src/zarchivewriter.cpp"
+	"${zarchive_reader2_SOURCE_DIR}/src/sha_256.c"
 )
 add_library(ZArchive::zarchive ALIAS zarchive)
-target_include_directories(zarchive SYSTEM PUBLIC "${zarchive_source_SOURCE_DIR}/include")
+target_include_directories(zarchive SYSTEM PUBLIC "${zarchive_reader2_SOURCE_DIR}/include")
 target_include_directories(zarchive PRIVATE "${zstd_SOURCE_DIR}/lib")
 target_link_libraries(zarchive PRIVATE libzstd_static)
 target_compile_features(zarchive PRIVATE cxx_std_20)
@@ -102,7 +104,7 @@ else()
 	target_compile_options(zarchive PRIVATE -w)
 endif()
 
-add_executable(zarchive_tool EXCLUDE_FROM_ALL "${zarchive_source_SOURCE_DIR}/src/main.cpp")
+add_executable(zarchive_tool EXCLUDE_FROM_ALL "${zarchive_reader2_SOURCE_DIR}/src/main.cpp")
 target_link_libraries(zarchive_tool PRIVATE zarchive)
 target_compile_features(zarchive_tool PRIVATE cxx_std_20)
 set_target_properties(zarchive_tool PROPERTIES OUTPUT_NAME zarchive)
