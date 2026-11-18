@@ -34,6 +34,7 @@
 #include "live-counters.h"
 #include "device-fault.h"
 #include "local-platform.h"
+#include "mode-toggle.h"
 #include "slow-log.h"
 #include "speculation-state.h"
 #include "startup-progress.h"
@@ -306,6 +307,17 @@ bool ReadMappedRawGuestMemory(void* userdata, uint64_t address, uint32_t* value)
 bool ReadMappedMemorySpan(void* userdata, uint64_t address, uint32_t* values, uint32_t count, bool clean) {
 	return Libs::LibKernel::Memory::IsFullyMapped(address, uint64_t {count} * 4u) &&
 	       ReadShaderMemorySpan(userdata, address, values, count, clean);
+}
+
+// KYTY_SPEC_PIPECACHE_SPLIT (live spec_pipecache_split; on under KYTY_SPECULATE=4, 0 otherwise: mode-toggle.h), read at
+// each GetGraphicsPrograms / GetComputeProgram (a lookup in progress keeps what it read): the GPU thread's lookup that must
+// translate a program builds it with the cache's m_mutex released and publishes it under it, the first publish winning
+// (ProgramCache::BuildUnlocked; set, in either mode); a speculation's thread's lookup reads a known program's plan back
+// and materializes with the lock released, the lock taken again to find or adopt (mode 4: speculation threads exist only
+// there); the "Shaders:" line from running counts. Off: the locked lookup, as before.
+[[nodiscard]] bool PipecacheSplitOn() {
+	static auto& on = LiveSwitch::Find("spec_pipecache_split", ModeToggle::Default("spec_pipecache_split"));
+	return on.load(std::memory_order_relaxed) != 0;
 }
 
 // An indirect dispatch takes a failed evaluation back (GetComputeProgram): with no thread groups in its
@@ -724,6 +736,46 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	// KYTY_SPEC_PIPECACHE_SPLIT (a speculation's lookup, `split` held, the entry's plan out of memory): EnsurePlan with the
+	// file read made with `split` released (UnlockedRead); its plan_use, preload and loaded-plan take as there, under the
+	// lock. Then the entry found again by its key: gone or another (retired meanwhile), false (the lookup refuses); brought
+	// back meanwhile by another lookup, this read dropped; else restored as EnsurePlan restores it.
+	template <typename Entry>
+	bool EnsurePlanUnlocked(Common::Mutex& split, Entry& entry) {
+		auto&      source   = entry->second;
+		const auto last_use = source.plan_use;
+		source.plan_use     = plan_clock;
+		if (source.plan_preloaded) {
+			source.plan_preloaded = false;
+			plan_preload_uses++;
+		}
+		ShaderRecompiler::IR::ResourcePlan plan;
+		if (TakeLoadedPlan(source, plan)) {
+			RestorePlan(source, std::move(plan));
+			plan_reloads++;
+			return true;
+		}
+		PreloadPlans(last_use);
+		const auto         spilled = source.plan_spilled;
+		const auto         key     = lookup_key;
+		SourceEntry* const was     = &source;
+		bool               read    = false;
+		bool               linear  = false;
+		{
+			const UnlockedRead unlocked(*this, split);
+			read = LoadPlanBytes(spilled, plan, linear);
+		}
+		lookup_key = key;
+		entry      = programs.find(key);
+		if (entry == programs.end() || &entry->second != was) return false;
+		if (!was->plan_out) return true;
+		if (!read || linear != (was->plan_linear != nullptr))
+			EXIT("a shader's resource plan could not be read back from the scratch file\n");
+		RestorePlan(*was, std::move(plan));
+		plan_reloads++;
+		return true;
+	}
+
 	// The source's plan in memory again (before each use of it), its last use noted.
 	void EnsurePlan(SourceEntry& source) {
 		const auto last_use = source.plan_use;
@@ -764,6 +816,7 @@ struct PipelineCache::ProgramCache {
 		const uint32_t            PlanSweepFlips     = PlanIdleFlips / 30u;
 		DrainLoadedPlans();
 		if (!PlanEvictionEnabled() || ++plan_clock % PlanSweepFlips != 0) return;
+		if (unlocked_readers != 0) return; // (KYTY_SPEC_PIPECACHE_SPLIT: a plan read with the lock released; the next)
 		// (RAM the system does not report: a budget of 0, every idle plan leaves.)
 		static const size_t budget = [] {
 			const uint64_t ram = LocalPlatform::EmulatorMemory();
@@ -819,6 +872,60 @@ struct PipelineCache::ProgramCache {
 	static thread_local std::shared_ptr<const std::atomic<bool>> t_table_waiting;
 	bool&                                     Pending() noexcept { return Spec::On() ? t_table_pending : table_pending; }
 	std::shared_ptr<const std::atomic<bool>>& Waiting() noexcept { return Spec::On() ? t_table_waiting : table_waiting; }
+	// KYTY_SPEC_PIPECACHE_SPLIT: the cache's m_mutex, offered for the lookup's scope (SplitOffer): on the GPU thread, a
+	// translation may be built with it released (t_split_lock); on a speculation's thread, a known program's plan read and
+	// its materialization (t_worker_split). Null otherwise.
+	static inline thread_local Common::Mutex* t_split_lock   = nullptr;
+	static inline thread_local Common::Mutex* t_worker_split = nullptr;
+	struct SplitOffer {
+		Common::Mutex** slot = nullptr;
+		Common::Mutex*  old  = nullptr;
+		explicit SplitOffer(Common::Mutex& mutex) {
+			if (!PipecacheSplitOn()) return;
+			if (GuestGpu::IsGpuThread()) {
+				if (!PipelineCache::t_find_only) slot = &t_split_lock;
+			} else if (Spec::On() && Spec::Current() != nullptr) {
+				slot = &t_worker_split;
+			}
+			if (slot != nullptr) old = std::exchange(*slot, &mutex);
+		}
+		~SplitOffer() {
+			if (slot != nullptr) *slot = old;
+		}
+		SplitOffer(const SplitOffer&)            = delete;
+		SplitOffer& operator=(const SplitOffer&) = delete;
+	};
+	// (Under m_mutex) the lookups reading a plan with the lock released now. While any does, no entry is freed (a dropped
+	// one is retired: Get's warm-code compare; ReleaseRetired waits) and no plan leaves memory (SweepPlans skips).
+	size_t unlocked_readers = 0;
+	// m_mutex released for a read of a plan (`cache.unlocked_readers` counting it), taken again at the scope's end (also
+	// when the read throws); the last reader out releases what was retired meanwhile.
+	struct UnlockedRead {
+		ProgramCache&  cache;
+		Common::Mutex& mutex;
+		UnlockedRead(ProgramCache& owner, Common::Mutex& lock): cache(owner), mutex(lock) {
+			++cache.unlocked_readers;
+			mutex.Unlock();
+		}
+		~UnlockedRead() {
+			mutex.Lock();
+			if (--cache.unlocked_readers == 0 && !cache.retired.empty() && !cache.warming) cache.ReleaseRetired();
+		}
+		UnlockedRead(const UnlockedRead&)            = delete;
+		UnlockedRead& operator=(const UnlockedRead&) = delete;
+	};
+	// KYTY_SPEC_PIPECACHE_SPLIT: the permutations of the programs in `programs` by their key's stage (the "Shaders:" line),
+	// counted by one walk at the first line printed with the switch on, then kept while `permutations_counted`: one more at
+	// each permutation stored (every push into a SourceEntry's permutations), an entry's all fewer when it leaves
+	// `programs` (erased or retired). A line printed with the switch off walks, as before, and stops the count.
+	std::array<size_t, static_cast<size_t>(ShaderType::Mesh) + 1> permutation_counts {};
+	bool permutations_counted = false;
+	void CountPermutations(ShaderType stage, size_t added) {
+		if (permutations_counted) permutation_counts[static_cast<size_t>(stage)] += added;
+	}
+	void UncountPermutations(ShaderType stage, size_t removed) {
+		if (permutations_counted) permutation_counts[static_cast<size_t>(stage)] -= removed;
+	}
 	void                                      ClearTable() noexcept {
 		if (Spec::On()) {
 			t_table_pending = false;
@@ -1986,6 +2093,7 @@ struct PipelineCache::ProgramCache {
 		if (const auto stored = CreateModuleInPlace(options, *module)) {
 			source.permutations.push_back(
 			    ModulePermutation(options, {}, std::move(module->program), std::move(specialization), stored));
+			CountPermutations(options.stage, 1);
 			source.prefetched.erase(module);
 			prefetch->adopted_modules++;
 			return &source.permutations.back();
@@ -2002,6 +2110,7 @@ struct PipelineCache::ProgramCache {
 		}
 		source.permutations.push_back(
 		    ModulePermutation(options, spirv, std::move(module->program), std::move(specialization)));
+		CountPermutations(options.stage, 1);
 		source.prefetched.erase(module);
 		prefetch->adopted_modules++;
 		return &source.permutations.back();
@@ -2218,6 +2327,120 @@ struct PipelineCache::ProgramCache {
 		if (index != LocalShaderWarmup::NoShader) recorded_programs[found.handle.id] = index;
 	}
 
+	// KYTY_SPEC_PIPECACHE_SPLIT (Get's translation on the GPU thread, normal mode; `split` held by this thread, the
+	// specialization of a known program materialized under it): the program built with `split` released, as the locked
+	// build makes it: TranslateProgram; for a new program its plan (ExtractResourcePlan) and its materialization over this
+	// lookup's runtime; the portable choice (PortableFormats, a known program's plan read under the lock first);
+	// CompileProgram, the shader module (CreateModule) and the compiled info (TakeOnWorker), as a table job makes them on a
+	// worker. Then `split` taken again (also when the build throws), and the result published where the locked build puts
+	// it, unless another thread's publish came first:
+	// - a known program (still the same entry, found again by its address: nothing erases it while `split` is released.
+	//   The one erase or retire of a program entry is a lookup's warm-code compare, the GPU thread's or a worker's
+	//   (any lookup not find-only), and it takes only an entry holding warm code; `known` holds none, as this lookup's own
+	//   compare before cleared it (or erased the entry: then no `known`), and warm code is set only on an entry the warmup
+	//   makes new. The map's nodes do not move) holding a permutation of this specialization and cursor now: that one is
+	//   taken, as this lookup's find would take it after that publish (its record as there), and this module destroyed;
+	// - a new program another thread made meanwhile (the warmup beside the game): this build dropped and the lookup made
+	//   again, locked throughout;
+	// - else this permutation published (FinishPermutation: its program id the next, taken under the lock at the publish,
+	//   so a dropped build takes none; the portable module under the exact specialization, as the locked build). Get
+	//   records it, as after the locked build.
+	// Nothing of the cache is read or written while `split` is released: the key is copied (lookup_key is the cache's
+	// scratch), and the materialization's failure report and the shader hash global are made after the lock is taken
+	// again. Returns the result to return (a permutation taken, or a refusal), else nothing (published in `entry`).
+	template <typename InputInfo, typename Entry>
+	std::optional<ShaderProgram> BuildUnlocked(Common::Mutex& split, const ShaderParams& params, InputInfo& input_info,
+	                                           uint32_t& push_data_cursor, uint32_t table_portable, ShaderType stage,
+	                                           const char* label, Entry& entry,
+	                                           const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                                           ShaderRecompiler::IR::ResourceSnapshot& resources,
+	                                           ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                           ShaderRecompiler::IR::MaterializeReport& report,
+	                                           const ShaderRecompiler::CompileOptions& options, double& front_ms) {
+		const auto   key   = lookup_key;
+		SourceEntry* known = entry != programs.end() ? &entry->second : nullptr;
+		std::optional<ShaderRecompiler::IR::ResourceSpecialization> portable;
+		if (known != nullptr) {
+			auto value = specialization;
+			if (ShaderRecompiler::IR::PortableFormats(known->resource_plan.info, value)) portable = std::move(value);
+		}
+		std::optional<ShaderRecompiler::IR::ResourcePlan> new_plan;
+		std::optional<ShaderRecompiler::CompileResult>    compiled;
+		ShaderRecompiler::IR::CompiledShaderInfo          info;
+		vk::ShaderModule                                  module       = nullptr;
+		bool                                              materialized = true;
+		const auto                                        front_begin  = std::chrono::steady_clock::now();
+		{
+			split.Unlock();
+			struct Relock {
+				Common::Mutex& mutex;
+				~Relock() { mutex.Lock(); }
+			} relock {split};
+			auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+			front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
+			if (known == nullptr) {
+				new_plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
+				materialized =
+				    ShaderRecompiler::IR::MaterializeResources(*new_plan, runtime, resources, specialization, &report);
+				if (materialized) {
+					auto value = specialization;
+					if (ShaderRecompiler::IR::PortableFormats(new_plan->info, value)) portable = std::move(value);
+				}
+			}
+			if (materialized) {
+				compiled.emplace(ShaderRecompiler::CompileProgram(std::move(translated), options,
+				                                                  portable ? *portable : specialization, push_data_cursor));
+				module = CreateModule(device, options, compiled->spirv);
+				info   = TakeOnWorker(*compiled);
+			}
+		}
+		Libs::LibKernel::Memory::g_srt_shader_hash = params.hash;
+		if (!materialized) return ReportMaterialization(label, stage, params.hash, report, false), ShaderProgram {};
+		const auto drop = [&] {
+			DestroyShaderModule(device, module);
+			LiveCounters::g_shader_modules.fetch_sub(1, std::memory_order_relaxed);
+		};
+		auto again = programs.find(key);
+		if (known == nullptr ? again != programs.end() : again == programs.end() || &again->second != known) {
+			drop();
+			struct NoSplit {
+				Common::Mutex* old = std::exchange(t_split_lock, nullptr);
+				~NoSplit() { t_split_lock = old; }
+			} no_split;
+			return Get(params, input_info, push_data_cursor, false, table_portable);
+		}
+		if (known != nullptr) {
+			const auto found = std::ranges::find_if(known->permutations, [&](const Permutation& candidate) {
+				const auto& layout = candidate.program.bindings;
+				return !candidate.table_mode &&
+				       layout.push_data_start_dword ==
+				           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords()) &&
+				       candidate.specialization == specialization;
+			});
+			if (found != known->permutations.end()) {
+				drop();
+				if (!unrecorded.empty()) [[unlikely]] // (as Get's find)
+					RecordFound(*found, stage, params, input_info, push_data_cursor);
+				if (&resources != &input_info.stage.resources) input_info.stage.resources = std::move(resources);
+				input_info.stage.program = &found->program;
+				found->program.bindings.AdvancePushData(push_data_cursor);
+				return found->handle;
+			}
+			entry = again;
+		} else {
+			(void)ReportMaterialization(label, stage, params.hash, report, true);
+			entry                       = programs.try_emplace(key, std::move(*new_plan)).first;
+			entry->second.plan_use      = plan_clock;
+			entry->second.source_digest = SourceDigest(params.code, params.back_code);
+		}
+		const bool made_portable = portable.has_value();
+		entry->second.permutations.push_back(FinishPermutation(params, options, *compiled, std::move(info),
+		                                                       made_portable ? std::move(*portable) : specialization, module));
+		CountPermutations(stage, 1);
+		if (made_portable) entry->second.permutations.back().specialization = std::move(specialization);
+		return std::nullopt;
+	}
+
 	template <typename InputInfo>
 	// `table_mode`: the permutation compiled in table mode (ShaderRecompiler::IR::EnterTableMode), empty
 	// when the program does not allow it.
@@ -2270,9 +2493,11 @@ struct PipelineCache::ProgramCache {
 			    !std::ranges::equal(params.back_code, entry->second.warm_back_code)) {
 				std::erase_if(by_program, [&](const auto& item) { return item.second.first == &entry->second; });
 				ForgetPlanLoads(entry->second);
+				UncountPermutations(entry->first.stage, entry->second.permutations.size());
 				// (A warmup beside the game may be making pipelines of its permutations: kept until it is done. So too while
-				// table pipelines made ahead (mode 4) are queued or building: ReleaseRetired.)
-				if (warming || ahead_pipeline_builds != 0) {
+				// table pipelines made ahead (mode 4) are queued or building, and while a lookup reads a plan with the lock
+				// released (KYTY_SPEC_PIPECACHE_SPLIT): ReleaseRetired.)
+				if (warming || ahead_pipeline_builds != 0 || unlocked_readers != 0) {
 					retired.push_back(programs.extract(entry));
 				} else {
 					for (const auto& p : entry->second.permutations) {
@@ -2287,7 +2512,16 @@ struct PipelineCache::ProgramCache {
 				std::vector<uint32_t>().swap(entry->second.warm_back_code);
 			}
 		}
-		if (entry != programs.end()) EnsurePlan(entry->second);
+		// KYTY_SPEC_PIPECACHE_SPLIT: a speculation's lookup reads the plan and materializes with the lock released; the entry
+		// found again after each (gone: refused). (Mode 0: no speculation thread; the global read first.)
+		Common::Mutex* const worker_split = Spec::On() ? t_worker_split : nullptr;
+		if (entry != programs.end()) {
+			if (worker_split != nullptr && entry->second.plan_out) {
+				if (!EnsurePlanUnlocked(*worker_split, entry)) return {};
+			} else {
+				EnsurePlan(entry->second);
+			}
+		}
 		ShaderRecompiler::IR::ResourceSnapshot temporary_resources;
 		auto& resources = NativePreparationScratchEnabled() ? input_info.stage.resources
 		                                                    : temporary_resources;
@@ -2334,11 +2568,48 @@ struct PipelineCache::ProgramCache {
 		};
 		if (entry != programs.end()) {
 			const ShaderRecompiler::IR::ResourceSpecialization* borrowed_specialization = nullptr;
-			if (!ReportMaterialization(label, stage, params.hash, report,
-			                           ShaderRecompiler::IR::MaterializeResources(
-			                               entry->second.resource_plan, runtime, resources, specialization,
-			                               &report, &entry->second.specialization_guard, &borrowed_specialization)))
-				return {};
+			bool                                                materialized            = false;
+			if (worker_split != nullptr) {
+				// KYTY_SPEC_PIPECACHE_SPLIT: over a private copy of the specialization guard, made under the lock (the shared
+				// one is written by a materialization), with the lock released (UnlockedRead: the plan is immutable, and no
+				// entry is freed nor plan swept while it is out); then the entry found again (gone: refused). The copy, with
+				// what this materialization taught it, is published back as the shared guard when the shared one is still the
+				// one copied (its publication unchanged: no locked lookup published another, and no RestorePlan reset it from a
+				// publication past 0) and the copy is this plan's (owner: the entry's plan, the same plan: only the GPU
+				// thread's sweep sends it out, and not while a reader is out); a specialization it lent then points into the
+				// shared guard, as a locked lookup's would, and the guard's selected-permutation shortcut applies. Else the
+				// shared guard is kept (another state of it, as right) and a lent specialization is taken by value for the
+				// find below. Which correct guard state is kept is all this decides.
+				ShaderRecompiler::IR::ResourceSpecializationGuard guard_copy = entry->second.specialization_guard;
+				const uint64_t                                    copied_publication = guard_copy.publication;
+				const auto                                        key                = lookup_key;
+				SourceEntry* const                                was                = &entry->second;
+				{
+					const UnlockedRead unlocked(*this, *worker_split);
+					materialized = ShaderRecompiler::IR::MaterializeResources(was->resource_plan, runtime, resources,
+					                                                          specialization, &report, &guard_copy,
+					                                                          &borrowed_specialization);
+				}
+				lookup_key = key;
+				entry      = programs.find(key);
+				if (entry == programs.end() || &entry->second != was) return {};
+				auto& shared = was->specialization_guard;
+				if (materialized && shared.publication == copied_publication &&
+				    (guard_copy.owner == nullptr || guard_copy.owner == &was->resource_plan)) {
+					const bool lent = borrowed_specialization != nullptr;
+					shared          = std::move(guard_copy);
+					if (lent) borrowed_specialization = &shared.specialization;
+				} else if (borrowed_specialization != nullptr) {
+					specialization          = *borrowed_specialization;
+					borrowed_specialization = nullptr;
+				}
+			} else {
+				materialized = ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime, resources,
+				                                                          specialization, &report,
+				                                                          &entry->second.specialization_guard,
+				                                                          &borrowed_specialization);
+			}
+			if (!ReportMaterialization(label, stage, params.hash, report, materialized)) return {};
 			if (table_mode) table_form(borrowed_specialization ? *borrowed_specialization : specialization);
 			const auto& active_specialization =
 			    table_mode ? table_specialization : borrowed_specialization ? *borrowed_specialization : specialization;
@@ -2490,6 +2761,7 @@ struct PipelineCache::ProgramCache {
 					            job->refused.c_str());
 			}
 			const auto& stored = entry->second.permutations.emplace_back(std::move(permutation));
+			CountPermutations(stage, 1);
 			if (!stored.handle) return {};
 			if (TableFormatIndexOn()) // (TableFormatOnlyBuffers' index: KYTY_TABLE_FORMAT_INDEX only, mode 0 as before)
 				by_program.try_emplace(&stored.program, std::pair {&entry->second, &stored});
@@ -2502,9 +2774,24 @@ struct PipelineCache::ProgramCache {
 		// this draw, and its modules are taken over.
 		if (entry == programs.end()) {
 			if (auto* group = PrefetchedGroup(params, adopt_only)) {
-				if (!ReportMaterialization(label, stage, params.hash, report,
-				                           ShaderRecompiler::IR::MaterializeResources(*group->plan, runtime, resources,
-				                                                                      specialization, &report))) {
+				// KYTY_SPEC_PIPECACHE_SPLIT: the group (taken: this lookup's alone until it moves or goes back) materialized
+				// with the lock released; a program made meanwhile (the GPU thread's lookup, which found the group taken,
+				// translated it): the group goes back, the lookup refused.
+				bool group_materialized = false;
+				if (worker_split != nullptr) {
+					const auto key = lookup_key;
+					{
+						const UnlockedRead unlocked(*this, *worker_split);
+						group_materialized =
+						    ShaderRecompiler::IR::MaterializeResources(*group->plan, runtime, resources, specialization, &report);
+					}
+					lookup_key = key;
+					if (programs.find(key) != programs.end()) return ReturnPrefetchedGroup(*group), ShaderProgram {};
+				} else {
+					group_materialized =
+					    ShaderRecompiler::IR::MaterializeResources(*group->plan, runtime, resources, specialization, &report);
+				}
+				if (!ReportMaterialization(label, stage, params.hash, report, group_materialized)) {
 					if (adopt_only) ReturnPrefetchedGroup(*group); // (left as found for the in-order lookup)
 					return {};
 				}
@@ -2544,36 +2831,50 @@ struct PipelineCache::ProgramCache {
 				            known_program ? "specialization" : "program");
 			}, SlowLog::HitchThreshold());
 			LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
-			auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
-			front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
-			translate_ms = front_ms;
-			if (entry == programs.end()) {
-				auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-				if (!ReportMaterialization(label, stage, params.hash, report,
-				                           ShaderRecompiler::IR::MaterializeResources(
-				                               resource_plan, runtime, resources, specialization, &report)))
-					return {};
-				entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
-				entry->second.plan_use      = plan_clock;
-				entry->second.source_digest = SourceDigest(params.code, params.back_code);
-			}
-			// A specialization met for the first time whose formatted buffers can decode their formats at
-			// run time gets the portable module (IR::PortableFormats) under its own specialization: the
-			// static precompile (WarmSeeds) holds that module's pipelines, so no driver compilation holds
-			// up this draw. The warmup file records the exact specialization, and the next start compiles
-			// its specialized module.
-			auto portable = specialization;
-			if (ShaderRecompiler::IR::PortableFormats(entry->second.resource_plan.info, portable)) {
-				entry->second.permutations.push_back(CompilePermutation(
-				    params, options, std::move(translated), std::move(portable), push_data_cursor));
-				entry->second.permutations.back().specialization = std::move(specialization);
+			// KYTY_SPEC_PIPECACHE_SPLIT: built with the lock released, published under it (BuildUnlocked: it returns the
+			// lookup's result when the permutation found or made meanwhile is taken instead; else the permutation is
+			// published in `entry`).
+			if (auto* const split = t_split_lock; split != nullptr && !table_mode) {
+				if (auto taken = BuildUnlocked(*split, params, input_info, push_data_cursor, table_portable, stage, label,
+				                               entry, runtime, resources, specialization, report, options, front_ms))
+					return *taken;
+				translate_ms = front_ms;
+				render_translations++;
+				render_translate_ms +=
+				    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
 			} else {
-				entry->second.permutations.push_back(CompilePermutation(
-				    params, options, std::move(translated), std::move(specialization), push_data_cursor));
+				auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+				front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
+				translate_ms = front_ms;
+				if (entry == programs.end()) {
+					auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+					if (!ReportMaterialization(label, stage, params.hash, report,
+					                           ShaderRecompiler::IR::MaterializeResources(
+					                               resource_plan, runtime, resources, specialization, &report)))
+						return {};
+					entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
+					entry->second.plan_use      = plan_clock;
+					entry->second.source_digest = SourceDigest(params.code, params.back_code);
+				}
+				// A specialization met for the first time whose formatted buffers can decode their formats at
+				// run time gets the portable module (IR::PortableFormats) under its own specialization: the
+				// static precompile (WarmSeeds) holds that module's pipelines, so no driver compilation holds
+				// up this draw. The warmup file records the exact specialization, and the next start compiles
+				// its specialized module.
+				auto portable = specialization;
+				if (ShaderRecompiler::IR::PortableFormats(entry->second.resource_plan.info, portable)) {
+					entry->second.permutations.push_back(CompilePermutation(
+					    params, options, std::move(translated), std::move(portable), push_data_cursor));
+					entry->second.permutations.back().specialization = std::move(specialization);
+				} else {
+					entry->second.permutations.push_back(CompilePermutation(
+					    params, options, std::move(translated), std::move(specialization), push_data_cursor));
+				}
+				CountPermutations(stage, 1);
+				render_translations++;
+				render_translate_ms +=
+				    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
 			}
-			render_translations++;
-			render_translate_ms +=
-			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
 		}
 		const auto& permutation = entry->second.permutations.back();
 		if (PipelineSourceLog())
@@ -2596,9 +2897,23 @@ struct PipelineCache::ProgramCache {
 		publish_stage(permutation.program);
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
+		// (KYTY_SPEC_PIPECACHE_SPLIT: the running counts, the same numbers, instead of a walk over every program under the
+		// lock at each new permutation; the walk made once when the count starts.)
 		std::array<size_t, static_cast<size_t>(ShaderType::Mesh) + 1> counts {};
-		for (const auto& [key, source]: programs) {
-			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+		if (PipecacheSplitOn()) {
+			if (!permutations_counted) {
+				for (const auto& [key, source]: programs) {
+					counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+				}
+				permutation_counts   = counts;
+				permutations_counted = true;
+			}
+			counts = permutation_counts;
+		} else {
+			permutations_counted = false;
+			for (const auto& [key, source]: programs) {
+				counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+			}
 		}
 		// Guest geometry shaders are compiled through the host mesh stage.
 		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu\n",
@@ -2993,6 +3308,7 @@ struct PipelineCache::ProgramCache {
 			                                     ShaderRecompiler::IR::ResourceSpecialization {table_specialization}, job->module);
 			permutation.table_mode = true;
 			auto& stored           = source.permutations.emplace_back(std::move(permutation));
+			CountPermutations(entry->first.stage, 1);
 			if (!stored.handle) return nullptr;
 			stored.ahead_unmet = true; // (until a lookup finds it: DropAheadUnmet)
 			if (TableFormatIndexOn()) by_program.try_emplace(&stored.program, std::pair {&source, &stored});
@@ -3253,6 +3569,7 @@ struct PipelineCache::ProgramCache {
 			ShaderParams params {record.code, std::move(user_data), record.hash, record.back_code};
 			entry->second.permutations.push_back(FinishPermutation(params, options, job->result, std::move(job->info),
 			                                                       std::move(record.specialization), job->module));
+			CountPermutations(entry->first.stage, 1);
 			job->module       = nullptr;
 			auto& permutation = entry->second.permutations.back();
 			recorded_programs[permutation.handle.id] = uint32_t(index);
@@ -3312,7 +3629,7 @@ struct PipelineCache::ProgramCache {
 	// (`all`: the cache's end. Else none while table pipelines made ahead are queued or building (mode 4): the last done
 	// releases them, RunAheadTablePipeline.)
 	void ReleaseRetired(bool all = false) {
-		if (!all && ahead_pipeline_builds != 0) return;
+		if (!all && (ahead_pipeline_builds != 0 || unlocked_readers != 0)) return;
 		for (auto& node: retired)
 			for (const auto& permutation: node.mapped().permutations) {
 				DestroyShaderModule(device, permutation.handle.module);
@@ -5223,6 +5540,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		if (pixel_active) CopyShaderCode(pixel_params, pixel_code, pixel_back_code);
 	}
 	Common::LockGuard lock(m_mutex);
+	const ProgramCache::SplitOffer split(m_mutex); // (KYTY_SPEC_PIPECACHE_SPLIT)
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
@@ -5311,6 +5629,9 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 		CopyShaderCode(params, code, back_code);
 	}
 	Common::LockGuard lock(m_mutex);
+	// (KYTY_SPEC_PIPECACHE_SPLIT, as a draw's: the report a failed materialization makes, g_unevaluated and
+	// g_materialization_failed, is this thread's, made after the lock is taken again.)
+	const ProgramCache::SplitOffer split(m_mutex);
 	m_program_cache->ClearTable();
 	uint32_t          push_data_cursor = 0;
 	g_unevaluated     = unevaluated;

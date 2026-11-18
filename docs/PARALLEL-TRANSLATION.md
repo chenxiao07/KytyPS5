@@ -90,6 +90,8 @@ switch acts only in mode 4. A verify switch N checks every Nth use against the p
 | eager_feedback (upstream, #300; off in mode 0 as upstream, cfbf1148) | completed copy-feedback snapshots written back before the game faults on them | 0 | 1 | eager_feedback_verify N |
 | feedback_batch (upstream, #301; off in mode 0 as upstream, cfbf1148) | copy-feedback snapshots copied together as the open buffer closes | 0 | 1 | |
 | table_learn_portable (live; KYTY_TABLE_LEARN_PORTABLE) | 1: an image set refused for another specialization that only a buffer's V# format makes, and a draw state stored with such other programs (the variant store), learn that buffer as portable and the pair compiles again; 2: also a refused set's retry that finds its program translating waits for it (Demon's Souls' view save: ~38 refused draws a frame gone, s1-10 fps +2.4, settled +2.2) | - | 2 | |
+| **The pipeline cache** | | | | |
+| spec_pipecache_split | the GPU thread's lookup that must translate a program builds it with the pipeline cache's lock released and publishes it under the lock, the first publish winning (a dispatch's too); a worker's lookup reads a program's plan back from its file and materializes with the lock released, then finds or adopts under it; the "Shaders:" line from running counts | 0 | 1 | |
 | **Compute** | | | | |
 | fill_buffer_clears | an image-clear dispatch over plain buffer memory made as a transfer fill | 0 | 1 | |
 | **The table path** | | | | |
