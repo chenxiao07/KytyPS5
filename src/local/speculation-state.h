@@ -36,6 +36,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1277,18 +1278,141 @@ inline void Stop(const char* why) noexcept {
 // The guest memory the command processor writes (labels): a wait on one is satisfied by work of the GPU queues, which
 // the commit checks a speculation against (EffectsLog); one on memory only the CPU writes orders CPU writes the
 // speculation cannot see (it stops there).
+// The set only grows (every word the processor ever wrote): as a std::unordered_set its rehash at each doubling ran
+// under the mutex on the thread that commits, one frame of 82 ms, then 161 ms 4 minutes later (17 Nov, Boletaria, mode
+// 4: 87-92% of those frames in NoteLabel's insert), longer each time. LabelSet: open addressing over a table that is
+// never more than half full; no new key does more than a bounded share of a growth: the next table (twice the size) is
+// cleared a slice per new key from 3/8 full on, the old one's slots are moved a slice per new key after the switch at
+// half full (lookups check both meanwhile). Allocator-agnostic: a reused block is not cleared in one go.
+class LabelSet {
+public:
+	LabelSet() = default;
+	~LabelSet() {
+		std::free(m_table);
+		std::free(m_old);
+		std::free(m_next);
+	}
+	LabelSet(const LabelSet&)            = delete;
+	LabelSet& operator=(const LabelSet&) = delete;
+
+	[[nodiscard]] bool Contains(uint64_t key) const noexcept {
+		if (key == 0) return m_zero;
+		if (m_table != nullptr && Find(m_table, m_mask, key)) return true;
+		return m_old != nullptr && Find(m_old, m_old_slots - 1, key);
+	}
+	void Insert(uint64_t key) {
+		if (key == 0) {
+			m_zero = true;
+			return;
+		}
+		if (Contains(key)) return;
+		if (m_table == nullptr) First();
+		Work();
+		if ((m_count + 1) * 2 > m_mask + 1) Switch();
+		Put(m_table, m_mask, key);
+		++m_count;
+	}
+	[[nodiscard]] uint64_t Size() const noexcept { return m_count + (m_zero ? 1 : 0); }
+
+private:
+	static constexpr size_t FirstSlots = size_t {1} << 16;
+	// Per new key: slots of the old table moved, slots of the next table cleared. (From half full to the next table's
+	// start at 3/8 of twice the size there are slots / 4 new keys for the old table's slots: 4 a key would do; from 3/8
+	// to half full, slots / 8 new keys for the next table's 2 x slots: 16 a key would do.)
+	static constexpr size_t MoveSlice = 64, ClearSlice = 64;
+
+	[[nodiscard]] static size_t Hash(uint64_t key) noexcept {
+		key ^= key >> 33u;
+		key *= 0xff51afd7ed558ccdull;
+		key ^= key >> 33u;
+		key *= 0xc4ceb9fe1a85ec53ull;
+		key ^= key >> 33u;
+		return static_cast<size_t>(key);
+	}
+	[[nodiscard]] static bool Find(const uint64_t* table, size_t mask, uint64_t key) noexcept {
+		for (size_t i = Hash(key) & mask;; i = (i + 1) & mask) {
+			if (table[i] == key) return true;
+			if (table[i] == 0) return false;
+		}
+	}
+	static void Put(uint64_t* table, size_t mask, uint64_t key) noexcept {
+		for (size_t i = Hash(key) & mask;; i = (i + 1) & mask) {
+			if (table[i] == key) return;
+			if (table[i] == 0) {
+				table[i] = key;
+				return;
+			}
+		}
+	}
+	[[nodiscard]] static uint64_t* Allocate(size_t slots) {
+		auto* table = static_cast<uint64_t*>(std::malloc(slots * sizeof(uint64_t)));
+		if (table == nullptr) throw std::bad_alloc();
+		return table;
+	}
+	void First() {
+		m_table = Allocate(FirstSlots);
+		std::fill_n(m_table, FirstSlots, uint64_t {0});
+		m_mask = FirstSlots - 1;
+	}
+	void Work() {
+		if (m_old != nullptr) {
+			for (const size_t end = std::min(m_old_slots, m_moved + MoveSlice); m_moved < end; ++m_moved)
+				if (m_old[m_moved] != 0) Put(m_table, m_mask, m_old[m_moved]);
+			if (m_moved == m_old_slots) {
+				std::free(m_old);
+				m_old       = nullptr;
+				m_old_slots = m_moved = 0;
+			}
+		}
+		const size_t slots = m_mask + 1;
+		if (m_next == nullptr && m_old == nullptr && (m_count + 1) * 8 > slots * 3) {
+			m_next    = Allocate(slots * 2);
+			m_cleared = 0;
+		}
+		if (m_next != nullptr && m_cleared < slots * 2) {
+			const size_t count = std::min(ClearSlice, slots * 2 - m_cleared);
+			std::fill_n(m_next + m_cleared, count, uint64_t {0});
+			m_cleared += count;
+		}
+	}
+	// At half full: the next table becomes the table, the current one the old one (its slots moved by Work).
+	void Switch() {
+		const size_t slots = m_mask + 1;
+		while (m_old != nullptr) Work(); // (never needed: see MoveSlice)
+		if (m_next == nullptr) m_next = Allocate(slots * 2), m_cleared = 0;
+		if (m_cleared < slots * 2) std::fill_n(m_next + m_cleared, slots * 2 - m_cleared, uint64_t {0}); // (nor this)
+		m_old       = m_table;
+		m_old_slots = slots;
+		m_moved     = 0;
+		m_table     = std::exchange(m_next, nullptr);
+		m_mask      = slots * 2 - 1;
+	}
+
+	uint64_t* m_table = nullptr;
+	size_t    m_mask  = 0;
+	uint64_t  m_count = 0; // keys in the table or still to move into it (key 0 apart)
+	uint64_t* m_old   = nullptr;
+	size_t    m_old_slots = 0, m_moved = 0;
+	uint64_t* m_next    = nullptr;
+	size_t    m_cleared = 0;
+	bool      m_zero    = false;
+};
 struct Labels {
-	std::mutex                   mutex;
-	std::unordered_set<uint64_t> addresses;
+	std::mutex mutex;
+	LabelSet   addresses;
 };
 inline Labels g_labels;
 inline void   NoteLabel(uint64_t address) {
 	  std::lock_guard lock(g_labels.mutex);
-	  g_labels.addresses.insert(address & ~uint64_t {3});
+	  g_labels.addresses.Insert(address & ~uint64_t {3});
 }
 [[nodiscard]] inline bool IsLabel(uint64_t address) {
 	std::lock_guard lock(g_labels.mutex);
-	return g_labels.addresses.contains(address & ~uint64_t {3});
+	return g_labels.addresses.Contains(address & ~uint64_t {3});
+}
+[[nodiscard]] inline uint64_t LabelCount() {
+	std::lock_guard lock(g_labels.mutex);
+	return g_labels.addresses.Size();
 }
 
 // What the thread that commits is doing (its effects' source, for the commits' stop reasons): translating the normal

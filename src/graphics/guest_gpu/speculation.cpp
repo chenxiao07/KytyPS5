@@ -1837,6 +1837,7 @@ void Speculation::Report() {
 	{
 		std::lock_guard lock(m_mutex);
 		std::printf("; stopped for the GPU thread: %llu", static_cast<unsigned long long>(std::exchange(m_cancelled, 0)));
+		std::printf("; labels %llu", static_cast<unsigned long long>(Spec::LabelCount()));
 	}
 	std::printf("\n");
 	std::fflush(stdout);
