@@ -461,6 +461,30 @@ static bool PlanEvictionEnabled() {
 	return enabled;
 }
 
+// The plans' budget in memory (SweepPlans): RAM/128 in plans of ~77 KB (RAM the system does not report: 0).
+static size_t PlanBudget() {
+	static const size_t budget = [] {
+		const uint64_t ram = LocalPlatform::EmulatorMemory();
+		return static_cast<size_t>(ram / 128u / (77u * 1024u));
+	}();
+	return budget;
+}
+
+// KYTY_SPEC_PRELOAD_FIX (live spec_preload_fix; on under KYTY_SPECULATE=4, 0 otherwise: mode-toggle.h; set, it acts in
+// either mode): a preload never displaces a plan a lookup used. The sweep sends the preloaded plans no lookup used yet out
+// first, the oldest preload first (before any idle plan a lookup met, whatever their age), and one sent out so is not
+// preloaded again until a lookup has used it; a worker's read an erase made stale leaves its live entry listed out again
+// (PreloadPlans meets it again). Off: the sweep and the preload as before.
+static bool PreloadFixOn() {
+	static auto& on = LiveSwitch::Find("spec_preload_fix", ModeToggle::Default("spec_preload_fix"));
+	return on.load(std::memory_order_relaxed) != 0;
+}
+
+// (Mode 4) The plans of the programs the ahead pool prepares kept in memory until their first lookup (AheadJob).
+static bool AheadPlanPinOn() {
+	return ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+}
+
 // A plan's bytes written (any thread: the file's end reserved atomically).
 static bool SpillPlanBytes(const ShaderRecompiler::IR::ResourcePlan& plan, SpilledPlan& out) {
 	static std::once_flag        once;
@@ -622,9 +646,30 @@ struct PipelineCache::ProgramCache {
 		std::multimap<uint32_t, SourceEntry*>::iterator             plan_node {};
 		bool                                                        plan_listed = false;
 		bool                                                        plan_preloaded = false; // back by a worker, not used since
+		// (Mode 4) Its plan kept in memory until its first lookup (AheadJob).
+		bool plan_pinned = false;
+		// KYTY_SPEC_PRELOAD_FIX: sent out as a preload no lookup used; not preloaded again until a lookup uses it.
+		bool preload_shunned = false;
 	};
+	// (Mode 4) The pinned plans (AheadJob): released at their first lookup (EnsurePlan), when the entry leaves the programs,
+	// and at each scene change (SceneLoop, WarmScene).
+	size_t plan_pins = 0;
+	void   Unpin(SourceEntry& source) {
+		if (!source.plan_pinned) return;
+		source.plan_pinned = false;
+		--plan_pins;
+	}
+	// (Under the cache's m_mutex.)
+	void ReleasePlanPins() {
+		if (plan_pins == 0) return;
+		for (auto& [key, source]: programs) {
+			(void)key;
+			Unpin(source);
+		}
+	}
 	// Plans: sweeps so far (one a flip, SweepPlans), out of memory now, brought back (by the render thread; by workers).
 	uint32_t plan_clock = 0;
+	uint32_t last_sweep_clock = 0; // (KYTY_SPEC_PRELOAD_FIX: plan_clock at the last sweep that ran)
 	size_t   plans_out = 0;
 	uint64_t plan_reloads = 0, plan_preloads = 0, plan_preload_uses = 0;
 
@@ -638,6 +683,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan plan;
 		bool                               linear = false;
 		uint64_t                           erased = 0;
+		bool                               failed = false; // (a pin's read-back that failed: nothing to restore)
 	};
 	struct PlanLoads {
 		std::mutex                                   mutex;
@@ -645,6 +691,10 @@ struct PipelineCache::ProgramCache {
 	};
 	std::shared_ptr<PlanLoads> plan_loads = std::make_shared<PlanLoads>();
 	uint64_t                   programs_erased = 0;
+	// (KYTY_SPEC_PRELOAD_FIX, or a pin's read-back) The entries a worker's read was posted for, not erased since
+	// (ForgetPlanLoads takes one out), whose result is not taken yet: a result an erase made stale is a live entry's exactly
+	// when its entry is here (no scan of the programs). At most the reads in flight; empty with the switch off in mode 0.
+	std::unordered_set<const SourceEntry*> loads_tracked;
 	void UnlistPlan(SourceEntry& source) {
 		if (!source.plan_listed) return;
 		plans_out_by_use.erase(source.plan_node);
@@ -654,6 +704,7 @@ struct PipelineCache::ProgramCache {
 	void ForgetPlanLoads(SourceEntry& entry) {
 		UnlistPlan(entry);
 		programs_erased++;
+		if (!loads_tracked.empty()) loads_tracked.erase(&entry);
 	}
 
 	// The plan back in the entry (its linear SRT plan kept meanwhile).
@@ -678,8 +729,9 @@ struct PipelineCache::ProgramCache {
 			loaded = std::move(found->second);
 			plan_loads->plans.erase(found);
 		}
+		if (!loads_tracked.empty()) loads_tracked.erase(&source);
 		source.plan_loading = false;
-		if (loaded.erased != programs_erased || loaded.linear != (source.plan_linear != nullptr)) return false;
+		if (loaded.failed || loaded.erased != programs_erased || loaded.linear != (source.plan_linear != nullptr)) return false;
 		plan = std::move(loaded.plan);
 		return true;
 	}
@@ -692,13 +744,16 @@ struct PipelineCache::ProgramCache {
 		static constexpr size_t   MaxPlans = 256, PlansPerJob = 4;
 		if (!push_job || plans_out_by_use.empty()) return;
 		std::vector<std::pair<SourceEntry*, SpilledPlan>> batch;
+		const bool fix = PreloadFixOn(); // (KYTY_SPEC_PRELOAD_FIX)
 		for (auto it = plans_out_by_use.lower_bound(around > PreloadWindow ? around - PreloadWindow : 0);
 		     it != plans_out_by_use.end() && it->first <= around + PreloadWindow && batch.size() < MaxPlans;) {
 			auto* entry        = it->second;
 			it                 = plans_out_by_use.erase(it); // (listed again when out again)
 			entry->plan_listed = false;
 			if (!entry->plan_out || entry->plan_loading) continue;
+			if (fix && entry->preload_shunned) continue; // (KYTY_SPEC_PRELOAD_FIX: left until a lookup uses it)
 			entry->plan_loading = true;
+			if (fix) loads_tracked.insert(entry);
 			batch.emplace_back(entry, entry->plan_spilled);
 		}
 		for (size_t first = 0; first < batch.size(); first += PlansPerJob) {
@@ -725,8 +780,26 @@ struct PipelineCache::ProgramCache {
 			if (plan_loads->plans.empty()) return;
 			plans.swap(plan_loads->plans);
 		}
+		// (A tracked entry whose read an erase made stale, or whose pin read-back failed: not loading any more, and listed out
+		// again, so it can be preloaded or pin-loaded again. Once a result: a read posted after it is stale only after another
+		// erase.)
+		const auto relist = [this](SourceEntry& entry) {
+			entry.plan_loading = false;
+			if (!entry.plan_out || entry.plan_listed) return;
+			entry.plan_node   = plans_out_by_use.emplace(entry.plan_use, &entry);
+			entry.plan_listed = true;
+		};
 		for (auto& [entry, loaded]: plans) {
-			if (loaded.erased != programs_erased) continue; // (the entry may be gone)
+			// (Tracked: posted under KYTY_SPEC_PRELOAD_FIX or as a pin's read-back and not erased since: a live entry.)
+			const bool tracked = !loads_tracked.empty() && loads_tracked.erase(entry) != 0;
+			if (loaded.erased != programs_erased) { // (the entry may be gone)
+				if (tracked) relist(*entry);
+				continue;
+			}
+			if (loaded.failed) {
+				relist(*entry);
+				continue;
+			}
 			entry->plan_loading = false;
 			if (!entry->plan_out || loaded.linear != (entry->plan_linear != nullptr)) continue;
 			RestorePlan(*entry, std::move(loaded.plan));
@@ -742,9 +815,11 @@ struct PipelineCache::ProgramCache {
 	// back meanwhile by another lookup, this read dropped; else restored as EnsurePlan restores it.
 	template <typename Entry>
 	bool EnsurePlanUnlocked(Common::Mutex& split, Entry& entry) {
-		auto&      source   = entry->second;
-		const auto last_use = source.plan_use;
-		source.plan_use     = plan_clock;
+		auto& source = entry->second;
+		Unpin(source);                  // ((Mode 4) its first lookup)
+		source.preload_shunned = false; // (KYTY_SPEC_PRELOAD_FIX: a lookup used it)
+		const auto last_use    = source.plan_use;
+		source.plan_use        = plan_clock;
 		if (source.plan_preloaded) {
 			source.plan_preloaded = false;
 			plan_preload_uses++;
@@ -768,7 +843,14 @@ struct PipelineCache::ProgramCache {
 		lookup_key = key;
 		entry      = programs.find(key);
 		if (entry == programs.end() || &entry->second != was) return false;
-		if (!was->plan_out) return true;
+		if (!was->plan_out) {
+			// (KYTY_SPEC_PRELOAD_FIX: restored meanwhile by DrainLoadedPlans, and used by this lookup: not an unused preload.)
+			if (was->plan_preloaded && PreloadFixOn()) {
+				was->plan_preloaded = false;
+				plan_preload_uses++;
+			}
+			return true;
+		}
 		if (!read || linear != (was->plan_linear != nullptr))
 			EXIT("a shader's resource plan could not be read back from the scratch file\n");
 		RestorePlan(*was, std::move(plan));
@@ -778,8 +860,10 @@ struct PipelineCache::ProgramCache {
 
 	// The source's plan in memory again (before each use of it), its last use noted.
 	void EnsurePlan(SourceEntry& source) {
-		const auto last_use = source.plan_use;
-		source.plan_use     = plan_clock;
+		Unpin(source);                  // ((Mode 4) its first lookup)
+		source.preload_shunned = false; // (KYTY_SPEC_PRELOAD_FIX: a lookup used it)
+		const auto last_use    = source.plan_use;
+		source.plan_use        = plan_clock;
 		if (source.plan_preloaded) {
 			source.plan_preloaded = false;
 			plan_preload_uses++;
@@ -817,21 +901,36 @@ struct PipelineCache::ProgramCache {
 		DrainLoadedPlans();
 		if (!PlanEvictionEnabled() || ++plan_clock % PlanSweepFlips != 0) return;
 		if (unlocked_readers != 0) return; // (KYTY_SPEC_PIPECACHE_SPLIT: a plan read with the lock released; the next)
+		// KYTY_SPEC_PRELOAD_FIX: the previous sweep's clock: a preload restored before it has had a whole sweep period.
+		const uint32_t previous_sweep = std::exchange(last_sweep_clock, plan_clock);
 		// (RAM the system does not report: a budget of 0, every idle plan leaves.)
-		static const size_t budget = [] {
-			const uint64_t ram = LocalPlatform::EmulatorMemory();
-			return static_cast<size_t>(ram / 128u / (77u * 1024u));
-		}();
-		size_t                    in_memory = 0;
+		const size_t              budget       = PlanBudget();
+		const bool                pins         = plan_pins != 0 && AheadPlanPinOn(); // ((Mode 4) a pinned plan counts, stays)
+		const bool                unused_first = PreloadFixOn(); // (KYTY_SPEC_PRELOAD_FIX: unused preloads go first)
+		size_t                    in_memory    = 0;
 		std::vector<SourceEntry*> idle;
+		size_t                    unused = 0; // (KYTY_SPEC_PRELOAD_FIX: the unused preloads, at the front of `idle`)
 		for (auto& [key, source]: programs) {
 			(void)key;
 			if (source.plan_out) continue;
 			in_memory++;
-			if (plan_clock - source.plan_use >= PlanIdleFlips) idle.push_back(&source);
+			if (pins && source.plan_pinned) continue;
+			if (unused_first && source.plan_preloaded) {
+				// (A preload no lookup used, restored before the previous sweep (its plan_use the restore's, a lookup clearing
+				// plan_preloaded): out first. One restored since keeps its place until the next sweep.)
+				if (source.plan_use < previous_sweep) {
+					idle.push_back(&source);
+					std::swap(idle[unused++], idle.back());
+				}
+			} else if (plan_clock - source.plan_use >= PlanIdleFlips) {
+				idle.push_back(&source);
+			}
 		}
 		if (in_memory <= budget || idle.empty()) return;
-		std::ranges::sort(idle, {}, [](const SourceEntry* source) { return source->plan_use; });
+		// (The unused preloads, oldest preload first, then the idle plans, least recently used first.)
+		const auto by_use = [](const SourceEntry* source) { return source->plan_use; };
+		if (unused != 0) std::ranges::sort(idle.begin(), idle.begin() + static_cast<std::ptrdiff_t>(unused), {}, by_use);
+		std::ranges::sort(idle.begin() + static_cast<std::ptrdiff_t>(unused), idle.end(), {}, by_use);
 		idle.resize(std::min(idle.size(), in_memory - budget));
 		uint32_t writes = 0;
 		auto     freed  = std::make_shared<std::vector<ShaderRecompiler::IR::ResourcePlan>>();
@@ -845,6 +944,7 @@ struct PipelineCache::ProgramCache {
 			freed->push_back(std::move(source.resource_plan));
 			source.resource_plan = {};
 			source.plan_out       = true;
+			if (unused_first && source.plan_preloaded && source.plan_use < previous_sweep) source.preload_shunned = true;
 			source.plan_preloaded = false;
 			plans_out++;
 			source.plan_node   = plans_out_by_use.emplace(source.plan_use, &source);
@@ -2494,6 +2594,7 @@ struct PipelineCache::ProgramCache {
 				std::erase_if(by_program, [&](const auto& item) { return item.second.first == &entry->second; });
 				ForgetPlanLoads(entry->second);
 				UncountPermutations(entry->first.stage, entry->second.permutations.size());
+				Unpin(entry->second);
 				// (A warmup beside the game may be making pipelines of its permutations: kept until it is done. So too while
 				// table pipelines made ahead (mode 4) are queued or building, and while a lookup reads a plan with the lock
 				// released (KYTY_SPEC_PIPECACHE_SPLIT): ReleaseRetired.)
@@ -3267,6 +3368,27 @@ struct PipelineCache::ProgramCache {
 		options.user_data            = job->user_data;
 		options.back_code            = job->back_code;
 		source.table_jobs.push_back(job);
+		// The program's plan kept in memory until its first lookup (EnsurePlan), while pinned plans are fewer than half the
+		// plans' budget (they count against it: SweepPlans takes other idle plans first); out of memory, read back on the
+		// ahead pool, restored as a preload is (DrainLoadedPlans at the next flip, or TakeLoadedPlan at the lookup). The
+		// ahead pool's programs were swept as any idle plan, and read back on the GPU thread or a worker at their first
+		// lookup (a full specialization check after each restore).
+		if (AheadPlanPinOn() && !source.plan_pinned && plan_pins < PlanBudget() / 2) {
+			source.plan_pinned = true;
+			++plan_pins;
+			if (source.plan_out && !source.plan_loading && push_ahead && !ahead_stopping) {
+				UnlistPlan(source);
+				source.plan_loading = true;
+				loads_tracked.insert(&source);
+				push_ahead([loads = plan_loads, entry = &source, spilled = source.plan_spilled, erased = programs_erased] {
+					LoadedPlan loaded;
+					loaded.erased = erased;
+					loaded.failed = !LoadPlanBytes(spilled, loaded.plan, loaded.linear); // (failed: the lookup reads it)
+					std::lock_guard lock(loads->mutex);
+					loads->plans[entry] = std::move(loaded);
+				});
+			}
+		}
 		return job;
 	}
 	void PushAhead(const std::shared_ptr<TableJob>& job) {
@@ -4546,7 +4668,12 @@ void PipelineCache::WarmScene(uint32_t scene, uint64_t compute_video, bool in_me
 	}
 	// (Mode 4) The scene's recorded table pairs' table programs queued on the ahead pool now, before its draws meet them,
 	// ahead of its pipelines, and their table pipelines once both programs of a pair are made (ProgramCache::PostTableAhead).
+	// The plans an earlier scene's jobs pinned that no lookup released let go first (ProgramCache::AheadJob).
 	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+		{
+			Common::LockGuard lock(m_mutex);
+			programs.ReleasePlanPins();
+		}
 		const auto posted = programs.PostTableAhead(programs.warm_records, programs.warm_recipes,
 		                                            known || !in_memory ? &only : nullptr, m_mutex);
 		PipelineCacheLog("Table ahead: {}: {} table programs queued (their vertex programs follow their pixel programs)",
@@ -4577,7 +4704,13 @@ void PipelineCache::SceneLoop(uint64_t compute_video) {
 			saved = now;
 		}
 		if (const auto generation = SceneTags::Generation(); generation != seen) {
-			seen             = generation;
+			seen = generation;
+			if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+				// (Mode 4) At every scene change the plans pinned for the ahead pool's programs that no lookup released (WarmScene
+				// runs only for a scene not warmed yet: the last warmed scene's, or a scene's on a return to it, would stay).
+				Common::LockGuard lock(m_mutex);
+				m_program_cache->ReleasePlanPins();
+			}
 			const auto scene = SceneTags::Current();
 			if (!m_scene_warmed_all && !m_scenes_warmed.contains(scene)) WarmScene(scene, compute_video, false);
 		}

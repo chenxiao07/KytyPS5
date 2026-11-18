@@ -92,6 +92,7 @@ switch acts only in mode 4. A verify switch N checks every Nth use against the p
 | table_learn_portable (live; KYTY_TABLE_LEARN_PORTABLE) | 1: an image set refused for another specialization that only a buffer's V# format makes, and a draw state stored with such other programs (the variant store), learn that buffer as portable and the pair compiles again; 2: also a refused set's retry that finds its program translating waits for it (Demon's Souls' view save: ~38 refused draws a frame gone, s1-10 fps +2.4, settled +2.2) | - | 2 | |
 | **The pipeline cache** | | | | |
 | spec_pipecache_split | the GPU thread's lookup that must translate a program builds it with the pipeline cache's lock released and publishes it under the lock, the first publish winning (a dispatch's too); a worker's lookup reads a program's plan back from its file and materializes with the lock released, then finds or adopts under it; the "Shaders:" line from running counts | 0 | 1 | |
+| spec_preload_fix | a preload never displaces a plan a lookup used: the plan sweep sends the preloaded plans no lookup used yet out first, the oldest first, and one sent out so is not preloaded again until its own lookup reads it; a plan whose worker read an erase made stale is listed out again | 0 | 1 | |
 | **Compute** | | | | |
 | fill_buffer_clears | an image-clear dispatch over plain buffer memory made as a transfer fill | 0 | 1 | |
 | **The table path** | | | | |
