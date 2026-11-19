@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "gpu_blit_shaders/gpu_imgui_hdr_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/presentation/window/hostInput.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 #include "libs/controller.h"
@@ -682,6 +683,14 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 		g_input_controller      = update.capture_controller;
 		g_input_keyboard        = update.capture_keyboard;
 		g_input_multiline       = update.multiline;
+		if (g_input_active) {
+			// (The releases of the mouse buttons go to the dialog now, and the keys' when it takes the keyboard: one held
+			// into it would stay held for the keymap, a combo's first input pressing the combo after the dialog. A key
+			// held into a dialog that leaves the keyboard to the game stays held for the keymap: its release still comes
+			// here. When the dialog takes the pad, Controller::ResetInputState (RefreshVisibility, as it opens and as
+			// it closes) clears the pad anyway, so the game sees that key's control up until the key is pressed again.)
+			HostInputReleaseHeld(g_input_keyboard);
+		}
 		if (update.text_input) {
 			SDL_StartTextInput();
 		} else if (SDL_IsTextInputActive() == SDL_TRUE) {
