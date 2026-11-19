@@ -248,6 +248,12 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 		if (arm != nullptr && exception_record->NumberParameters >= 2 && arm(exception_record->ExceptionInformation[1])) {
 			read_guard = true;
 		} else {
+			// A guarded copy that reached a guard page (a guest stack's, through a stale pointer) stops there, as at a page
+			// without access: before the guard-page handler, which would report it as that stack's overflow.
+			if (exception_record->NumberParameters >= 2 &&
+			    ResumeGuardedCopyAtGuard(exception->ContextRecord, exception_record->ExceptionInformation[1])) {
+				return EXCEPTION_CONTINUE_EXECUTION;
+			}
 			const auto handler = g_guard_page_handler.load(std::memory_order_acquire);
 			return handler != nullptr && exception_record->NumberParameters >= 2 &&
 			               handler(exception_record->ExceptionInformation[1], exception->ContextRecord)
