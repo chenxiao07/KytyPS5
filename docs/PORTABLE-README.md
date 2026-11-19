@@ -330,7 +330,10 @@ To switch:
 4. Start the game: "LANGUAGE SELECT" lists the languages of that release. Choose one and confirm with ×
    (J on the keyboard); the brightness and the speech and subtitle settings follow in that language.
 
-中文说明：游戏文件里其实包含全部语言，只是游戏按 `sce_sys\param.json` 里的 `userDefinedParam1`（发行区域）决定
+中文说明：模拟器默认让游戏在每个发行区域都提供全部语言（23 种文字，含简繁中文、日文、韩文；9 种语音），直接在游戏的
+「设置 > 语言」里选简体中文即可，语音语言在标题画面的设置里选。亚洲版（PPSA01340）也能直接运行。只有用
+`-Set KYTY_ALL_LANGUAGES=0` 关掉这个功能，或日志里的 `Demon's Souls languages: ...` 说没找到语言表时，才需要下面的修改。
+游戏文件里其实包含全部语言，只是游戏按 `sce_sys\param.json` 里的 `userDefinedParam1`（发行区域）决定
 语言选择列表。本 dump 是欧版（值为 `2`，列表里没有中文、日文、韩文）。用记事本把它改成 `0`（全部语言，含简繁中文和日文）
 或 `4`（亚洲版：简繁中文、英文、韩文、泰文）并保存（先备份原文件）；启动器的 "Console language" 选中文（简体）。
 没有存档时首次启动就会出现语言选择；已有存档时，先备份 `_SaveData`，再把 `_SaveData\PPSA01341\SAVEDATA0OptionsProfile0`
