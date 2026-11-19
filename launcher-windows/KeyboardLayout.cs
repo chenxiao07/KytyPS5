@@ -101,20 +101,20 @@ sealed class KeyboardLayout {
 		foreach (var control in Controls) {
 			string input;
 			if (!Bindings.TryGetValue(control, out input) || !Supported(input))
-				throw new IOException("Unsupported binding for " + control + ". Edit keyboard controls to choose a supported key.");
+				throw new IOException(Strings.F("keyboardcontrols.unsupportedBinding", control));
 			if (!used.Add(input))
-				throw new IOException("Duplicate binding: " + input + ". Edit keyboard controls to give each action its own input.");
+				throw new IOException(Strings.F("keyboardcontrols.duplicateBinding", input));
 			var conflict = Conflict(control, input);
 			if (conflict != null)
 				throw new IOException(Strings.F("keyboardcontrols.validate", control, conflict));
 		}
 		double value;
 		if (Sensitivity.Length != 0 && (!double.TryParse(Sensitivity, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out value) || value < 0.1 || value > 5))
-			throw new IOException("Mouse sensitivity must be blank or a number from 0.1 to 5.");
+			throw new IOException(Strings.T("keyboardcontrols.sensitivity"));
 	}
 	public string Assign(string control, string input) {
 		if (!Bindings.ContainsKey(control) || !Supported(input))
-			throw new IOException("Unsupported key. F7, F8, F11, Pause, Alt+Enter and Alt+F4 are reserved for the emulator.");
+			throw new IOException(Strings.T("keyboardcontrols.reservedKey"));
 		var conflict = Conflict(control, input);
 		if (conflict != null)
 			throw new IOException(conflict);

@@ -69,16 +69,25 @@ static class KeyboardPromptsTests {
             var loaded = KeyboardLayout.Read(new Settings(settingsPath));
             Check(loaded.Bindings["Cross"] == "R" && loaded.Sensitivity == "2.0", "Layout did not survive reload");
             try { loaded.Assign("Cross", "F7"); throw new Exception("Reserved key accepted"); } catch (IOException) { }
-            // A combo refusal reads in the launcher's language.
+            // A combo refusal, a reserved key and a duplicate binding read in the launcher's language.
             var refusal = new KeyboardLayout(); refusal.Assign("Cross", "Left Alt");
+            var duplicate = new KeyboardLayout(); duplicate.Bindings["Circle"] = "E";
             var language = Strings.Language;
             try {
                 Strings.Language = UiLanguage.Chinese;
                 try { refusal.Assign("R2", "Left Alt+Mouse:Left"); throw new Exception("Held single input accepted"); }
                 catch (IOException error) { Check(error.Message == "Left Alt 已单独绑定到 Cross，不能再作为组合键中按住的输入。", "Chinese combo refusal text"); }
+                try { refusal.Assign("Cross", "F7"); throw new Exception("Reserved key accepted"); }
+                catch (IOException error) { Check(error.Message == "不支持的按键。F7、F8、F11、Pause、Alt+Enter 和 Alt+F4 为模拟器保留。", "Chinese reserved key text"); }
+                try { duplicate.Validate(); throw new Exception("Duplicate binding accepted"); }
+                catch (IOException error) { Check(error.Message == "键位重复：E。请在键盘控制中为每个动作分配各自的输入。", "Chinese duplicate binding text"); }
                 Strings.Language = UiLanguage.English;
                 try { refusal.Assign("R2", "Left Alt+Mouse:Left"); throw new Exception("Held single input accepted"); }
                 catch (IOException error) { Check(error.Message == "Left Alt is bound to Cross on its own, so it cannot be held for a combo.", "English combo refusal text"); }
+                try { refusal.Assign("Cross", "F7"); throw new Exception("Reserved key accepted"); }
+                catch (IOException error) { Check(error.Message == "Unsupported key. F7, F8, F11, Pause, Alt+Enter and Alt+F4 are reserved for the emulator.", "English reserved key text"); }
+                try { duplicate.Validate(); throw new Exception("Duplicate binding accepted"); }
+                catch (IOException error) { Check(error.Message == "Duplicate binding: E. Edit keyboard controls to give each action its own input.", "English duplicate binding text"); }
             } finally { Strings.Language = language; }
             KeyboardPrompts.Apply(game, true, loaded);
             var custom = originals.Keys.ToDictionary(p => p, File.ReadAllBytes);
@@ -108,7 +117,7 @@ static class KeyboardPromptsTests {
             File.Delete(backup);
 			Reject(() => KeyboardPrompts.Apply(game, false));
 			foreach (var p in installed) Check(File.ReadAllBytes(p.Key).SequenceEqual(p.Value), "Missing backup caused a partial restore");
-			Console.WriteLine("PASS: default off, version guard, apply, idempotence, exact restore, partial recovery, mod/corrupt/missing backup protection, locked-file rollback, custom profile swaps/persistence/artwork/restore, protected settings writes, combo refusal language");
+			Console.WriteLine("PASS: default off, version guard, apply, idempotence, exact restore, partial recovery, mod/corrupt/missing backup protection, locked-file rollback, custom profile swaps/persistence/artwork/restore, protected settings writes, combo refusal language, older message language");
 			return 0;
 		} finally {
 			var expectedParent = System.IO.Path.GetFullPath(System.IO.Path.GetTempPath()).TrimEnd(System.IO.Path.DirectorySeparatorChar);
