@@ -1374,12 +1374,16 @@ struct State {
 		return Run::Read;
 	}
 	// The word `state`'s latest pending write over it gives (a copy: its source's, with no write of that speculation
-	// or an earlier one pending over the source).
+	// or an earlier one pending over the source). The latest write over any of its bytes must hold the whole word: one over
+	// part of it (an odd-sized or unaligned copy after an earlier write over the whole word) leaves the word made of two
+	// writes' bytes, which none gives: not served (before, the earlier whole write's word was served, its bytes that the
+	// later write changed stale).
 	[[nodiscard]] bool Resolve(const State& state, uint64_t at, uint32_t& value, const State*& by) {
 		const auto latest = std::find_if(state.writes.rbegin(), state.writes.rend(), [&](const MemoryWrite& write) {
-			return write.address <= at && at + 4 <= write.address + write.size;
+			return write.address < at + 4 && at < write.address + write.size;
 		});
 		if (latest == state.writes.rend()) return false;
+		if (latest->address > at || at + 4 > latest->address + latest->size) return false;
 		by = &state;
 		const auto entry = static_cast<size_t>(latest.base() - state.writes.begin()) - 1;
 		if (!latest->copy) {
