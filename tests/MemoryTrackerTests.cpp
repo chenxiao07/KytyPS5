@@ -1070,6 +1070,12 @@ volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode {1};
 volatile std::atomic<uint32_t> kyty_local_range_set_fast_mode {1};
 }
 
+// KYTY_SPECULATE's mode, which pageManager.cpp reads (ProtectAsyncOn); speculation.cpp, which defines it, is not
+// linked here. Mode 0. (C linkage, as speculation.cpp defines it.)
+extern "C" {
+volatile std::atomic_uint32_t kyty_local_speculate_mode {0};
+}
+
 namespace Libs::LibKernel::Memory {
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,

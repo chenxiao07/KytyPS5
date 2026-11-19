@@ -651,6 +651,12 @@ void TestFatalPaths() {
 
 } // namespace
 
+// KYTY_SPECULATE's mode, which pageManager.cpp reads (ProtectAsyncOn); speculation.cpp, which defines it, is not
+// linked here. Mode 0. (C linkage, as speculation.cpp defines it.)
+extern "C" {
+volatile std::atomic_uint32_t kyty_local_speculate_mode {0};
+}
+
 namespace Libs::LibKernel::Memory {
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
