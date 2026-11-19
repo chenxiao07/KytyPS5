@@ -421,10 +421,11 @@ public:
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
-	// Changed's stamps (mode 4): the latest resolution epoch of a registration or unregistration over its bytes (its own
-	// too), kept while KYTY_SPECULATE is 4 (TextureCache::StampRegistrationPages).
-	mutable std::atomic<uint64_t> overlap_epoch {0};
 	bool             guest_alias    = false; // TextureCache::GuestTexture: another view of its memory is an image too
+	// (Mode 4) Its upload is running with the texture cache's shared readers let in (TextureCache::UploadWindow); they take
+	// it as not current. Written by the GPU thread with no reader inside. (In the padding before query_epoch: no field
+	// moves.)
+	bool             refreshing     = false;
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
@@ -464,9 +465,6 @@ public:
 	mutable std::atomic<uint32_t> state_busy {0};
 	// RegisterImage calls on this object: a proof names one registration.
 	uint32_t         registrations      = 0;
-	// (Mode 4) Its upload is running with the texture cache's shared readers let in (TextureCache::UploadWindow); they take
-	// it as not current. Written by the GPU thread with no reader inside.
-	bool             refreshing         = false;
 	// TextureCache::ViewLevelBytes's last answer: the view's levels (base | count << 8; UINT32_MAX: none yet) and their
 	// bytes [level_begin, level_end) (level_end 0: the view needs the whole image).
 	mutable uint32_t level_view         = UINT32_MAX;
@@ -504,6 +502,12 @@ private:
 	bool              m_stencil_modified  = false;
 	bool              m_partial_dirty     = false;
 	std::vector<std::pair<uint64_t, uint64_t>> m_dirty_ranges;
+
+public:
+	// (Mode 4 only; last, after every field the other modes read, whose offsets stay as they were.) Changed's stamps: the
+	// latest resolution epoch of a registration or unregistration over its bytes (its own too), kept while KYTY_SPECULATE
+	// is 4 (TextureCache::StampRegistrationPages).
+	mutable std::atomic<uint64_t> overlap_epoch {0};
 };
 
 namespace ImageOps {
