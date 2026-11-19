@@ -398,6 +398,10 @@ struct PageManager::Impl {
 		HandedRange*          prev = nullptr, *next = nullptr; // (HandedLive's list, under its mutex)
 	};
 	static inline thread_local std::vector<HandedRange*> handed_ranges; // the GPU thread's, not yet seen applied
+	// Set at a hand-off, cleared when the GPU thread's list is empty again: a flush in any mode reads this one global (not
+	// the thread-local list) and looks further only while something is handed. (Not ProtectAsyncOn: a live flip to mode
+	// 0 can leave ranges handed while the switch reads off, and they must still be taken over.)
+	static inline std::atomic<bool> handed_any {false};
 	// Every handed range still referenced, any thread's (its owner's teardown settles those of its own: ~Impl): linked
 	// at its hand-off, unlinked as its last reference goes, under the mutex. Never freed (an owner or a job at static
 	// destruction still finds it); `count` lets a teardown with none skip the mutex.
@@ -541,6 +545,7 @@ struct PageManager::Impl {
 				live.count.fetch_add(1, std::memory_order_relaxed);
 			}
 			handed.push_back(item);
+			handed_any.store(true, std::memory_order_relaxed);
 			push(&RunHanded, item, range.begin, range.end - range.begin);
 		}
 		LiveCounters::Add(LiveCounters::Rp1Handed, g_read_protects.size());
@@ -558,6 +563,7 @@ struct PageManager::Impl {
 			ReleaseHanded(range);
 		}
 		handed.clear();
+		handed_any.store(false, std::memory_order_relaxed);
 	}
 	// At the texture offload's partial flush (FlushDeferredProtection(vaddr, size)): the handed ranges over [begin, end)
 	// applied (or waited for) too, so its hold's no access is in force at once there as well (a hold over a read-watched
@@ -1062,7 +1068,8 @@ template void PageManager::UpdateReadWatchers<false, true>(uint64_t, uint64_t);
 
 void PageManager::DeferReadProtection(bool on) noexcept {
 	if (!on) {
-		Impl::TakeOverHanded(); // (KYTY_SPEC_PROTECT_ASYNC: those handed at a submission first; none without it)
+		// (KYTY_SPEC_PROTECT_ASYNC: those handed at a submission first; none without it.)
+		if (Impl::handed_any.load(std::memory_order_relaxed)) Impl::TakeOverHanded();
 		Impl::FlushReadProtect();
 		++g_observation_epoch;
 	}
@@ -1070,7 +1077,8 @@ void PageManager::DeferReadProtection(bool on) noexcept {
 }
 
 void PageManager::FlushDeferredProtection() noexcept {
-	Impl::TakeOverHanded(); // (KYTY_SPEC_PROTECT_ASYNC: those handed at a submission first; none without it)
+	// (KYTY_SPEC_PROTECT_ASYNC: those handed at a submission first; none without it: one global's load.)
+	if (Impl::handed_any.load(std::memory_order_relaxed)) Impl::TakeOverHanded();
 	Impl::FlushReadProtect();
 	++g_observation_epoch;
 }
@@ -1084,7 +1092,8 @@ bool PageManager::FlushDeferredProtectionAtSubmit(HandPush push) noexcept {
 
 // (No new observation epoch: the guest learns nothing new from protections applied early.)
 void PageManager::FlushDeferredProtection(uint64_t vaddr, uint64_t size) noexcept {
-	Impl::TakeOverHandedOverlapping(vaddr, vaddr + size); // (KYTY_SPEC_PROTECT_ASYNC: none without it)
+	if (Impl::handed_any.load(std::memory_order_relaxed)) // (KYTY_SPEC_PROTECT_ASYNC: none without it)
+		Impl::TakeOverHandedOverlapping(vaddr, vaddr + size);
 	Impl::FlushReadProtectOverlapping(vaddr, vaddr + size, false);
 }
 
