@@ -59,6 +59,46 @@
 
 namespace Libs::Graphics {
 
+namespace {
+// Where the presenting thread is while it is inside a call that may block, and since when (steady clock, ns). The GPU
+// thread's next flips (Presenter::Submit) put it in the log once it has been there 5 s, then at 10, 20, 40 s and so on:
+// a frozen picture with the game running on (its flips counted, the music playing) left no line at all before (issue
+// #357, an RX 9070 XT, AMD's 25.20.42.14, at the Armor Spider's fireballs). Only the presenting thread sets it.
+std::atomic<const char*> g_present_stage {nullptr};
+std::atomic<int64_t>     g_present_stage_since {0};
+std::atomic<int64_t>     g_present_stage_reported {0}; // (the stage's `since` last reported, and the next report's wait in s)
+std::atomic<int64_t>     g_present_stage_next_s {5};
+
+[[nodiscard]] int64_t PresentStageNow() noexcept {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+struct PresentStage {
+	explicit PresentStage(const char* what) noexcept {
+		g_present_stage_since.store(PresentStageNow(), std::memory_order_relaxed);
+		g_present_stage.store(what, std::memory_order_release);
+	}
+	~PresentStage() noexcept { g_present_stage.store(nullptr, std::memory_order_release); }
+	KYTY_CLASS_NO_COPY(PresentStage);
+};
+
+// (The GPU thread, at a flip: one load while the presenting thread is not inside such a call.)
+void ReportPresentStage() noexcept {
+	const char* what = g_present_stage.load(std::memory_order_acquire);
+	if (what == nullptr) return;
+	const int64_t since = g_present_stage_since.load(std::memory_order_relaxed);
+	if (g_present_stage_reported.exchange(since, std::memory_order_relaxed) != since)
+		g_present_stage_next_s.store(5, std::memory_order_relaxed);
+	const int64_t waited_s = (PresentStageNow() - since) / 1'000'000'000;
+	const int64_t next_s   = g_present_stage_next_s.load(std::memory_order_relaxed);
+	if (waited_s < next_s) return;
+	g_present_stage_next_s.store(next_s * 2, std::memory_order_relaxed);
+	std::printf("Presenter: nothing shown for %lld s, the presenting thread still in %s (the game's frames go on)\n",
+	            static_cast<long long>(waited_s), what);
+	std::fflush(stdout);
+}
+} // namespace
+
 struct Presenter::Frame {
 	VulkanImage            image;
 	vk::ImageView          view = nullptr; // `image` sampled (the dithered copy, Swapchain::RecordDitheredCopy)
@@ -1399,8 +1439,9 @@ void Swapchain::Recreate(bool surface_lost) {
 
 Swapchain::Status Swapchain::AcquireNextImage() {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
-	m_image_index     = static_cast<uint32_t>(-1);
-	const auto result =
+	m_image_index = static_cast<uint32_t>(-1);
+	const PresentStage stage("vkAcquireNextImageKHR (waiting for a swapchain image)");
+	const auto         result =
 	    FrameGen::OwnsSwapchain()
 	        ? FrameGen::AcquireNextImage(m_window.graphic_ctx.device, m_handle, std::numeric_limits<uint64_t>::max(),
 	                                     m_image_acquired[m_frame_index], &m_image_index)
@@ -1877,22 +1918,33 @@ Swapchain::Status Swapchain::Present() {
 	present.waitSemaphoreCount = 1;
 
 	vk::Result result;
+	// (PresentStage: the queue's lock, then the call.)
+	std::optional<PresentStage> stage(std::in_place, "the present queue's lock");
+	const auto                  call = [&] {
+		stage.reset();
+		stage.emplace("vkQueuePresentKHR");
+	};
 	if (auto& graphics = m_window.graphic_ctx; FrameGen::OwnsSwapchain() && graphics.present_queue != nullptr) {
 		// FSR's swapchain: its game queue is the present queue (FrameGen::CreateSwapchain).
 		Common::LockGuard lock(graphics.present_queue_mutex);
+		call();
 		result = FrameGen::QueuePresent(graphics.present_queue, present);
 	} else if (FrameGen::OwnsSwapchain()) {
 		// ... or the graphics queue, without a present queue (issue #170: one graphics queue).
 		Common::LockGuard lock(graphics.queue_mutex);
+		call();
 		result = FrameGen::QueuePresent(graphics.queue, present);
 	} else if (graphics.present_queue != nullptr) {
 		// Its own queue: a present blocked in the kernel does not hold up other submissions.
 		Common::LockGuard lock(graphics.present_queue_mutex);
+		call();
 		result = graphics.present_queue.presentKHR(&present);
 	} else {
 		Common::LockGuard lock(graphics.queue_mutex);
+		call();
 		result = graphics.queue.presentKHR(&present);
 	}
+	stage.reset();
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
@@ -1996,6 +2048,7 @@ static bool PresentDirect() {
 }
 
 void Presenter::Submit(Frame& frame, bool reuse) {
+	ReportPresentStage();
 	m_impl->frames.ValidateForPresent(&frame, reuse);
 	if (PresentDirect()) {
 		Present(frame, reuse);
@@ -2005,6 +2058,7 @@ void Presenter::Submit(Frame& frame, bool reuse) {
 }
 
 void Presenter::SubmitBlank(uint32_t width, uint32_t height, bool opaque) {
+	ReportPresentStage();
 	if (PresentDirect()) {
 		// (A free frame, else none, as the presenter's thread does.)
 		if (auto* frame = m_impl->frames.Acquire(false); frame != nullptr) {
@@ -2151,7 +2205,10 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	// On Windows, presenting before it reaches the driver blocks vkQueuePresentKHR in the
 	// kernel while it holds the queue lock that submission needs: a deadlock. Wait (no locks
 	// held) until it has been submitted; this does not wait for the GPU.
-	LocalVulkanRecording::WaitDeferredSubmits();
+	{
+		const PresentStage stage("the wait for the frame's commands to reach the driver (WaitDeferredSubmits)");
+		LocalVulkanRecording::WaitDeferredSubmits();
+	}
 #endif
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
@@ -2218,7 +2275,10 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		// GPU work while it holds a device-wide lock: every queue submission waits behind it,
 		// including those the GPU work may still depend on (a deadlock). Wait for the GPU here,
 		// holding nothing; the present on its own queue then finds the semaphore signaled.
-		m_impl->present_scheduler.Wait(frame.present_tick);
+		{
+			const PresentStage stage("the wait for its own GPU work (the frame's copy into the swapchain image)");
+			m_impl->present_scheduler.Wait(frame.present_tick);
+		}
 #endif
 		// KYTY_FRAMEGEN: Streamline takes the present (vkQueuePresentKHR is its hook) and adds
 		// the generated frames; an idle refresh of the last frame carries no new inputs.
