@@ -103,7 +103,8 @@ constexpr uint32_t TranslatorFeatureAmdBarycentrics = 256u;
 // overlapping decals run one after the other, as the PS5 runs them. Without it, a GPU that runs consecutive draws'
 // pixels together lets the next decal read before the last one's write lands and write back over it: holes of 2x2
 // pixels in the candle wax and wall marks, different every frame (issues #315, #341). Only where the device has the
-// pixel interlock and storage reads without a format (TranslatorDeviceFeatures: AMD's Windows driver has no interlock).
+// pixel interlock and storage reads without a format, and not on AMD's Windows driver unless forced (TranslatorDeviceFeatures;
+// PixelInterlockExtension: characters' faces came out wrong with it there, issue #355).
 constexpr uint32_t TranslatorFeaturePixelInterlock = 512u;
 constexpr uint32_t TranslatorFeatures = TranslatorFeatureCooperativeHalves | TranslatorFeatureTableSlotsAtUse |
                                         TranslatorFeatureNativeFloatMinMax | TranslatorFeatureExecSelects |

@@ -177,13 +177,15 @@ static bool AmdExplicitVertexBarycentrics(vk::PhysicalDevice physical_device, co
 
 // VK_EXT_fragment_shader_interlock where the GPU has its pixel-ordered interlock and reads storage images without a
 // format (both enabled by VulkanCreateDevice): the deferred decals' read and write of the G-buffer ordered per pixel
-// (TranslatorFeaturePixelInterlock, issues #315 and #341). Not AMD's Windows driver, which has no interlock. The
-// emulator (`emulator`) only where its static pipeline store's translation may use it: none, or one a precompile made
-// with it. A store made before keeps the old translation (TranslatorFeaturesWithNextPrecompile), and the device it was
-// made for: a driver's global pipeline key may take the extensions enabled (NVIDIA's did not, 11-17). The precompile
-// program enables it wherever the GPU has it, and stamps its store. KYTY_PIXEL_INTERLOCK=1 enables it whatever the
-// store; =0 neither the extension nor the translation (the Steam Deck build: only with =1, not measured there).
-// Returns whether.
+// (TranslatorFeaturePixelInterlock, issues #315 and #341). Not on AMD's Windows driver by default: it has the interlock
+// (25.20.42.14 and 26.11.1 with an RX 9070 / 9070 XT), but with it the player character's face showed the game's
+// missing-texture checker (green, magenta dots, red diagonals) on an RX 9070 with 26.11.1, and KYTY_PIXEL_INTERLOCK=0
+// gave the face back (issue #355; the same translation is right on an RTX 5090). The emulator (`emulator`) only where
+// its static pipeline store's translation may use it: none, or one a precompile made with it. A store made before keeps
+// the old translation (TranslatorFeaturesWithNextPrecompile), and the device it was made for: a driver's global
+// pipeline key may take the extensions enabled (NVIDIA's did not, 11-17). The precompile program enables it wherever the
+// emulator would, and stamps its store. KYTY_PIXEL_INTERLOCK=1 enables it whatever the store and driver; =0 neither the
+// extension nor the translation (the Steam Deck build: only with =1, not measured there). Returns whether.
 static bool PixelInterlockExtension(vk::PhysicalDevice physical_device, const std::vector<vk::ExtensionProperties>& available,
                                     std::vector<const char*>& extensions, GraphicContext& graphics, bool emulator) {
 	graphics.fragment_shader_pixel_interlock = false;
@@ -205,6 +207,15 @@ static bool PixelInterlockExtension(vk::PhysicalDevice physical_device, const st
 	physical_device.getFeatures2(&features);
 	if (interlock.fragmentShaderPixelInterlock != VK_TRUE || features.features.shaderStorageImageReadWithoutFormat != VK_TRUE)
 		return off("the GPU lacks the pixel interlock or storage image reads without a format");
+	if (!forced) {
+		vk::PhysicalDeviceDriverProperties driver {};
+		vk::PhysicalDeviceProperties2      properties {};
+		properties.pNext = &driver;
+		physical_device.getProperties2(&properties);
+		if (driver.driverID == vk::DriverId::eAmdProprietary)
+			return off("AMD's Windows driver: characters' faces come out wrong with it, issue #355; KYTY_PIXEL_INTERLOCK=1 "
+			           "enables it");
+	}
 	namespace Translate = ShaderRecompiler::Frontend;
 	if (emulator && !forced && (PipelineCache::StaticStoreFeatures() & Translate::TranslatorFeaturePixelInterlock) == 0)
 		return off("the static pipeline store was made without it: the next precompile brings it, or KYTY_PIXEL_INTERLOCK=1");

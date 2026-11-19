@@ -514,7 +514,9 @@ hurts.
   before stay as they are until your next precompile, which brings it (Precompile on the launcher's Shaders page:
   only what is new is compiled); until then `-Set KYTY_PIXEL_INTERLOCK=1` uses it at once (those pipelines are then
   compiled the first time the game draws them), and `-Set KYTY_PIXEL_INTERLOCK=0` turns it off. AMD's Windows driver
-  has no interlock: there `run.cmd -Set KYTY_DRAW_READ_AFTER_WRITE=1` (or `-Set KYTY_DRAW_READ_AFTER_WRITE=1` in the
+  has the interlock too, but with it the player character's face showed the game's green missing-texture checker
+  (issue #355), so the emulator leaves it off there (`-Set KYTY_PIXEL_INTERLOCK=1` still turns it on). There
+  `run.cmd -Set KYTY_DRAW_READ_AFTER_WRITE=1` (or `-Set KYTY_DRAW_READ_AFTER_WRITE=1` in the
   launcher's Advanced > "Command-line options") orders the decals with barriers instead, but where there are hundreds
   of decals the frame rate can drop by up to ~15% (Boletaria's start without the 60 fps cap: 73 -> 61 fps on an RTX
   5090; at 60 fps it still held 60 there). With the interlock that switch is not needed.
