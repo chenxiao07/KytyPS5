@@ -82,7 +82,7 @@ sealed class KeyboardControlsWindow : Window {
 		Deactivated += (s, e) => { if (capturing != null) { capturing = null; held = null; ReleaseMouseCapture(); Refresh(); } };
 		Refresh();
 		try { layout.Validate(); }
-		catch (IOException error) { status.Text = error.Message + T(" You can repair it here or reset defaults.", " 可在此修复或恢复默认设置。"); }
+		catch (IOException error) { status.Text = error.Message + T(" You can repair it here or reset defaults.", "可在此修复或恢复默认设置。"); }
 	}
 	Button ActionButton(string text, Action action) {
 		var b = new Button { Style = (Style)Application.Current.FindResource("FlatButton"), Content = text, Tag = "editor-command", Margin = new Thickness(4), Padding = new Thickness(10, 6, 10, 6) };
