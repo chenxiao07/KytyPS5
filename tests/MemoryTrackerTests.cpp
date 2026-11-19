@@ -340,20 +340,24 @@ void TestLocalCpuEpochs() {
   };
   upload(first);
   upload(second);
+  // GPU-written pages given back to the CPU hold the GPU's bytes: their region's epoch moves (75aa4b9e, a shared
+  // ring copy's proof). Another region's CPU write does not move it.
   tracker.MarkRegionAsGpuModified(first, page);
   tracker.UnmarkRegionAsGpuModified(first, page);
+  const auto after_gpu = tracker.CpuModificationEpoch(first, page);
+  Check(after_gpu != 0 && after_gpu != initial, "GPU-written pages given back did not move their region's CPU epoch");
   tracker.MarkRegionAsCpuModified(second, page);
-  Check(tracker.CpuModificationEpoch(first, page) == initial,
-        "GPU changes or another region invalidated a local CPU epoch");
+  Check(tracker.CpuModificationEpoch(first, page) == after_gpu,
+        "another region's CPU write invalidated a local CPU epoch");
   g_epoch_tracker = &tracker;
   g_epoch_address = first;
-  g_epoch_before  = initial;
+  g_epoch_before  = after_gpu;
   g_epoch_checked = false;
   tracker.InvalidateRegion(first, page, []() noexcept {});
   g_epoch_tracker = nullptr;
   Check(g_epoch_checked, "epoch ordering test did not release host protection");
   {
-    Check(tracker.CpuModificationEpoch(first, page) != initial,
+    Check(tracker.CpuModificationEpoch(first, page) != after_gpu,
           "CPU invalidation did not publish a local epoch");
   }
   tracker.UntrackMemory(allocation, 2 * region);
@@ -1078,6 +1082,11 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
 }
 
 bool RestoreGuestWritable(uint64_t /*vaddr*/, uint64_t /*size*/) {
+  return false;
+}
+
+// (The guest's own protection, which the read guard's page lift restores: none here.)
+bool RestoreGuestProtection(uint64_t /*vaddr*/, uint64_t /*size*/) {
   return false;
 }
 

@@ -662,6 +662,11 @@ bool RestoreGuestWritable(uint64_t /*vaddr*/, uint64_t /*size*/) {
   return false;
 }
 
+// (The guest's own protection, which the read guard's page lift restores: none here.)
+bool RestoreGuestProtection(uint64_t /*vaddr*/, uint64_t /*size*/) {
+  return false;
+}
+
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {
