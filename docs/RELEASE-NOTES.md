@@ -20,8 +20,9 @@ are compiled once more without it the first time they appear (or with your next 
   0.6 GB less with plenty of RAM. The frame rate is the same.
 - **Keyboard and mouse: one control on two inputs at once** (PR #360, credit @shanedirksen): `--keymap
   R2=Left Alt+Mouse:Left` presses R2 when you click with Left Alt held, while a plain click keeps its own control. In
-  the Windows launcher's keyboard editor, hold one input and press another to bind both; when a combo cannot be bound,
-  the editor says why in the launcher's language (PR #365). Single-input bindings work as before.
+  the Windows launcher's keyboard editor, hold one input and press another to bind both; the editor's messages (a
+  combo it cannot bind, a duplicate or unsupported key) now come in the launcher's language (PRs #365, #367).
+  Single-input bindings work as before.
 - **Parallel translation (`KYTY_SPECULATE=4`, experimental), a follow-up by @CarpetHead** (PR #349): CPU lists such as
   `KYTY_RENDER_CPUS=0,8-15` now read their ranges (a range was cut short before); on Linux the state pass gets a core
   of its own; long sessions no longer meet single frames of 80–160 ms as the label set grows (also found by
@@ -78,7 +79,7 @@ decal fix below (only those shaders are compiled again).
 
 - **Windows 上的 AMD 显卡：角色的脸恢复正常**（#355，感谢 @supercc4e）：用 v20261118 并重新预编译后，Radeon 在 Windows 上会把玩家角色的脸显示成游戏的“缺失纹理”格子（绿底、紫色方点、红色斜线）。AMD 的 Windows 驱动其实支持 v20261118 开始用于贴花的像素互锁（上一版说明写的是不支持），开启后脸部就会出错。现在模拟器在 AMD 的 Windows 驱动上不再开启像素互锁，与 v20261118 之前相同。关闭后，#315/#341 里贴花重叠处的小孔可能再次出现；仍可用 `-Set KYTY_DRAW_READ_AFTER_WRITE=1` 规避，`-Set KYTY_PIXEL_INTERLOCK=1` 可强制开启互锁。之前为修脸加了 `-Set KYTY_PIXEL_INTERLOCK=0` 的可以去掉。
 - **内存占用更少，长时间游玩尤其明显：** 着色器录制（预热时重放的着色器和管线列表，通关后约 100 MB）启动后不再常驻内存，每次保存时从磁盘上的文件拷贝已有部分，并用文件的校验和核对。着色器的资源分析改为整块存放，不再每个值单独分配一次（总数达数百万）；为重建而保留的管线只存它用到的顶点输入（每条约 1.6 KB，原为约 11 KB）；游戏查找的约 22.4 万个文件路径只存一份，.zar 读取器的各个读取通道共用一份索引表。在所有世界之间来回一小时（RTX 5090），与 v20261118 相比：模拟 16 GB 内存的设置下平均少用约 0.5 GB 内存，内存充足时平均少约 0.6 GB。帧数不变。
-- **键盘鼠标：一个按键可绑定为两个输入的组合**（PR #360，感谢 @shanedirksen）：`--keymap R2=Left Alt+Mouse:Left` 表示按住左 Alt 再点鼠标左键时按下 R2，单独点左键仍是它原来的按键。Windows 启动器的键位编辑器里，按住一个输入再按另一个即可绑定组合；无法绑定时，编辑器会用启动器的语言说明原因（PR #365）。单个输入的绑定与以前相同。
+- **键盘鼠标：一个按键可绑定为两个输入的组合**（PR #360，感谢 @shanedirksen）：`--keymap R2=Left Alt+Mouse:Left` 表示按住左 Alt 再点鼠标左键时按下 R2，单独点左键仍是它原来的按键。Windows 启动器的键位编辑器里，按住一个输入再按另一个即可绑定组合；编辑器的提示（无法绑定的组合、重复或不支持的按键）现在都使用启动器的语言（PR #365、#367）。单个输入的绑定与以前相同。
 - **并行翻译（`KYTY_SPECULATE=4`，实验功能），@CarpetHead 的后续修复**（PR #349）：`KYTY_RENDER_CPUS=0,8-15` 这类 CPU 列表现在能正确读取范围（以前范围会被截断）；Linux 上状态遍历线程有了自己的核心；长时间游玩时不再随着标签集合增大出现 80–160 ms 的单帧卡顿（@Rufus7787 在 PR #356 中也发现了这个问题）；提交时会核对更多工作线程读过的数据。默认模式不变。
 - **画面冻结时日志会留下记录**（#357）：如果画面停住而游戏仍在运行（音乐还在播），5 秒后日志会写明把画面交给 Windows 的哪一步在等待，方便报告问题时定位。
 - **感谢** @supercc4e 的报告和测试，@CarpetHead 和 @shanedirksen 的 PR，@Rufus7787 找到标签卡顿，以及 @Bios2000 在 Linux 上测试 #349。
