@@ -88,11 +88,11 @@ sealed class KeyboardLayout {
 				continue;
 			if (!SplitCombo(Bindings[other], out otherFirst, out otherSecond)) {
 				if (combo && Bindings[other] == first)
-					return first + " is bound to " + other + " on its own, so it cannot be held for a combo.";
+					return Strings.F("keyboardcontrols.heldBoundAlone", first, other);
 			} else if (!combo && input == otherFirst)
-				return input + " is held for " + other + "'s combo, so it cannot be bound on its own.";
+				return Strings.F("keyboardcontrols.boundAloneIsHeld", input, other);
 			else if (combo && ((first == otherFirst && second == otherSecond) || (first == otherSecond && second == otherFirst)))
-				return other + " already has " + first + " and " + second + " as a combo.";
+				return Strings.F("keyboardcontrols.samePair", other, first, second);
 		}
 		return null;
 	}
@@ -106,7 +106,7 @@ sealed class KeyboardLayout {
 				throw new IOException("Duplicate binding: " + input + ". Edit keyboard controls to give each action its own input.");
 			var conflict = Conflict(control, input);
 			if (conflict != null)
-				throw new IOException(control + ": " + conflict + " Edit keyboard controls to change one of them.");
+				throw new IOException(Strings.F("keyboardcontrols.validate", control, conflict));
 		}
 		double value;
 		if (Sensitivity.Length != 0 && (!double.TryParse(Sensitivity, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out value) || value < 0.1 || value > 5))
