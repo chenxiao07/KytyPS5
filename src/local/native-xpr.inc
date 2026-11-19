@@ -269,6 +269,15 @@ struct RenderExecutor::NativeXprDrawState {
 	RenderState                      first_rendering; // as the stored draw began it
 	std::vector<Target>              targets;
 	LocalDrawRecording::DynamicState dynamic;
+	// (Mode 4) Made by a worker from a sibling's capture (TableWorkerEntry). Read at every table draw and emission in any
+	// mode (such a state stays in the catalog across a live flip to mode 0): in the padding after `dynamic` (1276 bytes,
+	// 4-aligned, before the 8-aligned dynamic_hash), so no field moves; on dynamic_hash's line, which a draw under a state
+	// other than the last one emitted reads.
+	bool                             derived = false;
+	// (Mode 4) Captured by a worker (RenderExecutor::WorkerCaptureTargets), or derived from such a capture (copied with it):
+	// its depth target's shader reads are decided at each emission (NativeXprEmitTargets, which reads it per target in any
+	// mode: beside `derived`, in the same padding).
+	bool                             worker_captured = false;
 	uint64_t                         dynamic_hash = 0; // of the dynamic state's bytes: two states compare it first
 	ResolvedDynamicState             resolved;         // the dynamic state's Vulkan values (once, at capture)
 	// Metadata epoch under which no target had a pending fast clear.
@@ -292,10 +301,14 @@ struct RenderExecutor::NativeXprDrawState {
 	// spec_depth_layers2 (mode 4 only): the depth target as the normal path resolved it at the capture. Immutable once
 	// captured (a capture again replaces the state): a worker reads it under the catalog's read lock and keeps the pointer.
 	std::shared_ptr<const RenderDepthInfo> depth_info;
+	// The frame a draw last used it (NativeXprCollect lets one go that none used for NativeXprCache::StateKeepFrames).
+	mutable uint64_t                 used_frame = 0;
+	void Use(uint64_t frame) const { std::atomic_ref<uint64_t>(used_frame).store(frame, std::memory_order_relaxed); }
+	[[nodiscard]] uint64_t UsedFrame() const { return std::atomic_ref<uint64_t>(used_frame).load(std::memory_order_relaxed); }
 	// (Mode 4, set at captures; TableWorkerEntry) The capture's pipeline inputs (the targets as the normal path resolved
 	// them, whether a pixel shader runs, the topology), immutable once captured (a capture again replaces the state,
 	// capture_id moves; a worker keeps the pointer); the hash of the context registers and the user configuration
-	// (WorkerEntryContextHash); `derived`: made by a worker from a sibling's capture (TableWorkerEntry).
+	// (WorkerEntryContextHash).
 	struct PipelineInputs {
 		RenderColorInfo       color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 		uint32_t              color_count              = 0;
@@ -306,10 +319,6 @@ struct RenderExecutor::NativeXprDrawState {
 	};
 	std::shared_ptr<const PipelineInputs> pipeline_inputs;
 	uint64_t                              ctx_hash = 0;
-	bool                                  derived  = false;
-	// (Mode 4) Captured by a worker (RenderExecutor::WorkerCaptureTargets), or derived from such a capture (copied with it):
-	// its depth target's shader reads are decided at each emission (NativeXprEmitTargets).
-	bool                                  worker_captured = false;
 	// (Mode 4, a worker's capture) The colour targets it took as the in-order FindImage's reuse of an existing image
 	// (TextureCache::t_adopt_picks), proven again at the entry's commit check (TextureCache::AdoptedTargetCurrent).
 	std::vector<TextureCache::AdoptPick>  adopted;
@@ -338,10 +347,6 @@ struct RenderExecutor::NativeXprDrawState {
 	};
 	std::shared_ptr<Virtual>               virtual_targets;
 	[[nodiscard]] static constexpr ImageId VirtualId() noexcept { return ImageId {ImageId::INVALID_INDEX - 1u, 0u}; }
-	// The frame a draw last used it (NativeXprCollect lets one go that none used for NativeXprCache::StateKeepFrames).
-	mutable uint64_t                 used_frame = 0;
-	void Use(uint64_t frame) const { std::atomic_ref<uint64_t>(used_frame).store(frame, std::memory_order_relaxed); }
-	[[nodiscard]] uint64_t UsedFrame() const { return std::atomic_ref<uint64_t>(used_frame).load(std::memory_order_relaxed); }
 };
 
 // One object: its resources under the compiled programs it was translated with.

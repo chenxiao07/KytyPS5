@@ -168,12 +168,6 @@ struct RenderExecutor::TableImageSet {
 	// KYTY_DRAW_READ_AFTER_WRITE=1 a draw with the set transits it every time (TableTransit), never in place, ordered
 	// after the last draw's write (Image::GetBarriers, issue #315).
 	bool                      read_after_write = false;
-	// (Mode 4) The targets of every draw state its translation bound it under while it had pending slots (TableDraw; that
-	// translation's thread only, until its commit reads them: TableCompletePendingImages).
-	std::vector<ImageId>      pending_targets;
-	// (Mode 4) A worker built it with a storage image resolved read only (its commit's check notes the GPU write the owner's
-	// FindTexture would have, once each such image is still as the worker found it).
-	bool                      worker_storage = false;
 	// The words select another specialization, or an image no set can hold: the draws take the native path
 	// (TableResolveSet tries again after TableImageSet::RetryFrames).
 	bool                  refused = false;
@@ -186,6 +180,13 @@ struct RenderExecutor::TableImageSet {
 	// is made for (null: the pair's).
 	const ShaderRecompiler::IR::CompiledShaderInfo* program  = nullptr;
 	const PipelineCache::Pipeline*                  pipeline = nullptr;
+	// (Mode 4 only, after the fields every mode reads, whose offsets they leave as they were.)
+	// The targets of every draw state its translation bound it under while it had pending slots (TableDraw; that
+	// translation's thread only, until its commit reads them: TableCompletePendingImages).
+	std::vector<ImageId>      pending_targets;
+	// A worker built it with a storage image resolved read only (its commit's check notes the GPU write the owner's
+	// FindTexture would have, once each such image is still as the worker found it).
+	bool                      worker_storage = false;
 };
 
 // Two specializations of a program the table way alike but for their images' and samplers' bindings: the same slots,
@@ -392,14 +393,6 @@ struct RenderExecutor::TableXpr {
 		return memo[((reinterpret_cast<uintptr_t>(pair) * 0x9e3779b97f4a7c15ull) ^ (key * 0xc2b2ae3d27d4eb4full)) >> 52u];
 	}
 	uint64_t                  images_epoch = 0;       // TextureCache::ImagesEpoch after it
-	// (Mode 4) a speculation's last table draw here, by its translation (Spec::State::id), segment, chain head, draw
-	// state's capture (a state re-captured in place keeps its address), the images epoch read before its checks, and its
-	// overlay and open-write generations after it (id 0: none to match). TableDraw's spec_in_place.
-	struct SpecPlace {
-		uint64_t           id = 0, images = 0, overlay = 0, open = 0, capture = 0;
-		size_t             segment = 0;
-		const Spec::State* chain   = nullptr;
-	} spec_place;
 	// The game buffer the last arguments came from, and the indices' by their address (each mesh has its own): used
 	// again while no registration changed and the guest wrote none of its region (ObtainBuffer then returns the same
 	// buffer; it streams CPU-dirty ranges).
@@ -450,7 +443,6 @@ struct RenderExecutor::TableXpr {
 		uint64_t id = 0, rollbacks = 0, waits = 0;
 		size_t   segment = 0;
 	};
-	std::unique_ptr<SpecRingCopy[]> spec_ring_copies; // (made at a speculation's first copy)
 	uint32_t                          special_generation = 1; // moves with the image starts and the mappings
 	// Addresses no image starts at, each with the TextureCache::StartEpoch it was proven at (only an address gaining
 	// its first image moves that epoch): TableBlocks asks the texture cache (a lock and a map lookup) again only then.
@@ -477,10 +469,21 @@ struct RenderExecutor::TableXpr {
 	// An indirect image's candidates for the draw or dispatch being made (per stage), in the order its set binds them
 	// (TableEvaluate: the set's key; TableResolveSet), and the enumeration's scratch.
 	std::array<std::vector<ShaderRecompiler::IR::DescriptorValue>, 2> indirect;
-	// (KYTY_SPEC_PAIR_DENSE_INDIRECT: per stage, each indirect image's count of them in `indirect`, in plan order: a
-	// program with several dense roots has their candidates one after another there.)
-	std::array<std::vector<uint32_t>, 2>                              indirect_counts;
 	ShaderRecompiler::IR::AddressProbeCandidates                      probe;
+	// (Mode 4 only, after the fields every mode reads per draw, whose offsets they leave as they were.)
+	// A speculation's last table draw here, by its translation (Spec::State::id), segment, chain head, draw state's
+	// capture (a state re-captured in place keeps its address), the images epoch read before its checks, and its overlay
+	// and open-write generations after it (id 0: none to match). TableDraw's spec_in_place.
+	struct SpecPlace {
+		uint64_t           id = 0, images = 0, overlay = 0, open = 0, capture = 0;
+		size_t             segment = 0;
+		const Spec::State* chain   = nullptr;
+	} spec_place;
+	std::unique_ptr<SpecRingCopy[]> spec_ring_copies; // (SpecRingCopy above; made at a speculation's first copy)
+	// (KYTY_SPEC_PAIR_DENSE_INDIRECT: per stage, each indirect image's count of them in `indirect`, in plan order: a
+	// program with several dense roots has their candidates one after another there. Written for a stage with an indirect
+	// image only (TableEvaluate, TableScoutApply), the one TableResolveSet reads it for.)
+	std::array<std::vector<uint32_t>, 2> indirect_counts;
 };
 // KYTY_TABLE_MEMO: a descriptor set left service (NativeXprRetireSet): a memo entry may hold it.
 void RenderExecutor::TableMemoRetired() {
@@ -2260,8 +2263,8 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 		const auto& program = *pair.programs[st];
 		auto&       out     = table.indirect[st];
 		out.clear();
-		table.indirect_counts[st].clear();
 		if (program.table_plan.indirect.empty()) return true;
+		table.indirect_counts[st].clear(); // (read for a stage with an indirect image only)
 		thread_local const auto runtime = [] {
 			ShaderRecompiler::IR::SrtRuntime value;
 			MaterializationReaders(value);
@@ -3388,7 +3391,7 @@ static void TableScoutApply(Table& table, const Pair& pair, const Scout::Ticket&
 		in += ticket.slot_words[st];
 		segments += ticket.segments[st];
 		table.indirect[st].clear();
-		table.indirect_counts[st].clear();
+		if (!pair.programs[st]->table_plan.indirect.empty()) table.indirect_counts[st].clear(); // (read for such a stage only)
 	}
 	in = segments;
 	table.words.assign(in, in + ticket.image_words);
@@ -3561,6 +3564,90 @@ static bool TableWorkerKeepsMoved(const Spec::State& spec, const BufferCache& ca
 	return true;
 }
 
+// (Mode 4, TableDraw's set: out of line, so the other modes' TableDraw carries none of it.) A set resolved under another
+// draw state, whose deps TableTransit's target tests refuse for this one's targets, is not the draw's: the words tagged with
+// the draw state's targets (TableTargetsKey, three words more than any words TableEvaluate makes, so no untagged lookup
+// compares equal) find, or resolve, the set made for them, in a slot of its own (TableSet: the same lookups, proofs and
+// publication, the tagged words the set's key); the untagged words back right after. The set found is tested again by
+// TableTransit as any. The memo's set is not offered to the second call: a first call that took the role's last set may
+// have run the collection, which can have destroyed it.
+RenderExecutor::TableImageSet* RenderExecutor::TableDrawStateSet(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
+                                                                 const NativeXprDrawState& draw_state, TableImageSet* set,
+                                                                 Spec::State* spec_state) {
+	auto& table = OwnTable();
+	if (TableTargetsDiffer(*set, draw_state)) {
+		const auto key  = TableTargetsKey(draw_state);
+		const auto size = table.words.size();
+		table.memo_set    = nullptr;
+		table.memo_verify = false;
+		table.words.push_back(TableTargetsTag);
+		table.words.push_back(static_cast<uint32_t>(key));
+		table.words.push_back(static_cast<uint32_t>(key >> 32u));
+		set = TableSet(buffer, pair, &variant, &draw_state);
+		// The tagged slot's set made for these targets and still not laid out for them (a worker's, published before its
+		// commit's completion refused such a slot, below): the owner retires it, as its own path retires a set found
+		// invalid, and resolves the slot's set afresh under this draw state. A speculation leaves it to the owner (its draw
+		// a hole). (A worker's only: the owner's own build is laid out for the draw state it ran under, and one that
+		// differed would be retired at every draw.)
+		if (set != nullptr && spec_state == nullptr && Role() == 0 && set->proposer != 0 && TableTargetsDiffer(*set, draw_state)) {
+			bool retired = false;
+			{
+				const auto write = CatalogWrite();
+				const auto found = pair.sets.find(XXH3_64bits(set->words.data(), set->words.size() * sizeof(uint32_t)));
+				if (found != pair.sets.end() && found->second.get() == set) {
+					if (table.last_set == set) table.last_set = nullptr;
+					pair.ClearSets();
+					++table.epoch;
+					NativeXprRetireSet(set->pool, set->set);
+					pair.sets.erase(found);
+					retired = true;
+				}
+			}
+			if (retired) set = TableSet(buffer, pair, &variant, &draw_state);
+		}
+		table.words.resize(size);
+	}
+	// A set this translation proposed with pending slots notes the draw's targets, which its commit's completion must not
+	// hold as textures (TableCompletePendingImages).
+	if (spec_state != nullptr && set != nullptr && !set->pending_images.empty() && set->proposer == spec_state->id)
+		for (const auto& target: draw_state.targets)
+			if (std::ranges::find(set->pending_targets, target.id) == set->pending_targets.end())
+				set->pending_targets.push_back(target.id);
+	return set;
+}
+
+// (Mode 4, TableDraw's spec_in_place: out of line, so the other modes' TableDraw carries none of it.) The speculation's
+// key of its executor's last table draw (TableXpr::spec_place) is this draw's: the same translation, segment, chain head,
+// images epoch, overlay and open-write generations and capture.
+template <typename Table>
+[[gnu::noinline]] static bool TableSpecInPlace(const Table& table, const Spec::State& spec, uint64_t images_epoch,
+                                               uint64_t capture_id) {
+	return table.spec_place.id == spec.id && table.spec_place.segment == spec.closed.size() &&
+	       table.spec_place.chain == spec.previous.load(std::memory_order_acquire) && table.spec_place.images == images_epoch &&
+	       table.spec_place.overlay == spec.overlay_gen && table.spec_place.open == spec.open_gen &&
+	       table.spec_place.capture == capture_id;
+}
+// The speculation's facts an emission can note (a meta answer, a left clear, a consumed clear): their count.
+[[gnu::noinline]] static size_t TableSpecFacts(const Spec::State& spec) {
+	return spec.meta_facts.size() + spec.left_clears.size() + spec.consume_pending.size();
+}
+// The draw's key for spec_in_place, its own transits and writes taken (`keyable`, and no fact noted since
+// `facts_before`), else none.
+template <typename Table>
+[[gnu::noinline]] static void TableSpecPlaceNote(Table& table, const Spec::State& spec, uint64_t images_epoch, uint64_t capture_id,
+                                                 size_t facts_before, bool keyable) {
+	if (TableSpecFacts(spec) == facts_before && keyable)
+		table.spec_place = {.id      = spec.id,
+		                    .images  = images_epoch,
+		                    .overlay = spec.overlay_gen,
+		                    .open    = spec.open_gen,
+		                    .capture = capture_id,
+		                    .segment = spec.closed.size(),
+		                    .chain   = spec.previous.load(std::memory_order_acquire)};
+	else
+		table.spec_place.id = 0;
+}
+
 RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
                                                       const NativeXprDrawState& draw_state,
                                                       std::span<const uint64_t> commands, uint64_t index_base,
@@ -3576,7 +3663,8 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	auto&       cache  = *m_native_xpr;
 	const auto& sh     = buffer.GetShaders();
 	const auto  stages = pair.programs[1] != nullptr ? 2u : 1u;
-	if (pair.push_fit) [[unlikely]] LiveCounters::Add(LiveCounters::SpecPairPushFitDraws); // (KYTY_SPEC_PAIR_PUSH_FIT's row)
+	// (KYTY_SPEC_PAIR_PUSH_FIT's row, mode 4 only: the mode in a register, the pair's flag not read in the other modes.)
+	if (speculate_mode == 4 && pair.push_fit) [[unlikely]] LiveCounters::Add(LiveCounters::SpecPairPushFitDraws);
 	const std::array<std::span<const uint32_t>, 2> user_data {std::span<const uint32_t> {sh.GetVs().gs_user_sgpr.value},
 	                                                          std::span<const uint32_t> {sh.GetPs().ps_user_sgpr.value}};
 	// (The index buffer's held entry, a cold line of a 320 KiB table, loads while the tables are evaluated.)
@@ -3602,53 +3690,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 2);
 	auto* set = TableSet(buffer, pair, &variant, &draw_state);
-	// (Mode 4) A set resolved under another draw state, whose deps TableTransit's target tests refuse for this one's targets,
-	// is not the draw's: the words tagged with the draw state's targets (TableTargetsKey, three words more than any words
-	// TableEvaluate makes, so no untagged lookup compares equal) find, or resolve, the set made for them, in a slot of its
-	// own (TableSet: the same lookups, proofs and publication, the tagged words the set's key); the untagged words back
-	// right after. The set found is tested again by TableTransit as any. The memo's set is not offered to the second call: a
-	// first call that took the role's last set may have run the collection, which can have destroyed it.
-	if (set != nullptr && speculate_mode == 4) {
-		if (TableTargetsDiffer(*set, draw_state)) {
-			const auto key  = TableTargetsKey(draw_state);
-			const auto size = table.words.size();
-			table.memo_set    = nullptr;
-			table.memo_verify = false;
-			table.words.push_back(TableTargetsTag);
-			table.words.push_back(static_cast<uint32_t>(key));
-			table.words.push_back(static_cast<uint32_t>(key >> 32u));
-			set = TableSet(buffer, pair, &variant, &draw_state);
-			// The tagged slot's set made for these targets and still not laid out for them (a worker's, published before
-			// its commit's completion refused such a slot, below): the owner retires it, as its own path retires a set
-			// found invalid, and resolves the slot's set afresh under this draw state. A speculation leaves it to the owner
-			// (its draw a hole). (A worker's only: the owner's own build is laid out for the draw state it ran under, and one
-			// that differed would be retired at every draw.)
-			if (set != nullptr && spec_state == nullptr && Role() == 0 && set->proposer != 0 &&
-			    TableTargetsDiffer(*set, draw_state)) {
-				bool retired = false;
-				{
-					const auto write = CatalogWrite();
-					const auto found = pair.sets.find(XXH3_64bits(set->words.data(), set->words.size() * sizeof(uint32_t)));
-					if (found != pair.sets.end() && found->second.get() == set) {
-						if (table.last_set == set) table.last_set = nullptr;
-						pair.ClearSets();
-						++table.epoch;
-						NativeXprRetireSet(set->pool, set->set);
-						pair.sets.erase(found);
-						retired = true;
-					}
-				}
-				if (retired) set = TableSet(buffer, pair, &variant, &draw_state);
-			}
-			table.words.resize(size);
-		}
-		// A set this translation proposed with pending slots notes the draw's targets, which its commit's completion must
-		// not hold as textures (TableCompletePendingImages).
-		if (spec_state != nullptr && set != nullptr && !set->pending_images.empty() && set->proposer == spec_state->id)
-			for (const auto& target: draw_state.targets)
-				if (std::ranges::find(set->pending_targets, target.id) == set->pending_targets.end())
-					set->pending_targets.push_back(target.id);
-	}
+	// (Mode 4: a set resolved under another draw state, TableDrawStateSet, out of line.)
+	if (set != nullptr && speculate_mode == 4) [[unlikely]]
+		set = TableDrawStateSet(buffer, pair, variant, draw_state, set, spec_state);
 	if (spec_state != nullptr && set != nullptr)
 		spec_state->NoteSet(reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(set->set)));
 	if (set == nullptr) return LiveCounters::Add(LiveCounters::TableNoSet), Spec::Refuse("table: no set"), TableResult::Native;
@@ -3740,7 +3784,6 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 9);
 	std::array<std::pair<Buffer*, uint64_t>, 64> arguments;
 	std::array<uint32_t, 64>                     group_sizes;
-	std::array<uint64_t, 64>                     group_address; // (relocation only: written and read under `reloc`)
 	uint32_t                                     groups = 0;
 	for (size_t first = 0; first < commands.size();) {
 		size_t count = 1;
@@ -3749,7 +3792,6 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		if (owner == nullptr) return TableResult::Native;
 		arguments[groups]   = {owner, offset};
 		group_sizes[groups] = static_cast<uint32_t>(count);
-		if (reloc) group_address[groups] = commands[first];
 		++groups;
 		first += count;
 	}
@@ -3802,18 +3844,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	// segment already). A draw whose emission noted a meta answer, a left clear or a consumed clear leaves no key (those
 	// answers came from the cache, whose bits some changes move without moving ImagesEpoch), nor does a worker-captured
 	// draw state (its depth access follows its target's uniformity, which a partial transit splits).
+	// (TableSpecInPlace, TableSpecFacts, TableSpecPlaceNote: out of line.)
 	const bool spec_emit     = !own && speculate_mode == 4;
 	const bool spec_in_place = spec_emit && same_command && emit.state == &draw_state && table.last_set == set &&
-	                           !read_after_write && table.spec_place.id == spec_state->id &&
-	                           table.spec_place.segment == spec_state->closed.size() &&
-	                           table.spec_place.chain == spec_state->previous.load(std::memory_order_acquire) &&
-	                           table.spec_place.images == images_epoch && table.spec_place.overlay == spec_state->overlay_gen &&
-	                           table.spec_place.open == spec_state->open_gen &&
-	                           table.spec_place.capture == draw_state.capture_id;
-	const auto spec_facts = [&] {
-		return spec_state->meta_facts.size() + spec_state->left_clears.size() + spec_state->consume_pending.size();
-	};
-	const size_t spec_facts_before = spec_emit ? spec_facts() : 0;
+	                           !read_after_write && TableSpecInPlace(table, *spec_state, images_epoch, draw_state.capture_id);
+	const size_t spec_facts_before = spec_emit ? TableSpecFacts(*spec_state) : 0;
 	// KYTY_TABLE_SERIALS: the checks again only when a serial sum moved (1), or as before with the sums counted (2).
 	const auto serials = own ? TableSerialsMode() : 0u;
 	if (!in_place && !spec_in_place) {
@@ -3928,8 +3963,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	}
 	// (A draw of vertices of GPU-read arguments: their first vertex and instance from them, as the normal path's
 	// DrawAuto with gpu_args gives them (DrawOffsetSource::IndirectArgs), not from the index offset or user data.)
-	for (uint32_t group = 0; group < groups; ++group) {
-		if (reloc && TableRelocRecord(vk_buffer, *spec_state, Spec::RelocArgs, arguments[group], group_address[group],
+	for (uint32_t group = 0, group_first = 0; group < groups; group_first += group_sizes[group++]) {
+		// (Relocation: the group's guest address, its first command, the groups' sizes summed before it.)
+		if (reloc && TableRelocRecord(vk_buffer, *spec_state, Spec::RelocArgs, arguments[group], commands[group_first],
 		                              uint64_t {group_sizes[group]} * stride, vertex_arguments ? 1u : 2u, group_sizes[group],
 		                              static_cast<uint32_t>(stride)))
 			continue;
@@ -3961,18 +3997,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	table.images_epoch = texture_cache.ImagesEpoch();
 	// (Mode 4: this draw's key for spec_in_place, its own transits and writes taken; none after an emission that noted a
 	// cache answer, or for a worker-captured state.)
-	if (spec_emit) {
-		if (spec_facts() == spec_facts_before && !draw_state.worker_captured)
-			table.spec_place = {.id      = spec_state->id,
-			                    .images  = images_epoch,
-			                    .overlay = spec_state->overlay_gen,
-			                    .open    = spec_state->open_gen,
-			                    .capture = draw_state.capture_id,
-			                    .segment = spec_state->closed.size(),
-			                    .chain   = spec_state->previous.load(std::memory_order_acquire)};
-		else
-			table.spec_place.id = 0;
-	}
+	if (spec_emit) [[unlikely]]
+		TableSpecPlaceNote(table, *spec_state, images_epoch, draw_state.capture_id, spec_facts_before,
+		                   !draw_state.worker_captured);
 	if (vertex_arguments && groups != 0) { // (KYTY_SPEC_DRAW_INDIRECT_VERIFY: what it read)
 		auto&       noted  = m_table_args_emit;
 		const auto* source = arguments[0].first;
@@ -4190,7 +4217,7 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 		{
 			const auto write = CatalogWrite();
 			pair->programs   = programs;
-			pair->push_fit   = PipelineCache::t_push_fit_taken; // (the lookup above)
+			pair->push_fit   = Spec::On() && PipelineCache::t_push_fit_taken; // (the lookup above: mode 4 sets it)
 			TableRuns(*pair);
 			TableScoutPublish(*pair);
 		}
