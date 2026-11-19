@@ -64,18 +64,36 @@
 
 namespace LocalPlatform {
 
-// "1,2,3" -> bit mask of CPUs 0..63; 0 for an empty or invalid list.
+// "1,2,3" or "0,8-15" (a range "a-b" takes a to b, both ends; "15-8" as "8-15") -> bit mask of CPUs 0..63; 0 for an
+// empty or invalid list. A range with an end below 0 is skipped; "8-" or "8-x" takes the 8 and stops there. A list with
+// no '-' reads as it did before ranges. (Ranges were read as two CPUs before, "0,8-15" as {0, 8}: a Linux tester's
+// KYTY_RENDER_CPUS, 16 Nov.)
 static uint64_t CpuListMask(const char* list) {
 	uint64_t mask = 0;
 	if (list == nullptr) return 0;
 	for (const char* p = list; *p != '\0';) {
-		char*      end = nullptr;
-		const long cpu = std::strtol(p, &end, 10);
+		char* end   = nullptr;
+		long  first = std::strtol(p, &end, 10);
 		if (end == p) break;
-		if (cpu >= 0 && cpu < 64) mask |= uint64_t(1) << cpu;
+		long last = first;
+		if (*end == '-') {
+			char*      range_end = nullptr;
+			const long to        = std::strtol(end + 1, &range_end, 10);
+			if (range_end != end + 1) last = to, end = range_end; // (else the '-' stops the list after `first`)
+		}
+		if (last < first) std::swap(first, last);
+		for (long cpu = first; first >= 0 && cpu <= last && cpu < 64; ++cpu) mask |= uint64_t(1) << cpu;
 		p = (*end == ',') ? end + 1 : end;
 	}
 	return mask;
+}
+
+std::string CpuListResolved(const char* list) {
+	const uint64_t mask = CpuListMask(list);
+	std::string    text;
+	for (uint32_t cpu = 0; cpu < 64; ++cpu)
+		if ((mask >> cpu) & 1u) text += (text.empty() ? "" : ",") + std::to_string(cpu);
+	return text.empty() ? std::string("none") : text;
 }
 
 #if defined(_WIN32)
@@ -277,6 +295,10 @@ std::string EfficiencyCpu(const char* avoid) {
 			pick = cpu.index, pick_avoided = avoided;
 	}
 	return pick == UINT32_MAX ? std::string {} : std::to_string(pick);
+}
+
+std::string SpareCpu(const char* /*avoid*/) {
+	return {};
 }
 
 uint32_t PerformanceLogicalCpus() {
@@ -2436,6 +2458,43 @@ void AvoidCpuList(const char* avoid_cpus) {
 				if ((avoid >> cpu) & 1u) CPU_CLR(cpu, &set);
 		if (CPU_COUNT(&set) != 0) (void)sched_setaffinity(0, sizeof(set), &set);
 	}
+}
+
+#if defined(__linux__)
+// A CPU's physical core: its SMT siblings (topology/thread_siblings_list, "0,8" or "0-1"), the CPU itself included; the CPU
+// alone where the file is missing.
+static uint64_t CoreSiblings(int cpu) {
+	uint64_t core = uint64_t {1} << cpu;
+	char     path[96];
+	std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+	if (FILE* file = std::fopen(path, "r"); file != nullptr) {
+		char list[256] = {};
+		if (std::fgets(list, sizeof(list), file) != nullptr) core |= CpuListMask(list);
+		std::fclose(file);
+	}
+	return core;
+}
+#endif
+
+std::string SpareCpu(const char* avoid) {
+#if defined(__linux__)
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (sched_getaffinity(getpid(), sizeof(set), &set) != 0) return {};
+	// (With KYTY_RENDER_CORE the render thread's core is avoided too: Kyty.CoreKeeper moves every other thread off it every
+	// 250 ms, a pin there included; a CPU off that core it never touches.)
+	const uint64_t avoid_mask = CpuListMask(avoid) | g_render_core.load(std::memory_order_relaxed);
+	int            sibling    = -1; // (the highest CPU outside the list whose core has one of the list's CPUs)
+	for (int cpu = 63; cpu >= 0; --cpu) {
+		if (!CPU_ISSET(cpu, &set) || ((avoid_mask >> cpu) & 1u) != 0) continue;
+		if ((CoreSiblings(cpu) & avoid_mask) == 0) return std::to_string(cpu);
+		if (sibling < 0) sibling = cpu;
+	}
+	return sibling < 0 ? std::string {} : std::to_string(sibling);
+#else
+	(void)avoid;
+	return {};
+#endif
 }
 
 int KeepRenderCoreAlone() {

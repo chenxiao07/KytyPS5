@@ -252,7 +252,7 @@ inline void InitializePerformanceSwitches() {
 	// measured best; a dedicated core made the whole process slower there.
 	if (const char* cpus = std::getenv("KYTY_RENDER_CPUS"); cpus != nullptr && *cpus != '\0') {
 		LocalPlatform::PinThreadToCpuList(cpus);
-		enabled += std::string(enabled.empty() ? "" : " ") + "KYTY_RENDER_CPUS=" + cpus;
+		enabled += std::string(enabled.empty() ? "" : " ") + "KYTY_RENDER_CPUS=" + LocalPlatform::CpuListResolved(cpus);
 	}
 	if (const int core = LocalPlatform::KeepRenderCoreAlone(); core >= 0)
 		enabled += std::string(enabled.empty() ? "" : " ") + "KYTY_RENDER_CORE=" + std::to_string(core);

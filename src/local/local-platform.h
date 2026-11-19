@@ -16,7 +16,11 @@ void SetThreadName(const char* name);
 // The OS id of the calling thread (Linux: gettid, Windows: GetCurrentThreadId).
 uint32_t ThreadId();
 
-// Pins the calling thread to a comma-separated CPU list ("1,2,3"); an empty or invalid
+// A CPU list as read ("0,8-15" -> "0,8,9,10,11,12,13,14,15"; "none" when it names no CPU 0..63): what start-up lines
+// print, so a list read otherwise than meant shows.
+std::string CpuListResolved(const char* list);
+
+// Pins the calling thread to a comma-separated CPU list ("1,2,3", ranges "8-15"); an empty or invalid
 // list leaves the affinity alone.
 void PinThreadToCpuList(const char* list);
 // As PinThreadToCpuList; false: not pinned (no list, or the OS refused it: no CPU of the list the process may run on).
@@ -38,6 +42,12 @@ std::string SpeculationCpuList();
 // `avoid` where there is one, the lowest-numbered first: "16" on an 8 P-core + 16 E-core part. "" where every core is
 // alike or the query fails. Linux: "".
 std::string EfficiencyCpu(const char* avoid);
+// Linux: the highest-numbered logical CPU the process may run on (the main thread's affinity) whose physical core has no
+// CPU of the list `avoid` (SMT siblings: topology/thread_siblings_list; each CPU its own core where the file is missing);
+// where every such core does, the highest CPU outside the list; "" when there is none. The render thread's core
+// (KeepRenderCoreAlone) is avoided too. "8" with "1-7" avoided on an 8-core part numbered 0-7 cores, 8-15 siblings.
+// Windows: "" (not done).
+std::string SpareCpu(const char* avoid);
 // The logical CPUs of the performance cores (the highest efficiency class; all of them where every core is alike) the
 // process may run on; 0 where that is not known (Linux). KYTY_SIMULATE_PCORES=<n> stands in for it (a test).
 uint32_t PerformanceLogicalCpus();

@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "label-pages.h"
 #include "live-switch.h"
 #include "mode-toggle.h"
 #include "write-guard.h"
@@ -81,13 +82,21 @@ struct WaitCheck {
 	uint64_t address = 0, reference = 0, mask = 0;
 	uint32_t function = 0, bytes = 4;
 };
+// Words read from its own pending guest memory writes (Resolve, ReadCopyRun): `bytes` at `address`, as the write
+// `entry` (an index of State::writes) gave them, the words taken at `words` in State::journal_words.
+struct JournalRead {
+	uint64_t address = 0;
+	size_t   entry   = 0;
+	uint32_t words   = 0;
+	uint32_t bytes   = 0;
+};
 
 // The notes' counts: a segment's notes are those after the previous segment's counts, up to its own.
 struct Counts {
 	size_t current = 0, written = 0, bda = 0, invalidated = 0, writes = 0, touched_images = 0, touched_buffers = 0,
 	       clean_reads = 0, feedbacks = 0, buffer_ranges = 0, sets = 0, chain_reads = 0, waits = 0, cpu_copies = 0,
 	       late_reads = 0, texel_syncs = 0, pending_buffers = 0, table_ranges = 0, pending_targets = 0, indexed_draws = 0,
-	       scenes = 0, used_pairs = 0, left_clears = 0;
+	       scenes = 0, used_pairs = 0, left_clears = 0, journal_reads = 0, journal_words = 0;
 };
 
 // spec_pending_buffers (under KYTY_SPECULATE=4 only): a table V#'s range with no
@@ -326,6 +335,25 @@ inline int64_t CommitVerifyEvery() {
 	return every.load(std::memory_order_relaxed);
 }
 
+// KYTY_SPEC_SET_CPU_DIRTY_STOP (live spec_set_cpu_dirty_stop; -1, the default: on under KYTY_SPECULATE=4; 1 on, 0 off):
+// a commit stops at an image the CPU wrote since its segment found it (Speculation::CommitSegments), the entry of a set's
+// image made before its refresh test (TableTransit, TableValidateSet). Off: neither, as before.
+[[nodiscard]] inline bool SetCpuDirtyStopOn() {
+	static auto& stop  = LiveSwitch::Find("spec_set_cpu_dirty_stop", -1);
+	const auto   value = stop.load(std::memory_order_relaxed);
+	return value > 0 || (value < 0 && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4);
+}
+// KYTY_SPEC_COPY_IMAGE_REFUSE (live spec_copy_image_refuse; the same rule): a speculation's copy (journaled or on the GPU)
+// or GPU fill over image memory is refused (BufferCache::CopyBuffer, FillBuffer: a hole when its packet is a dispatch's
+// linear copy; at a DMA_DATA or COPY_DATA packet, which is no hole, the speculation ends), and so is a worker binding an
+// image its open segment writes (TextureCache's read-only lookups, TableTransit, NativeXprEmitTargets). Off: none of it,
+// as before.
+[[nodiscard]] inline bool CopyImageRefuseOn() {
+	static auto& refuse = LiveSwitch::Find("spec_copy_image_refuse", -1);
+	const auto   value  = refuse.load(std::memory_order_relaxed);
+	return value > 0 || (value < 0 && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4);
+}
+
 // An image's barrier state as a segment found it (the commit transitions the image there first if other work moved
 // it since) and as it left it.
 struct ImageUse {
@@ -338,6 +366,9 @@ struct ImageUse {
 	// The levels its sampled views spanned, [sample_lo, sample_hi), and whether any access was not one (redo_level_precise).
 	uint32_t                      sample_lo = UINT32_MAX, sample_hi = 0;
 	bool                          sample_other = false;
+	bool                          found_cpu_dirty = false; // (Image::IsCpuDirty, maybe-dirty too, when the segment found it)
+	uint64_t                      found_validity  = 0;     // (Image::validity then, read before it)
+	bool                          found_stencil_modified = false; // (Image::IsStencilModified then: spec_copy_image_refuse)
 };
 
 // The 64 KiB granules ranges were added over, hashed into 4096 bits, and up to BigRanges ranges over 64 granules or
@@ -444,6 +475,9 @@ struct ImageEntry {
 	// a transfer, a clear, an upload, a download).
 	uint32_t                      sample_lo = UINT32_MAX, sample_hi = 0;
 	bool                          sample_other = false;
+	bool                          found_cpu_dirty = false; // (spec_set_cpu_dirty_stop)
+	uint64_t                      found_validity  = 0;
+	bool                          found_stencil_modified = false; // (spec_copy_image_refuse)
 };
 
 // (spec_predict_dcc=3.) The fast clears speculations' holes will consume, by surface and slice, until that speculation
@@ -497,6 +531,12 @@ struct State {
 	// - words it read from a previous speculation's pending writes, and the waits it found satisfied (ChainRead);
 	std::vector<ChainRead> chain_reads;
 	std::vector<WaitCheck> waits;
+	// - under KYTY_SPECULATE=4 (journal_reads_on, as the state is made or cleared): the words it read from its own
+	//   pending writes (JournalRead) and the words it took, which its commit checks against memory
+	//   (Speculation::JournalReadsMoved);
+	std::vector<JournalRead> journal_reads;
+	std::vector<uint32_t>    journal_words;
+	bool                     journal_reads_on = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 	// - the sources and destinations of the copies it makes on the CPU at its commit (in order: what the guest or the
 	//   processor writes there before is copied, or copied over): no GPU work may have written them since.
 	std::vector<Range> cpu_copies;
@@ -629,7 +669,8 @@ struct State {
 		        touched_images.size(), touched_buffers.size(), clean_reads.size(), feedbacks.size(), buffer_ranges.size(),
 		        sets.size(),           chain_reads.size(),     waits.size(),       cpu_copies.size(),
 		        late_reads.size(),     texel_syncs.size(),     pending_buffers.size(), table_ranges.size(), pending_targets.size(),
-		        indexed_draws,         scenes,                 used_pairs.size(),      left_clears.size()};
+		        indexed_draws,         scenes,                 used_pairs.size(),      left_clears.size(),
+		        journal_reads.size(),  journal_words.size()};
 	}
 	// Its pending guest memory writes or a previous speculation's over the range; the ranges its work or a previous
 	// one's writes.
@@ -782,6 +823,26 @@ struct State {
 		return nullptr;
 	}
 	[[nodiscard]] Counts Sealed() const noexcept { return closed.empty() ? Counts {} : closed.back().end; }
+	// spec_copy_image_refuse: whether the open segment writes anything (a journaled copy or guest memory write, made in
+	// its After; a range its work writes on the GPU, obtained in its Before), and whether it writes over a range.
+	[[nodiscard]] bool OpenSegmentWritesAny() const noexcept {
+		return !open_journal_set.Empty() || written.size() > Sealed().written;
+	}
+	[[nodiscard]] bool OpenSegmentWrites(uint64_t address, uint64_t size) const {
+		if (size == 0) return false;
+		if (open_journal_set.Intersects(address, size)) return true;
+		for (size_t i = Sealed().written; i < written.size(); ++i)
+			if (written[i].begin < address + size && address < written[i].end) return true;
+		return false;
+	}
+	// ... over an image's bytes, its metadata or its stencil plane (an ImageInfo), as the depth layers2 target's test
+	// (and the plane, which the normal path's refresh uploads when GPU work wrote it: MarkStencilModified).
+	template <typename Info>
+	[[nodiscard]] bool OpenSegmentWritesImage(const Info& info) const {
+		return OpenSegmentWrites(info.data.address, info.data.size) ||
+		       (info.HasMetadata() && OpenSegmentWrites(info.metadata.range.address, info.metadata.range.size)) ||
+		       (info.HasStencil() && OpenSegmentWrites(info.stencil.address, info.stencil.size));
+	}
 
 	void NoteCurrent(uint64_t address, uint64_t size) {
 		if (Note(current, Sealed().current, address, size)) current_set.Add(address, size);
@@ -1081,9 +1142,13 @@ struct State {
 		const auto source = latest->value + (address - latest->address);
 		if (owner->JournalIntersects(source, bytes) || owner->WrittenIntersects(source, bytes)) return Run::Refused;
 		if (!CopyGuest(out, source, bytes)) return Run::Refused;
-		if (owner == this) NoteCleanRead(source, bytes);
-		else
+		if (owner == this) {
+			NoteCleanRead(source, bytes);
+			const auto entry = static_cast<size_t>(latest.base() - writes.cbegin()) - 1;
+			NoteJournalRead(address, static_cast<uint32_t>(bytes), entry, out);
+		} else {
 			for (uint32_t i = 0; i < count; ++i) chain_reads.push_back({address + 4ull * i, out[i]});
+		}
 		return Run::Read;
 	}
 	// The word `state`'s latest pending write over it gives (a copy: its source's, with no write of that speculation
@@ -1094,15 +1159,44 @@ struct State {
 		});
 		if (latest == state.writes.rend()) return false;
 		by = &state;
+		const auto entry = static_cast<size_t>(latest.base() - state.writes.begin()) - 1;
 		if (!latest->copy) {
 			value = static_cast<uint32_t>(latest->value);
+			if (&state == this) NoteJournalRead(at, 4, entry, &value);
 			return true;
 		}
 		const auto source = latest->value + (at - latest->address);
 		if (state.JournalIntersects(source, 4) || state.WrittenIntersects(source, 4)) return false;
 		if (!CopyGuest(&value, source, 4)) return false;
-		if (&state == this) NoteCleanRead(source, 4);
+		if (&state == this) {
+			NoteCleanRead(source, 4);
+			NoteJournalRead(at, 4, entry, &value);
+		}
 		return true;
+	}
+	// (As Note: within the open segment's last few, the same write's words taken again are noted once, and the next
+	// words of the last one extend it when it was noted since the packet's Mark: Rollback cuts records and words
+	// together, so a record from before it is never grown.)
+	void NoteJournalRead(uint64_t address, uint32_t bytes, size_t entry, const uint32_t* taken) {
+		if (!journal_reads_on || bytes == 0) return;
+		const auto first =
+		    std::max(Sealed().journal_reads, journal_reads.size() - std::min<size_t>(journal_reads.size(), 8));
+		for (size_t i = journal_reads.size(); i > first; --i) {
+			auto& read = journal_reads[i - 1];
+			if (read.entry != entry) continue;
+			if (read.address <= address && address + bytes <= read.address + read.bytes &&
+			    (address - read.address) % 4 == 0 &&
+			    std::memcmp(journal_words.data() + read.words + (address - read.address) / 4, taken, bytes) == 0)
+				return;
+			if (i == journal_reads.size() && i > checkpoint.journal_reads && read.address + read.bytes == address &&
+			    read.words + read.bytes / 4 == journal_words.size()) {
+				journal_words.insert(journal_words.end(), taken, taken + bytes / 4);
+				read.bytes += bytes;
+				return;
+			}
+		}
+		journal_reads.push_back({address, entry, static_cast<uint32_t>(journal_words.size()), bytes});
+		journal_words.insert(journal_words.end(), taken, taken + bytes / 4);
 	}
 
 	void Mark(uint64_t work) noexcept {
@@ -1135,6 +1229,8 @@ struct State {
 		scenes        = std::min(scenes, checkpoint.scenes);
 		used_pairs.resize(std::min(used_pairs.size(), checkpoint.used_pairs));
 		left_clears.resize(std::min(left_clears.size(), checkpoint.left_clears));
+		journal_reads.resize(std::min(journal_reads.size(), checkpoint.journal_reads));
+		journal_words.resize(std::min(journal_words.size(), checkpoint.journal_words));
 		bda_all = checkpoint_bda_all;
 	}
 
@@ -1158,6 +1254,9 @@ struct State {
 		sets.clear();
 		chain_reads.clear();
 		waits.clear();
+		journal_reads.clear();
+		journal_words.clear();
+		journal_reads_on = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 		cpu_copies.clear();
 		late_reads.clear();
 		texel_syncs.clear();
@@ -1217,7 +1316,8 @@ struct State {
 			segment.images.push_back({entry.image, entry.serial, entry.found, entry.state,
 			                          std::move(entry.found_subresources), entry.subresources, entry.found_group,
 			                          entry.group, entry.found_buffer_modified, entry.sample_lo, entry.sample_hi,
-			                          entry.sample_other});
+			                          entry.sample_other, entry.found_cpu_dirty, entry.found_validity,
+			                          entry.found_stencil_modified});
 			entry.used = false;
 		}
 		used.clear();
@@ -1276,19 +1376,20 @@ inline void Stop(const char* why) noexcept {
 
 // The guest memory the command processor writes (labels): a wait on one is satisfied by work of the GPU queues, which
 // the commit checks a speculation against (EffectsLog); one on memory only the CPU writes orders CPU writes the
-// speculation cannot see (it stops there).
+// speculation cannot see (it stops there). The words by guest page (LabelPages::Set: a bit a word, nothing rehashed
+// as it grows; a std::unordered_set rehashed every word under the mutex at each doubling, tens of ms past a million).
 struct Labels {
-	std::mutex                   mutex;
-	std::unordered_set<uint64_t> addresses;
+	std::mutex      mutex;
+	LabelPages::Set addresses;
 };
 inline Labels g_labels;
 inline void   NoteLabel(uint64_t address) {
 	  std::lock_guard lock(g_labels.mutex);
-	  g_labels.addresses.insert(address & ~uint64_t {3});
+	  g_labels.addresses.Insert(address & ~uint64_t {3});
 }
 [[nodiscard]] inline bool IsLabel(uint64_t address) {
 	std::lock_guard lock(g_labels.mutex);
-	return g_labels.addresses.contains(address & ~uint64_t {3});
+	return g_labels.addresses.Contains(address & ~uint64_t {3});
 }
 
 // What the thread that commits is doing (its effects' source, for the commits' stop reasons): translating the normal

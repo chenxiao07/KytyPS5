@@ -114,6 +114,7 @@ struct RenderExecutor::TableImageSet {
 	// pending slots are filled only if that translation commits the segment that proposed it (a worker's next translation
 	// bound a set its first one then forgot unfilled: null image slots).
 	uint64_t              proposer = 0;
+	size_t                proposed_segment = SIZE_MAX; // (the proposer's open segment then: spec_set_cpu_dirty_stop)
 	std::atomic<bool>     published {false};
 	vk::DescriptorSet     set  = nullptr;
 	vk::DescriptorPool    pool = nullptr;
@@ -998,7 +999,6 @@ static void TableAsideDrain(uint64_t frame) {
 // segment stops; the set is never published).
 bool RenderExecutor::TableCompletePendingImages(TableImageSet& set) {
 	auto&                                textures = m_context.GetTextureCache();
-	const auto                           handle   = m_context.GetCommandScheduler().Current().Handle();
 	std::vector<vk::DescriptorImageInfo> infos(set.pending_images.size());
 	std::vector<vk::WriteDescriptorSet>  writes;
 	size_t                               done = 0;
@@ -1013,7 +1013,10 @@ bool RenderExecutor::TableCompletePendingImages(TableImageSet& set) {
 		image.usage.texture = true;
 		const ImageSubresourceRange range {desc.view_info.base_level, desc.view_info.level_count, desc.view_info.base_layer,
 		                                   desc.view_info.layer_count};
-		image.Transit(pending.layout, vk::AccessFlagBits2::eShaderRead, range, handle);
+		// (The open buffer read at each slot: a slot's FindImage / FindTexture that reclaims memory (a failed creation:
+		// ReclaimImageMemory waits for the current tick) submitted the one open before and began the next.)
+		image.Transit(pending.layout, vk::AccessFlagBits2::eShaderRead, range,
+		              m_context.GetCommandScheduler().Current().Handle());
 		infos[i] = vk::DescriptorImageInfo {nullptr, view, pending.layout};
 		vk::WriteDescriptorSet write;
 		write.dstSet          = set.set;
@@ -1057,10 +1060,13 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 	};
 	if (spec != nullptr) {
 		if (WorkerSets() == 0) return Spec::Refuse("table image set"), nullptr;
-		// (One it built already in this translation.)
+		// (One it built already in this translation. spec_set_cpu_dirty_stop: not one with pending slots proposed in an
+		// earlier segment, which TableTransit refuses here: TableSet resolves its words afresh, into a set of this segment.)
 		for (const auto& proposed: spec->proposed_sets)
-			if (proposed.pair == &pair && proposed.hash == words_hash &&
-			    std::ranges::equal(static_cast<TableImageSet*>(proposed.set)->words, words))
+			if (const auto* built = static_cast<TableImageSet*>(proposed.set);
+			    proposed.pair == &pair && proposed.hash == words_hash && std::ranges::equal(built->words, words) &&
+			    !(!built->pending_images.empty() && built->proposed_segment != spec->closed.size() &&
+			      Spec::SetCpuDirtyStopOn()))
 				return static_cast<TableImageSet*>(proposed.set);
 		if (Catalog().m_native_xpr == nullptr || CatalogTable() == nullptr) return worker_refuse("worker set: no catalog");
 		read_only.emplace();
@@ -1083,6 +1089,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			set->ResolutionEpoch(Role()) = set->resolution_epoch;
 			set->validated_frame         = UINT64_MAX; // (the owner proves it in full at its first use)
 			set->proposer                = spec->id;   // (before it is reachable: TableSet's foreign-proposal check)
+			set->proposed_segment        = spec->closed.size();
 			auto* const raw      = set.get();
 			auto* const owner    = &Catalog();
 			auto* const target   = &pair;
@@ -1506,6 +1513,20 @@ static bool TableRefreshPending(const Image& image, const TextureCache::ImageDes
 	return TextureCache::RefreshPending(image, desc);
 }
 
+// spec_set_cpu_dirty_stop: a speculation's entry for a set's image (Image::SpeculativeEntry) made before its refresh
+// test, so that what the entry notes as found is what the test saw. Only for a registered image. Every entry joins the
+// segment's images, which its commit restores (Before: RestoreState records a barrier on the image's VkImage) and leaves
+// (After: its barrier state), and Changed's "images registered" proves only that none of them was unregistered SINCE the
+// speculation began (skipped while the resolution epoch did not move). A catalog set can still hold an image unregistered
+// before that (an area travel's unmap: DeleteImage -> RetireImage, erased once the packets in flight then passed,
+// TextureCache::EraseRetired; its VkImage destroyed with it), and TableValidateSet's proof refuses it only after this
+// entry: the entry was kept, its barrier recorded in Before, and the image could be erased before that command buffer
+// ran. The normal path never makes one: a set's unregistered image fails TableValidateSet's proof first.
+static void TableEarlyEntry(Image& image) {
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && Spec::SetCpuDirtyStopOn() && image.registered)
+		(void)image.SpeculativeEntry();
+}
+
 // A set's images are the same objects, registered and current (as NativeXprValidateResources proves a record's):
 // once a frame, and again when registrations moved. The main executor checks a use it proved again only when its
 // image's validity moved or a registration stamped the view's pages since (1-1: ~1500 sets a frame, ~0.5 ms, nearly
@@ -1568,7 +1589,9 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 			return false;
 		};
 		// The guest rewrote it (a texture streaming in), or a GPU buffer write its bytes or its stencil plane: upload it
-		// as the normal path's FindTexture does.
+		// as the normal path's FindTexture does. (A speculation's entry for it first, as TableTransit's, for a registered
+		// image only: TableEarlyEntry.)
+		TableEarlyEntry(*image);
 		if (TableRefreshPending(*image, dep.desc)) {
 			if (held) (void)refuse();
 			if (Spec::Current() != nullptr) return Spec::Refuse("texture upload"), false;
@@ -1917,6 +1940,18 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 		pair.LastSet(Role()) = set;
 		if (set == nullptr) return nullptr; // (a program still translating)
 	}
+	// spec_set_cpu_dirty_stop: not its own set with pending slots proposed in an earlier segment (the role's last,
+	// previous or memo set). Those slots are completed in that segment's Before and are no image entry of this one, so
+	// TableTransit refuses it; kept as the role's last set, every later draw with these words was refused too, each a
+	// hole, for the rest of the translation. Resolved afresh instead, as a set first proposed in this segment (its slots
+	// completed in this segment's Before; TableResolveSet passes over the earlier one) and the role's last set from here.
+	if (spec != nullptr && set->proposer == spec->id && !set->pending_images.empty() &&
+	    set->proposed_segment != spec->closed.size() && Spec::SetCpuDirtyStopOn()) {
+		LiveCounters::Add(LiveCounters::SpecPendingReuseFreshN);
+		set                  = TableResolveSet(buffer, pair, variant, draw_state, words);
+		pair.LastSet(Role()) = set;
+		if (set == nullptr) return nullptr; // (refused, or a program still translating)
+	}
 	set->used_frame.store(frame, std::memory_order_relaxed);
 	if (set->refused) return LiveCounters::Add(LiveCounters::TableRefusedSets), Spec::Refuse("table: refused set"), nullptr;
 	if (!TableValidateSet(*set)) {
@@ -2262,7 +2297,24 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				if (const auto epoch = cpu_epoch(held.address, held.size); epoch == 0 || epoch != held.cpu_epoch) {
 					LiveCensus::Scope reprove(LiveCensus::DrawPhase, 0x7ab1e, 6);
 					current = range_clean(held.address, held.size);
-					if (current) held.cpu_epoch = epoch;
+					// (Inside a speculation range_clean's BufferCache::IsRegionCpuModified answers clean for a range in the
+					// translation's current_set, its pages CPU-dirty still: noted current by a packet a Rollback took back
+					// since (Rollback cuts `current`, keeps current_set), or by a translation dropped since. The tracker's
+					// own bits decide: dirty, no epoch is kept (re-proven at each use while dirty: a later translation,
+					// whose current_set lacks the range, then resolves it afresh and notes it there) and, when no note of
+					// the translation's `current` covers the range, it is noted current, as the fresh lookup's
+					// EnsureBufferContents notes it, so the commit uploads it before the work. Before, nothing uploaded it
+					// and the work read the buffer's stale bytes. Any speculation mode.)
+					if (current) {
+						// (Behind the plain global, as BufferCache::IsRegionCpuModified's: mode 0, no thread-local read.)
+						auto* spec = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr;
+						const bool dirty = spec != nullptr && buffer_cache.IsRegionCpuDirty(held.address, held.size);
+						held.cpu_epoch   = dirty ? 0 : epoch;
+						if (dirty && std::none_of(spec->current.begin(), spec->current.end(), [&](const Spec::Range& noted) {
+							    return noted.begin <= held.address && held.address + held.size <= noted.end;
+						    }))
+							spec->NoteCurrent(held.address, held.size);
+					}
 				}
 			}
 			if (!current) {
@@ -2487,6 +2539,35 @@ static bool TableSetApart(const Set& set, const State& draw_state) {
 bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk_buffer,
                                   const NativeXprDrawState* draw_state) {
 	auto& textures = m_context.GetTextureCache();
+	// spec_copy_image_refuse: a speculation's set reused without a lookup (a catalog set, the role's last) holding an image
+	// whose bytes its open segment writes, as the read-only lookups refuse one (TextureCache): looked at only when the
+	// open segment writes anything at all.
+	const auto* const open_writer = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 &&
+	                                        Spec::CopyImageRefuseOn()
+	                                    ? Spec::Current()
+	                                    : nullptr;
+	const bool open_writes = open_writer != nullptr && open_writer->OpenSegmentWritesAny();
+	const auto reused_written = [] {
+		LiveCounters::Add(LiveCounters::SpecImageOpenWritesReusedN);
+		return Spec::Refuse("table: written in its segment"), false;
+	};
+	// Its own set's pending slots too (spec_worker_images: completed in its commit's Before from the bytes before these
+	// writes), which set.images does not hold. (Only the translation that proposed a set binds it before it is published,
+	// and its commit completes the slots after the translation: its pending_images is this thread's to read.)
+	if (const auto* spec = Spec::On() ? Spec::Current() : nullptr; spec != nullptr && set.proposer == spec->id &&
+	                                                                 !set.pending_images.empty()) {
+		if (open_writes)
+			for (const auto& pending: set.pending_images)
+				if (open_writer->OpenSegmentWritesImage(pending.desc.info)) return reused_written();
+		// spec_set_cpu_dirty_stop: nor bound in a later segment than the one that proposed it. Its slots' images are
+		// completed in that one's Before and are no image entry of the later segment, whose commit's CPU-dirty and
+		// buffer-write stops never see them (a hole between the two writing them): refused. (TableSet resolves such a
+		// set's words afresh before it gets here: this is the guard.)
+		if (set.proposed_segment != spec->closed.size() && Spec::SetCpuDirtyStopOn()) {
+			LiveCounters::Add(LiveCounters::SpecPendingReuseRefusedN);
+			return Spec::Refuse("table: pending set of an earlier segment"), false;
+		}
+	}
 	for (const auto& dep: set.images) {
 		auto* image = textures.m_slot_images.try_get(dep.id);
 		if (image == nullptr) return false;
@@ -2500,9 +2581,14 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 		    (is_target && (target->layout != dep.layout || (target->access | dep.target_read) != dep.access)))
 			return false;
 		if (is_target) continue;
+		if (open_writes && (open_writer->OpenSegmentWritesImage(image->info) || open_writer->OpenSegmentWritesImage(dep.desc.info)))
+			return reused_written();
 		// An image the shader writes is GPU-modified, CPU-clean and current with buffer writes (as the normal path's
 		// FindTexture leaves a storage image: it acquires it again otherwise). One written since the set was proven this
 		// frame (by the CPU, a GPU buffer write, or into its stencil plane) is uploaded by the normal path's FindTexture.
+		// (A speculation's entry for it first: the state it notes as found is the one the test saw, or a write after,
+		// which its commit then stops at: spec_set_cpu_dirty_stop. A registered image only: TableEarlyEntry.)
+		TableEarlyEntry(*image);
 		if ((dep.storage && !image->SafeToDownload()) || TableRefreshPending(*image, dep.desc)) return false;
 		if (dep.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
 			if (image->info.IsVolume()) return false;

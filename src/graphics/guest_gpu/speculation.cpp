@@ -336,8 +336,11 @@ void Speculation::Retire(std::unique_ptr<Spec::State> record) {
 // upload threads still free over the whole render list; where there is no such list (Linux), off the render threads'
 // CPUs (KYTY_RENDER_CPUS). On the E-cores a worker translates a chunk slower than the GPU thread can wait for it: in
 // the 8 Nov placement trial the arena gained 2.8 fps in-process with the workers on CPUs 8-15, Latria and 1-1 were
-// level, and the translation lost to cancels fell by a third to a half everywhere. Live: speculate_cpus, a CPU mask
-// (0: this default), taken by each worker at its next wake. More workers than the list's CPUs share them (SMT).
+// level, and the translation lost to cancels fell by a third to a half everywhere. Live: speculate_cpu_mask
+// (KYTY_SPECULATE_CPU_MASK), a CPU mask written in decimal (LiveSwitch reads every switch in base 10, the variable and
+// `set` alike: CPUs 8-15 are 65280; "0xff00" reads as 0, this default), taken by each worker at its next wake. (It was
+// named speculate_cpus, so LiveSwitch read KYTY_SPECULATE_CPUS, the list, as a number: "8,10,12,14" became mask 8, CPU
+// 3, and every worker was pinned there.) More workers than the list's CPUs share them (SMT).
 static const std::pair<std::string, const char*>& SpeculationCpus() {
 	static const auto cpus = []() -> std::pair<std::string, const char*> {
 		if (const char* list = std::getenv("KYTY_SPECULATE_CPUS"); list != nullptr && *list != 0) return {list, "KYTY_SPECULATE_CPUS"};
@@ -362,11 +365,20 @@ static void PinSpeculationWorker(int64_t mask) {
 
 // KYTY_SPEC_PASS_CPUS: the state pass thread's CPUs. Unset: one CPU of the lowest efficiency class the process may run
 // on, outside the workers' CPUs where there is one (LocalPlatform::EfficiencyCpu: an E-core, 16 on an 8 P-core + 16
-// E-core part); where every core is alike (or on Linux) none, and the thread is not pinned.
+// E-core part). On Linux, where efficiency classes are not read: a CPU on a physical core with none of the render
+// threads' (KYTY_RENDER_CPUS) or the workers' CPUs (LocalPlatform::SpareCpu; 8, core 0, with KYTY_RENDER_CPUS=1-7 on an
+// 8-core part numbered 0-7, 8-15 siblings), else a sibling of one; with none left the thread is not pinned. Where every
+// core is alike on Windows it is not pinned.
 static const std::string& PassCpus() {
 	static const std::string cpus = [] {
 		const char* list = std::getenv("KYTY_SPEC_PASS_CPUS");
-		return list != nullptr && *list != 0 ? std::string(list) : LocalPlatform::EfficiencyCpu(SpeculationCpus().first.c_str());
+		if (list != nullptr && *list != 0) return std::string(list);
+		const std::string& workers = SpeculationCpus().first;
+		if (std::string efficiency = LocalPlatform::EfficiencyCpu(workers.c_str()); !efficiency.empty()) return efficiency;
+		std::string avoid  = workers;
+		const char* render = std::getenv("KYTY_RENDER_CPUS");
+		if (render != nullptr && *render != 0) avoid += (avoid.empty() ? "" : ",") + std::string(render);
+		return LocalPlatform::SpareCpu(avoid.c_str());
 	}();
 	return cpus;
 }
@@ -376,7 +388,7 @@ void Speculation::AheadRun(Translator& translator) {
 	// (Worker packets, live spec_worker_packets: its segments recorded as packets, spliced at commit. Armed only
 	// inside a segment recorded so: otherwise its calls go to the driver as before.)
 	const LocalVulkanRecording::PassiveProducerScope passive_producer;
-	static auto& live_cpus    = LiveSwitch::Find("speculate_cpus", 0);
+	static auto& live_cpus    = LiveSwitch::Find("speculate_cpu_mask", 0);
 	int64_t      applied_cpus = live_cpus.load(std::memory_order_relaxed);
 	if (translator.pass_only) {
 		// (Normal priority; never re-pinned live. The CPUs said are those the pin took, or none.)
@@ -384,7 +396,7 @@ void Speculation::AheadRun(Translator& translator) {
 		const bool  pinned = !cpus.empty() && LocalPlatform::TryPinThreadToCpuList(cpus.c_str());
 		std::printf("Speculation: the state pass on its own thread, %s%s (KYTY_SPEC_PASS_THREAD; the workers take only "
 		            "chunks)\n",
-		            pinned ? "CPUs " : "not pinned", pinned ? cpus.c_str() : "");
+		            pinned ? "CPUs " : "not pinned", pinned ? LocalPlatform::CpuListResolved(cpus.c_str()).c_str() : "");
 	} else {
 		PinSpeculationWorker(applied_cpus);
 	}
@@ -393,8 +405,9 @@ void Speculation::AheadRun(Translator& translator) {
 		const char* render = std::getenv("KYTY_RENDER_CPUS");
 		std::printf("Speculation: %u workers on CPUs %s (%s); render threads on CPUs %s\n",
 		            static_cast<unsigned>(m_translators.size() - (m_pass_thread ? 1u : 0u)),
-		            cpus.first.empty() ? "off the render threads' CPUs" : cpus.first.c_str(), cpus.first.empty() ? "no list" : cpus.second,
-		            render != nullptr && *render != 0 ? render : "any");
+		            cpus.first.empty() ? "off the render threads' CPUs" : LocalPlatform::CpuListResolved(cpus.first.c_str()).c_str(),
+		            cpus.first.empty() ? "no list" : cpus.second,
+		            render != nullptr && *render != 0 ? LocalPlatform::CpuListResolved(render).c_str() : "any");
 	}
 	// (Its Vulkan calls go to the driver as they are made, no recording stream: what they name is alive then.)
 	RenderContext::SetThreadExecutors(&translator.executors);
@@ -866,6 +879,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 			auto& hole  = r.holes.emplace_back();
 			hole.packet = packet;
 			hole.dwords = dwords;
+			hole.header = *packet;
 			hole.reason = r.state.refused;
 			hole.at     = spec; // (spec_stop_as_hole)
 			CommandProcessor::SkipSuspendedPacket(spec);
@@ -1070,6 +1084,21 @@ const char* Speculation::Changed(const Result& result, size_t index) const {
 				return "commit: memory unmapped";
 			}
 	}
+	// spec_set_cpu_dirty_stop (Spec::SetCpuDirtyStopOn): every image the segment uses is still the object it found
+	// (serial) and registered, whatever the epoch says. UnregisterImage moves the resolution epoch before it clears
+	// `registered`: a speculation that took its epochs and made an entry between the two (TableEarlyEntry read it still
+	// registered) has an epoch that includes the unregister, so the check below is skipped, and Before would restore the
+	// retired image (a barrier on a VkImage EraseRetired may destroy before it runs). Plain data on the GPU thread, one
+	// pass over the segment's images. (The null image is never registered: exempt.)
+	if (Spec::SetCpuDirtyStopOn())
+		for (const auto& use: segment.images) {
+			const auto* image = use.image;
+			if (image->serial == use.serial &&
+			    (image->registered || (image->info.data.address == 0 && image->info.data.size == 0)))
+				continue;
+			LiveCounters::Add(LiveCounters::SpecImageUnregisteredStops);
+			return "commit: an image it uses was unregistered";
+		}
 	if (textures.ResolutionEpoch() == epochs.images) return nullptr;
 	// (Live spec_exact_image_stop: the registration log's exact ranges; -1, the default: on under KYTY_SPECULATE=4; 1 on,
 	// 0 off.)
@@ -1164,6 +1193,20 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 				return ++m_stop_reasons["commit: a segment run as a hole did not reach its hole"], Progress::Stopped;
 			if (!cp.SameState(*result.hole_states[index]))
 				return ++m_stop_reasons["commit: a segment run as a hole ended in another state"], Progress::Stopped;
+			// (Its hole's header as translated: RunHole reads the packet's words as they are now but runs it with the
+			// translation's length, which the header holds. Nothing after Changed() checked the segment's command
+			// words, the hole's among them, and the run itself may have written them. Read as the chain reads are,
+			// through the backing view where a guest write is pending. A stop leaves the GPU thread at the hole's
+			// packet, Result::resume_at.)
+			{
+				const auto& hole = result.holes[index];
+				const void* word = hole.packet;
+				if (WriteGuard::g_count.load(std::memory_order_relaxed) != 0)
+					if (const auto* backing = WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(hole.packet), 4u))
+						word = backing;
+				if (*static_cast<const uint32_t*>(word) != hole.header)
+					return ++m_stop_reasons["commit: a segment run as a hole: its hole packet moved"], Progress::Stopped;
+			}
 			result.resume_at.reset();
 			// (Its Before did not run: the worker sets it proposed are the next segment's to check and complete before that
 			// one's replay, as they would have been this one's. A later segment may bind any of them, through the reuse of
@@ -1183,6 +1226,45 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		for (const auto& use: state.closed[index].images)
 			if (!use.found_buffer_modified && use.image->IsBufferModified())
 				return ++m_stop_reasons["commit: GPU work wrote an image it uses"], Progress::Stopped;
+		// spec_copy_image_refuse (Spec::CopyImageRefuseOn): nor its stencil plane (MarkStencilModified: a buffer write over
+		// it), which the normal path's refresh uploads (RefreshImage) and this work was recorded without.
+		if (Spec::CopyImageRefuseOn())
+			for (const auto& use: state.closed[index].images)
+				if (!use.found_stencil_modified && use.image->IsStencilModified()) {
+					LiveCounters::Add(LiveCounters::SpecStencilModifiedStops);
+					return ++m_stop_reasons["commit: GPU work wrote a stencil it uses"], Progress::Stopped;
+				}
+		// spec_set_cpu_dirty_stop (Spec::SetCpuDirtyStopOn): nor written on the CPU since (a hole's host write over its
+		// pages, or an earlier segment's guest memory writes). The work's set reuse checked it only at translation
+		// (TableTransit's and TableValidateSet's refresh tests, which make its entry first); the normal path's next
+		// acquisition uploads (a storage image: guest bytes over what the GPU wrote). CPU-dirty now and either clean when
+		// found or written since (its validity moved: every CPU write's does). A use that only sampled views above level 0
+		// (redo_level_precise's sample-only use: a texture streaming in from its small levels) passes while its sampled
+		// levels' bytes are not dirty: RefreshPending of those levels (DirtyForView), the normal path's own test for such a
+		// view. Maybe-dirty only: when its refresh would upload, the stored hash of its guest edges no longer theirs
+		// (RefreshImage's own test, read only).
+		if (Spec::SetCpuDirtyStopOn())
+			for (const auto& use: state.closed[index].images) {
+				const auto* image = use.image;
+				if (!image->IsCpuDirty() ||
+				    (use.found_cpu_dirty && image->validity.load(std::memory_order_acquire) == use.found_validity))
+					continue;
+				if (!use.sample_other && use.sample_lo != 0 && use.sample_lo < use.sample_hi && image->serial == use.serial) {
+					TextureCache::ImageDesc sampled;
+					sampled.type                  = TextureCache::BindingType::Texture;
+					sampled.view_info.base_level  = use.sample_lo;
+					sampled.view_info.level_count = use.sample_hi - use.sample_lo;
+					if (!TextureCache::RefreshPending(*image, sampled)) continue;
+				}
+				if (image->IsDefinitelyCpuDirty()) {
+					LiveCounters::Add(LiveCounters::SpecCpuDirtyStopsDefinite);
+					return ++m_stop_reasons["commit: the CPU wrote an image it uses"], Progress::Stopped;
+				}
+				if (image->MaybeCpuHashMoved()) {
+					LiveCounters::Add(LiveCounters::SpecCpuDirtyStopsMaybe);
+					return ++m_stop_reasons["commit: the CPU wrote an image it uses (maybe-dirty)"], Progress::Stopped;
+				}
+			}
 		for (const auto& left: state.left_clears)
 			if (left.segment == index && (left.image->serial != left.serial ||
 			                              left.image->validity.load(std::memory_order_relaxed) != left.validity))
@@ -1288,6 +1370,11 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 				if (*static_cast<const uint32_t*>(word) != read.value)
 					return ++m_stop_reasons["commit: a command buffer before wrote otherwise"], Progress::Stopped;
 			}
+			// The words it read from its own speculation's journal that an earlier segment's write gave, as the chain
+			// reads (KYTY_SPECULATE=4: JournalReadsMoved).
+			if (state.journal_reads_on && to.journal_reads > from.journal_reads)
+				if (const char* moved = JournalReadsMoved(result, index))
+					return ++m_stop_reasons[moved], Progress::Stopped;
 			for (size_t i = from.waits; i < to.waits; ++i) {
 				const auto& wait  = state.waits[i];
 				uint64_t    value = 0;
@@ -1371,6 +1458,24 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 	return Progress::Complete;
 }
 
+// (Before: an image of the segment's entries as Before's start found it (`at_start`, taken before anything there can
+// release one), and whether an image was erased since (`erased`: TextureCache::EraseEpoch moved).)
+struct ImageAtBeforeStart {
+	ImageId id;                 // (TextureCache::LiveImageId then: {} when it was erased already)
+	bool    registered = false;
+};
+
+// (Before: an image of the segment's entries gone: erased (before Before or in it: its slot's generation moved), its
+// slot another image's (the serial), or unregistered in this Before (ReclaimImageMemory takes registered images only:
+// a victim a speculation's packet still holds is erased by a later EraseRetired, whatever the GPU still has recorded).
+// Not one already unregistered when Before began and still alive (a parked image, one retired but not yet erased): its
+// VkImage lives, and it gets the barrier as before. The liveness is read first: the fields of an erased object are not.)
+static bool ImageGoneInBefore(TextureCache& textures, const Image& image, uint64_t serial,
+                              const ImageAtBeforeStart& at_start, bool erased) {
+	if (!at_start.id || (erased && textures.TryGetImage(at_start.id) != &image)) return true;
+	return image.serial != serial || (at_start.registered && !image.registered);
+}
+
 void Speculation::Before(Result& result, size_t index) {
 	const Spec::EffectSourceScope source(Spec::EffectSource::Commit);
 	auto&       resources = m_renderer.GetGpuResources();
@@ -1386,6 +1491,14 @@ void Speculation::Before(Result& result, size_t index) {
 	// (their CPU-dirty pages uploaded, then GPU-owned), those it reads made current, its BDA reads prepared, and each
 	// image where the work found it.
 	RenderLockGuard lock(m_renderer.GetMutex());
+	// Its images as they are before anything here can erase or unregister one (the last loop's ImageGoneInBefore).
+	const auto                      erase_epoch = textures.EraseEpoch();
+	std::vector<ImageAtBeforeStart> images_at_start;
+	images_at_start.reserve(segment.images.size());
+	for (const auto& use: segment.images) {
+		const auto id = textures.LiveImageId(*use.image);
+		images_at_start.push_back({id, id && use.image->registered});
+	}
 	// spec_pending_buffers: the V# ranges it found no buffer for, obtained in order first (made or joined, uploaded), so
 	// the check after Before (preparation registered buffers) sees what that moved under the segment's other ranges.
 	const auto registration_now = buffers.RegistrationEpoch(); // (an entry proven at it or after: nothing moved under it)
@@ -1563,8 +1676,23 @@ void Speculation::Before(Result& result, size_t index) {
 		                                               pending.base_layer, pending.layer_count, pending.clear);
 		if (!ok) state.target_failed = true;
 	}
-	for (const auto& use: segment.images) {
-		EXIT_IF(use.image->serial != use.serial); // (nothing released images since: Epochs)
+	// The images back in the states the segment's barriers start from. This Before may have released one: a creation it
+	// made failed for memory (ReclaimImageMemory unregisters its victims, among them maybe the segment's own, and erases
+	// them after a wait), and any EraseRetired here (that one, a deferred RetireImage a Finish ran) erases retired images
+	// whose packets passed, among them maybe one the segment found already unregistered. One erased, its slot reused, or
+	// unregistered here gets no barrier (it would name a destroyed VkImage, or another image) and the segment stops before
+	// the splice (target_failed). One unregistered before Before and still alive (a parked image) gets it, as before.
+	// (With spec_set_cpu_dirty_stop on, Changed stops the segment first at an image already unregistered when it ran.)
+	// (Was an EXIT_IF on the serial alone; then registered-or-null-image too, which stopped ~0.9 segments a frame on the
+	// 1-3 walk in mode 4 for images merely unregistered before Before: 9,701 "a pending target not acquired" stops.)
+	const bool erased = textures.EraseEpoch() != erase_epoch;
+	for (size_t i = 0; i < segment.images.size(); ++i) {
+		const auto& use = segment.images[i];
+		if (ImageGoneInBefore(textures, *use.image, use.serial, images_at_start[i], erased)) {
+			state.target_failed = true;
+			LiveCounters::Add(LiveCounters::SpecImageGoneInBeforeN);
+			continue;
+		}
 		use.image->RestoreState(use.found, use.found_subresources, scheduler.Current().Handle());
 	}
 }
@@ -1751,6 +1879,57 @@ Speculation::AsHole Speculation::SegmentAsHole(Result& result, CommandProcessor&
 		return AsHole::NotReached;
 	}
 	return AsHole::Reached;
+}
+
+// Guest memory now as a speculation's thread reads it (Spec::State::CopyGuest): through the write guard's backing view
+// where a guest write is pending; on Linux, a page a read watcher guards refused (GPU-written bytes not downloaded yet,
+// which a pread of /proc/self/mem would read stale) and the rest through the backing view (spec_backing_reads 1, the
+// default); else a guarded copy (a page without access refuses). False: not read.
+static bool ReadGuestNow(void* out, uint64_t address, uint64_t bytes) {
+	if (const auto* backing = WriteGuard::GuardedBacking(address, bytes)) {
+		std::memcpy(out, backing, bytes);
+		return true;
+	}
+#if !defined(_WIN32)
+	static auto& backing_reads = LiveSwitch::Find("spec_backing_reads", 1);
+	if (backing_reads.load(std::memory_order_relaxed) != 0) {
+		if (Libs::LibKernel::Memory::ReadFaults(address, bytes)) return false;
+		if (Libs::LibKernel::Memory::TryReadBackingToHost(address, out, bytes)) return true;
+	}
+#endif
+	return Common::GuardedCopy(out, reinterpret_cast<const void*>(address), bytes) == 0;
+}
+
+// KYTY_SPECULATE=4: the words segment `index` read from the speculation's own journal that a write of an earlier
+// segment gave (Spec::State::journal_reads with `entry` before the segment's own writes), checked at its commit as the
+// chain reads are: such a word notes nothing else the commit checks (a wait over it pushes no WaitCheck). It runs among
+// the checks before the segment's Before. Memory then is what the in-order path reads at the segment's start: the
+// earlier segments' writes landed at their commits (After), the holes before it ran (RunHole), a segment run as a hole
+// (SegmentAsHole) ran its packets in order, and a previous speculation's commits are done; nothing of this segment's
+// has landed, and a word its own writes gave is not checked (in order it reads them). So each must be in memory as the
+// reader took it (Spec::State::journal_words), with no GPU write logged over it since the speculation began (logged as
+// recorded, before it reaches memory: memory cannot tell). Null: all hold.
+const char* Speculation::JournalReadsMoved(const Result& result, size_t index) const {
+	const auto&                            state = result.state;
+	const auto                             from  = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
+	const auto&                            to    = state.closed[index].end;
+	thread_local std::array<uint8_t, 4096> now;
+	for (size_t i = from.journal_reads; i < to.journal_reads; ++i) {
+		const auto& read = state.journal_reads[i];
+		if (read.entry >= from.writes) continue; // (its own writes gave it)
+		if (m_log.stamps.MaybeSince(read.address, read.bytes, result.effects_from) &&
+		    m_log.FirstGpuWriteOver(result.effects_from, read.address, read.bytes) != nullptr)
+			return "commit: a journal word read, a GPU write over it";
+		const auto* taken = reinterpret_cast<const uint8_t*>(state.journal_words.data() + read.words);
+		for (uint64_t done = 0; done < read.bytes;) { // (by page)
+			const auto address = read.address + done;
+			const auto n       = std::min<uint64_t>(read.bytes - done, now.size() - (address & (now.size() - 1)));
+			if (!ReadGuestNow(now.data(), address, n)) return "commit: a journal word read, not readable now";
+			if (std::memcmp(now.data(), taken + done, n) != 0) return "commit: a journal word read otherwise";
+			done += n;
+		}
+	}
+	return nullptr;
 }
 
 void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {

@@ -3208,6 +3208,13 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		return;
 	}
 
+	// spec_copy_image_refuse: a speculation's GPU fill over image memory, as its GPU copy below (behind the plain global:
+	// mode 0, no thread-local read).
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && Spec::Current() != nullptr &&
+	    Spec::CopyImageRefuseOn() && m_texture_cache.HasTrackedDataOverlap(vaddr, size)) {
+		LiveCounters::Add(LiveCounters::SpecFillIntoImageN);
+		return Spec::Refuse("GPU fill over an image");
+	}
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size, "fill");
 	const auto id          = FindBuffer(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true, id);
@@ -3234,6 +3241,19 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		if (spec != nullptr) {
 			// A speculative translation's copy is made at its commit, in order with its other guest memory writes,
 			// between ranges no GPU work wrote (speculation-state.h: work that writes them stops the commit first).
+			// spec_copy_image_refuse (Spec::CopyImageRefuseOn): not over image memory. Journaled, it lands in the
+			// segment's After, after its own work, which no binding test of the image saw coming (none asks the journal):
+			// in order the copy dirties the image first and the binding uploads it. Refused, a dispatch's linear copy
+			// (DemonsSouls TryLinearCopy) is a hole, made in order; the work after it, translated with the image clean,
+			// stops at its commit (spec_set_cpu_dirty_stop). A DMA_DATA or COPY_DATA packet is no hole (Speculation's
+			// IsHole): the speculation ends at it, and the GPU thread translates on from it in order.
+			if (Spec::CopyImageRefuseOn()) {
+				LiveCounters::Add(LiveCounters::SpecCopyJournaledN);
+				if (m_texture_cache.HasTrackedDataOverlap(dst_vaddr, size)) {
+					LiveCounters::Add(LiveCounters::SpecCopyIntoImageN);
+					return Spec::Refuse("journaled copy over an image");
+				}
+			}
 			spec->NoteCpuCopy(src_vaddr, size);
 			spec->NoteCpuCopy(dst_vaddr, size);
 			spec->Journal(dst_vaddr, src_vaddr, static_cast<uint32_t>(size), true);
@@ -3243,6 +3263,13 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		return;
 	}
 
+	// spec_copy_image_refuse: nor a GPU copy over image memory. A speculation's InvalidateMemoryFromGPU only notes the
+	// range, replayed in its segment's Before, after the commit's image checks ("GPU work wrote an image it uses"): an
+	// image the segment binds after the copy was recorded without the upload the normal path's binding makes.
+	if (spec != nullptr && dst_memory && Spec::CopyImageRefuseOn() && m_texture_cache.HasTrackedDataOverlap(dst_vaddr, size)) {
+		LiveCounters::Add(LiveCounters::SpecGpuCopyIntoImageN);
+		return Spec::Refuse("GPU copy over an image");
+	}
 	auto& command = m_scheduler.Current();
 	if (dst_memory) {
 		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size, "copy");

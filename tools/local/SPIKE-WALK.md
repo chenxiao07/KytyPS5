@@ -35,7 +35,7 @@ The two crossings:
 - **First crossing:** ~9-10 s into the run, at the arch mouth (x ≈ 15, z ≈ 424). This is the detector's spike and the crossing window.
 - **Second window:** the longest frame from 11 frames after the first crossing to the run's end, taken out on the bridge. The "Boletarian Palace - The Lord's Path" banner comes at ~18 s.
 
-**The save.** Any save with the 1-3 archstone (The Lord's Path) unlocked: step 1 travels there from anywhere. Pass it with `-Baseline <dir>` (a folder with `PPSA01341` and `.kyty-capacity`, as bench-windows.py's `KYTY_BENCH_BASELINE`). Your own save stays moved aside and comes back verified at the end.
+**The save.** Any save with the 1-3 archstone (The Lord's Path) unlocked: step 1 travels there from anywhere. The save's game must also have the Tower Knight (the 1-2 boss) beaten in play (a Linux tester's report, BIOS2000 on #342, 16 Nov). The reader checks each walk's end position (its last `where`: z ≈ 390.3 on the bridge) and warns when it is off. Pass it with `-Baseline <dir>` (a folder with `PPSA01341` and `.kyty-capacity`, as bench-windows.py's `KYTY_BENCH_BASELINE`). Your own save stays moved aside and comes back verified at the end.
 
 **Settings the driver uses:**
 - `KYTY_FPS_HUD=2`: bench-run finds the game by the HUD.
@@ -62,6 +62,13 @@ Alternate the two sides (A B B A …), one boot each, in one sitting.
 - **tail:** the 10 frames after the crossing: peak, time over calm, frames over 25 / 33 ms.
 - **2nd window:** as the window, around the longest frame later in the run.
 - **write faults a frame:** the mean over the walk's measure windows.
+
+Then, after those rows (per walk and in the means), the rows past the crossing window. A walk too short for a row prints "-".
+- **late burst worst ms:** the worst frame from +30 to +60 frames after the crossing frame.
+- **late burst over-calm ms:** the time over calm from that worst frame to 10 frames after it (11 frames).
+- **plateau ms:** the mean frame time over frames +60 to +120 after the crossing.
+- **walk mean / p95 / p99 ms, walk >25:** over the whole run, from the pad's start (`LIVE_PAD flip=`) to the release 18 s later in the dump: the mean frame time, the 95th and 99th percentile frame (nearest rank), and the frames over 25 ms.
+- **stand ms:** the mean frame time over the `-Tail` standing windows after the run: their `LIVE_MEASURE` replies' time over their frames. "-" for a boot run with `-Tail 0`.
 
 The most telling single rows are "window over-calm ms", the crossing frame and "tail over-calm ms".
 
