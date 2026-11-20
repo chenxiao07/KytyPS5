@@ -72,6 +72,14 @@ bool RenderExecutor::WeaveStart(uint32_t workers, const void* processor,
 	return true;
 }
 
+// No GPU command used a ring (the GPU thread opened no parcel), so each buffer goes now (Buffer's destructor, or the
+// reclaimer's).
+void RenderExecutor::WeaveForget() {
+	if (g_weave_turn == nullptr || g_weave_turn->executor != this) return;
+	delete g_weave_turn;
+	g_weave_turn = nullptr;
+}
+
 // The weave's executor state goes with the executor WeaveStart made it for, as RenderContext is destroyed at shutdown:
 // the GPU thread is joined by then, and it joined the weave's threads (StopAll).
 RenderExecutor::~RenderExecutor() {

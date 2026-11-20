@@ -765,6 +765,9 @@ private:
 	[[nodiscard]] bool WeaveStart(uint32_t workers, const void* processor,
 	                              bool (*same)(const void* processor, const Weave::Registers& start,
 	                                           const Weave::RegisterLog& log, uint32_t first, uint32_t index));
+	// A start that failed (no weave thread runs, no parcel was opened): what WeaveStart made, the views and rings,
+	// freed.
+	void WeaveForget();
 	[[nodiscard]] bool WeaveOpen(Weave::Parcel& parcel, bool copies_matched,
 	                             std::span<const std::pair<uint64_t, uint64_t>> copies_passed);
 	[[nodiscard]] bool WeaveTurnAt(const uint32_t* packet, const uint32_t*& until);

@@ -131,7 +131,9 @@ While the weave runs, the GPU thread gets one physical core to itself, as `KYTY_
 
 The comment at `KeepRenderCoreAlone`'s call in `performance-switches.h` records that a dedicated core made the whole
 process slower on Windows. Placement is therefore the weave's default only, never mode 0's. If the
-weave stands down after start-up (its checks at the first draw, section 6), the core stays kept for the run.
+weave stands down after start-up (its checks at the first draw, section 6), the core is given back, as if the weave
+had never been asked: the default CPU set and the threads kept off the core get it again. A core `KYTY_RENDER_CORE`
+names stays.
 
 ## 5. With mode 4
 
@@ -164,7 +166,10 @@ Each prints one line and the run stays in mode 0.
 | its threads could not start | `Weave: its threads could not start (<error>); the weave stays off.` |
 | a worker's upload ring not host-coherent | `Weave: worker <n>'s upload ring is not host-coherent; the weave stays off.` |
 
-The Steam Deck build stands down by both its scout default and its four cores. There is no memory gate (section 7).
+The last three also free what the start made (the workers' upload rings and views, the reader's and the workers'
+processors, the linear-copy records) and give back the GPU thread's core if only the weave kept it (section 4), so
+the run goes on in mode 0 as if the weave had never been asked. The Steam Deck build stands down by both its scout
+default and its four cores. There is no memory gate (section 7).
 
 Two more lines are reports, not stand-downs: `Weave: the GPU thread has waited <ms> ms at a safepoint (worker <n> in
 a draw)`, once a wait passes 1 s and again at each doubling (a freeze would sit there), and the same while pausing.

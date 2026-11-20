@@ -121,7 +121,7 @@ constexpr uint32_t WeaveLogBytes   = WeaveLogScalars + Weave::LogBlockBytes;
 constexpr size_t WeavePoolCopies = 64;
 
 // The command processor's side of the weave: made by the GPU thread as the weave starts, never freed while the game
-// runs (its threads read it until StopAll has joined them).
+// runs (its threads read it until StopAll has joined them), unless the start failed (CommandProcessor::WeaveStart).
 struct WeaveCp {
 	RenderExecutor*                                                  executor = nullptr;
 	std::unique_ptr<CommandProcessor>                                reader;

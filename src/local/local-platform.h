@@ -128,6 +128,12 @@ void MakeBackgroundThread(const char* avoid_cpus);
 // alone. `fallback` stands for an unset KYTY_RENDER_CORE (a caller's default, such as "auto"; null: unset); with
 // KYTY_RENDER_CPUS set it is not taken (the thread is placed). Returns the CPU (-1: not done).
 int KeepRenderCoreAlone(const char* fallback = nullptr);
+// The core KeepRenderCoreAlone kept because of its caller's `fallback` let go, on the thread it placed, as if it had
+// never been kept (a weave that could not start: the run goes on in mode 0). Windows: the default CPU set every CPU,
+// the thread's mask the process's, and every thread AvoidCpuList kept off the core given it back. Linux: the keeper
+// stopped, the thread on the process's CPUs, and every thread kept off the core given it back. A core KYTY_RENDER_CORE
+// asked for, or the Steam Deck build's default, stays.
+void ReleaseRenderCore();
 // The cores of the performance class (the highest efficiency class; every core where all are alike) the process may run
 // on, their logical CPUs, and all the logical CPUs it may run on (Windows: GetLogicalProcessorInformationEx; Linux: the
 // sysfs topology, the class from /sys/devices/cpu_core/cpus where there is one). 0s where not known.

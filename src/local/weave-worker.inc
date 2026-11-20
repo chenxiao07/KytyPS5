@@ -143,7 +143,8 @@ struct RenderExecutor::WeaveClear {
 
 // The weave's executor state: the workers', and the GPU thread's turn over the open parcel (weave-turn.inc). One,
 // made by WeaveStart for the executor every weave call is made on (the GPU thread's: WeaveCp::executor,
-// weave-reader.inc), and deleted with that executor (~RenderExecutor, at shutdown).
+// weave-reader.inc), and deleted with that executor (~RenderExecutor, at shutdown), or when the start failed
+// (WeaveForget).
 struct WeaveTurn {
 	const RenderExecutor*                      executor = nullptr;
 	std::array<WeaveWorker, Weave::MaxWorkers> workers;
@@ -236,7 +237,8 @@ struct WeaveTurn {
 };
 
 // (Null until WeaveStart. The weave's threads read it, a worker at each parcel's begin and any thread at a slot's
-// release: WeaveStart wrote it before they started, and it is deleted only once StopAll has joined them.)
+// release: WeaveStart wrote it before they started, and it is deleted only once StopAll has joined them, or once a
+// start that failed has joined them, WeaveForget.)
 static WeaveTurn* g_weave_turn = nullptr;
 
 namespace {

@@ -549,6 +549,12 @@ bool Start(const Bodies& bodies) {
 	return decide(true);
 }
 
+void StartFailed() noexcept {
+	kyty_local_weave_mode.store(0, std::memory_order_relaxed);
+	g_workers = 0;
+	LocalPlatform::ReleaseRenderCore();
+}
+
 bool Stopping() noexcept {
 	const auto* r = Started();
 	return r == nullptr || r->stopping.load(std::memory_order_relaxed);

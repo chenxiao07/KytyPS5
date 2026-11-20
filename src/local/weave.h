@@ -164,6 +164,10 @@ struct Bodies {
 // start line printed, Active(); once (later calls return the first one's answer). False: none run (stood down, the
 // scout not running, KYTY_SPECULATE not 0, or a thread could not start).
 [[nodiscard]] bool Start(const Bodies& bodies);
+// The GPU thread, after a start that failed past the start-up gates (CommandProcessor::WeaveStart, once it has freed
+// what it made): the switch 0, and the GPU thread's core given back if only the weave kept it (RenderCoreFallback's
+// "auto", LocalPlatform::ReleaseRenderCore). The run goes on in mode 0 as if the weave had never been asked.
+void StartFailed() noexcept;
 // StopAll has begun: every loop returns.
 [[nodiscard]] bool Stopping() noexcept;
 

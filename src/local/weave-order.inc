@@ -224,18 +224,35 @@ bool CommandProcessor::WeaveSameOf(const void* processor, const Weave::Registers
 	return cp.WeaveSame(worker);
 }
 
+namespace {
+
+// The linear-copy records WeaveCopiesStart made, freed (weave-copies.inc).
+void WeaveCopiesForget();
+
+} // namespace
+
 // The GPU thread, at queue 0's first top-level draw packet woven: the reader's and the workers' processors, the
 // executor's state for them, the linear-copy records, and the threads. Once; false: the weave stood down (each reason
-// says so in one line, Weave::Start).
+// says so in one line, Weave::Start), and the run goes on in mode 0 as if it had never been asked (`undo`).
 bool CommandProcessor::WeaveStart() {
 	auto& order = g_weave_order;
 	if (order.started || order.failed) return order.started;
 	order.failed        = true; // (until it has started: never tried again)
 	const auto workers  = Weave::Workers();
 	auto&      executor = m_renderer.GetRenderExecutor();
+	// A start that failed frees what was made for it. No weave thread runs (none started, or Weave::Start joined them)
+	// and no parcel was opened, so it goes in the reverse order: the linear-copy records, the reader's and the
+	// workers' processors, the executor's views and rings (Weave::Start's runtime stays, as it was made to). Then the
+	// switch is 0 and the GPU thread's core is given back if only the weave kept it (Weave::StartFailed).
+	const auto undo = [&executor] {
+		WeaveCopiesForget();
+		delete std::exchange(g_weave, nullptr);
+		executor.WeaveForget();
+		Weave::StartFailed();
+	};
 	CheckBuffer();
 	if (workers == 0 || !executor.WeaveStart(workers, this, &CommandProcessor::WeaveSameOf)) {
-		kyty_local_weave_mode.store(0, std::memory_order_relaxed); // (stood down: Enabled() false from here on)
+		undo(); // (stood down: Enabled() false from here on)
 		return false;
 	}
 	auto* weave     = new WeaveCp;
@@ -248,8 +265,10 @@ bool CommandProcessor::WeaveStart() {
 	WeaveCopiesStart(); // (before the reader and the workers start)
 	if (!Weave::Start({.read    = &CommandProcessor::WeaveRead,
 	                   .make    = &CommandProcessor::WeaveMake,
-	                   .release = &CommandProcessor::WeaveRelease}))
+	                   .release = &CommandProcessor::WeaveRelease})) {
+		undo();
 		return false;
+	}
 	order.started = true;
 	order.failed  = false;
 	return true;

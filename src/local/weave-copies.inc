@@ -32,13 +32,18 @@ struct WeaveCopyRun {
 	uint64_t clock_begin = 0, clock_end = 0;
 };
 // The records (`written` made) and their runs (final below `run`), record `index` at `index % Weave::CopyRecords`.
-// Made by the GPU thread before the reader and the workers start, never freed while the game runs.
+// Made by the GPU thread before the reader and the workers start, never freed while the game runs (unless the weave
+// could not start: WeaveCopiesForget).
 struct WeaveCopies {
 	std::array<WeaveCopyRecord, Weave::CopyRecords> records;
 	std::array<WeaveCopyRun, Weave::CopyRecords>    runs;
 	std::atomic<uint64_t>                           written {0}, run {0};
 };
 WeaveCopies* g_weave_copies = nullptr;
+
+void WeaveCopiesForget() {
+	delete std::exchange(g_weave_copies, nullptr);
+}
 
 // The records a worker may still read once listed: the reader waits for the GPU thread to be this far past a record
 // before it writes over it.
