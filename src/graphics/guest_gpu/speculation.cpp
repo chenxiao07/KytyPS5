@@ -30,6 +30,7 @@
 #include <map>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 extern "C" {
@@ -2400,6 +2401,21 @@ void Speculation::Before(Result& result, size_t index) {
 		                        !buffers.IsRegionCpuDirtyNoCreate(entry.address, entry.size)))) {
 			entry.obtained = true;
 			continue;
+		}
+		// For a pending non-texel read, the live owner replaces the repeated lookups. Check after the first
+		// LRU touch, where EnsureBufferContents would synchronize. A dirty range takes the full path below.
+		if (entry.pending && !entry.written && !entry.texel) {
+			const auto id = buffers.RegisteredBuffer(entry.address, entry.size);
+			if (const auto* live = buffers.GetBufferIfLive(id); live != nullptr && live->HasDeviceAddress()) {
+				buffers.TouchSpeculated(id);
+				if (!buffers.IsRegionCpuDirtyNoCreate(entry.address, entry.size)) {
+					// ObtainBuffer still checks for a shader-ring copy and synchronizes at its usual point.
+					const auto* owner = buffers.ObtainBuffer(entry.address, entry.size, false, false, id).first;
+					entry.obtained    = owner == live;
+					obtained_all      = obtained_all && entry.obtained;
+					continue;
+				}
+			}
 		}
 		(void)buffers.FindBuffer(entry.address, entry.size);
 		if (!entry.written) buffers.EnsureBufferContents(entry.address, entry.size);
