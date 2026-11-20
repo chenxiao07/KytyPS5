@@ -365,6 +365,27 @@ uint32_t PerformanceCoresIn(uint64_t mask) {
 	return static_cast<uint32_t>(cores.size());
 }
 
+uint32_t CoresIn(uint64_t mask) {
+	DWORD_PTR process = 0, system = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) == 0) process = ~DWORD_PTR(0);
+	ULONG length = 0;
+	(void)GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+	std::vector<uint8_t> buffer(length);
+	if (length == 0 || !GetSystemCpuSetInformation(reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data()), length,
+	                                               &length, GetCurrentProcess(), 0))
+		return 0;
+	const uint64_t     allowed = static_cast<uint64_t>(process) & mask;
+	std::set<uint32_t> cores;
+	for (ULONG offset = 0; offset < length;) {
+		const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+		if (info->Type == CpuSetInformation && info->CpuSet.Group == 0 && info->CpuSet.LogicalProcessorIndex < 64 &&
+		    ((allowed >> info->CpuSet.LogicalProcessorIndex) & 1u) != 0)
+			cores.insert(info->CpuSet.CoreIndex);
+		offset += info->Size;
+	}
+	return static_cast<uint32_t>(cores.size());
+}
+
 uint64_t CoresOf(uint64_t mask) {
 	ULONG length = 0;
 	(void)GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
@@ -2535,6 +2556,18 @@ static uint64_t CoreSiblings(int cpu) {
 	}
 	return core;
 }
+// The CPUs the process may run on, read while the process loads (taskset, a cgroup cpuset: sched_getaffinity), before
+// any thread is pinned to fewer (CoresIn).
+static uint64_t AffinityAtLoad() {
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (sched_getaffinity(0, sizeof(set), &set) != 0) return ~uint64_t {0};
+	uint64_t mask = 0;
+	for (int cpu = 0; cpu < 64; ++cpu)
+		if (CPU_ISSET(cpu, &set)) mask |= uint64_t {1} << cpu;
+	return mask;
+}
+static const uint64_t g_affinity_at_load = AffinityAtLoad();
 #endif
 
 std::string SpareCpu(const char* avoid) {
@@ -2592,6 +2625,25 @@ uint32_t PerformanceCoresIn(uint64_t mask) {
 		++cores;
 	}
 	return cores;
+#else
+	(void)mask;
+	return 0;
+#endif
+}
+
+uint32_t CoresIn(uint64_t mask) {
+#if defined(__linux__)
+	uint64_t online = 0;
+	if (FILE* file = std::fopen("/sys/devices/system/cpu/online", "r"); file != nullptr) {
+		char list[256] = {};
+		if (std::fgets(list, sizeof(list), file) != nullptr) {
+			list[std::strcspn(list, "\n")] = '\0';
+			online = CpuListMask(list);
+		}
+		std::fclose(file);
+	}
+	const uint64_t allowed = (online != 0 ? online : ~uint64_t {0}) & g_affinity_at_load & mask;
+	return allowed == 0 ? 0 : PerformanceCoresIn(allowed);
 #else
 	(void)mask;
 	return 0;

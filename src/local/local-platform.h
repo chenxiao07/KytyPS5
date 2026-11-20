@@ -62,6 +62,11 @@ bool     SetCurrentThreadAffinity(uint64_t mask);
 // are alike). Linux: the distinct cores (CoreSiblings' thread_siblings_list) among the CPUs of `mask`, every class alike.
 // 0 when unknown.
 uint32_t PerformanceCoresIn(uint64_t mask);
+// The physical cores of every efficiency class among the CPUs of `mask` the process may run on: SMT siblings one core,
+// an E-core one core (Windows: CPU set CoreIndex in the process's affinity mask, CPU-set limits not seen, as
+// PerformanceCoresIn; Linux: the online CPUs the process could run on as it loaded, sched_getaffinity, which a taskset
+// or cgroup cpuset narrows, thread_siblings_list). 0 when unknown. 16 for ~0 on an 8 P-core (16 CPUs) + 8 E-core part.
+uint32_t CoresIn(uint64_t mask);
 // Every logical CPU (0..63) of a physical core that holds a CPU of `mask`: the mask with its SMT siblings (Windows: CPU
 // set CoreIndex; Linux: thread_siblings_list). `mask` itself where the topology is not known.
 uint64_t CoresOf(uint64_t mask);

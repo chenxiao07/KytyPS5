@@ -1500,6 +1500,8 @@ void GuestGpu::ThreadRun(void* data) {
 		const char* pass_env    = std::getenv("KYTY_SPEC_PASS_THREAD");
 		const bool  pass_thread = (pass_env == nullptr || std::atoi(pass_env) > 0) &&
 		                          kyty_local_speculate_threads.load(std::memory_order_relaxed) + 1 < Spec::MaxPacketSlots;
+		static_assert(AsyncUpload::SpecPacketSlots == Spec::MaxPacketSlots); // (the upload pipe's count repeats this test)
+		AsyncUpload::g_spec_pass_made.store(pass_thread ? 1 : 0, std::memory_order_relaxed);
 		gpu->m_speculation = std::make_unique<Speculation>(gpu->m_renderer, 0, 0, 0, pass_thread);
 		gpu->m_ahead.store(gpu->m_speculation.get(), std::memory_order_release);
 		// (The async queue's threads take the packet slots after the graphics queue's: none left, no async speculation.)
