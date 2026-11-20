@@ -419,6 +419,18 @@ private:
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ResolveBlockTexelOverlap(const ImageInfo& requested, ImageId cached_id);
+	// Why the uncompressed `texels` cannot be the texels of the block-compressed `blocks` (ResolveBlockTexelOverlap's
+	// rule: the same tiling, and every level `texels` holds at the same bytes); null: they can. `common_levels`: the
+	// levels both hold (ExpandImage's copy), `texels` may have more.
+	[[nodiscard]] static const char* BlockTexelRefusal(const ImageInfo& texels, const ImageInfo& blocks,
+	                                                   bool common_levels = false);
+	// KYTY_BLOCK_CLASS_OVERLAP_REPLACE (textureCache.cpp): an image at the requested address of the other block class
+	// (block-compressed against uncompressed) whose bytes are not the requested one's is replaced, not returned for it.
+	[[nodiscard]] static bool BlockClassOverlapReplaceOn();
+	void                      ReplaceBlockClassOverlap(const ImageInfo& requested, ImageId cached_id, const char* why);
+	uint64_t                  m_block_class_replaced = 0; // (since start-up)
+	uint64_t                  m_block_class_logged   = 0; // (the count the last summary line gave)
+	uint64_t                  m_block_class_tick     = 0; // (the collector tick of that line)
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
 	void                        PrepareDccClear(ImageId id, const ImageDesc& desc);

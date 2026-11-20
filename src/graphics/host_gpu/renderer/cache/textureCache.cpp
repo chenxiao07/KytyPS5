@@ -359,6 +359,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	m_image_granules.assign((ImageGranuleSpace >> ImageGranuleBits) / 64, 0);
+	(void)BlockClassOverlapReplaceOn(); // (its start-up line)
 	g_report_cache               = this;
 	LiveCounters::g_image_report = [](const char* path) {
 		if (g_report_cache != nullptr) g_report_cache->WriteReport(path);
@@ -1806,6 +1807,23 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (const auto texel_id = ResolveBlockTexelOverlap(requested, cached_id)) {
 			return {texel_id};
 		}
+		// (KYTY_BLOCK_CLASS_OVERLAP_REPLACE: of the other block class and not its texels or blocks, the cached image does
+		// not hold the requested one's bytes: the checks below would return it for it, as a view of another format.)
+		if (requested.IsBlock() != cached.info.IsBlock() && BlockClassOverlapReplaceOn()) {
+			// (A compressed request over texels: ExpandImage copies the levels both hold, whichever has more.)
+			const char* why = requested.IsBlock() ? BlockTexelRefusal(cached.info, requested, true)
+			                                      : BlockTexelRefusal(requested, cached.info);
+			// (Both only sampled: an image of its own beside the other, as other sampled views of one allocation in
+			// shapes neither holds are; a write binding at the address frees the other, FreeGuestAliases.)
+			if (why != nullptr && GuestTextureRequest(binding, requested) && GuestTexture(cached)) {
+				NoteGuestAlias(requested, cached);
+				return {merged_id};
+			}
+			if (why != nullptr) {
+				ReplaceBlockClassOverlap(requested, cached_id, why);
+				return {merged_id};
+			}
+		}
 		if (requested.IsBlock() && !cached.info.IsBlock()) {
 			return {ExpandImage(requested, cached_id)};
 		}
@@ -1922,19 +1940,29 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 // is an image of its own made from the other's contents, and the other is parked (ExpandImage takes it back the other
 // way, with the texels' contents). Before, the storage view was an image of its own made from the guest's bytes and the
 // compressed texture kept its old contents: faces showed the previous preset's makeup, tattoos or stale bytes.
-ImageId TextureCache::ResolveBlockTexelOverlap(const ImageInfo& requested, ImageId cached_id) {
-	const auto& cached = m_slot_images[cached_id].info;
-	if (requested.IsBlock() || !cached.IsBlock() || requested.IsDepth() || cached.IsDepth() || requested.samples != 1 ||
-	    cached.samples != 1 || requested.tile_mode != cached.tile_mode || requested.type != cached.type ||
-	    requested.IsVolume() || requested.resources.layers != cached.resources.layers || requested.HasMetadata() ||
-	    cached.HasMetadata() || requested.HasStencil() || cached.HasStencil() ||
-	    requested.resources.levels > cached.resources.levels || requested.resources.levels > requested.mip_layout.size())
-		return {};
-	for (uint32_t level = 0; level < requested.resources.levels; ++level) {
-		if (requested.mip_layout[level].offset != cached.mip_layout[level].offset ||
-		    requested.mip_layout[level].size != cached.mip_layout[level].size)
-			return {};
+const char* TextureCache::BlockTexelRefusal(const ImageInfo& texels, const ImageInfo& blocks, bool common_levels) {
+	if (texels.IsBlock() || !blocks.IsBlock()) return "block class";
+	if (texels.IsDepth() || blocks.IsDepth() || texels.samples != 1 || blocks.samples != 1) return "depth or samples";
+	if (texels.tile_mode != blocks.tile_mode) return "tiling";
+	if (texels.type != blocks.type || texels.IsVolume()) return "type";
+	if (texels.resources.layers != blocks.resources.layers) return "layers";
+	if (texels.HasMetadata() || blocks.HasMetadata() || texels.HasStencil() || blocks.HasStencil())
+		return "metadata or stencil";
+	const uint32_t levels =
+	    common_levels ? std::min(texels.resources.levels, blocks.resources.levels) : texels.resources.levels;
+	if ((!common_levels && texels.resources.levels > blocks.resources.levels) || levels > texels.mip_layout.size() ||
+	    levels > blocks.mip_layout.size())
+		return "levels";
+	for (uint32_t level = 0; level < levels; ++level) {
+		if (texels.mip_layout[level].offset != blocks.mip_layout[level].offset ||
+		    texels.mip_layout[level].size != blocks.mip_layout[level].size)
+			return "level placement";
 	}
+	return nullptr;
+}
+
+ImageId TextureCache::ResolveBlockTexelOverlap(const ImageInfo& requested, ImageId cached_id) {
+	if (BlockTexelRefusal(requested, m_slot_images[cached_id].info) != nullptr) return {};
 	RefreshCopySource(cached_id);
 	auto texel_id = TakeParkedImage(requested);
 	if (!texel_id) texel_id = InsertImage(requested);
@@ -1959,6 +1987,61 @@ ImageId TextureCache::ResolveBlockTexelOverlap(const ImageInfo& requested, Image
 		            m_slot_images[cached_id].info.resources.levels);
 	}
 	return texel_id;
+}
+
+// KYTY_BLOCK_CLASS_OVERLAP_REPLACE (default 1; 0 off, read once): an image registered at the requested address of the
+// other block class (block-compressed against uncompressed) that is not its texels or blocks (BlockTexelRefusal: another
+// tiling, level placement, metadata...) is replaced: parked, and the requested image made from guest memory as any new
+// one. Before, ResolveOverlap's later checks returned it whenever the formats shared a size class (a BC1 image for an
+// R32G32 request: both 8-byte blocks, FormatsCompatible), and the binding viewed that image's bytes in the other format.
+// Demon's Souls: after some reloads a 2048x2048 BC1 texture of the previous load stayed registered where the water
+// simulation's 512x512 R32G32_UINT state now lives (the same 2 MiB of 8-byte blocks); the simulation read and wrote
+// through it from the old texture's blocks and never from its own initial state: a spiked stream-bed sheet until the
+// game set the simulation up again. It fires only where the old code returned an image of the other block class:
+// ResolveBlockTexelOverlap (the texels of a texture's blocks, a GPU block compressor's) and ExpandImage of an image
+// holding the blocks' bytes keep their paths, and a sampled request over an image only sampled gets an image of its own
+// beside it (NoteGuestAlias, as other sampled views of one allocation in shapes neither holds). The replaced image's
+// contents are not copied or downloaded (its bytes are not the requested image's); parked (unregistered), its Vulkan
+// image stays until the collector retires it a flip later. A speculation's recorder thread refuses the binding (the GPU
+// thread translates it again).
+// One line at start-up, one at each of the first 32 replacements, then one every 60 flips the count moved.
+bool TextureCache::BlockClassOverlapReplaceOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_BLOCK_CLASS_OVERLAP_REPLACE");
+		const bool  set   = value == nullptr || value[0] != '0';
+		std::printf("Texture cache: an image of the other block class at a requested address replaced, not viewed: %s "
+		            "(KYTY_BLOCK_CLASS_OVERLAP_REPLACE=%s)\n",
+		            set ? "on" : "off", set ? "0 turns it off" : "0");
+		std::fflush(stdout);
+		return set;
+	}();
+	return on;
+}
+
+void TextureCache::ReplaceBlockClassOverlap(const ImageInfo& requested, ImageId cached_id, const char* why) {
+	// (A speculation's recorder thread changes no registration: the GPU thread translates the binding again.)
+	if (CommandScheduler::ThreadRecorder() != nullptr)
+		throw CommandScheduler::RecorderRefusal {"image of the other block class"};
+	auto&      cached      = m_slot_images[cached_id];
+	const bool gpu_written = cached.IsGpuModified();
+	if (cached.binding.is_bound || cached.binding.is_target) {
+		cached.binding.needs_rebind = true;
+	}
+	if (++m_block_class_replaced <= 32) {
+		std::printf("Texture cache: 0x%llx: fmt %u %ux%u levels %u (gpu-written %d) replaced for fmt %u %ux%u levels %u "
+		            "(%s, refused for: %s); %llu replaced so far\n",
+		            static_cast<unsigned long long>(requested.data.address), static_cast<uint32_t>(cached.info.guest_format),
+		            cached.info.extent.width, cached.info.extent.height, cached.info.resources.levels, gpu_written ? 1 : 0,
+		            static_cast<uint32_t>(requested.guest_format), requested.extent.width, requested.extent.height,
+		            requested.resources.levels,
+		            requested.IsBlock() ? "the cached image is not the texels of the requested blocks"
+		                                : "the request is not the texels of the cached blocks",
+		            why,
+		            static_cast<unsigned long long>(m_block_class_replaced));
+		std::fflush(stdout);
+		m_block_class_logged = m_block_class_replaced;
+	}
+	ParkImage(cached_id);
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
@@ -5638,6 +5721,15 @@ void TextureCache::RunGarbageCollector() {
 		return true;
 	});
 	RetireStaleImages(tick);
+	// (KYTY_BLOCK_CLASS_OVERLAP_REPLACE: past its first 32 lines, the replacements since the last, every 60 flips.)
+	if (m_block_class_replaced != m_block_class_logged && tick >= m_block_class_tick + 60) {
+		std::printf("Texture cache: %llu images of the other block class replaced since the last line (%llu in all)\n",
+		            static_cast<unsigned long long>(m_block_class_replaced - m_block_class_logged),
+		            static_cast<unsigned long long>(m_block_class_replaced));
+		std::fflush(stdout);
+		m_block_class_logged = m_block_class_replaced;
+		m_block_class_tick   = tick;
+	}
 	if (TextureOffload::AnyEnabled()) OffloadScan(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
