@@ -35,7 +35,7 @@ The two crossings:
 - **First crossing:** ~9-10 s into the run, at the arch mouth (x ≈ 15, z ≈ 424). This is the detector's spike and the crossing window.
 - **Second window:** the longest frame from 11 frames after the first crossing to the run's end, taken out on the bridge. The "Boletarian Palace - The Lord's Path" banner comes at ~18 s.
 
-**The save.** Any save with the 1-3 archstone (The Lord's Path) unlocked: step 1 travels there from anywhere. The save's game must also have the Tower Knight (the 1-2 boss) beaten in play (a Linux tester's report, BIOS2000 on #342, 16 Nov). The reader checks each walk's end position (its last `where`: z ≈ 390.3 on the bridge) and warns when it is off. Pass it with `-Baseline <dir>` (a folder with `PPSA01341` and `.kyty-capacity`, as bench-windows.py's `KYTY_BENCH_BASELINE`). Your own save stays moved aside and comes back verified at the end.
+**The save.** Any save: step 1 travels to the 1-3 archstone (The Lord's Path) from anywhere with the engine console's `+cp11_loadLevel 1 3`, so no archstone needs to be unlocked and no boss beaten. The walk was checked from a new-game save taken right after character creation (20 Nov: `place` lands on the start point and the run ends in the same corridor, z 390.5 against 389.2-390.6 from a later save). The reader checks each walk's end position (its last `where`: z ≈ 390.3 on the bridge) and warns when it is off. Pass it with `-Baseline <dir>` (a folder with `PPSA01341` and `.kyty-capacity`, as bench-windows.py's `KYTY_BENCH_BASELINE`). Your own save stays moved aside and comes back verified at the end.
 
 **Settings the driver uses:**
 - `KYTY_FPS_HUD=2`: bench-run finds the game by the HUD.
