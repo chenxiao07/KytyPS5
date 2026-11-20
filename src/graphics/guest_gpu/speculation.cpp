@@ -1727,6 +1727,14 @@ struct ChangedRules {
 	        kyty_local_speculate_mode.load(std::memory_order_relaxed)};
 }
 
+// In mode 4, the commit's two walks over a
+// segment's pending_buffers entries (Before's, the patch step's) skipped where the worker's summary of them
+// (Segment::PendingSummary, made as it closed the segment) proves each entry would pass them with nothing done; anything
+// it cannot prove (an entry pending, a registration since the oldest proof over the entries' span, a span over more than
+// 64 tracker regions, an entry Before did not obtain) takes the walk as before.
+// (The GPU thread, from a segment's Before to its patch step: every one of its entries obtained.)
+static thread_local bool t_pending_obtained_all = false;
+
 Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcessor& cp) {
 	m_renderer.GetBufferCache().ServeAhead(); // (spec_buffer_ahead: the ranges speculations found no buffer over)
 	auto&       scheduler = m_renderer.GetCommandScheduler();
@@ -2215,7 +2223,19 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
                 return owner != nullptr && owner->HasDeviceAddress() ? owner->BufferDeviceAddress() + owner->Offset(entry.address)
 				                                                                : 0;
 			};
-			for (size_t i = pfrom; i < pto; ++i) {
+			// spec_pending_summary: none pending, all obtained in Before, and no buffer registered or unregistered over the
+			// entries' span since the oldest proof (RegisteredSince over the span answers for each entry's range and later
+			// proof: its regions are among the span's): every entry passes with nothing patched. Otherwise the walk, timed.
+			const auto& summary = state.closed[index].pending_summary;
+			const auto  regions = summary.end > summary.begin
+			                          ? (summary.end - 1) / TRACKER_REGION_SIZE - summary.begin / TRACKER_REGION_SIZE + 1
+			                          : uint64_t {0};
+			const bool  skip = t_pending_obtained_all && summary.valid && !summary.any_pending &&
+			                  (summary.min_since >= registration_now ||
+			                   (regions != 0 && regions <= 64 &&
+			                    !pbuffers.RegisteredSince(summary.begin, summary.end - summary.begin, summary.min_since)));
+			t_pending_obtained_all = false;
+			for (size_t i = skip ? pto : pfrom; i < pto; ++i) {
 				const auto& entry = state.pending_buffers[i];
 				const bool  moved = !entry.pending && entry.obtained && entry.since < registration_now &&
 				                   pbuffers.RegisteredSince(entry.address, entry.size, entry.since) &&
@@ -2322,6 +2342,7 @@ static bool SegmentWritesRange(const Spec::State& state, size_t index, const Spe
 }
 
 void Speculation::Before(Result& result, size_t index) {
+	t_pending_obtained_all = false; // (spec_pending_summary: first, so no return below leaves an earlier segment's true)
 	const Spec::EffectSourceScope source(Spec::EffectSource::Commit);
 	auto&       resources = m_renderer.GetGpuResources();
 	auto&       buffers   = m_renderer.GetBufferCache();
@@ -2353,7 +2374,19 @@ void Speculation::Before(Result& result, size_t index) {
 	// spec_pending_buffers: the V# ranges it found no buffer for, obtained in order first (made or joined, uploaded), so
 	// the check after Before (preparation registered buffers) sees what that moved under the segment's other ranges.
 	const auto registration_now = buffers.RegistrationEpoch(); // (an entry proven at it or after: nothing moved under it)
-	for (size_t i = from.pending_buffers; i < to.pending_buffers; ++i) {
+	// spec_pending_summary: none pending and every one proven at the latest registration or after (the worker's summary,
+	// Segment::PendingSummary): each takes the walk's first branch, obtained with no lookup. Otherwise the walk, timed.
+	const auto& pending_summary = segment.pending_summary;
+	const bool pending_walk     = to.pending_buffers > from.pending_buffers;
+	const bool pending_skip     = pending_walk && pending_summary.valid && !pending_summary.any_pending &&
+	                          pending_summary.min_since >= registration_now;
+	if (pending_skip) {
+		for (size_t i = from.pending_buffers; i < to.pending_buffers; ++i) state.pending_buffers[i].obtained = true;
+		t_pending_obtained_all = true;
+	}
+	const bool take_pending_walk = pending_walk && !pending_skip;
+	bool       obtained_all      = true;
+	for (size_t i = pending_skip ? to.pending_buffers : from.pending_buffers; i < to.pending_buffers; ++i) {
 		// (As the owner's table path: the range's game buffer, made or joined, then made current, then obtained, which
 		// then gives that buffer, not a copy in the shader ring (no device address: an exit in a long run). Anything but
 		// the range's live game buffer is left unobtained: the patch step then stops the segment.)
@@ -2374,7 +2407,9 @@ void Speculation::Before(Result& result, size_t index) {
 		(void)offset;
 		const auto* game = buffers.GetBufferIfLive(buffers.RegisteredBuffer(entry.address, entry.size));
 		entry.obtained   = owner != nullptr && owner == game && game->HasDeviceAddress();
+		obtained_all     = obtained_all && entry.obtained;
 	}
+	if (take_pending_walk) t_pending_obtained_all = obtained_all;
 	for (size_t i = from.written; i < to.written; ++i) {
 		const auto& range = state.written[i];
 		(void)buffers.ObtainBuffer(range.begin, range.end - range.begin, true);

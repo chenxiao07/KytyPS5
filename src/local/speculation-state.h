@@ -525,6 +525,13 @@ struct Segment {
 	bool                  bda_all = false; // all BDA ranges prepared before it (an unbounded plan)
 	std::vector<ImageUse> images;
 	size_t                recorded = 0; // the recorder's recorded command buffers up to this count
+	// A worker summarizes pending buffer entries when it closes a segment. The commit uses the summary in
+	// Speculation::Before and the patch step. A valid summary records whether any entry still needs a buffer,
+	// the oldest proof epoch, and the span of the entries' ranges.
+	struct PendingSummary {
+		bool     valid = false, any_pending = false;
+		uint64_t min_since = UINT64_MAX, begin = UINT64_MAX, end = 0;
+	} pending_summary;
 };
 
 // KYTY_SPEC_DRAW_INDIRECT_VERIFY (live spec_draw_indirect_verify, N: every Nth DRAW_INDIRECT taken as a table draw, 0
@@ -1577,9 +1584,22 @@ struct State {
 	// the overlay.
 	void CloseSegment(size_t recorded_count) {
 		FlushCommandWords(); // (the segment's command words among its reads)
+		const size_t pending_from = closed.empty() ? 0 : closed.back().end.pending_buffers;
 		auto& segment    = closed.emplace_back();
 		segment.end      = Sizes();
 		segment.bda_all  = bda_all;
+		// Summarize pending buffers on the translating thread before publishing the segment.
+		if (pending_buffers.size() > pending_from) {
+			auto& summary = segment.pending_summary;
+			summary.valid = true;
+			for (size_t i = pending_from; i < pending_buffers.size(); ++i) {
+				const auto& entry   = pending_buffers[i];
+				summary.any_pending = summary.any_pending || entry.pending;
+				summary.min_since   = std::min(summary.min_since, entry.since);
+				summary.begin       = std::min(summary.begin, entry.address);
+				summary.end         = std::max(summary.end, entry.address + entry.size);
+			}
+		}
 		segment.recorded = recorded_count;
 		for (const auto index: used) {
 			auto& entry = overlay[index];
