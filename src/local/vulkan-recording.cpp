@@ -294,8 +294,10 @@ public:
         if (active || was_recording) state_epoch.fetch_add(1, std::memory_order_relaxed);
         was_recording = active;
     }
+    // (By reference: the wrappers pass a named capture, which a by-value parameter would copy on the GPU thread's
+    // hottest path.)
     template<typename Capture>
-    bool Enqueue(Capture capture) {
+    bool Enqueue(Capture&& capture) {
         if (passive) [[unlikely]] return EnqueuePassive(capture);
         for (int attempt = 0; attempt < 2; ++attempt) {
             WaitForRoom();
