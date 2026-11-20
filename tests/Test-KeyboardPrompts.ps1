@@ -7,7 +7,7 @@ if (!$compiler) { throw 'Visual Studio C# compiler not found.' }
 $out = Join-Path $root '_Build/keyboard-prompts-tests'
 New-Item -ItemType Directory -Force $out | Out-Null
 $exe = Join-Path $out 'KeyboardPromptsTests.exe'
-$arguments = @('/nologo','/target:exe','/r:System.Drawing.dll','/r:System.Web.Extensions.dll',"/out:$exe",(Join-Path $root 'launcher-windows/KeyboardPrompts.cs'),(Join-Path $root 'launcher-windows/KeyboardLayout.cs'),(Join-Path $root 'launcher-windows/PromptTexture.cs'),(Join-Path $root 'launcher-windows/Settings.cs'),(Join-Path $root 'launcher-windows/Strings.cs'),(Join-Path $PSScriptRoot 'KeyboardPromptsTests.cs'))
+$arguments = @('/nologo','/target:exe','/r:System.Drawing.dll','/r:System.Web.Extensions.dll',"/out:$exe",(Join-Path $root 'launcher-windows/KeyboardPrompts.cs'),(Join-Path $root 'launcher-windows/KeyboardLayout.cs'),(Join-Path $root 'launcher-windows/PromptTexture.cs'),(Join-Path $root 'launcher-windows/PageMarks.cs'),(Join-Path $root 'launcher-windows/Settings.cs'),(Join-Path $root 'launcher-windows/Strings.cs'),(Join-Path $PSScriptRoot 'KeyboardPromptsTests.cs'))
 # The .gz files embedded unpacked, as KytyLauncher.csproj embeds them (KeyboardPromptsUnpack).
 $resources = Join-Path $out 'resources'
 New-Item -ItemType Directory -Force $resources | Out-Null
