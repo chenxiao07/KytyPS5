@@ -292,6 +292,10 @@ private:
 		uint32_t fill_value = 0xffffffffu;
 		uint64_t fill_size  = 0;
 		bool     fill_known = false;
+		// KYTY_SAMPLE_PENDING_HTILE_CLEAR: the slice whose depth a sample cleared while its clear stays pending for the target
+		// bind's stencil (bit 0: one-layer surfaces only), and the clears applied (the line's count).
+		uint32_t sample_depth_done = 0;
+		uint64_t sample_clears     = 0;
 	};
 
 	struct OverlapResult {
@@ -422,6 +426,31 @@ private:
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
 	void                        PrepareDccClear(ImageId id, const ImageDesc& desc);
+	// KYTY_SAMPLE_PENDING_HTILE_CLEAR (textureCache.cpp): a one-layer depth surface sampled with its HTile fast clear
+	// pending gets the clear first (FindTexture, m_lock held): HtileSampleClearLocked decides it before the binding's
+	// upload (a speculation's recorder thread: refused there, RecorderRefusal), ApplyHtileSampleClear records it after.
+	struct HtileSampleClear {
+		uint32_t slices = 0; // (1: the surface's one slice; 0: no clear)
+		uint64_t meta   = 0; // the HTile's address
+		float    value  = 0.0f;
+		bool     keep   = false; // the fill clears a compressed stencil too: the bit stays for the target bind
+	};
+	[[nodiscard]] static uint64_t         HtileSampleMeta(const Image& image, const ImageDesc& desc, bool* stencil_compressed);
+	[[nodiscard]] static HtileSampleClear HtileFillClearLocked(const MetaDataInfo& record, uint64_t meta,
+	                                                           bool stencil_compressed);
+	[[nodiscard]] bool HtileWouldClearLocked(uint64_t meta, bool stencil_compressed, Spec::State* spec, HtileSampleClear* clear);
+	[[nodiscard]] HtileSampleClear        HtileSampleClearLocked(const Image& image, const ImageDesc& desc);
+	void                                  ApplyHtileSampleClear(ImageId id, const HtileSampleClear& clear);
+
+public:
+	// KYTY_SAMPLE_PENDING_HTILE_CLEAR (default 1; read once): on.
+	[[nodiscard]] static bool SampleHtileClearOn();
+	// (With it on) Whether FindTexture would clear this sampled depth view first (a speculation's thread: as after its
+	// holes): the native and table paths, which bind without it, leave such a use to the normal path. `meta`: the HTile's
+	// address; `consume`: that clear consumes the bit (a speculation notes it: ConsumeMeta).
+	[[nodiscard]] bool SampleHtileClearPending(const Image& image, const ImageDesc& desc, uint64_t* meta, bool* consume);
+
+private:
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] bool          RefillUpload(Image& image);
 	[[nodiscard]] TextureTransferPlan

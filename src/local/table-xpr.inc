@@ -2628,6 +2628,20 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 				break;
 			}
 		}
+		// A depth image with an HTile clear pending: the normal path's FindTexture clears it first
+		// (KYTY_SAMPLE_PENDING_HTILE_CLEAR); the draw or dispatch is left to it.
+		if (image->info.IsDepth() && TextureCache::SampleHtileClearOn()) {
+			uint64_t meta    = 0;
+			bool     consume = false;
+			if (textures.SampleHtileClearPending(*image, dep.desc, &meta, &consume)) {
+				// (A speculation's: a hole that consumes the clear where the normal path does.)
+				if (auto* spec = Spec::Current()) {
+					if (consume) spec->ConsumeMeta(meta, 0);
+					return Spec::Refuse("table: depth texture with an HTile clear pending"), false;
+				}
+				return false;
+			}
+		}
 	}
 	// As CommitBindings': the transitions all precede the one draw or dispatch. A draw's image bound both as a texture
 	// and as storage that the shader writes: ordered after the last draw's write with KYTY_DRAW_READ_AFTER_WRITE=1
