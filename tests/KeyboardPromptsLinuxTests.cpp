@@ -5,13 +5,21 @@
 //
 //   g++ -std=c++20 -iquote launcher-linux -I3rdparty/stb -DKYTY_PROMPT_ASSETS_DIR='"<repo>/launcher-windows/KeyboardPrompts"'
 //       tests/KeyboardPromptsLinuxTests.cpp launcher-linux/keyboard_prompts.cpp launcher-linux/keyboard_layout.cpp
-//       launcher-linux/prompt_texture.cpp launcher-linux/prompt_assets.cpp launcher-linux/bytes.cpp -o prompts_test
+//       launcher-linux/page_marks.cpp launcher-linux/prompt_texture.cpp launcher-linux/prompt_assets.cpp
+//       launcher-linux/bytes.cpp -o prompts_test
+//
+// The page marks of the UI sheet are tried on a sparse file of the sheet's real size (about 320 MB of holes) whose two
+// mapped spots hold made-up "original" bytes, as the icons' originals are made up.
 #include "keyboard_layout.h"
 #include "keyboard_prompts.h"
+#include "page_marks.h"
 #include "prompt_texture.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -61,6 +69,24 @@ static Snapshot Take(const fs::path& folder) {
 	for (const auto& entry: fs::directory_iterator(folder))
 		all[entry.path().filename().string()] = Read(entry.path());
 	return all;
+}
+
+static std::vector<std::string> Lines(const fs::path& path) {
+	std::vector<std::string> lines;
+	std::ifstream            file(path);
+	for (std::string line; std::getline(file, line);) lines.push_back(line);
+	return lines;
+}
+
+// The text of the PromptError an action ends with.
+static std::string RejectText(const std::function<void()>& action, const std::string& what) {
+	try {
+		action();
+	} catch (const PromptError& error) {
+		return error.what();
+	}
+	Check(false, "expected a rejection: " + what);
+	return {};
 }
 
 int main() {
@@ -263,6 +289,318 @@ int main() {
 		Apply(game, true);
 		Apply(game, false);
 
+		// The resampler the page marks (66x66) are drawn with: a power of two gives what Scaled gives; other sizes average
+		// the part of the drawing a pixel covers, edges by share, colours by alpha.
+		{
+			const auto cap = PromptTexture::Draw("A");
+			for (const int width: {1, 2, 64, 128, 512})
+				Check(PromptTexture::Resampled(cap, width) == PromptTexture::Scaled(cap, width), "Resampled equals Scaled at " + std::to_string(width));
+			Buffer half(512 * 512 * 4, 0);
+			for (int y = 0; y < 512; ++y)
+				for (int x = 0; x < 250; ++x) {
+					uint8_t* p = &half[(static_cast<size_t>(y) * 512 + static_cast<size_t>(x)) * 4];
+					p[0] = 255, p[3] = 255; // opaque red left of column 250, nothing right of it
+				}
+			const auto small = PromptTexture::Resampled(half, 66);
+			auto       at    = [&](int x, int y) { return &small[(static_cast<size_t>(y) * 66 + static_cast<size_t>(x)) * 4]; };
+			Check(small.size() == 66 * 66 * 4, "Resampled size");
+			Check(at(0, 0)[0] == 255 && at(0, 0)[1] == 0 && at(0, 0)[3] == 255, "an opaque pixel stays opaque");
+			Check(at(65, 30)[0] == 0 && at(65, 30)[3] == 0, "an empty pixel stays empty");
+			Check(at(32, 10)[3] > 0 && at(32, 10)[3] < 255 && at(32, 10)[0] == 255 && at(32, 10)[1] == 0, "an edge pixel is partly covered and keeps its colour");
+			try {
+				PromptTexture::Resampled(half, 513);
+				Check(false, "a size above 512 was accepted");
+			} catch (const PromptError&) {}
+		}
+
+		// The two page-switch marks in the UI sheet (KeyboardPromptsTests.cs' page marks section). The sheet is a sparse file
+		// of the real size with a 0xA5 header before the mapped pixels, so that a stray write there shows.
+		{
+			const auto&   map = PageMarks::Offsets();
+			Buffer        marks(map.size() * 4);
+			uint32_t      seed = 12345;
+			for (auto& byte: marks) {
+				seed = seed * 1664525u + 1013904223u;
+				byte = static_cast<uint8_t>(seed >> 24u);
+			}
+			PageMarks::SetOriginalForTesting(marks);
+			const uint64_t size  = PageMarks::ExpectedSize();
+			const fs::path atlas = game_root / PageMarks::RelativePath();
+			fs::create_directories(atlas.parent_path());
+			{
+				std::ofstream sheet(atlas, std::ios::binary);
+				sheet << std::string(65, '\xA5');
+			}
+			fs::resize_file(atlas, size);
+			PageMarks::WriteRegions(atlas, marks);
+			Check(PageMarks::ReadRegions(atlas) == marks, "the fixture's page marks");
+
+			const fs::path marks_backup = backup / "page-marks.bin", pending = backup / "page-marks.pending",
+			               record = backup / "page-marks.generated";
+			auto           clear = [&] {
+                fs::remove(marks_backup);
+                fs::remove(record);
+			};
+			// A sheet's age is set back a year so that a rewrite shows.
+			auto age = [&] {
+				fs::last_write_time(atlas, fs::file_time_type::clock::now() - std::chrono::hours(24 * 365));
+				return fs::last_write_time(atlas);
+			};
+			const KeyboardLayout standard;
+			const auto           drawn = PageMarks::Render(standard.IconLabel("ps4_button_square.ctxr"), standard.IconLabel("ps4_button_triangle.ctxr"));
+			Check(drawn.size() == marks.size() && drawn != marks, "the default page marks are drawn");
+			Check(!std::equal(drawn.begin(), drawn.begin() + 66 * 66 * 4, drawn.begin() + 66 * 66 * 4), "the square and triangle marks differ");
+			Check(std::any_of(drawn.begin(), drawn.end(), [](uint8_t byte) { return byte != 0; }), "the marks are not blank");
+
+			// Apply. The icons and the marks change together.
+			Apply(game, true);
+			Check(Take(folder) == installed, "enable changed the icons");
+			Check(PageMarks::ReadRegions(atlas) == drawn, "enable did not draw the default page marks");
+			Check(Read(marks_backup) == marks, "page-marks.bin does not hold the original bytes");
+			Check(Lines(record) == std::vector<std::string> {Bytes::Sha256Hex(drawn)}, "page-marks.generated does not list exactly the written marks");
+			Check(!fs::exists(pending), "enable left page-marks.pending");
+			Check(fs::file_size(atlas) == size, "enable changed the sheet's size");
+			// Idempotence. Starts from: own default marks, icons replaced.
+			auto stamp = age();
+			Apply(game, true);
+			Check(fs::last_write_time(atlas) == stamp && PageMarks::ReadRegions(atlas) == drawn, "a second enable rewrote the page marks");
+			// Restore. Starts from: own default marks, icons replaced.
+			Apply(game, false);
+			Check(PageMarks::ReadRegions(atlas) == marks && fs::file_size(atlas) == size, "disable did not restore the page marks");
+			Check(Take(folder) == originals, "disable did not restore the icons");
+			clear();
+			Apply(game, false);
+			Check(!fs::exists(marks_backup), "a disable with original page marks created page-marks.bin");
+
+			// A foreign sheet: one byte of a spot changed (a mod, another game version). The icons go ahead without it.
+			Buffer edited = marks;
+			edited[100] ^= 1;
+			PageMarks::WriteRegions(atlas, edited);
+			stamp = age();
+			Apply(game, true);
+			Check(Take(folder) == installed, "a foreign page mark stopped the icons");
+			Check(fs::last_write_time(atlas) == stamp && PageMarks::ReadRegions(atlas) == edited && !fs::exists(marks_backup) &&
+			          !fs::exists(pending) && !fs::exists(record),
+			      "enable wrote a foreign sheet or created page mark files for it");
+			Apply(game, false);
+			Check(Take(folder) == originals, "a foreign page mark stopped the icon restore");
+			PageMarks::WriteRegions(atlas, marks);
+
+			// Another size: the sheet one byte longer.
+			fs::resize_file(atlas, size + 1);
+			stamp = age();
+			Apply(game, true);
+			Check(Take(folder) == installed, "a wrong-size sheet stopped the icons");
+			Check(fs::last_write_time(atlas) == stamp && fs::file_size(atlas) == size + 1 && !fs::exists(marks_backup), "enable touched a wrong-size sheet");
+			Apply(game, false);
+			fs::resize_file(atlas, size);
+			clear();
+
+			// No sheet at all.
+			fs::rename(atlas, root / "sheet-away");
+			Apply(game, true);
+			Check(Take(folder) == installed && !fs::exists(marks_backup) && !fs::exists(pending), "a missing sheet stopped the icons or left page mark files");
+			Apply(game, false);
+			fs::rename(root / "sheet-away", atlas);
+			clear();
+
+			// A missing backup: own marks with page-marks.bin deleted. Stops before anything is written.
+			Apply(game, true);
+			fs::remove(marks_backup);
+			const auto missing = RejectText([&] { Apply(game, false); }, "a missing page marks backup");
+			Check(missing.find("global_pages.ctxr") != std::string::npos && missing.find("page-marks.bin") != std::string::npos,
+			      "the missing page marks backup refusal does not name the sheet to restore");
+			Check(PageMarks::ReadRegions(atlas) == drawn && Take(folder) == installed, "a missing page marks backup changed the game");
+			Write(marks_backup, marks);
+			Apply(game, false);
+			Check(PageMarks::ReadRegions(atlas) == marks && Take(folder) == originals, "restore with the backup put back");
+			// A damaged one is refused too.
+			Apply(game, true);
+			Buffer damaged = marks;
+			damaged[0] ^= 1;
+			Write(marks_backup, damaged);
+			Check(RejectText([&] { Apply(game, false); }, "a damaged page marks backup").find("Invalid original prompt backup") != std::string::npos,
+			      "the damaged page marks backup is named");
+			Check(PageMarks::ReadRegions(atlas) == drawn, "a damaged page marks backup changed the sheet");
+			Write(marks_backup, marks);
+			Apply(game, false);
+			clear();
+
+			// A custom Square label changes only the square mark.
+			KeyboardLayout square_only;
+			square_only.Assign("Square", "J");
+			Apply(game, true, &square_only);
+			const auto   relabeled = PageMarks::ReadRegions(atlas);
+			const size_t half      = 66 * 66 * 4;
+			Check(!std::equal(relabeled.begin(), relabeled.begin() + half, drawn.begin()) &&
+			          std::equal(relabeled.begin() + half, relabeled.end(), drawn.begin() + half),
+			      "a custom Square key did not change only the square mark");
+			Apply(game, true);
+			Check(PageMarks::ReadRegions(atlas) == drawn, "switching back to the default profile did not redraw the marks");
+			Apply(game, false);
+			clear();
+
+			// Failed write after the sheet is open: the last mapped pixel cannot be written, nor can the rollback write it,
+			// so page-marks.pending stays for the next Play.
+			PageMarks::SetWriteHookForTesting([&](size_t pixel) {
+				if (pixel == map.size() - 1) throw PromptError("simulated sheet write failure");
+			});
+			const auto failed = RejectText([&] { Apply(game, true); }, "a failed sheet write");
+			PageMarks::SetWriteHookForTesting({});
+			Check(failed.find("also failed") != std::string::npos && failed.find("global_pages.ctxr") != std::string::npos, "the failed sheet rollback is reported");
+			Check(fs::exists(pending), "a write that failed after the sheet was open left no page-marks.pending");
+			Check(PageMarks::ReadRegions(atlas) == marks, "the rollback did not restore the page marks");
+			Check(Take(folder) == originals, "a failed page marks write left an icon changed");
+			Apply(game, true);
+			Check(PageMarks::ReadRegions(atlas) == drawn && !fs::exists(pending), "enable after a failed write did not relabel and remove page-marks.pending");
+			Apply(game, false);
+			Check(PageMarks::ReadRegions(atlas) == marks, "disable after a failed write did not restore the page marks");
+			clear();
+			// A write that fails but whose rollback works: nothing is left behind.
+			size_t calls = 0;
+			PageMarks::SetWriteHookForTesting([&](size_t pixel) {
+				if (pixel == 10 && ++calls == 1) throw PromptError("simulated sheet write failure");
+			});
+			const auto undone = RejectText([&] { Apply(game, true); }, "a failed sheet write with a rollback");
+			PageMarks::SetWriteHookForTesting({});
+			Check(undone.find("also failed") == std::string::npos, "a rollback that worked was reported as failed");
+			Check(!fs::exists(pending) && PageMarks::ReadRegions(atlas) == marks && Take(folder) == originals, "a rolled-back sheet write left something behind");
+			clear();
+
+			// No font to draw the marks with. Over an untouched sheet the icons still go ahead; over the launcher's own
+			// marks the batch stops, as it does for the other things its own work needs.
+			PageMarks::SetRenderHookForTesting([] { throw PromptError("No bold sans-serif TrueType font was found"); });
+			stamp = age();
+			Apply(game, true);
+			Check(Take(folder) == installed, "a missing font stopped the icons");
+			Check(fs::last_write_time(atlas) == stamp && PageMarks::ReadRegions(atlas) == marks && !fs::exists(marks_backup) && !fs::exists(pending) &&
+			          !fs::exists(record),
+			      "enable touched the sheet or created page mark files without a font");
+			Apply(game, false);
+			PageMarks::SetRenderHookForTesting({});
+			Apply(game, true);
+			PageMarks::SetRenderHookForTesting([] { throw PromptError("No bold sans-serif TrueType font was found"); });
+			Check(RejectText([&] { Apply(game, true); }, "own marks without a font").find("font") != std::string::npos, "the missing font is named");
+			Check(PageMarks::ReadRegions(atlas) == drawn && Take(folder) == installed, "a missing font changed the game");
+			Apply(game, false);
+			PageMarks::SetRenderHookForTesting({});
+			Check(PageMarks::ReadRegions(atlas) == marks, "disable without a font did not restore the marks");
+			clear();
+
+			// Links. A linked sheet, a sheet below a linked folder and a hard-linked sheet are left alone; the icons go
+			// ahead and the other name of the file keeps its bytes.
+			fs::rename(atlas, root / "sheet-target");
+			fs::create_symlink(root / "sheet-target", atlas);
+			Apply(game, true);
+			Check(Take(folder) == installed, "a linked sheet stopped the icons");
+			Check(PageMarks::ReadRegions(root / "sheet-target") == marks && !fs::exists(marks_backup) && !fs::exists(pending) && !fs::exists(record),
+			      "enable wrote through a linked sheet");
+			Apply(game, false);
+			fs::remove(atlas);
+			fs::rename(root / "sheet-target", atlas);
+			const fs::path sheet_folder = game_root / "ui" / "textures" / "_ps5";
+			fs::rename(sheet_folder, root / "folder-target");
+			fs::create_directory_symlink(root / "folder-target", sheet_folder);
+			Apply(game, true);
+			Check(Take(folder) == installed, "a linked folder stopped the icons");
+			Check(PageMarks::ReadRegions(root / "folder-target" / "_ps5" / "global_pages.ctxr") == marks && !fs::exists(marks_backup),
+			      "enable wrote through a linked folder");
+			Apply(game, false);
+			fs::remove(sheet_folder);
+			fs::rename(root / "folder-target", sheet_folder);
+			fs::create_hard_link(atlas, root / "sheet-twin");
+			Apply(game, true);
+			Check(Take(folder) == installed, "a hard-linked sheet stopped the icons");
+			Check(PageMarks::ReadRegions(atlas) == marks && PageMarks::ReadRegions(root / "sheet-twin") == marks && !fs::exists(marks_backup) &&
+			          !fs::exists(pending),
+			      "enable wrote a hard-linked sheet");
+			Apply(game, false);
+			fs::remove(root / "sheet-twin");
+			clear();
+			// The launcher's own marks on a sheet that has since been linked: the sheet cannot be looked at, so the marks
+			// are left as they are, and the icons are restored.
+			Apply(game, true);
+			fs::rename(atlas, root / "sheet-target");
+			fs::create_symlink(root / "sheet-target", atlas);
+			Apply(game, false);
+			Check(Take(folder) == originals && PageMarks::ReadRegions(root / "sheet-target") == drawn, "a linked sheet with own marks stopped the icon restore or was written");
+			fs::remove(atlas);
+			fs::rename(root / "sheet-target", atlas);
+			Apply(game, true);
+			Apply(game, false);
+			Check(PageMarks::ReadRegions(atlas) == marks, "restore after the sheet was linked and unlinked");
+			clear();
+			// A sheet that cannot be opened for writing (a user who may write it is not root, who may write anything).
+			if (::geteuid() != 0) {
+				fs::permissions(atlas, fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write, fs::perm_options::remove);
+				Apply(game, true);
+				Check(Take(folder) == installed && PageMarks::ReadRegions(atlas) == marks && !fs::exists(marks_backup), "a read-only sheet stopped the icons or was written");
+				Apply(game, false);
+				fs::permissions(atlas, fs::perms::owner_write, fs::perm_options::add);
+				clear();
+			}
+
+			// Folders of another case (a dump made on Windows).
+			fs::rename(game_root / "ui", game_root / "UI");
+			Apply(game, true);
+			const fs::path upper = game_root / "UI" / "textures" / "_ps5" / "_ps5" / "global_pages.ctxr";
+			Check(PageMarks::ReadRegions(upper) == drawn, "a sheet in folders of another case was not relabeled");
+			Apply(game, false);
+			Check(PageMarks::ReadRegions(upper) == marks, "a sheet in folders of another case was not restored");
+			fs::rename(game_root / "UI", game_root / "ui");
+			clear();
+
+			// The Windows launcher's record: marks it wrote are the launcher's own here too.
+			{
+				std::ofstream lines(record);
+				lines << Bytes::Sha256Hex(drawn) << "\r\n";
+			}
+			Write(marks_backup, marks);
+			PageMarks::WriteRegions(atlas, drawn);
+			Apply(game, false);
+			Check(PageMarks::ReadRegions(atlas) == marks && Take(folder) == originals, "marks recorded by the other launcher were not restored");
+			clear();
+
+			// Whole-sheet scan, last. Every byte outside the mapped pixels still holds the fixture: 0xA5 in the 65-byte header,
+			// zero everywhere else.
+			std::vector<uint64_t> positions;
+			for (const int32_t at: map)
+				for (int k = 0; k < 4; ++k) positions.push_back(static_cast<uint64_t>(at) + static_cast<uint64_t>(k));
+			std::sort(positions.begin(), positions.end());
+			// (By runs between the mapped bytes, so that a build without optimisation does not take minutes over 320 MB.)
+			uint64_t          at = 0, stray = UINT64_MAX;
+			size_t            next = 0;
+			std::ifstream     sheet(atlas, std::ios::binary);
+			std::vector<char> chunk(1 << 20), zeros(1 << 20, 0);
+			while (sheet.read(chunk.data(), static_cast<std::streamsize>(chunk.size())) || sheet.gcount() > 0) {
+				const auto read = static_cast<size_t>(sheet.gcount());
+				for (size_t pos = 0; pos < read;) {
+					const uint64_t here = at + pos;
+					if (next < positions.size() && positions[next] == here) {
+						++next;
+						++pos;
+						continue;
+					}
+					size_t run = read - pos;
+					if (next < positions.size() && positions[next] - here < run) run = static_cast<size_t>(positions[next] - here);
+					for (size_t done = 0; done < run && stray == UINT64_MAX;) {
+						const uint64_t from   = here + done;
+						const size_t   length = from < 65 ? static_cast<size_t>(std::min<uint64_t>(run - done, 65 - from)) : std::min(run - done, zeros.size());
+						const char*    bytes  = chunk.data() + pos + done;
+						const bool     same   = from < 65 ? std::all_of(bytes, bytes + length, [](char c) { return static_cast<uint8_t>(c) == 0xA5; })
+						                                  : std::memcmp(bytes, zeros.data(), length) == 0;
+						if (!same) stray = from;
+						done += length;
+					}
+					pos += run;
+				}
+				at += read;
+			}
+			Check(at == size && next == positions.size() && stray == UINT64_MAX, "a byte outside the mapped pixels changed (first at " + std::to_string(stray) + ")");
+			PageMarks::SetOriginalForTesting(Buffer());
+			fs::remove(atlas);
+		}
+
 		// A game that is not extracted (a ZArchive) is refused to enable, and ignored when off.
 		Game zar {(root / "game.zar").string(), "", ""};
 		Write(root / "game.zar", {1, 2, 3});
@@ -311,7 +649,7 @@ int main() {
 		const auto pairs = defaults.Pairs();
 		Check(pairs[0] == "Cross=E" && pairs[7] == "R1=Mouse:Left" && pairs.back() == "LeftStickRight=D", "pairs");
 
-		std::printf("PASS (%d checks): default off, version guard, apply, idempotence, exact restore, partial recovery, mod/corrupt/missing backup protection, write-failure rollback, custom profile swaps/artwork/restore, links, case, locking, layout rules\n", g_checks);
+		std::printf("PASS (%d checks): default off, version guard, apply, idempotence, exact restore, partial recovery, mod/corrupt/missing backup protection, write-failure rollback, custom profile swaps/artwork/restore, links, case, locking, resampler, page marks apply/idempotence/restore/foreign sheet/wrong size/missing sheet/missing or damaged backup/custom Square/failed write after open/no font/links/read-only/case/whole-sheet scan, layout rules\n", g_checks);
 	} catch (const std::exception& error) {
 		std::printf("EXCEPTION: %s\n", error.what());
 		fs::remove_all(root);
