@@ -75,31 +75,6 @@ static uint64_t ReleaseGateCapBytes() {
 	static auto& value = LiveSwitch::Find("release_gate_cap_mb", 1024);
 	return static_cast<uint64_t>(std::max<int64_t>(value.load(std::memory_order_relaxed), 0)) << 20u;
 }
-// KYTY_SPEC_BACKING_RANGE_LOCK (live spec_backing_range_lock; on under KYTY_SPECULATE=4, 0 otherwise: mode-toggle.h): a
-// locked backing read (TryTransferBacking's reader: TryReadBacking, TryReadBackingToHost's reads over 64 KiB) that one
-// mapping covers holds a host read slot narrowed to its backing pages (BackingReadTransaction, as the small lock-free
-// reads do) instead of both writers' mutexes for its copy: a writer of other pages no longer waits for the whole copy (a
-// 320 MiB upload source read held them 27 ms at boot, the GPU thread's 8-byte label behind it). The sparse reader
-// (TryReadSparseBacking: a partly unmapped span, the upload worker's image staging of a streamed texture pool) the same
-// way, a mapping's piece at a time, in address order, the map lock held throughout; a piece whose slot is not had takes
-// both mutexes for that piece alone.
-// Exact: the reader's hold protects its bytes from a write while it copies them, and nothing else. The shared map lock
-// (taken first, as before) keeps the mapping and so its backing bytes fixed; every writer of backing bytes publishes its
-// pages and waits for any slot over them before it writes (DataWriteFence: the data writers, TryTransferBacking; the
-// CPU-owned writers, TryWriteCpuBacking; zeroing and mapping changes hold the map lock exclusively and wait for every
-// slot, BackingWriteFence), and the reader publishes its pages before it checks the writers' (Narrow: a write under way
-// over them, it falls back to the mutexes), both sides sequentially consistent, so one sees the other. A data write over
-// several mappings is fenced a piece at a time, so through an alias the reader's bytes may span two of its pieces: such a
-// write publishes its pieces' hull for its whole length, and a range reader whose pages the hull covers takes the mutexes,
-// which that writer holds throughout (ClearOfSpanWrite): it sees the write all or none. The sparse reader has each piece
-// all or none; a write may be seen in some of its pieces and not in others, as by the multi-piece image copies and the
-// small lock-free reads. A writer over a range reader's pages waits for its copy in the fence, spinning ~50 us and then
-// asleep until a reader releases its slot (DataWriteFence; with the switch on every reader's release wakes it). Off,
-// or not taken (no free slot, a write under way, several mappings): both mutexes, as before.
-static bool BackingRangeLockOn() {
-	static auto& on = LiveSwitch::Find("spec_backing_range_lock", ModeToggle::Default("spec_backing_range_lock"));
-	return on.load(std::memory_order_relaxed) != 0;
-}
 class ParkedViewReleaser {
 public:
 	static void Queue(uint64_t vaddr, uint64_t size) {
@@ -214,6 +189,32 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>> m_ranges;
 };
 #endif
+
+// KYTY_SPEC_BACKING_RANGE_LOCK (live spec_backing_range_lock; on under KYTY_SPECULATE=4, 0 otherwise: mode-toggle.h): a
+// locked backing read (TryTransferBacking's reader: TryReadBacking, TryReadBackingToHost's reads over 64 KiB) that one
+// mapping covers holds a host read slot narrowed to its backing pages (BackingReadTransaction, as the small lock-free
+// reads do) instead of both writers' mutexes for its copy: a writer of other pages no longer waits for the whole copy (a
+// 320 MiB upload source read held them 27 ms at boot, the GPU thread's 8-byte label behind it). The sparse reader
+// (TryReadSparseBacking: a partly unmapped span, the upload worker's image staging of a streamed texture pool) the same
+// way, a mapping's piece at a time, in address order, the map lock held throughout; a piece whose slot is not had takes
+// both mutexes for that piece alone.
+// Exact: the reader's hold protects its bytes from a write while it copies them, and nothing else. The shared map lock
+// (taken first, as before) keeps the mapping and so its backing bytes fixed; every writer of backing bytes publishes its
+// pages and waits for any slot over them before it writes (DataWriteFence: the data writers, TryTransferBacking; the
+// CPU-owned writers, TryWriteCpuBacking; zeroing and mapping changes hold the map lock exclusively and wait for every
+// slot, BackingWriteFence), and the reader publishes its pages before it checks the writers' (Narrow: a write under way
+// over them, it falls back to the mutexes), both sides sequentially consistent, so one sees the other. A data write over
+// several mappings is fenced a piece at a time, so through an alias the reader's bytes may span two of its pieces: such a
+// write publishes its pieces' hull for its whole length, and a range reader whose pages the hull covers takes the mutexes,
+// which that writer holds throughout (ClearOfSpanWrite): it sees the write all or none. The sparse reader has each piece
+// all or none; a write may be seen in some of its pieces and not in others, as by the multi-piece image copies and the
+// small lock-free reads. A writer over a range reader's pages waits for its copy in the fence, spinning ~50 us and then
+// asleep until a reader releases its slot (DataWriteFence; with the switch on every reader's release wakes it). Off,
+// or not taken (no free slot, a write under way, several mappings): both mutexes, as before.
+static bool BackingRangeLockOn() {
+	static auto& on = LiveSwitch::Find("spec_backing_range_lock", ModeToggle::Default("spec_backing_range_lock"));
+	return on.load(std::memory_order_relaxed) != 0;
+}
 
 // The view a partial unmap maps again, from its unmap to the end of UnmapBacking (InRemapWindow).
 static std::atomic<uint64_t> g_remap_window_begin {0};
