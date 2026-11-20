@@ -3326,7 +3326,9 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 				return false;
 			if (const auto found = spec->overlay_index.find(image); found != spec->overlay_index.end()) {
 				const auto& entry = spec->overlay[found->second];
-				if (entry.used && Spec::UsedOtherwise(entry.found, entry.found_subresources, entry.state, entry.subresources))
+				// (An entry of another image object at this address is not this one's: not taken.)
+				if (entry.serial != image->serial ||
+				    (entry.used && Spec::UsedOtherwise(entry.found, entry.found_subresources, entry.state, entry.subresources)))
 					return false;
 			}
 			const auto written = [&](uint64_t address, uint64_t size) {

@@ -3168,6 +3168,34 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 	for (const auto& dep: set.images) {
 		auto* image = textures.m_slot_images.try_get(dep.id);
 		if (image == nullptr) return false;
+		// A speculation's set (a catalog set reused without a lookup) naming an image released since (an area travel's
+		// unmap: DeleteImage -> RetireImage; erased once the packets of its release passed, which a packet that began
+		// after it does not hold back): refused before anything reads it further. One still registered here is held
+		// by this packet (Spec::PacketNow at a later release sees it). A view past the image's levels or layers too
+		// (Image::GetBarriers would walk states it does not have). Both on a speculation's thread only: the GPU
+		// thread's sets are proven against registrations before they get here (TableValidateSet).
+		// (One line each of the first 16, then every 256th: the address the set's view names.)
+		const auto say = [&](std::atomic<uint64_t>& count, const char* what) {
+			if (const auto n = count.fetch_add(1, std::memory_order_relaxed) + 1; n <= 16 || n % 256 == 0) {
+				std::printf("Table: %s (addr=0x%llx serial=%llu): %llu times\n", what,
+				            static_cast<unsigned long long>(dep.desc.info.data.address),
+				            static_cast<unsigned long long>(dep.serial), static_cast<unsigned long long>(n));
+				std::fflush(stdout);
+			}
+		};
+		if (Spec::Current() != nullptr && (!image->registered || image->serial != dep.serial)) {
+			static std::atomic<uint64_t> released {0};
+			say(released, "a speculation's set named an image released since, refused");
+			return Spec::Refuse("table: image released"), false;
+		}
+		if (Spec::Current() != nullptr && !dep.whole &&
+		    (dep.range.base_level + dep.range.level_count > image->info.resources.levels ||
+		     (!image->info.IsVolume() && // (a volume's slice views: GetBarriers takes its one layer)
+		      dep.range.base_layer + dep.range.layer_count > image->info.resources.layers))) {
+			static std::atomic<uint64_t> past {0};
+			say(past, "a speculation's set viewed past its image's levels or layers, refused");
+			return Spec::Refuse("table: view past its image"), false;
+		}
 		// A target of the draw: NativeXprEmitTargets put it in its attachment layout, which the set must have been
 		// made for; an image the set holds as a texture must not be one.
 		const auto target = draw_state == nullptr
