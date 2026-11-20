@@ -64,7 +64,9 @@ The parts, in the order a draw meets them (`src/local/weave.h` has the same over
 naming what makes it safe. The GPU thread changes what workers read (pairs, variants, sets, draw states and their maps)
 only inside a `Weave::Hold`, a **safepoint**: it waits until no worker is inside a draw and keeps them out until it
 ends. A worker never waits for the GPU thread inside a draw without limit, so the GPU thread's wait is one draw at
-most. The reader and a worker wait for the texture cache's lock at most 5 µs (`AskWait`): still held then, the question
+most: it spins briefly, then sleeps until the worker leaves the draw, which wakes it (the GPU thread runs above the
+normal priority, and with the core placement off a worker may share its CPU). The reader and a worker wait for the
+texture cache's lock at most 5 µs (`AskWait`): still held then, the question
 gets the answer that declines (for a worker a hole or a need; for the reader, which asks the texture cache as it reads
 a linear copy's source, the copy left undecoded). The GPU thread notes each pair, set and draw state it frees or rebuilds in place in a **free log**; an
 object freed since a parcel began cuts its strand at the object's first draw. A retired buffer or image slot is

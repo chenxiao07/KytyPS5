@@ -89,9 +89,10 @@ extern thread_local Thread t_thread;
 // --- Safepoints ---
 
 // Hold: the GPU thread, around a structural write of what workers read (pairs, variants, sets, draw states and their
-// maps): it waits until no worker is inside a draw and keeps them out until it ends; a line once a wait passes 1 s,
-// naming the worker. A no-op unless Active(). While Active() it does EXIT_IF(t_thread != Thread::None): a hold taken on
-// a weave thread would wait for itself, and a worker never reaches a structural write. Holds nest.
+// maps): it waits until no worker is inside a draw (a short spin, then asleep until the worker leaves it) and keeps
+// them out until it ends; a line once a wait passes 1 s, naming the worker. A no-op unless Active(). While
+// Active() it does EXIT_IF(t_thread != Thread::None): a hold taken on a weave thread would wait for itself, and a
+// worker never reaches a structural write. Holds nest.
 class Hold {
 public:
 	Hold() noexcept {

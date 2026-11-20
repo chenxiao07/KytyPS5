@@ -19,7 +19,8 @@
 // Safepoints. Each worker has a gate it marks busy around one draw (DrawScope). A Hold asks every worker to stay
 // out of its next draw and waits until none is inside one, so the GPU thread may then change what workers read
 // (a pair rebuilt, a map grown). A worker never waits for the GPU thread inside a draw; the GPU thread's wait is
-// one draw's at most, and a line tells once it has lasted a second (a freeze would sit there).
+// one draw's at most: it spins briefly, then sleeps until the worker leaves the draw, and a line tells once it has
+// lasted a second (a freeze would sit there).
 
 #include "weave.h"
 
@@ -34,6 +35,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -90,21 +92,31 @@ void SpinPause() {
 #endif
 }
 
-// A wait's report: a line once it has lasted a second, and again at each doubling, so a wait that never ends (a
-// freeze) says so where it is. The clock is read once every 4096 spins, never while a wait is short.
+// A wait on the GPU thread (a hold's, a pause's) and its report. It spins while it is short, about 50 us by the clock
+// (a hold waits one draw at most, usually far less), then sleeps a step at a time, each step the caller's (until
+// woken, or a tick passes): the GPU thread runs above the normal priority, and with the core placement off
+// (KYTY_RENDER_CORE=off, or KYTY_RENDER_CPUS set) the thread it waits for may be on its CPU, which a spin would keep it
+// off. The report: a line once the wait has lasted a second, and again at each doubling, so a wait that never ends (a
+// freeze) says so where it is. The clock is read once every 256 pauses and after each sleep, never in a shorter wait.
 class Stall {
 public:
+	static constexpr int64_t SpinNs = 50'000;
+
 	explicit Stall(const char* what) noexcept: m_what(what) {}
-	template <typename Line>
-	void Spin(Line&& line) {
-		SpinPause();
-		if ((++m_spins & 4095u) != 0) return;
-		const auto now = NowNs();
-		if (m_start == 0) {
-			m_start = now;
+	// One step of the wait: a pause, or once the spin is over `sleep()` and the report when one is due.
+	template <typename Sleep, typename Line>
+	void Step(Sleep&& sleep, Line&& line) {
+		if (!m_sleeping) {
+			SpinPause();
+			if ((++m_spins & 255u) != 0) return;
+			if (const auto now = NowNs(); m_start == 0)
+				m_start = now;
+			else if (now - m_start >= SpinNs)
+				m_sleeping = true;
 			return;
 		}
-		if (const auto waited_ms = static_cast<uint64_t>((now - m_start) / 1'000'000); waited_ms >= m_next_ms) {
+		sleep();
+		if (const auto waited_ms = static_cast<uint64_t>((NowNs() - m_start) / 1'000'000); waited_ms >= m_next_ms) {
 			m_next_ms *= 2;
 			line(static_cast<uint32_t>(waited_ms), m_what);
 			std::fflush(stdout);
@@ -112,19 +124,59 @@ public:
 	}
 
 private:
-	const char* m_what    = nullptr;
-	uint32_t    m_spins   = 0;
-	int64_t     m_start   = 0;
-	uint64_t    m_next_ms = 1000;
+	const char* m_what     = nullptr;
+	uint32_t    m_spins    = 0;
+	bool        m_sleeping = false;
+	int64_t     m_start    = 0;
+	uint64_t    m_next_ms  = 1000;
 };
 
-// A worker's gate: inside a draw (DrawScope), and the slot clock as that draw began (HoldsSlot).
+// A worker's gate: inside a draw (DrawScope), the slot clock as that draw began (HoldsSlot), and the holders asleep
+// until it leaves (Hold::Open, SleepOnGate). Each gate's holders sleep on its own mutex and condition variable.
 struct alignas(64) Gate {
 	std::atomic<uint32_t> busy {0};
 	std::atomic<uint64_t> seen {0};
+	std::atomic<uint32_t> waiters {0};
+};
+struct GateSleep {
+	std::mutex              mutex;
+	std::condition_variable woken;
 };
 
 std::array<Gate, MaxWorkers> g_gates;
+
+// Worker `worker`'s gate's sleep, made once and never freed: a holder or a worker may still use one while the game's
+// exit runs the static destructors.
+[[nodiscard]] GateSleep& GateSleepOf(uint32_t worker) {
+	static auto* const sleeps = new std::array<GateSleep, MaxWorkers>();
+	return (*sleeps)[worker];
+}
+
+// A holder past its spins: asleep until worker `worker` is out of its draw, or a tick has passed (Hold::Open reports
+// between). The worker's leaving is a store, then a load (~DrawScope: `busy`, then `waiters`); this is a store, the
+// flush, then a load (`waiters`, FlushProcessWriteBuffers, `busy` under the mutex). After the flush either the worker's
+// `busy` 0 is visible here, or its look at `waiters` comes after and finds this holder (RenderMutex's asymmetric form,
+// renderContext.h). The worker wakes under the same mutex, so no wake falls between that look and the sleep. Where the
+// host has no flush a wake can be missed in that one window, and the 1 ms tick bounds it.
+void SleepOnGate(uint32_t worker) {
+	auto& gate  = g_gates[worker];
+	auto& sleep = GateSleepOf(worker);
+	gate.waiters.fetch_add(1, std::memory_order_seq_cst);
+	const bool flushed = LocalPlatform::FlushProcessWriteBuffers();
+	{
+		std::unique_lock lock(sleep.mutex);
+		(void)sleep.woken.wait_for(lock, std::chrono::milliseconds(flushed ? 100 : 1),
+		                           [&] { return gate.busy.load(std::memory_order_seq_cst) == 0; });
+	}
+	gate.waiters.fetch_sub(1, std::memory_order_seq_cst);
+}
+
+// The holders asleep on worker `worker`'s gate woken: it has left its draw, or stays out of the next one.
+void WakeHolders(uint32_t worker) {
+	auto& sleep = GateSleepOf(worker);
+	{ const std::lock_guard lock(sleep.mutex); }
+	sleep.woken.notify_all();
+}
 // Holds open (each thread's outermost Hold counts one): a worker stays out of its next draw while this isn't 0.
 std::atomic<uint32_t> g_requested {0};
 // Moves at each slot first asked about (HoldsSlot): a draw that began before a slot's stamp may hold that slot.
@@ -527,10 +579,12 @@ void Pause() {
 			busy |= state == Parcel::Cut || state == Parcel::Taken || state == Parcel::Releasing;
 		}
 		if (parked && !busy) break;
-		stall.Spin([&](uint32_t waited_ms, const char* what) {
-			std::printf("Weave: the GPU thread has waited %u ms %s (the reader %s)\n", waited_ms, what,
-			            parked ? "stopped" : "still reading");
-		});
+		// (Once a run, at a live change: a millisecond's sleep at a time, no wake.)
+		stall.Step([] { std::this_thread::sleep_for(std::chrono::milliseconds(1)); },
+		           [&](uint32_t waited_ms, const char* what) {
+			           std::printf("Weave: the GPU thread has waited %u ms %s (the reader %s)\n", waited_ms, what,
+			                       parked ? "stopped" : "still reading");
+		           });
 	}
 	// The submissions fed before the pause go unread: the reader finds a gap after Resume and asks for the GPU
 	// thread's registers (no submission is fed while paused, PushFeed).
@@ -561,14 +615,16 @@ void Hold::Open() noexcept {
 	if (t_holds++ != 0) return;
 	g_requested.fetch_add(1, std::memory_order_seq_cst);
 	// (Each worker either is inside a draw, which it ends without waiting for this thread, or sees the request
-	// before its next one and stays out: both sides store, then load the other's, seq_cst.)
+	// before its next one and stays out: both sides store, then load the other's, seq_cst. Past the spins the wait
+	// sleeps on the worker's gate, SleepOnGate.)
 	for (uint32_t worker = 0; worker < MaxWorkers; ++worker) {
 		Stall stall("at a safepoint");
 		while (g_gates[worker].busy.load(std::memory_order_seq_cst) != 0)
-			stall.Spin([&](uint32_t waited_ms, const char* what) {
-				std::printf("Weave: the GPU thread has waited %u ms %s (worker %u in a draw)\n", waited_ms, what,
-				            worker + 1);
-			});
+			stall.Step([&] { SleepOnGate(worker); },
+			           [&](uint32_t waited_ms, const char* what) {
+				           std::printf("Weave: the GPU thread has waited %u ms %s (worker %u in a draw)\n", waited_ms,
+				                       what, worker + 1);
+			           });
 	}
 	LiveCounters::Add(LiveCounters::WeaveSafepoints);
 }
@@ -586,8 +642,10 @@ DrawScope::DrawScope(uint32_t worker) noexcept: m_worker(worker) {
 		gate.seen.store(g_slot_clock.load(std::memory_order_seq_cst), std::memory_order_seq_cst);
 		if (g_requested.load(std::memory_order_seq_cst) == 0) return;
 		// A hold is open: out of the draw until it ends (a structural write, short), so the holder never waits for a
-		// draw begun after it asked.
+		// draw begun after it asked. A holder that saw this draw's `busy` and slept is woken.
 		gate.busy.store(0, std::memory_order_seq_cst);
+		if (gate.waiters.load(std::memory_order_seq_cst) != 0) [[unlikely]]
+			WakeHolders(m_worker);
 		for (uint32_t spin = 0; g_requested.load(std::memory_order_acquire) != 0; ++spin) {
 			if (spin < 4096)
 				SpinPause();
@@ -598,7 +656,13 @@ DrawScope::DrawScope(uint32_t worker) noexcept: m_worker(worker) {
 }
 
 DrawScope::~DrawScope() {
-	g_gates[m_worker].busy.store(0, std::memory_order_release);
+	auto& gate = g_gates[m_worker];
+	gate.busy.store(0, std::memory_order_release);
+	// (The store before the load in program order: a sleeping holder's flush is what orders them on the CPU,
+	// SleepOnGate. A holder asleep is rare; the look at `waiters` is one load of this gate's line.)
+	std::atomic_signal_fence(std::memory_order_seq_cst);
+	if (gate.waiters.load(std::memory_order_relaxed) != 0) [[unlikely]]
+		WakeHolders(m_worker);
 }
 
 // --- The free log ---
