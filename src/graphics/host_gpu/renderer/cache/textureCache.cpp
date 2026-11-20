@@ -1166,7 +1166,9 @@ void TextureCache::TouchImage(Image& image) {
 		    image.info.data.address == 0 && image.info.data.size == 0)
 			return;
 		auto& touched = spec->touched_images;
-		if (touched.empty() || touched.back().first != &image) touched.emplace_back(&image, image.serial);
+		if ((touched.empty() || touched.back().first != &image) && spec->TouchImageOnce(&image, image.serial)) {
+			touched.emplace_back(&image, image.serial);
+		}
 		return;
 	}
 	if (image.registered) {

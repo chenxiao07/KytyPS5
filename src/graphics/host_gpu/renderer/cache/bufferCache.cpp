@@ -3442,7 +3442,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSpec(Spec::State& spec, ui
 	if (is_written) spec.NoteWritten(vaddr, size);
 	else if (m_memory_tracker.IsRegionCpuModified(vaddr, size) || spec.JournalIntersects(vaddr, size))
 		spec.NoteCurrent(vaddr, size);
-	if (spec.touched_buffers.empty() || spec.touched_buffers.back() != *owner) spec.touched_buffers.push_back(*owner);
+	if ((spec.touched_buffers.empty() || spec.touched_buffers.back() != *owner) && spec.TouchBufferOnce(*owner)) {
+		spec.touched_buffers.push_back(*owner);
+	}
 	if (!Spec::t_no_range) {
 		spec.NoteBufferRange(vaddr, size); // (spec_reloc_refs: the caller records it)
 		// (A buffer reference the commit cannot relocate: not a V# (patched by its entry), not the table path's index

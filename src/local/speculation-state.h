@@ -766,6 +766,30 @@ struct State {
 		if (all) proposed_sets.clear();
 	}
 	std::vector<Common::SlotId>              touched_buffers;
+	// In mode 4 a direct-mapped filter skips repeated touches within the open segment. A hit is the same image
+	// and serial or the same buffer slot. A miss records the touch for the commit's validation and LRU updates
+	// (Speculation::Changed / After). Closing or rolling back a segment clears the filter so removed touches can
+	// be recorded again.
+	static constexpr size_t                                TouchSeenSlots = 64;
+	std::array<std::pair<const void*, uint64_t>, TouchSeenSlots> touch_image_seen {};
+	std::array<Common::SlotId, TouchSeenSlots>             touch_buffer_seen {};
+	// Whether the open segment records this touch (false: a repeat, already recorded in it).
+	[[nodiscard]] bool TouchImageOnce(const void* image, uint64_t serial) {
+		auto& seen = touch_image_seen[((reinterpret_cast<uintptr_t>(image) >> 4u) ^ serial) % TouchSeenSlots];
+		if (seen.first == image && seen.second == serial) return false;
+		seen = {image, serial};
+		return true;
+	}
+	[[nodiscard]] bool TouchBufferOnce(Common::SlotId buffer) {
+		auto& seen = touch_buffer_seen[(buffer.index ^ (buffer.generation << 7u)) % TouchSeenSlots];
+		if (seen && seen == buffer) return false;
+		seen = buffer;
+		return true;
+	}
+	void TouchSeenReset() {
+		touch_image_seen.fill({nullptr, 0});
+		touch_buffer_seen.fill(Common::SlotId {});
+	}
 	// All segments' current and written ranges and guest memory writes, for the caches' questions; the open
 	// segment's guest memory writes (made after its work: its work cannot read them) and the sources of its copies
 	// (read after its work: its work cannot write them).
@@ -1462,6 +1486,7 @@ struct State {
 	void Rollback() {
 		++rollbacks;
 		note_seen.clear(); // (before_merge)
+		TouchSeenReset();
 		current.resize(std::min(current.size(), checkpoint.current));
 		written.resize(std::min(written.size(), checkpoint.written));
 		bda.resize(std::min(bda.size(), checkpoint.bda));
@@ -1507,6 +1532,7 @@ struct State {
 	void Clear() {
 		command_begin = command_end = 0;
 		id            = NextId();
+		TouchSeenReset();
 		current.clear();
 		written.clear();
 		invalidated.clear();
@@ -1585,6 +1611,8 @@ struct State {
 	void CloseSegment(size_t recorded_count) {
 		FlushCommandWords(); // (the segment's command words among its reads)
 		const size_t pending_from = closed.empty() ? 0 : closed.back().end.pending_buffers;
+		// Start the next segment with an empty touch filter.
+		TouchSeenReset();
 		auto& segment    = closed.emplace_back();
 		segment.end      = Sizes();
 		segment.bda_all  = bda_all;
