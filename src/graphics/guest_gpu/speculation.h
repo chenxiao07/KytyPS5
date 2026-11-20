@@ -178,6 +178,15 @@ private:
 		// (Mode 4) the segment run as a hole the commit waits in, at a wait inside it (resume_at; `cp` holds the run's
 		// state there).
 		size_t       blocked_segment = SIZE_MAX;
+		// (The report's classes) its segments run as holes (redone in order: SegmentAsHole); a stop that left the in-order
+		// path no more than a hole's run would (SegmentAsHole NotTaken: its last segment, or a wait inside it that does not
+		// hold, where in order the GPU thread blocks too and the rest goes in order after a block anyway).
+		size_t       redone    = 0;
+		bool         stop_free = false;
+		// (The report's) a stop after its segment ran as a hole or after a hole ran: the in-order path goes on past it, so
+		// the segments from `next` on are abandoned (else `next` is the refused segment, which runs in order as its hole
+		// would).
+		bool         stop_past = false;
 		uint64_t     retired   = 0;          // when Finish kept it for reuse (m_clock; 0: in use)
 		// When its translation started and ended, when each segment's ended.
 		uint64_t              start_ns = 0, end_ns = 0;
@@ -351,6 +360,18 @@ private:
 	std::vector<std::pair<uint64_t, std::unique_ptr<Spec::State>>> m_retired_records; // (when: m_clock)
 	uint64_t                          m_waits_for_ahead = 0, m_ahead_misses = 0; // (the report's)
 	uint64_t                          m_blind = 0, m_stopped = 0, m_blind_stopped = 0; // (the report's)
+	// (The report's classes of the results: committed, full (to its chunk's or submission's end) or cut short (its
+	// translation stopped early, the GPU thread coming for it most often: the rest in order), and of those the ones with
+	// segments run in order as holes (and how many segments); stopped with nothing abandoned (Result::stop_free); stopped
+	// abandoning work: the segments a hole would have committed, of all the segments of the results committed or stopped
+	// (translations dropped before a commit not counted), and their translation time.)
+	uint64_t m_class_full = 0, m_class_cut = 0, m_class_redone = 0, m_redone_segments = 0, m_class_stop_free = 0,
+	         m_class_stop_lost = 0, m_abandoned = 0, m_abandoned_ns = 0, m_translated_segments = 0;
+	// (The report's: the late target stops whose segment has no pending target that clears: no DCC clear its acquisition
+	// consumes, no layered-depth draw, whose acquisition may clear.)
+	uint64_t                          m_target_noclear = 0;
+	// (Why SegmentAsHole last said NotTaken, as a stop reason's suffix; null: not under KYTY_SPECULATE=4.)
+	const char*                       m_not_taken = nullptr;
 	// (The report's: the GPU thread's time waiting for a translation; from a push to its translation's start; the
 	// translations by duration: < 0.5, 1, 2, 4, 8 ms and longer, and the longest.)
 	uint64_t                          m_wait_ns = 0, m_start_delay_ns = 0, m_started = 0, m_longest_ns = 0;

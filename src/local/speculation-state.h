@@ -675,6 +675,7 @@ struct State {
 	std::vector<Range>         table_ranges;    // (their ranges, merged as notes are: the commit's host-write and unmap checks)
 	std::vector<PendingTarget> pending_targets; // (spec_commit_targets)
 	bool                       target_failed = false; // (spec_commit_targets: the commit's Before could not acquire one)
+	const char*                target_failed_why = nullptr; // (its first site's stop reason: Speculation's TargetFailed)
 	bool                       images_failed = false; // (spec_worker_images: a set's pending slot not completed)
 	bool                       any_resolve   = false; // (mode 4: a proposed set has a resolve, Before's pass for it)
 	// (Mode 4) The raw SRT words a translation read from the stale clean backing where GPU work had written them into a
@@ -1519,9 +1520,10 @@ struct State {
 		pending_buffers.clear();
 		table_ranges.clear();
 		pending_targets.clear();
-		target_failed = false;
-		images_failed = false;
-		any_resolve   = false;
+		target_failed     = false;
+		target_failed_why = nullptr;
+		images_failed     = false;
+		any_resolve       = false;
 		srt_verify.clear();
 		srt_failed = false;
 		draw_verifies.clear();

@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstring>
 #include <immintrin.h> // (_mm_pause: CommitReady's spin)
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -953,6 +954,9 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	r.next           = 0;
 	r.blocked        = SIZE_MAX;
 	r.blocked_segment = SIZE_MAX;
+	r.redone         = 0;
+	r.stop_free      = false;
+	r.stop_past      = false;
 	r.resume_at.reset();
 	r.start_ns       = NowNs();
 	r.start_at       = execution;
@@ -1112,6 +1116,31 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 		m_blind_stopped += r.blind ? 1 : 0;
 	}
 	const auto kept      = committed == 0 ? r.start_ns : r.segment_ends[committed - 1];
+	// (A failed result's last segment was never closed: its holes and one.)
+	const size_t translated = r.failed ? r.holes.size() + 1 : r.state.closed.size();
+	m_translated_segments += translated;
+	if (progress != Progress::Stopped) {
+		// (Committed: full, the old line's "whole"; or cut short, its "partly" when nothing stopped.)
+		++(r.stop != nullptr && r.stop != ChunkEnd ? m_class_cut : m_class_full);
+		m_class_redone += r.redone != 0 ? 1 : 0;
+		m_redone_segments += r.redone;
+	} else if (r.stop_free) {
+		++m_class_stop_free;
+	} else if (r.failed) {
+		++m_class_stop_lost;
+		m_abandoned += translated;
+		m_abandoned_ns += r.end_ns - r.start_ns;
+	} else {
+		// (The segments from the first a hole would have committed: past the refused one, which runs in order as its hole
+		// would; from `next` when the stop came after a run as a hole or a hole's run, stop_past.)
+		const size_t first = r.stop_past ? committed : committed + 1;
+		++m_class_stop_lost;
+		if (translated > first) {
+			const auto from = first == 0 ? r.start_ns : r.segment_ends[first - 1];
+			m_abandoned += translated - first;
+			m_abandoned_ns += r.end_ns > from ? r.end_ns - from : 0;
+		}
+	}
 	m_kept_ns += kept - r.start_ns;
 	m_lost_ns += r.end_ns - kept;
 	m_segments += committed;
@@ -1602,6 +1631,35 @@ const char* Speculation::RelocPatch(Result& result, size_t index) {
 	return nullptr;
 }
 
+// "commit: a pending target not acquired", by the Before site that failed the segment (the first; the common prefix kept,
+// so a reader of the old text still groups them).
+constexpr const char* TargetFoundState    = "commit: a pending target not acquired (found state)";
+constexpr const char* TargetAcquire       = "commit: a pending target not acquired (acquire)";
+constexpr const char* TargetLayersState   = "commit: a pending target not acquired (depth layers: state)";
+constexpr const char* TargetLayersAcquire = "commit: a pending target not acquired (depth layers: acquire)";
+constexpr const char* TargetLayersClear   = "commit: a pending target not acquired (depth layers: clear)";
+constexpr const char* TargetLayersMeta    = "commit: a pending target not acquired (depth layers: meta)";
+constexpr const char* TargetRefresh       = "commit: a pending target not acquired (refresh)";
+constexpr const char* TargetLayouts       = "commit: a pending target not acquired (completed layouts differ)";
+constexpr const char* TargetGone          = "commit: a pending target not acquired (gone in Before)";
+constexpr const char* TargetUndefined     = "commit: a pending target not acquired (restore: undefined)";
+constexpr const char* TargetCompletedKeep = "commit: a pending target not acquired (restore: completed moved)";
+constexpr const char* TargetCompletedUse  = "commit: a pending target not acquired (restore: completed layout)";
+static void TargetFailed(Spec::State& state, const char* why) {
+	if (!state.target_failed) state.target_failed_why = why;
+	state.target_failed = true;
+}
+
+// A stop reason with the cause SegmentAsHole did not take its segment for (null: the reason as it is). One string a pair,
+// made once (the stop counts are keyed by the pointer; the GPU thread's).
+static const char* WithCause(const char* why, const char* cause) {
+	if (cause == nullptr) return why;
+	static std::map<std::pair<const char*, const char*>, std::string> made;
+	const auto [it, fresh] = made.try_emplace({why, cause});
+	if (fresh) it->second = std::string(why) + " " + cause;
+	return it->second.c_str();
+}
+
 static bool SegmentWritesRange(const Spec::State& state, size_t index, const Spec::Counts& from, const Spec::Counts& to,
                                uint64_t address, uint64_t size); // (below)
 
@@ -1676,8 +1734,10 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		const auto as_hole = SegmentAsHole(result, cp, segment, true);
 		if (as_hole == AsHole::Blocked) return result.blocked_segment = segment, Progress::Blocked;
 		if (as_hole == AsHole::NotReached)
-			return ++m_stop_reasons["commit: a segment run as a hole did not reach its hole"], Progress::Stopped;
-		return ++m_stop_reasons["commit: a segment run as a hole blocked at a wait"], Progress::Stopped;
+			return result.stop_past = true, ++m_stop_reasons["commit: a segment run as a hole did not reach its hole"],
+			       Progress::Stopped;
+		// (In order the GPU thread blocks there too, and the rest goes in order after a block: no more than a hole's run.)
+		return result.stop_free = true, ++m_stop_reasons["commit: a segment run as a hole blocked at a wait"], Progress::Stopped;
 	}
 	// (Blocked at a wait hole: from there.)
 	// (After its segment ran as a hole, `cp` is already in the state the hole runs from: not the worker's copied.)
@@ -1685,7 +1745,7 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		const bool as_hole = std::exchange(result.blocked_as_hole, false);
 		const auto run     = RunHole(result, cp, hole, !as_hole);
 		if (run == HoleRun::Blocked) return result.blocked = hole, result.blocked_as_hole = as_hole, Progress::Blocked;
-		if (run == HoleRun::Changed) return Progress::Stopped;
+		if (run == HoleRun::Changed) return result.stop_past = true, Progress::Stopped;
 	}
 	while (result.next < segments) {
 		const auto index = result.next;
@@ -2035,7 +2095,12 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 			// chunk.)
 			if (post && !state.journal_reads_on) return ++m_stop_reasons[why], Progress::Stopped;
 			const auto as_hole = SegmentAsHole(result, cp, index);
-			if (as_hole == AsHole::NotTaken) return ++m_stop_reasons[why], Progress::Stopped;
+			if (as_hole == AsHole::NotTaken) {
+				result.stop_free = m_not_taken != nullptr && (std::strcmp(m_not_taken, "(last segment)") == 0 ||
+				                                              std::strcmp(m_not_taken, "(wait)") == 0);
+				return ++m_stop_reasons[WithCause(why, m_not_taken)], Progress::Stopped;
+			}
+			++result.redone;
 			result.next = index + 1;
 			// (Blocked at a wait inside it, the execution kept (resume_at): Resume goes on from there.)
 			if (as_hole == AsHole::Blocked) return result.blocked_segment = index, Progress::Blocked;
@@ -2043,9 +2108,11 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 			// the hole (the packets changed under the walk), or reached it in another state than the work after it assumed
 			// (the worker's at the hole, which nothing checked: what Changed found moved may have moved a register).)
 			if (as_hole == AsHole::NotReached)
-				return ++m_stop_reasons["commit: a segment run as a hole did not reach its hole"], Progress::Stopped;
+				return result.stop_past = true, ++m_stop_reasons["commit: a segment run as a hole did not reach its hole"],
+				       Progress::Stopped;
 			if (!cp.SameState(*result.hole_states[index]))
-				return ++m_stop_reasons["commit: a segment run as a hole ended in another state"], Progress::Stopped;
+				return result.stop_past = true, ++m_stop_reasons["commit: a segment run as a hole ended in another state"],
+				       Progress::Stopped;
 			// (Its hole's header as translated: RunHole reads the packet's words as they are now but runs it with the
 			// translation's length, which the header holds. A write over what the segment read, or the run itself, may
 			// have written the hole's words (a Changed() stop checked none of them). Read as the chain reads are,
@@ -2058,7 +2125,8 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 					if (const auto* backing = WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(hole.packet), 4u))
 						word = backing;
 				if (*static_cast<const uint32_t*>(word) != hole.header)
-					return ++m_stop_reasons["commit: a segment run as a hole: its hole packet moved"], Progress::Stopped;
+					return result.stop_past = true, ++m_stop_reasons["commit: a segment run as a hole: its hole packet moved"],
+					       Progress::Stopped;
 			}
 			result.resume_at.reset();
 			// (Its Before did not run: the worker sets it proposed are the next segment's to check and complete before that
@@ -2072,7 +2140,7 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 				}
 			const auto run = RunHole(result, cp, index, false);
 			if (run == HoleRun::Blocked) return result.blocked = index, result.blocked_as_hole = true, Progress::Blocked;
-			if (run == HoleRun::Changed) return Progress::Stopped;
+			if (run == HoleRun::Changed) return result.stop_past = true, Progress::Stopped;
 			continue;
 		}
 		const auto prepared = CurrentEpochs();
@@ -2102,8 +2170,16 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		// Its relocatable references written as they resolve now (after Before's registrations; the joins' copies are in
 		// the open buffer, which SubmitRecorded submits before the segment's work).
 		if (const char* why = reloc ? RelocPatch(result, index) : nullptr) return ++m_stop_reasons[why], Progress::Stopped;
-		if (std::exchange(result.state.target_failed, false)) // (spec_commit_targets)
-			return ++m_stop_reasons["commit: a pending target not acquired"], Progress::Stopped;
+		if (std::exchange(result.state.target_failed, false)) { // (spec_commit_targets)
+			const char* site = std::exchange(result.state.target_failed_why, nullptr);
+			const auto  tfrom = index == 0 ? size_t {0} : state.closed[index - 1].end.pending_targets;
+			const auto  tto   = state.closed[index].end.pending_targets;
+			bool        clearing = false;
+			for (size_t t = tfrom; t < std::min(tto, state.pending_targets.size()) && !clearing; ++t)
+				clearing = state.pending_targets[t].clear || state.pending_targets[t].depth_layers2;
+			m_target_noclear += clearing ? 0 : 1;
+			return ++m_stop_reasons[site != nullptr ? site : "commit: a pending target not acquired"], Progress::Stopped;
+		}
 		if (std::exchange(result.state.images_failed, false)) // (spec_worker_images)
 			return ++m_stop_reasons["commit: a pending image not completed"], Progress::Stopped;
 		// (Mode 4: the SRT words its translation read stale, again after Before and the checks after it: what Before did
@@ -2173,7 +2249,7 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		if (index < result.holes.size()) {
 			const auto run = RunHole(result, cp, index);
 			if (run == HoleRun::Blocked) return result.blocked = index, Progress::Blocked;
-			if (run == HoleRun::Changed) return Progress::Stopped;
+			if (run == HoleRun::Changed) return result.stop_past = true, Progress::Stopped;
 		}
 	}
 	return Progress::Complete;
@@ -2399,20 +2475,20 @@ void Speculation::Before(Result& result, size_t index) {
 			// after that draw's replay); an open rendering of the view that already clears it (BeginRendering would continue
 			// it: the normal path would not clear again); the image found Undefined (the acquisition's upload / clear would be
 			// discarded by RestoreState's barrier back to Undefined, and the replayed draw would load garbage).
-			const auto stop = [&] { state.target_failed = true; };
+			const auto stop = [&](const char* why) { TargetFailed(state, why); };
 			if (state.target_failed || !GuestGpu::IsGpuThread() || use == segment.images.end() ||
 			    Spec::UsedOtherwise(use->found, use->found_subresources, use->left, use->left_subresources) ||
 			    (use->found_subresources.empty() ? use->found.layout == vk::ImageLayout::eUndefined
 			                                     : std::ranges::any_of(use->found_subresources, [](const auto& s) {
 				                                       return s.layout == vk::ImageLayout::eUndefined;
 			                                       }))) {
-				stop();
+				stop(TargetLayersState);
 				continue;
 			}
 			const auto& desc = *static_cast<const TextureCache::ImageDesc*>(pending.depth_desc.get());
 			TextureCache::DepthDrawState drawn {};
 			if (!textures.AcquireDepthDrawAtCommit(pending.id, pending.serial, desc, &drawn)) {
-				stop();
+				stop(TargetLayersAcquire);
 				continue;
 			}
 			const auto key      = std::make_pair(static_cast<const Image*>(pending.image), desc.view_info.base_layer);
@@ -2425,7 +2501,7 @@ void Speculation::Before(Result& result, size_t index) {
 				const auto* open    = command.OpenRendering();
 				if (repeated || (open != nullptr && open->depth_stencil_attachment.image_view == drawn.view &&
 				                 open->depth_stencil_attachment.depth_clear)) {
-					stop();
+					stop(TargetLayersClear);
 					continue;
 				}
 				const auto& view   = desc.view_info;
@@ -2451,22 +2527,23 @@ void Speculation::Before(Result& result, size_t index) {
 				command.EndRendering();
 			}
 			if (drawn.meta_cleared && !textures.TouchMeta(desc.info.metadata.range.address, desc.view_info.base_layer, false)) {
-				stop(); // (cannot happen after FindDepthTarget made the entry HTile; slices >= 32 are never cleared)
+				stop(TargetLayersMeta); // (cannot happen after FindDepthTarget made the entry HTile; slices >= 32 are never cleared)
 				continue;
 			}
 			continue;
 		}
-		const bool  ok      = use != segment.images.end() && use->found.layout != vk::ImageLayout::eUndefined &&
-		                use->found_subresources.empty() &&
+		const bool  found   = use != segment.images.end() && use->found.layout != vk::ImageLayout::eUndefined &&
+		                use->found_subresources.empty();
+		const bool  ok      = found &&
 		                textures.AcquireTargetAtCommit(pending.id, pending.serial, pending.base_level, pending.level_count,
 		                                               pending.base_layer, pending.layer_count, pending.clear);
-		if (!ok) state.target_failed = true;
+		if (!ok) TargetFailed(state, found ? TargetAcquire : TargetFoundState);
 	}
 	// (Mode 4: the images GPU work wrote through a buffer since the translation found them, refreshed as the normal path's
 	// binding refreshes them (the commit's checks marked them: ImageUse::refresh), before the restore loop puts them back
 	// in the states the segment's barriers start from. One not refreshed fails the segment.)
 	for (const auto& use: segment.images)
-		if (use.refresh && !textures.RefreshAtCommit(*use.image, use.serial)) state.target_failed = true;
+		if (use.refresh && !textures.RefreshAtCommit(*use.image, use.serial)) TargetFailed(state, TargetRefresh);
 	// The images back in the states the segment's barriers start from. This Before may have released one: a creation it
 	// made failed for memory (ReclaimImageMemory unregisters its victims, among them maybe the segment's own, and erases
 	// them after a wait), and any EraseRetired here (that one, a deferred RetireImage a Finish ran) erases retired images
@@ -2547,7 +2624,7 @@ void Speculation::Before(Result& result, size_t index) {
 				conflict = std::ranges::any_of(proposed.completed, other_layout);
 			}
 			if (conflict) {
-				state.target_failed = true;
+				TargetFailed(state, TargetLayouts);
 				break;
 			}
 		}
@@ -2557,7 +2634,7 @@ void Speculation::Before(Result& result, size_t index) {
 		auto& use      = state.closed[index].images[i];
 		use.keep_state = false;
 		if (ImageGoneInBefore(textures, *use.image, use.serial, images_at_start[i], erased)) {
-			state.target_failed = true;
+			TargetFailed(state, TargetGone);
 			LiveCounters::Add(LiveCounters::SpecImageGoneInBeforeN);
 			continue;
 		}
@@ -2585,7 +2662,7 @@ void Speculation::Before(Result& result, size_t index) {
 				}
 			}
 			if (now_defined) {
-				state.target_failed = true;
+				TargetFailed(state, TargetUndefined);
 				continue;
 			}
 		}
@@ -2633,7 +2710,7 @@ void Speculation::Before(Result& result, size_t index) {
 					}
 				}
 				if (kept) use.keep_state = true;
-				else state.target_failed = true;
+				else TargetFailed(state, TargetCompletedKeep);
 				continue;
 			}
 			constexpr auto sro    = vk::ImageLayout::eShaderReadOnlyOptimal;
@@ -2642,7 +2719,7 @@ void Speculation::Before(Result& result, size_t index) {
 			                               ? use.found.layout == sro
 			                               : std::ranges::all_of(use.found_subresources, [&](const auto& s) { return s.layout == sro; });
 			if (!lc_sro || use.not_sampled || !found_sro) {
-				state.target_failed = true;
+				TargetFailed(state, TargetCompletedUse);
 				continue;
 			}
 		}
@@ -2902,14 +2979,17 @@ Speculation::HoleRun Speculation::RunHole(Result& result, CommandProcessor& cp, 
 Speculation::AsHole Speculation::SegmentAsHole(Result& result, CommandProcessor& cp, size_t index, bool resume) {
 	Pm4Execution execution;
 	bool         through = resume; // (it runs through the waits inside it)
+	m_not_taken = nullptr; // (the cause of a NotTaken below, for the stop's reason)
 	if (resume) {
 		// (Blocked at a wait inside it: on from there.)
 		execution = std::move(*result.resume_at);
 		result.resume_at.reset();
 	} else {
 		// (Under KYTY_SPECULATE=4 only; otherwise the stop stands.)
-		if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4 || index >= result.holes.size())
-			return AsHole::NotTaken;
+		if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return AsHole::NotTaken;
+		// (The chunk's last segment: no hole packet after it to run to. Its stop leaves the in-order path exactly its own
+		// packets, the run a hole of it would make.)
+		if (index >= result.holes.size()) return m_not_taken = "(last segment)", AsHole::NotTaken;
 		const auto& state = result.state;
 		const auto  from  = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
 		const auto& to    = state.closed[index].end;
@@ -2921,13 +3001,13 @@ Speculation::AsHole Speculation::SegmentAsHole(Result& result, CommandProcessor&
 		// `cp` untouched until Resume goes on from that wait (its queue's front is blocked: nothing else runs its
 		// processor), as RunHole's blocked wait after a segment run as a hole already relies on (blocked_as_hole).
 		if (to.waits != from.waits || to.covered_waits != from.covered_waits) {
-			if (!SegmentWaitsHold(state, from.waits, to.waits)) return AsHole::NotTaken;
+			if (!SegmentWaitsHold(state, from.waits, to.waits)) return m_not_taken = "(wait)", AsHole::NotTaken;
 			through = true;
 		}
 		// From the segment's start (the chunk's, or past the hole before it: `cp` is in that state, the commit checked
 		// the chunk's start state and ran the hole) up to its hole's packet.
 		execution = index == 0 ? result.start_at : result.holes[index - 1].after;
-		if (!execution.Started() || !result.holes[index].at.Started()) return AsHole::NotTaken;
+		if (!execution.Started() || !result.holes[index].at.Started()) return m_not_taken = "(not started)", AsHole::NotTaken;
 		// Its recorded work dropped, never submitted: the GPU thread records it again.
 		m_renderer.GetCommandScheduler().DiscardFirst(*result.recorder, state.closed[index].recorded - result.submitted);
 		result.submitted = state.closed[index].recorded;
@@ -3098,6 +3178,23 @@ void Speculation::Report() {
 		std::lock_guard lock(m_mutex);
 		std::printf("; stopped for the GPU thread: %llu", static_cast<unsigned long long>(std::exchange(m_cancelled, 0)));
 	}
+	// (The classes, last on the line, in words the old fields do not use. committed = full + cut = the old whole + partly
+	// less the stops; committed + stopped-free + stopped-abandoning = whole + partly + not committed. "with segments redone"
+	// counts committed results with a segment run in order as a hole (the "holes" above are the refused packets, run in
+	// order between segments in any result). The abandoned share is the number to compare between trees.)
+	std::printf("; classes: committed %llu (full %llu, cut short %llu; %llu with segments redone, %llu segments redone), "
+	            "stopped-free %llu, stopped-abandoning %llu (segments abandoned %llu = %.2f%% of %llu in commits), abandoned "
+	            "translation %.2f ms a frame; target stops without a clearing target %llu",
+	            static_cast<unsigned long long>(m_class_full + m_class_cut), static_cast<unsigned long long>(m_class_full),
+	            static_cast<unsigned long long>(m_class_cut), static_cast<unsigned long long>(m_class_redone),
+	            static_cast<unsigned long long>(m_redone_segments), static_cast<unsigned long long>(m_class_stop_free),
+	            static_cast<unsigned long long>(m_class_stop_lost), static_cast<unsigned long long>(m_abandoned),
+	            m_translated_segments != 0 ? 100.0 * static_cast<double>(m_abandoned) / static_cast<double>(m_translated_segments)
+	                                       : 0.0,
+	            static_cast<unsigned long long>(m_translated_segments), ms(m_abandoned_ns),
+	            static_cast<unsigned long long>(m_target_noclear));
+	m_class_full = m_class_cut = m_class_redone = m_redone_segments = m_class_stop_free = m_class_stop_lost = 0;
+	m_abandoned = m_abandoned_ns = m_translated_segments = m_target_noclear = 0;
 	std::printf("\n");
 	std::fflush(stdout);
 	m_whole = m_partly = m_none = m_segments = m_holes_run = m_waits_blocked = 0;
