@@ -106,6 +106,10 @@ struct RenderExecutor::TableImageSet {
 		vk::DescriptorType      type    = vk::DescriptorType::eSampledImage;
 		TextureCache::ImageDesc desc;
 		vk::ImageLayout         layout  = vk::ImageLayout::eShaderReadOnlyOptimal;
+		// Its view has metadata: the commit re-tests FindTexture's metadata step before it (MetadataBindNoop; the segment
+		// stops when the step would change anything: an image found without the view's metadata would have it adopted in
+		// Before) and notes the use as the owner's build does (NoteMetaUse).
+		bool                    metadata = false;
 	};
 	std::vector<PendingImage> pending_images;
 	// A speculation's proposal (spec_worker_sets): the Spec::State::id of the translation that built it (0: the owner's),
@@ -176,6 +180,13 @@ struct RenderExecutor::TableImageSet {
 	// is made for (null: the pair's).
 	const ShaderRecompiler::IR::CompiledShaderInfo* program  = nullptr;
 	const PipelineCache::Pipeline*                  pipeline = nullptr;
+	// (Mode 4 only, after the fields every mode reads, whose offsets they leave as they were.)
+	// The targets of every draw state its translation bound it under while it had pending slots (TableDraw; that
+	// translation's thread only, until its commit reads them: TableCompletePendingImages).
+	std::vector<ImageId>      pending_targets;
+	// A worker built it with a storage image resolved read only (its commit's check notes the GPU write the owner's
+	// FindTexture would have, once each such image is still as the worker found it).
+	bool                      worker_storage = false;
 };
 
 // Two specializations of a program the table way alike but for their images' and samplers' bindings: the same slots,
@@ -229,6 +240,7 @@ struct RenderExecutor::TablePair {
 	// program is translated for it (ShaderVertexInputInfo::start_instance_sgpr).
 	int32_t                                                     start_instance = -1;
 	bool                                                        refused  = false;
+	bool push_fit = false; // KYTY_SPEC_PAIR_PUSH_FIT: its programs the retry's (the reduced pixel form): spec_pair_push_fit_draws_n
 	const char* special = nullptr; // a dispatch's: the normal path's special path that takes it (refused)
 	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> programs {}; // vertex, pixel (null: inactive)
 	std::array<std::vector<Run>, 2>                             runs;
@@ -423,6 +435,14 @@ struct RenderExecutor::TableXpr {
 	};
 	static constexpr size_t           RingCopies = 4096;
 	std::unique_ptr<RingCopy[]>       ring_copies = std::make_unique<RingCopy[]>(RingCopies);
+	// (Mode 4) a speculation's copies, shared on the same terms within one translation (Spec::State::id), segment and
+	// wait count (State::waits and covered_waits: every wait it passes moves it) while no Rollback took notes back since
+	// (State::rollbacks). TableBlocks.
+	struct SpecRingCopy {
+		RingCopy copy;
+		uint64_t id = 0, rollbacks = 0, waits = 0;
+		size_t   segment = 0;
+	};
 	uint32_t                          special_generation = 1; // moves with the image starts and the mappings
 	// Addresses no image starts at, each with the TextureCache::StartEpoch it was proven at (only an address gaining
 	// its first image moves that epoch): TableBlocks asks the texture cache (a lock and a map lookup) again only then.
@@ -450,6 +470,20 @@ struct RenderExecutor::TableXpr {
 	// (TableEvaluate: the set's key; TableResolveSet), and the enumeration's scratch.
 	std::array<std::vector<ShaderRecompiler::IR::DescriptorValue>, 2> indirect;
 	ShaderRecompiler::IR::AddressProbeCandidates                      probe;
+	// (Mode 4 only, after the fields every mode reads per draw, whose offsets they leave as they were.)
+	// A speculation's last table draw here, by its translation (Spec::State::id), segment, chain head, draw state's
+	// capture (a state re-captured in place keeps its address), the images epoch read before its checks, and its overlay
+	// and open-write generations after it (id 0: none to match). TableDraw's spec_in_place.
+	struct SpecPlace {
+		uint64_t           id = 0, images = 0, overlay = 0, open = 0, capture = 0;
+		size_t             segment = 0;
+		const Spec::State* chain   = nullptr;
+	} spec_place;
+	std::unique_ptr<SpecRingCopy[]> spec_ring_copies; // (SpecRingCopy above; made at a speculation's first copy)
+	// (KYTY_SPEC_PAIR_DENSE_INDIRECT: per stage, each indirect image's count of them in `indirect`, in plan order: a
+	// program with several dense roots has their candidates one after another there. Written for a stage with an indirect
+	// image only (TableEvaluate, TableScoutApply), the one TableResolveSet reads it for.)
+	std::array<std::vector<uint32_t>, 2> indirect_counts;
 };
 // KYTY_TABLE_MEMO: a descriptor set left service (NativeXprRetireSet): a memo entry may hold it.
 void RenderExecutor::TableMemoRetired() {
@@ -513,6 +547,89 @@ void RenderExecutor::TableForgetStates() {
 				}
 }
 
+// (Mode 4, TableWorkerEntry below) This draw's topology and primitive restart, as the normal path derives them
+// (GetDrawTopology; ResolvePrimitiveRestart less its scan, which only stops the emulator when a custom reset value is in the
+// indices): the draw kind and the index size are not in the state key or the context hash. False: not derivable here
+// (refused).
+static bool WorkerEntryDrawTopology(const CommandBuffer& buffer, bool indexed, vk::IndexType index_type,
+                                    vk::PrimitiveTopology& topology, bool& restart) {
+	restart = false;
+	if (!GetDrawTopology(buffer.GetUserConfig(), !indexed, topology)) return false;
+	if (!indexed) return true; // (DrawAuto: no restart)
+	const auto control = buffer.GetUserConfig().GetPrimitiveResetControl();
+	if ((control & ~0x3u) != 0) return false;
+	if ((control & 0x1u) == 0) return true;
+	switch (buffer.GetUserConfig().GetPrimType()) {
+		case Prospero::PrimitiveType::kLineStrip:
+		case Prospero::PrimitiveType::kTriFan:
+		case Prospero::PrimitiveType::kTriStrip: break;
+		default: return true;
+	}
+	uint32_t element_size = 0;
+	if (index_type == vk::IndexType::eUint16) element_size = 2;
+	else if (index_type == vk::IndexType::eUint32) element_size = 4;
+	else return false;
+	const auto index_mask  = UINT32_MAX >> ((4 - element_size) * 8);
+	const auto reset_index = buffer.GetRegisters().GetPrimitiveResetIndex();
+	if ((control & 0x2u) != 0 && (reset_index & ~index_mask) != 0) return true;
+	restart = (reset_index & index_mask) == index_mask;
+	return true;
+}
+
+// (Mode 4, TableWorkerEntry below) What a worker made for a draw, held until its commit publishes it.
+struct RenderExecutor::TableEntryHolder {
+	std::remove_cvref_t<decltype(TableXpr::pairs)> node; // a new pair: its one node (moved into the catalog's map at publication)
+	TablePair*                                     pair = nullptr; // drawn with: the node's, or the catalog's
+	TableVariant                                   variant;        // the variant made here (own_variant)
+	TableVariant*                                  drawn_variant = nullptr;
+	bool                                           own_variant   = false;
+	std::unique_ptr<NativeXprDrawState>            state;          // derived from a sibling's capture (null: the key's own)
+	const NativeXprDrawState*                      drawn_state = nullptr;
+	uint64_t                                       capture     = 0; // drawn_state's capture_id
+	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> programs {};
+	uint64_t                                       pair_hash = 0, key = 0;
+	bool                                           new_pair  = false;
+	std::atomic<bool>                              poisoned {false}; // a set of its draws sampled a target: never published
+	// (The records of the unrecorded permutations it rests on and the normal pipeline made for it, put in at its commit
+	// (PipelineCache::CommitAdopted); dropped if never committed.)
+	std::shared_ptr<PipelineCache::AdoptedCommit> adopted;
+	// (An entry made with records: a later draw of this translation drawn with it is so only when its own normal lookups
+	// read clean and are in its commit (TableWorkerEntry's reuse, PipelineCache::AdoptedCovers); the targets its normal
+	// pipeline key is built from: the base state's inputs.)
+	bool                                                      reuse_checked = false;
+	std::shared_ptr<const NativeXprDrawState::PipelineInputs> inputs;
+	bool                                                      meta_noted = false; // (TableEntrySettleInOrder done)
+	// (Its table pipeline was compiling: the compile's job (null: not parked); the stand-in its draws were recorded with
+	// (the pipeline's layouts, no handle: the variant's pipeline until the commit); the cells of its draws' pipeline binds
+	// (each in its packet's copy in the passive producer's chunk, with the segment recording it); resolved: the compiled
+	// pipeline written in every cell and put in the variant (TableEntryResolveParked, the commit's check).)
+	std::shared_ptr<PipelineCache::ParkedPipeline> parked;
+	std::unique_ptr<PipelineCache::Pipeline>       parked_stand_in;
+	std::vector<std::pair<size_t, uint64_t*>>      parked_cells;
+	bool                                           parked_resolved = false;
+	// (Its state a worker's capture whose commit makes colour targets: its segment ran as a hole (its draws went with it;
+	// the hole made the targets in order): nothing made at a later commit, never published.)
+	bool                                           virtual_hole = false;
+	// (TableEntryOverlay) The shader map generation its programs are proven as of (the code hashed again when it moved); its
+	// catalog part begun (TableEntrySettle: out of the overlay from then); put in the overlay (the GPU thread's); its segment
+	// re-run as a hole (on_hole: never in the overlay, and a draw drawn with it through the overlay fails its check).
+	uint64_t                                       generation = 0;
+	std::atomic<bool>                              overlay_settled {false};
+	bool                                           overlay_added = false;
+	std::atomic<bool>                              ran_as_hole {false};
+};
+// (Mode 4) Holders not published whole, kept until no speculation translates or has a result unfinished (TableSweepPairs): a
+// draw recorded with them, and the proposals settled after theirs (their sets, into a new pair's node), may still refer to
+// them.
+static std::mutex                                                     g_entry_orphans_mutex;
+static std::vector<std::shared_ptr<RenderExecutor::TableEntryHolder>> g_entry_orphans;
+static std::atomic<uint32_t>                                          g_entry_orphans_n {0};
+// (Mode 4, TableEntryOverlay) The entries whose segment committed and whose catalog part waits (the settle queue's): the
+// GPU thread's adds (a try of the mutex: none when a worker holds it), the workers' lookups.
+static std::mutex                                                     g_entry_overlay_mutex;
+static std::vector<std::shared_ptr<RenderExecutor::TableEntryHolder>> g_entry_overlay;
+static std::atomic<uint32_t>                                          g_entry_overlay_n {0};
+
 // The pairs and dispatches no draw or dispatch looked up for PairKeepFrames leave, their image sets retired. Every
 // pointer to a pair goes too: the lookups' (pair_cache, found_*), the last draw's and dispatch's, the store request,
 // the gather and the prefetch chain (next). Only the catalog's owner, while no speculation translates or has a result
@@ -526,6 +643,10 @@ void RenderExecutor::TableSweepPairs() {
 	// (Put off while a speculation translates or has a result unfinished: tried at every call until done. Checked again
 	// under the lock: a translation counted after it reads the catalog after the sweep, and sees its epoch.)
 	if (kyty_local_speculations_live.load(std::memory_order_seq_cst) != 0) return;
+	// (Mode 4's only: the commits' catalog parts still waiting run first, they may name pairs the sweep frees; then the
+	// entries' orphans.)
+	if (s_settle_pending_n.load(std::memory_order_relaxed) != 0) SettleDrain(true);
+	if (g_entry_orphans_n.load(std::memory_order_relaxed) != 0) TableRetireEntryOrphans();
 	table->pairs_swept = frame;
 	if (table->pairs.size() + table->dispatches.size() <= TableXpr::PairsKept) return;
 	const auto write = CatalogWrite();
@@ -668,6 +789,68 @@ static void TablePrefetchNext(Pair*& previous, Pair& pair) {
 // TableContinue). The set build keeps it across the program lookup (`unlocked` there only tests it), so the lookup's guest
 // reads are made without a fault: a fault there would wait for the GPU thread while it waits for the catalog's write.
 static thread_local std::shared_lock<std::shared_mutex>* t_catalog_read = nullptr;
+// (Mode 4, TableWorkerEntry) The variant it made and draws with now, not in its pair's vector (TableResolveSet's re-find
+// after an unlock does not apply to it); the poisoned flag of the entry drawn with (TableDraw sets it).
+static thread_local const void*        t_entry_variant = nullptr;
+static thread_local std::atomic<bool>* t_entry_poison  = nullptr;
+// (Mode 4) The entry drawn with now when it is parked on its table pipeline's compile (TableDraw binds its stand-in through a
+// cell).
+static thread_local RenderExecutor::TableEntryHolder* t_entry_parked = nullptr;
+// (Mode 4) A parked entry's pipeline bind, recorded as a packet whose pipeline handle is a cell the commit writes
+// (TableEntryResolveParked, the GPU thread, before the segment is spliced; nothing reads a passive producer's chunk before
+// its splice, and a discard runs nothing of it), as the relocatable buffer references' cells are (TableReloc). Its replay
+// ends the draws' replays' reuse of the pipeline they bound last (LocalDrawRecording keeps it): a bind they do not see.
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+namespace TableParked {
+struct Packet {
+	VkCommandBuffer command  = VK_NULL_HANDLE;
+	uint64_t        pipeline = 0; // (the cell: a VkPipeline, written by the commit)
+};
+static_assert(std::is_standard_layout_v<Packet> && std::is_trivially_copyable_v<Packet>);
+static void Replay(std::span<const LocalVulkanRecording::Segment> segments, const vk::detail::DispatchLoaderDynamic& dispatch) {
+	Packet packet;
+	std::memcpy(&packet, segments[0].data, sizeof(packet));
+	LocalVulkanRecording::InvalidateReplayState();
+	// (Never spliced unwritten: the commit's check stops the segment first. A null one binds nothing rather than fault.)
+	if (packet.pipeline == 0) return;
+	dispatch.vkCmdBindPipeline(LocalVulkanRecording::Resolve(packet.command), VK_PIPELINE_BIND_POINT_GRAPHICS,
+	                           reinterpret_cast<VkPipeline>(packet.pipeline)); // NOLINT (a 64-bit non-dispatchable handle)
+}
+} // namespace TableParked
+#endif
+// Whether this thread records packets whose cells its commit writes (a passive producer's: a speculation worker's segment).
+static bool TableCellsRecordable() {
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	return LocalVulkanRecording::Passive();
+#else
+	return false;
+#endif
+}
+// The parked entry's bind recorded with a cell, noted with the segment recording it (false: not recorded, the draw refused).
+static bool TableParkedBind(vk::CommandBuffer vk_buffer, RenderExecutor::TableEntryHolder& h) {
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	if (!LocalVulkanRecording::Passive()) return false;
+	const TableParked::Packet           packet {static_cast<VkCommandBuffer>(vk_buffer), 0};
+	const LocalVulkanRecording::Segment segment {&packet, sizeof(packet)};
+	void*                               copy = nullptr;
+	if (!LocalVulkanRecording::EnqueuePacketCopy(TableParked::Replay, segment, &copy) || copy == nullptr) return false;
+	const auto* spec = Spec::Current();
+	h.parked_cells.emplace_back(spec != nullptr ? spec->closed.size() : 0,
+	                            reinterpret_cast<uint64_t*>(static_cast<std::byte*>(copy) + offsetof(TableParked::Packet, pipeline)));
+	return true;
+#else
+	(void)vk_buffer, (void)h;
+	return false;
+#endif
+}
+// (Mode 4, the GPU thread) TableDraw refused a draw under a state a worker derived from a sibling's capture whose set holds
+// a target; its caller (TableTry) then takes the store path for the draw (request_store), so the in-order store captures
+// the state and replaces the derived one.
+static thread_local bool t_store_derived = false;
+// (Mode 4) A speculation's draw that lacks its table entry makes it itself (TableWorkerEntry).
+[[nodiscard]] static bool WorkerEntryOn() {
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+}
 // catalog_writer_first: before a worker's table try takes the catalog shared, it waits while the owner waits to write
 // (pause, then yield), unless this thread holds the catalog shared already.
 static void CatalogGate(const std::atomic<int32_t>& writer_waiting, bool on) {
@@ -720,7 +903,13 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		const auto pair_hash = XXH3_64bits(pair_key.data(), sizeof(pair_key));
 		// (Another executor's catalog: what it learned, none of it made here.)
 		const auto found = catalog == nullptr || Role() == 0 ? decltype(catalog->pairs.end()) {} : catalog->pairs.find(pair_hash);
-		if (Role() != 0 && (catalog == nullptr || found == catalog->pairs.end())) return Spec::Refuse("table store"), TableResult::Native;
+		if (Role() != 0 && (catalog == nullptr || found == catalog->pairs.end())) {
+			// (Mode 4: the worker makes the pair itself, TableWorkerEntry.)
+			if (catalog != nullptr && WorkerEntryOn())
+				if (const auto drawn = TableWorkerEntry(buffer, nullptr, pair_hash, commands, index_base, index_bytes, index_type, direct))
+					return *drawn;
+			return Spec::Refuse("table store"), TableResult::Native;
+		}
 		// (A frame's draws use ~600 pairs at 1-1: 256 entries missed often, each a cold map bucket and node.)
 		const auto entries = (kyty_local_table_mru.load(std::memory_order_relaxed) & 1u) != 0 ? TableXpr::PairCacheEntries : 256;
 		auto&      cached  = table.pair_cache[pair_hash & (entries - 1)];
@@ -767,7 +956,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		const auto write = CatalogWrite();
 		TableReset(pair);
 	}
-	if (pair.refused) return Spec::Refuse("table: pair refused"), TableResult::Native;
+	if (pair.refused) return Spec::Refuse(Spec::TablePairRefusedText), TableResult::Native;
 	// KYTY_FRAMEGEN: the frame's first G-buffer draw goes the normal way (or a native record's), whose hook reads the
 	// camera from its constants (a speculation's thread leaves them all to the GPU thread's).
 	if (FrameGen::Enabled() && pair.programs[0] != nullptr &&
@@ -854,6 +1043,8 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 				                               index_type, direct);
 				table.memo_set     = nullptr;
 				table.memo_verify  = false;
+				// (Mode 4: a derived state's draw refused for a target in its set: the store path, as below.)
+				if (memo_state.derived && std::exchange(t_store_derived, false)) return request_store();
 				return result;
 			}
 		}
@@ -865,13 +1056,29 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	                          : std::ranges::find(pair.variants, cache.state_key, &TableXpr::Variant::state);
 	if (variant != pair.variants.end()) pair.variant_hint = static_cast<uint32_t>(variant - pair.variants.begin());
 	if (variant != pair.variants.end() && variant->refused) return Spec::Refuse("table: variant refused"), TableResult::Native;
-	if (pair.programs[0] == nullptr || variant == pair.variants.end() || variant->pipeline == nullptr)
+	if (pair.programs[0] == nullptr || variant == pair.variants.end() || variant->pipeline == nullptr) {
+		// (Mode 4: the worker makes the variant, and the draw state if the key has none, TableWorkerEntry.)
+		if (Role() != 0 && pair.programs[0] != nullptr && WorkerEntryOn())
+			if (const auto drawn = TableWorkerEntry(buffer, &pair, 0, commands, index_base, index_bytes, index_type, direct))
+				return *drawn;
+		// (Mode 4: the pair's programs not made yet (its store compiling): an entry a worker made for the key, not in the
+		// catalog yet, TableEntryOverlay.)
+		if (Role() != 0 && pair.programs[0] == nullptr && WorkerEntryOn())
+			if (const auto drawn = TableEntryOverlay(buffer, &pair, commands, index_base, index_bytes, index_type, direct))
+				return *drawn;
 		return LiveCounters::Add(LiveCounters::TableStoreVariant), request_store();
+	}
 	// The draw state (TableStore captures it).
 	if (cache.last_state == nullptr || cache.last_state_key != cache.state_key) {
 		const auto& states   = Catalog().NativeXprState().states;
 		const auto  state_it = states.find(cache.state_key);
-		if (state_it == states.end()) return request_store();
+		if (state_it == states.end()) {
+			// (Mode 4: the worker derives the draw state from a sibling's, TableWorkerEntry.)
+			if (Role() != 0 && WorkerEntryOn())
+				if (const auto drawn = TableWorkerEntry(buffer, &pair, 0, commands, index_base, index_bytes, index_type, direct))
+					return *drawn;
+			return request_store();
+		}
 		cache.last_state_key = cache.state_key;
 		cache.last_state     = state_it->second.get();
 	}
@@ -879,6 +1086,10 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	TablePrefetchArrays(pair, pair.LastSet(Role()));
 	if (!NativeXprTargetsCurrent(draw_state)) return LiveCounters::Add(LiveCounters::TableStoreTargets), request_store();
 	const auto result = TableDraw(buffer, pair, *variant, draw_state, commands, index_base, index_bytes, index_type, direct);
+	// (Mode 4, the GPU thread: a state a worker derived from a sibling's capture whose draw TableDraw refused for a target in
+	// its set: the store path for it, as for a draw whose state has no capture or whose targets are not current; TableStore's
+	// capture then replaces the derived state.)
+	if (draw_state.derived && std::exchange(t_store_derived, false)) return request_store();
 	if (memo && result == TableResult::Drawn)
 		table.MemoAt(&pair, cache.state_key) = {&pair, cache.state_key, table.memo_epoch, &draw_state,
 		                                        const_cast<TableImageSet*>(table.last_set),
@@ -907,9 +1118,11 @@ bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64
 	std::optional<RenderLockGuard> lock;
 	if (Role() == 0) lock.emplace(m_context.GetMutex());
 	if (!NativeXprTargetsCurrent(*table.last_state)) return false;
-	if (TableDraw(buffer, *table.last_pair, variant, *table.last_state, commands, index_base, index_bytes, index_type,
-	              direct) != TableResult::Drawn)
-		return false;
+	const auto drawn = TableDraw(buffer, *table.last_pair, variant, *table.last_state, commands, index_base, index_bytes,
+	                             index_type, direct);
+	// (Mode 4: a derived state's refusal mark cleared: the packet goes to NativeXprTry again, whose TableTry asks the store.)
+	if (table.last_state->derived) t_store_derived = false;
+	if (drawn != TableResult::Drawn) return false;
 	LiveCounters::Add(LiveCounters::TableContinued, std::max<size_t>(commands.size(), 1));
 	return true;
 }
@@ -1007,6 +1220,14 @@ bool RenderExecutor::TableCompletePendingImages(TableImageSet& set) {
 		auto       desc    = pending.desc;
 		const auto id      = textures.FindImage(desc, false, true); // (may fail: no memory for it, a refusal)
 		if (!id) continue;
+		// An image a draw that bound the set renders to: the slot would hold it read-only as a texture (the dep below, not
+		// a target) while that draw's attachment holds it, where the owner's build lays it out as the target
+		// (TableResolveSet). The segment stops: in order, the owner's build. (The rest of the set's slots are left: it is
+		// retired unpublished.)
+		if (std::ranges::find(set.pending_targets, id) != set.pending_targets.end()) break;
+		// (Its view with metadata: FindTexture's metadata step still a no-op here, the in-order point before the work,
+		// else the slot fails and the segment stops.)
+		if (pending.metadata && !textures.MetadataBindNoop(id, desc)) continue;
 		const auto view = textures.FindTexture(id, desc);
 		if (!view) continue;
 		auto& image = textures.GetImage(id);
@@ -1033,6 +1254,8 @@ bool RenderExecutor::TableCompletePendingImages(TableImageSet& set) {
 		dep.range  = range;
 		dep.desc   = desc;
 		set.image_ids.push_back(id);
+		// (Its view's metadata noted as the owner's build notes a dep's, KYTY_TABLE_SERIALS.)
+		if (pending.metadata) textures.NoteMetaUse(desc.info.metadata.range.address, id.index);
 		++done;
 	}
 	if (!writes.empty())
@@ -1043,7 +1266,7 @@ bool RenderExecutor::TableCompletePendingImages(TableImageSet& set) {
 		);
 	bool ok = done == set.pending_images.size();
 	set.span_begin = set.span_end = 0; // (its span grew: found again at its next proof)
-	if (ok) set.pending_images.clear();
+	if (ok) set.pending_images.clear(), std::vector<ImageId>().swap(set.pending_targets);
 	return ok;
 }
 
@@ -1145,8 +1368,61 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				                               }
 				                               TableKeepAside(holder);
 			                               }});
-			if (!raw->pending_images.empty())
-				spec->proposed_sets.back().complete = [owner, raw] { return owner->TableCompletePendingImages(*raw); };
+			// (Its commit's settle is all catalog part, under the owner's write; one that retires a set (a revalidated set
+			// replacing its slot's, the unpublished one of a set with pending images, read as the settle reads it) runs at
+			// its commit.)
+			spec->proposed_sets.back().catalog_owner   = owner;
+			spec->proposed_sets.back().settle_must_now = [holder, replaces] {
+				return replaces || (*holder && !(*holder)->pending_images.empty());
+			};
+			if (!raw->pending_images.empty()) {
+				// (The images it completes, each with its serial and the slot's layout, and the set's handle: for its segment's
+				// Before, and spec_set_cpu_dirty_stop off for the commits of later segments that bind it, CommitSegments'
+				// reuse test.)
+				spec->proposed_sets.back().complete = [owner, raw, spec, index = spec->proposed_sets.size() - 1] {
+					const auto first = raw->images.size();
+					const bool ok    = owner->TableCompletePendingImages(*raw);
+					auto&      textures  = owner->m_context.GetTextureCache();
+					auto&      completed = spec->proposed_sets[index].completed;
+					const auto handle    = reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(raw->set));
+					const bool snapshot  = Spec::CompletedSnapshotOn();
+					for (size_t i = first; i < raw->images.size(); ++i)
+						if (const auto* image = textures.TryGetImage(raw->images[i].id)) {
+							completed.push_back({image, raw->images[i].serial, handle, raw->images[i].layout});
+							// (spec_completed_snapshot: its state as this completion left it, every slot of the set done.)
+							if (snapshot) {
+								const Image::StateLock lock(*image);
+								completed.back().snapshot     = true;
+								completed.back().state        = image->backing.state;
+								completed.back().subresources = image->backing.subresource_states;
+							}
+						}
+					return ok;
+				};
+				// (The memory its completion uploads from, for the commit's test before it against the committing segment's
+				// writes (Speculation::Before): each pending slot's own desc range, metadata and stencil plane, and the images
+				// over the slot's bytes as FindImage would meet them. Read only, the GPU thread.)
+				spec->proposed_sets.back().pending_over = [raw](uint64_t address, uint64_t size) {
+					for (const auto& pending: raw->pending_images) {
+						const auto& data = pending.desc.info.data;
+						if (data.address < address + size && address < data.address + data.size) return true;
+					}
+					return false;
+				};
+				spec->proposed_sets.back().pending_written =
+				    [owner, raw](const std::function<bool(uint64_t, uint64_t)>& written) {
+					    auto& textures = owner->m_context.GetTextureCache();
+					    for (const auto& pending: raw->pending_images) {
+						    const auto& info = pending.desc.info;
+						    if (written(info.data.address, info.data.size) ||
+						        (info.HasMetadata() && written(info.metadata.range.address, info.metadata.range.size)) ||
+						        (info.HasStencil() && written(info.stencil.address, info.stencil.size)) ||
+						        textures.ImagesOverWritten(info.data.address, info.data.size, written))
+							    return true;
+					    }
+					    return false;
+				    };
+			}
 			// (spec_proposed_check: what TableValidateSet's first steps ask, at the commit: the BDA page table's generation
 			// the set's, and each image the one it was built with.)
 			spec->proposed_sets.back().check = [owner, raw] {
@@ -1155,6 +1431,23 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				for (const auto& dep: raw->images) {
 					const auto* image = textures.m_slot_images.try_get(dep.id);
 					if (image == nullptr || image->serial != dep.serial) return false;
+				}
+				// (Mode 4: each storage image still one the owner's FindTexture would change nothing on here, before the
+				// replay that binds the set (else the segment stops: the normal path refreshes or marks it); then the GPU
+				// write that FindTexture notes (CommitGpuWrite), as the owner's build of the set would have. A colour target
+				// bound as storage too is a target dep with the shader write in target_read (KYTY_TABLE_TARGET_READ): one as
+				// well.)
+				if (raw->worker_storage) {
+					const auto written = [](const TableImageSet::Image& dep) {
+						return dep.storage || (dep.target && (dep.target_read & vk::AccessFlagBits2::eShaderWrite));
+					};
+					for (const auto& dep: raw->images)
+						if (written(dep) && TextureCache::StorageChanges(textures.m_slot_images[dep.id]) != nullptr) return false;
+					for (const auto& dep: raw->images)
+						if (written(dep)) {
+							const auto& data = textures.m_slot_images[dep.id].info.data;
+							Spec::NoteGpuWrite(data.address, data.size);
+						}
 				}
 				return true;
 			};
@@ -1179,6 +1472,12 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		set->refused = true;
 		return publish();
 	};
+	// (Mode 4: a speculation's program lookup runs with the catalog's read lock dropped, below: taken back here, through
+	// the writer-first gate, as the worker entry's lookups and capture take it.)
+	const auto relock = [this] {
+		CatalogGate(Catalog().m_catalog_writer_waiting, CatalogWriterFirst());
+		t_catalog_read->lock();
+	};
 	ShaderVertexInputInfo  vertex_info;
 	ShaderPixelInputInfo   pixel_info;
 	ShaderComputeInputInfo compute_info;
@@ -1198,7 +1497,18 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		// it: nothing releases it here), which the GPU thread's CatalogWrite waits for: its guest reads (PrepareProgramInto's
 		// hash, AGC metadata and vertex tables, Get's code and SRT words) are made without a fault, the set refused when
 		// one cannot be (PipelineCache: "worker set: code unread", "GPU-written shader code"; t_no_fault_failed). The
-		// epoch and variant checks after it hold for the lock; they stay for a lookup made without it.)
+		// epoch and variant checks after it hold for the lock; they stay for a lookup made without it: mode 4 drops it
+		// around the lookup, and proves the rest of what the draw holds as well, below.)
+		// (Mode 4: the lock dropped around the lookup, so the GPU thread's catalog writes (TableStore in holes) do not wait
+		// for it. EXACT: the lookup reads nothing of the catalog (the variant's mapping and the pair's portable masks are
+		// the copies held below, the rest is the draw's registers, guest memory and the pipeline cache under its own lock).
+		// Once the lock is back, everything the draw holds of the catalog and reads after it is proven as it was: the epoch
+		// (TableReset, a set replaced or retired; the sweeps of pairs and states run only between translations), the
+		// variant found again at the same address (the vector did not grow) with its pipeline, mapping and fetch_embedded
+		// (TableStore's in-place update), the pair's portable masks (TableLearnPortable's in-place update), the draw state's
+		// capture (NativeXprCaptureState replaces a state in place: capture_id moves). The pair's programs are compared
+		// after, as before. Anything moved: the set refused ("worker set: catalog changed", the draw a hole), never built
+		// over a mix; the draw's references may be stale then, so no retry in the hold.)
 		// (Copies held by a speculation only. Mode 0 reads them in place.)
 		struct Held {
 			std::remove_cvref_t<decltype(variant->mapping)> mapping;
@@ -1212,9 +1522,14 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		const auto* portable = held ? &held->portable : &pair.portable;
 		const auto  since    = spec != nullptr && CatalogTable() != nullptr ? CatalogTable()->epoch : 0;
 		const bool  unlocked = spec != nullptr && t_catalog_read != nullptr && t_catalog_read->owns_lock();
+		const bool     outside      = unlocked && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+		const bool     fetch_held   = outside && variant->fetch_embedded;
+		const uint64_t capture_held = outside && draw_state != nullptr ? draw_state->capture_id : 0;
+		if (outside) t_catalog_read->unlock();
 		(void)m_context.GetPipelineCache().GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx,
 		                                                       buffer.GetUserConfig(), *mapping, stages == 2,
 		                                                       vertex_info, pixel_info, true, *portable);
+		if (outside) relock();
 		PipelineCache::t_no_fault_reads = false;
 		if (spec != nullptr && PipelineCache::t_no_fault_failed) return worker_refuse("worker set: program read");
 		if (unlocked) {
@@ -1223,11 +1538,20 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			// grew meanwhile moved the variant TableDraw holds by reference, and reads after this set (its pipeline, its
 			// index as the role's last variant). Refused then, as when the variant left.)
 			const auto again = std::ranges::find(pair.variants, held->state, &TableVariant::state);
-			if (again == pair.variants.end() || &*again != variant) return worker_refuse("worker set: catalog changed");
+			if (variant != t_entry_variant && (again == pair.variants.end() || &*again != variant)) // (a worker entry's own)
+				return worker_refuse("worker set: catalog changed");
 			// (TableStore's targets path updates a variant in place, without moving the epoch or
 			// the vector: its pipeline swapped, or null while TryCreateGraphicsPipeline is pending, or the variant refused.
 			// The set's layout and TableDraw's bind read that pipeline: refused unless it is the one held before the unlock.)
-			if (again->pipeline != held->pipeline || again->pipeline == nullptr || again->refused)
+			if (variant != t_entry_variant && (again->pipeline != held->pipeline || again->pipeline == nullptr || again->refused))
+				return worker_refuse("worker set: catalog changed");
+			// (Mode 4, the lock dropped for the lookup: the rest of what the draw read before the drop and reads after it, as
+			// it was: the variant's other in-place fields (TableStore), the pair's portable masks (the lookup's input), the
+			// draw state's capture (NativeXprCaptureState replaces a state in place, at its address).)
+			if (outside && variant != t_entry_variant && (again->mapping != held->mapping || again->fetch_embedded != fetch_held))
+				return worker_refuse("worker set: catalog changed");
+			if (outside && pair.portable != held->portable) return worker_refuse("worker set: catalog changed");
+			if (outside && draw_state != nullptr && draw_state->capture_id != capture_held)
 				return worker_refuse("worker set: catalog changed");
 		}
 		if (m_context.GetPipelineCache().TablePending())
@@ -1262,6 +1586,10 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 					return nullptr; // (no set this draw: the next one compiles the pair again)
 				}
 			}
+			// (KYTY_SPEC_PAIR_DENSE_INDIRECT: counted for a pair with a dense root: its candidates' shapes another program's.)
+			if (!pair.programs[0]->table_plan.indirect.empty() ||
+			    (stages == 2 && !pair.programs[1]->table_plan.indirect.empty()))
+				LiveCounters::Add(LiveCounters::SpecPairDenseShapeRefused);
 			return refuse(vertex_info.stage.program != pair.programs[0] ? "another specialization (VS)"
 			                                                            : "another specialization (PS)");
 		}
@@ -1277,12 +1605,18 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		const auto* portable0 = held_portable ? &*held_portable : &pair.portable[0];
 		const auto since     = spec != nullptr && CatalogTable() != nullptr ? CatalogTable()->epoch : 0;
 		const bool unlocked  = spec != nullptr && t_catalog_read != nullptr && t_catalog_read->owns_lock();
+		// (Mode 4: the lock dropped around the lookup, as above. A dispatch's pair changes in place only its portable
+		// masks; its compute input, programs and pipeline with a TableReset, which moves the epoch.)
+		const bool outside   = unlocked && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+		if (outside) t_catalog_read->unlock();
 		const auto handle    = pipelines.GetComputeProgram(sh.GetCs(), ctx.GetShaderRegisters(), compute_info, nullptr, true,
 		                                                   *portable0);
+		if (outside) relock();
 		PipelineCache::t_no_fault_reads = false;
 		if (spec != nullptr && PipelineCache::t_no_fault_failed) return worker_refuse("worker set: program read");
 		if (unlocked && (CatalogTable() == nullptr || CatalogTable()->epoch != since))
 			return worker_refuse("worker set: catalog changed");
+		if (outside && pair.portable[0] != *held_portable) return worker_refuse("worker set: catalog changed");
 		if (pipelines.TablePending()) return spec != nullptr ? worker_refuse("worker set: program pending") : nullptr;
 		if (compute_info.stage.program != pair.programs[0]) {
 			if (spec != nullptr) return worker_refuse("worker set: other specialization");
@@ -1309,6 +1643,36 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		ResetBindings();
 		return worker_refuse(TextureCache::ReadOnlyFailed());
 	}
+	// (Mode 4, a worker's set with a storage image: TextureCache::FindImageReadOnly.) A storage image the set also binds
+	// otherwise (either stage) is one the owner's build marks force_general and shader_write (BindImage), from this set's
+	// bindings alone (the owner's build binds both stages' images after ResetBindings, and resets them after; a target's
+	// binding marks no force_general; a null image none): `twice`, laid out below as the owner's build lays it out
+	// (General, whole, read and written; a target's attachment layout). A sampled binding left pending holds the null image
+	// here: of the storage image's bytes, it would be bound twice and its commit would make it read-only while the storage
+	// dep makes it General: refused.
+	bool                 worker_storage = false;
+	std::vector<ImageId> twice;
+	if (spec != nullptr)
+		for (uint32_t st = 0; st < stages; ++st)
+			for (const auto& binding: prepared[st].images) {
+				if (binding.desc.type != TextureCache::BindingType::Storage) continue;
+				worker_storage = true;
+				for (uint32_t other = 0; other < stages; ++other)
+					for (const auto& sampled: prepared[other].images) {
+						if (sampled.pending && sampled.pending_desc != nullptr) {
+							const auto& data  = sampled.pending_desc->info.data;
+							const auto& bytes = textures.GetImage(binding.image_id).info.data;
+							if (!bytes.Empty() && data.address < bytes.End() && bytes.address < data.End()) {
+								ResetBindings();
+								return worker_refuse("worker storage: bound twice, pending");
+							}
+						}
+						if (sampled.image_id == binding.image_id && sampled.desc.type != TextureCache::BindingType::Storage &&
+						    !textures.GetImage(binding.image_id).info.data.Empty() &&
+						    std::ranges::find(twice, binding.image_id) == twice.end())
+							twice.push_back(binding.image_id);
+					}
+			}
 	// An address probe's indirect image (a dispatch's): its root's elements in the order of the candidates the set's
 	// key holds (TableEvaluate's), each found among the dispatch's own (the normal path's materialization: the same
 	// enumeration, in the order the records name them); past them the null images it was padded with.
@@ -1330,6 +1694,47 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				images[elements[j]] = original[*found];
 			}
 		}
+	} else {
+		// KYTY_SPEC_PAIR_DENSE_INDIRECT: a vertex or pixel program's dense indirect image (a draw's), as the dispatch's
+		// above, per stage: its root's elements in the order of the candidates the set's key holds (TableEvaluate's: key
+		// 0's first, the rest by their words), each found among the stage's own (the normal path's materialization,
+		// MaterializeDenseIndirectImage: each distinct T# in the order of the first key that names it), past them the
+		// null images it was padded with. Required: the block's mapping (TableEvaluate) names element positions in the
+		// key's order; bound in the specialization's order instead, a key whose T# sorts elsewhere would sample another
+		// key's texture. (No stage has an indirect image without the switch: a pair's programs, never a module, decide.)
+		for (uint32_t st = 0; st < stages; ++st) {
+			const auto& program = *pair.programs[st];
+			if (program.table_plan.indirect.empty()) continue;
+			LiveCounters::Add(LiveCounters::SpecPairDenseSetMisses);
+			const auto differ = [&] {
+				LiveCounters::Add(LiveCounters::SpecPairDenseSetDiffer);
+				ResetBindings();
+				return refuse("indirect candidates differ");
+			};
+			// (Each root's candidates, in plan order, one after another in TableEvaluate's `indirect`: its count of them.)
+			const auto& all    = OwnTable().indirect[st];
+			const auto& counts = OwnTable().indirect_counts[st];
+			if (counts.size() != program.table_plan.indirect.size()) return differ();
+			size_t first = 0, t = 0;
+			for (const auto& entry: program.table_plan.indirect) {
+				const auto& elements = program.info.images.at(entry.root).indirect_resources;
+				const auto& own      = runtimes[st]->resources.images;
+				if (first + counts[t] > all.size()) return differ();
+				const auto wanted = std::span<const ShaderRecompiler::IR::DescriptorValue>(all).subspan(first, counts[t]);
+				first += counts[t++];
+				auto& images = prepared[st].images;
+				if (wanted.size() > elements.size()) return differ();
+				const auto original = images;
+				for (size_t j = 0; j < wanted.size(); ++j) {
+					const auto found = std::ranges::find_if(elements, [&](uint32_t resource) {
+						return resource < own.size() && own[resource] == wanted[j];
+					});
+					if (found == elements.end() || elements[j] >= images.size() || *found >= original.size())
+						return differ();
+					images[elements[j]] = original[*found];
+				}
+			}
+		}
 	}
 	// Each image's layout and access as the normal path's CommitBindings gives them: a null image (a texture not
 	// streamed in yet) as it is bound (not held); a target of the draw state in its attachment layout and access
@@ -1342,9 +1747,12 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		for (auto& binding: prepared[st].images) {
 			auto&       image   = textures.GetImage(binding.image_id);
 			// (spec_worker_sets: the set's own bindings' state, which a speculation's read-only build does not mark (BindImage):
-			// all sampled textures there, neither written nor bound twice apart; the image's fields are the GPU thread's draw.)
-			const bool  bound_general = spec == nullptr && image.binding.force_general;
-			const bool  bound_written = spec == nullptr && image.binding.shader_write;
+			// the image's fields are the GPU thread's draw. An image the set binds both ways, `twice`, is what BindImage marks
+			// force_general and shader_write; its other images' shader_write changes nothing below, a storage binding's own
+			// test before it.)
+			const bool  twice_here    = spec != nullptr && std::ranges::find(twice, binding.image_id) != twice.end();
+			const bool  bound_general = spec == nullptr ? image.binding.force_general : twice_here;
+			const bool  bound_written = spec == nullptr ? image.binding.shader_write : twice_here;
 			const bool  storage = binding.desc.type == TextureCache::BindingType::Storage;
 			const auto  found   = draw_state == nullptr ? decltype(draw_state->targets.end()) {}
 			                                                : std::ranges::find(draw_state->targets, binding.image_id,
@@ -1451,7 +1859,8 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 						const auto& desc = *bound.pending_desc;
 						set->pending_images.push_back({item.write.dstBinding, element, item.write.descriptorType, desc,
 						                               desc.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-						                                                   : vk::ImageLayout::eShaderReadOnlyOptimal});
+						                                                   : vk::ImageLayout::eShaderReadOnlyOptimal,
+						                               desc.info.HasMetadata()});
 					}
 					image_infos.push_back(MakeImageInfo(bound, occurrences.at(resource)++));
 					++element;
@@ -1503,6 +1912,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 #endif
 		);
 	set->resolution_epoch = epoch;
+	set->worker_storage   = worker_storage;
 	LiveCounters::Add(LiveCounters::TableEvaluations);
 	return publish();
 }
@@ -1617,6 +2027,13 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 		bool sampled = textures.IsSampledImageCurrent(dep.id, dep.desc, true);
 		bool current = sampled || textures.IsSampledDepthCurrent(dep.id, dep.desc, set.ResolutionEpoch(Role()));
 		const bool texture = dep.desc.type == TextureCache::BindingType::Texture;
+		// (Mode 4: a view of an image ResolveOverlap picked (a worker's set, FindImageReadOnly) fails IsSampledImageCurrent's
+		// own-backing proof; role 0's own validation proves it by the lookup below, any other by IsOverlapImageCurrent: the
+		// candidates unchanged since this role's last proof, the pick the same.)
+		if (!current && !own && (texture || dep.desc.type == TextureCache::BindingType::Storage) &&
+		    kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 &&
+		    textures.IsOverlapImageCurrent(dep.id, dep.desc, set.ResolutionEpoch(Role())))
+			current = true;
 		if (!current && own && (texture || dep.desc.type == TextureCache::BindingType::Storage) &&
 		    !m_context.GetCommandScheduler().Current().IsInvalid()) {
 			// A surface the game uses as depth and as colour in turn (0x28a010000 at 1-1 and Latria, twice a frame): the
@@ -1673,6 +2090,84 @@ static uint32_t TableCodeWord(const ShaderRecompiler::IR::TablePlan::Operand& op
 	const auto address = code + operand.value;
 	return operand.kind == ShaderRecompiler::IR::TablePlan::Operand::Kind::ShaderBaseLow ? static_cast<uint32_t>(address)
 	                                                                                    : static_cast<uint32_t>(address >> 32u);
+}
+
+// KYTY_SPEC_PAIR_DENSE_INDIRECT (live spec_pair_dense_indirect, default 0; KYTY_SPECULATE=4 only; the pipeline cache
+// sets CompileOptions::table_dense_indirect from it): a vertex or pixel table program's dense indirect image (T#s at heap +
+// table_offset + key * 32, the key below key_bound: IR::EnterTableMode) enumerated as resource materialization does
+// (IR::EnumerateDense: MaterializeDenseIndirectImage, the normal path's function, over the heap address the block's slots
+// give), with its counts. False: the normal path takes the draw. The enumeration's guest reads are the materialization
+// readers' (MaterializationReaders, as the address probe's): 1 KiB clean span reads of the table, word by word where a
+// span is refused, all through TryReadGpuCleanBackingToHost, which refuses GPU-dirty or GPU-modified bytes and, on a
+// speculation's thread, its own written or journaled ranges (the enumeration then fails: the normal path) and notes the
+// rest as the speculation's clean reads (SpeculationReadsClean / CleanReadKept): the commit re-checks them as it does
+// TableEvaluate's slot reads (NativeXprReader::Read -> ReadJournaled, noted clean): a hole or processor write over them
+// stops the commit before the reading segment (an unvalued read: any write; ReadJournaled's are valued). Its range sync
+// (MakeRangeReadable) refuses the speculation over GPU-written bytes (SyncGpuCleanBackingSpec); on the GPU thread it reads
+// them back, as the normal path's materialization does at that draw.
+[[gnu::noinline]] static bool TableEnumerateDense(const ShaderRecompiler::IR::TablePlan::IndirectImage& entry,
+                                                  const ShaderRecompiler::IR::ImageResource& root, uint64_t heap,
+                                                  const ShaderRecompiler::IR::SrtRuntime&    runtime,
+                                                  ShaderRecompiler::IR::AddressProbeCandidates& found) {
+	using Plan = ShaderRecompiler::IR::TablePlan;
+	// (KYTY_TABLE_INDIRECT=0 keeps indirect images off the table path: dispatches are declined for one, these draws too.)
+	if (kyty_local_table_indirect_mode.load(std::memory_order_relaxed) == 0)
+		return LiveCounters::Add(LiveCounters::SpecPairDenseRefusedIndirectOff), false;
+	if (!ShaderRecompiler::IR::EnumerateDense(entry.probe, root, heap, runtime, found))
+		return LiveCounters::Add(LiveCounters::SpecPairDenseUnreadable), false;
+	const auto count = static_cast<uint32_t>(found.descriptors.size());
+	uint32_t   valid = 0;
+	for (const auto& descriptor: found.descriptors)
+		if (std::ranges::any_of(descriptor.dwords, [](uint32_t word) { return word != 0; })) ++valid;
+	if (valid > 15) LiveCounters::Add(LiveCounters::SpecPairDenseWide);
+	if (found.dropped_shapes != 0) LiveCounters::Add(LiveCounters::SpecPairDenseShapeDrops);
+	if (count > Plan::IndirectCapacity) return LiveCounters::Add(LiveCounters::SpecPairDenseOverCapacity), false;
+	if (found.keys.size() > Plan::IndirectMaxKeys || found.candidates.size() != found.keys.size())
+		return LiveCounters::Add(LiveCounters::SpecPairDenseRefusedKeys), false;
+	if (count == 0) return LiveCounters::Add(LiveCounters::SpecPairDenseRefusedOther), false;
+	LiveCounters::Add(LiveCounters::SpecPairDenseTaken);
+	return true;
+}
+// KYTY_SPEC_PAIR_DENSE_INDIRECT: a dense candidate's words without the LOD statistics fields (NativeXprLodStatsMask), the
+// form its order and the set's key take.
+static std::array<uint32_t, 8> TableDenseLodMasked(const ShaderRecompiler::IR::DescriptorValue& candidate) {
+	std::array<uint32_t, 8> masked;
+	for (uint32_t w = 0; w < 8; ++w) masked[w] = candidate.dwords[w] & ~NativeXprLodStatsMask[w];
+	return masked;
+}
+// KYTY_SPEC_PAIR_DENSE_INDIRECT: a pixel program's indirect elements' LOD statistics words. TableEvaluate pushes 0 for
+// them (their plan descriptors have no words); element j (the root's indirect_resources[j]) takes candidates[j]'s, the T#
+// the set binds there (TableResolveSet's order), as RebindBuffers gives a normal path element its own T#'s. The stage's
+// words are the last `pushed` of `lod_stats`, by image; elements past the candidates (null images) keep 0. (`candidates`:
+// this root's, of TableEvaluate's `out`.)
+[[gnu::noinline]] static void TableDenseLodStats(const ShaderRecompiler::IR::CompiledShaderInfo&            program,
+                                                 const ShaderRecompiler::IR::TablePlan::IndirectImage&       entry,
+                                                 std::span<const ShaderRecompiler::IR::DescriptorValue>      candidates,
+                                                 std::vector<uint32_t>&                                      lod_stats) {
+	const auto pushed = std::min<size_t>(program.bindings.lod_stats_count, program.table_plan.images.size());
+	if (lod_stats.size() < pushed || entry.root >= program.info.images.size()) return;
+	const auto  base     = lod_stats.size() - pushed;
+	const auto& elements = program.info.images[entry.root].indirect_resources;
+	for (size_t j = 0; j < candidates.size() && j < elements.size(); ++j) {
+		if (elements[j] >= pushed) continue;
+		ShaderTextureResource desc;
+		std::memcpy(&desc, candidates[j].dwords.data(), sizeof(desc));
+		lod_stats[base + elements[j]] = desc.MipStatsCntEn() ? (0x80000000u | desc.MipStatsCntId() |
+		                                                        (uint32_t(desc.BaseLevel()) << 8u) |
+		                                                        (uint32_t(desc.MinLodWarn5()) << 12u))
+		                                                     : 0u;
+	}
+}
+// KYTY_SPEC_PAIR_DENSE_INDIRECT: a pixel program whose LOD statistics words are in its block (lod_stats_in_block, a
+// program with a dense root): the stage's words (the last `words` of `lod_stats`, by image) copied to
+// TablePlan::LodStatsBlockDword, where the shader reads them (TableDraw pushes none for it).
+[[gnu::noinline]] static void TableDenseLodToBlock(const ShaderRecompiler::IR::TablePlan& plan,
+                                                   const std::vector<uint32_t>& lod_stats, std::vector<uint32_t>& block) {
+	const auto words = std::min<size_t>(plan.lod_stats_words, lod_stats.size());
+	const auto at    = plan.LodStatsBlockDword();
+	if (block.size() < at + plan.lod_stats_words) return;
+	std::fill_n(block.begin() + at, plan.lod_stats_words, 0u);
+	std::copy_n(lod_stats.end() - static_cast<ptrdiff_t>(words), words, block.begin() + at);
 }
 
 // The slots of the pair's stages, read into their blocks where the plans address them from the user data and lower
@@ -1769,6 +2264,7 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 		auto&       out     = table.indirect[st];
 		out.clear();
 		if (program.table_plan.indirect.empty()) return true;
+		table.indirect_counts[st].clear(); // (read for a stage with an indirect image only)
 		thread_local const auto runtime = [] {
 			ShaderRecompiler::IR::SrtRuntime value;
 			MaterializationReaders(value);
@@ -1789,9 +2285,15 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 		using Plan = ShaderRecompiler::IR::TablePlan;
 		for (const auto& entry: program.table_plan.indirect) {
 			auto& found = table.probe;
-			if (!ShaderRecompiler::IR::EnumerateAddressProbe(entry.probe, program.info.images[entry.root],
-			                                                 address(entry.records_low, entry.records_high),
-			                                                 address(entry.heap_low, entry.heap_high), runtime, found))
+			// (KYTY_SPEC_PAIR_DENSE_INDIRECT: a vertex or pixel program's dense table, key_bound set (EnterTableMode takes
+			// no other form with one): TableEnumerateDense. The rest is the address probe's: the order, the mapping by
+			// key, the words in the set's key.)
+			if (entry.probe.key_bound != 0
+			        ? !TableEnumerateDense(entry, program.info.images[entry.root], address(entry.heap_low, entry.heap_high),
+			                               runtime, found)
+			        : !ShaderRecompiler::IR::EnumerateAddressProbe(entry.probe, program.info.images[entry.root],
+			                                                       address(entry.records_low, entry.records_high),
+			                                                       address(entry.heap_low, entry.heap_high), runtime, found))
 				return false;
 			const auto count = static_cast<uint32_t>(found.descriptors.size());
 			if (count == 0 || count > Plan::IndirectCapacity || found.keys.size() > Plan::IndirectMaxKeys ||
@@ -1799,10 +2301,24 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 				return false;
 			std::array<uint32_t, Plan::IndirectCapacity> order {}, position {};
 			for (uint32_t j = 0; j < count; ++j) order[j] = j;
-			std::sort(order.begin() + 1, order.begin() + count,
-			          [&](uint32_t a, uint32_t b) { return found.descriptors[a].dwords < found.descriptors[b].dwords; });
+			// (KYTY_SPEC_PAIR_DENSE_INDIRECT: a dense table's candidates ordered, and keyed below, by their words without the
+			// LOD statistics fields, as plain images are keyed: the game reassigns the counters every frame, which never
+			// change an image's resolution or view (NativeXprLodStatsMask), and a key of the full words would make a new
+			// set every frame. Candidates equal without them resolve to the same image: either order binds the same.
+			// The set's own reorder (TableResolveSet) and the LOD words (TableDenseLodStats) take the full words of `out`.)
+			const bool dense = entry.probe.key_bound != 0;
+			if (dense)
+				std::sort(order.begin() + 1, order.begin() + count, [&](uint32_t a, uint32_t b) {
+					return TableDenseLodMasked(found.descriptors[a]) < TableDenseLodMasked(found.descriptors[b]);
+				});
+			else
+				std::sort(order.begin() + 1, order.begin() + count,
+				          [&](uint32_t a, uint32_t b) { return found.descriptors[a].dwords < found.descriptors[b].dwords; });
 			for (uint32_t j = 0; j < count; ++j) position[order[j]] = j;
+			const auto first = out.size(); // (this root's candidates: out[first, first + count); several dense roots)
 			for (uint32_t j = 0; j < count; ++j) out.push_back(found.descriptors[order[j]]);
+			table.indirect_counts[st].push_back(count);
+			const auto own = std::span<const ShaderRecompiler::IR::DescriptorValue>(out).subspan(first, count);
 			std::array<uint32_t, Plan::IndirectMaxKeys> by_key {};
 			const auto keys = static_cast<uint32_t>(found.keys.size());
 			for (uint32_t k = 0; k < keys; ++k) by_key[k] = k;
@@ -1814,9 +2330,21 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 				mapping[1 + 2 * k] = found.keys[by_key[k]];
 				mapping[2 + 2 * k] = position[found.candidates[by_key[k]]];
 			}
+			// (KYTY_SPEC_PAIR_DENSE_INDIRECT: a pixel program's elements have LOD statistics words (a compute program's
+			// none): element j, which the set binds out[j] at, takes out[j]'s, as the normal path's element takes its
+			// own T#'s (RebindBuffers); the stage's words are the last ones pushed above, by image; the padding's null: 0.)
+			if (program.bindings.lod_stats_count != 0) TableDenseLodStats(program, entry, own, table.lod_stats);
 			words.push_back(count);
-			for (const auto& candidate: out) words.insert(words.end(), candidate.dwords.begin(), candidate.dwords.end());
+			if (dense)
+				for (const auto& candidate: own) {
+					const auto masked = TableDenseLodMasked(candidate);
+					words.insert(words.end(), masked.begin(), masked.end());
+				}
+			else
+				for (const auto& candidate: own) words.insert(words.end(), candidate.dwords.begin(), candidate.dwords.end());
 		}
+		// (KYTY_SPEC_PAIR_DENSE_INDIRECT: a dense pixel program's LOD statistics words, complete now, into its block.)
+		if (program.table_plan.lod_stats_words != 0) TableDenseLodToBlock(program.table_plan, table.lod_stats, table.blocks[st]);
 		return true;
 	};
 	for (uint32_t st = 0; st < stages; ++st) {
@@ -1924,7 +2452,8 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 				// (A retry that came back pending: the refused set is still the slot's.) (The GPU thread's only: workers
 				// would write the shared_ptr under the shared lock while others read it. A speculation's TableResolveSet keeps
 				// the catalog's read across its program lookup, its guest reads made without a fault; were it ever released
-				// there, the owner could destroy `retried` meanwhile (TableReset, the set collection, a publish).)
+				// there, the owner could destroy `retried` meanwhile (TableReset, the set collection, a publish). Mode 4
+				// does: `retried` is read below by the GPU thread's own call only.)
 				if (Spec::Current() == nullptr && retried != nullptr && set == nullptr && TableLearnPortable() == 2 &&
 				    m_context.GetPipelineCache().TablePending()) {
 					// (Under the catalog's write lock: workers read retry_wait under the shared one, and this assignment can drop
@@ -2345,11 +2874,37 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						const auto tick        = m_context.GetCommandScheduler().CurrentTick();
 						const auto cpu         = buffer_cache.CpuModificationEpoch(address, size); // (before the copy)
 						vk::DeviceAddress device = 0;
+						// (Mode 4: a speculation's copy used again within its translation, on the GPU thread's RingCopy
+						// terms (the same range, observation epoch, tick and tracker regions' CPU epoch, none 0; the checks
+						// above, CPU-dirty, not GPU-modified, no journaled write over it, made as before), in the same
+						// segment and wait count, with no Rollback since. What keeps the bytes is what keeps the GPU
+						// thread's share: the observation epoch, this thread's, which ProcessPm4Spec steps before every
+						// packet that is not a draw, dispatch or register packet (FlushDeferredProtection), so a share
+						// never crosses a label, write, wait or DMA. The use's note is the copy's (NoteCleanRead of the
+						// same range: the commit's checks see the same lists); the shader reads the copy's bytes at its
+						// address, in the same ring, fenced for the same commit.)
+						TableXpr::SpecRingCopy* spec_shared = nullptr;
+						if (spec != nullptr && cpu != 0 && ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+							if (!table.spec_ring_copies)
+								table.spec_ring_copies = std::make_unique<TableXpr::SpecRingCopy[]>(TableXpr::RingCopies);
+							spec_shared = &table.spec_ring_copies[((address ^ (size << 40u)) * 0x9e3779b97f4a7c15ull) >> 52u];
+						}
+						const auto spec_waits = [&] { return uint64_t {spec->waits.size()} + spec->covered_waits; };
+						const auto spec_own   = [&] {
+							const auto& own = spec_shared->copy;
+							return own.address == address && own.size == size && own.observation == observation &&
+							       own.tick == tick && own.cpu_epoch == cpu && own.device != 0 && spec_shared->id == spec->id &&
+							       spec_shared->segment == spec->closed.size() && spec_shared->rollbacks == spec->rollbacks &&
+							       spec_shared->waits == spec_waits();
+						};
 						if (shared != nullptr && cpu != 0 && shared->address == address && shared->size == size &&
 						    shared->observation == observation && shared->tick == tick && shared->cpu_epoch == cpu) {
 							device = shared->device;
 							LiveCounters::Add(LiveCounters::TableRingShared);
 							LiveCounters::Add(LiveCounters::TableRingSharedBytes, size);
+						} else if (spec_shared != nullptr && spec_own()) {
+							device = spec_shared->copy.device;
+							spec->NoteCleanRead(address, size);
 						} else if (auto [mapped, offset] = upload.Map(size, 16, false);
 						           mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(address, mapped, size)) {
 							upload.Commit();
@@ -2357,6 +2912,17 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 							device = upload.BufferDeviceAddress() + offset;
 							LiveCounters::Add(LiveCounters::TableRingCopies);
 							LiveCounters::Add(LiveCounters::TableRingBytes, size);
+							if (spec_shared != nullptr) // (after its note)
+								*spec_shared = {.copy      = {.address     = address,
+								                              .size        = size,
+								                              .observation = observation,
+								                              .tick        = tick,
+								                              .cpu_epoch   = cpu,
+								                              .device      = device},
+								                .id        = spec->id,
+								                .rollbacks = spec->rollbacks,
+								                .waits     = spec_waits(),
+								                .segment   = spec->closed.size()};
 							if (shared != nullptr && cpu != 0)
 								*shared = {.address     = address,
 								           .size        = size,
@@ -2434,7 +3000,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 					pending_here.push_back({plan.BufferDword(i), held.address, held.size, false,
 					                        program.info.buffers[i].formatted, false, held.registration});
 				else
-					spec->NoteBufferRange(held.address, held.size);
+					spec->NoteBufferRange(held.address, held.size), spec->NoteUnrel(held.address, held.size);
 			}
 			const auto [word, stride]      = word_of(words4);
 			block[plan.BufferDword(i)]     = static_cast<uint32_t>(held.device);
@@ -2531,6 +3097,37 @@ static bool TableSetApart(const Set& set, const State& draw_state) {
 		if (std::ranges::find(draw_state.target_ids, id) != draw_state.target_ids.end()) return false;
 	return true;
 }
+// (Mode 4) Whether TableTransit's target tests refuse the set under a draw state: an image the set holds as a target the
+// draw does not target, the reverse, or another attachment layout or access. (Those tests only: TableTransit may refuse
+// for another cause too.) A set's deps are laid out for the draw state it was resolved under (TableResolveSet: a target
+// in its attachment layout and access, any other image as a texture or storage), and its descriptors carry those
+// layouts; the pair's sets are keyed by the words alone.
+template<typename Set, typename State> // (RenderExecutor::TableImageSet, RenderExecutor::NativeXprDrawState)
+static bool TableTargetsDiffer(const Set& set, const State& draw_state) {
+	for (const auto& dep: set.images) {
+		const auto target    = std::ranges::find(draw_state.targets, dep.id, &State::Target::id);
+		const bool is_target = target != draw_state.targets.end();
+		if (dep.target != is_target ||
+		    (is_target && (target->layout != dep.layout || (target->access | dep.target_read) != dep.access)))
+			return true;
+	}
+	return false;
+}
+// (Mode 4) The draw state's targets (each one's image, attachment layout and access: what TableResolveSet lays a target
+// dep out from), the words' tag for the set resolved under them. All of them, not only those among the set's image_ids:
+// a set's pending slots are not there until its commit completes them.
+inline constexpr uint32_t TableTargetsTag = 0x7a4e5170u;
+template<typename State>
+static uint64_t TableTargetsKey(const State& draw_state) {
+	uint64_t key = TableTargetsTag;
+	for (const auto& target: draw_state.targets) {
+		const std::array<uint64_t, 3> part {uint64_t {target.id.index} | uint64_t {target.id.generation} << 32u,
+		                                    static_cast<uint64_t>(target.layout),
+		                                    static_cast<uint64_t>(static_cast<VkAccessFlags2>(target.access))};
+		key = XXH3_64bits_withSeed(part.data(), sizeof(part), key);
+	}
+	return key;
+}
 
 // A set's images in their layouts (other work may have moved them since the set was last bound), a DCC image's
 // pending fast clear applied first, as the normal path's FindTexture does (a speculation's refuses: its packet is a
@@ -2571,6 +3168,34 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 	for (const auto& dep: set.images) {
 		auto* image = textures.m_slot_images.try_get(dep.id);
 		if (image == nullptr) return false;
+		// A speculation's set (a catalog set reused without a lookup) naming an image released since (an area travel's
+		// unmap: DeleteImage -> RetireImage; erased once the packets of its release passed, which a packet that began
+		// after it does not hold back): refused before anything reads it further. One still registered here is held
+		// by this packet (Spec::PacketNow at a later release sees it). A view past the image's levels or layers too
+		// (Image::GetBarriers would walk states it does not have). Both on a speculation's thread only: the GPU
+		// thread's sets are proven against registrations before they get here (TableValidateSet).
+		// (One line each of the first 16, then every 256th: the address the set's view names.)
+		const auto say = [&](std::atomic<uint64_t>& count, const char* what) {
+			if (const auto n = count.fetch_add(1, std::memory_order_relaxed) + 1; n <= 16 || n % 256 == 0) {
+				std::printf("Table: %s (addr=0x%llx serial=%llu): %llu times\n", what,
+				            static_cast<unsigned long long>(dep.desc.info.data.address),
+				            static_cast<unsigned long long>(dep.serial), static_cast<unsigned long long>(n));
+				std::fflush(stdout);
+			}
+		};
+		if (Spec::Current() != nullptr && (!image->registered || image->serial != dep.serial)) {
+			static std::atomic<uint64_t> released {0};
+			say(released, "a speculation's set named an image released since, refused");
+			return Spec::Refuse("table: image released"), false;
+		}
+		if (Spec::Current() != nullptr && !dep.whole &&
+		    (dep.range.base_level + dep.range.level_count > image->info.resources.levels ||
+		     (!image->info.IsVolume() && // (a volume's slice views: GetBarriers takes its one layer)
+		      dep.range.base_layer + dep.range.layer_count > image->info.resources.layers))) {
+			static std::atomic<uint64_t> past {0};
+			say(past, "a speculation's set viewed past its image's levels or layers, refused");
+			return Spec::Refuse("table: view past its image"), false;
+		}
 		// A target of the draw: NativeXprEmitTargets put it in its attachment layout, which the set must have been
 		// made for; an image the set holds as a texture must not be one.
 		const auto target = draw_state == nullptr
@@ -2626,6 +3251,20 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 				    m_context.GetCommandScheduler().Current().RawHandle() != vk_buffer)
 					return false;
 				break;
+			}
+		}
+		// A depth image with an HTile clear pending: the normal path's FindTexture clears it first
+		// (KYTY_SAMPLE_PENDING_HTILE_CLEAR); the draw or dispatch is left to it.
+		if (image->info.IsDepth() && TextureCache::SampleHtileClearOn()) {
+			uint64_t meta    = 0;
+			bool     consume = false;
+			if (textures.SampleHtileClearPending(*image, dep.desc, &meta, &consume)) {
+				// (A speculation's: a hole that consumes the clear where the normal path does.)
+				if (auto* spec = Spec::Current()) {
+					if (consume) spec->ConsumeMeta(meta, 0);
+					return Spec::Refuse("table: depth texture with an HTile clear pending"), false;
+				}
+				return false;
 			}
 		}
 	}
@@ -2794,6 +3433,7 @@ static void TableScoutApply(Table& table, const Pair& pair, const Scout::Ticket&
 		in += ticket.slot_words[st];
 		segments += ticket.segments[st];
 		table.indirect[st].clear();
+		if (!pair.programs[st]->table_plan.indirect.empty()) table.indirect_counts[st].clear(); // (read for such a stage only)
 	}
 	in = segments;
 	table.words.assign(in, in + ticket.image_words);
@@ -2895,6 +3535,161 @@ static void TableScoutVerify(const Table& table, const Pair& pair, const Scout::
 		            differ[4] ? " apply" : "", detail);
 }
 
+// A speculation worker's table index-buffer bind and indirect draws under KYTY_SPECULATE=4 (Spec::State::reloc_on)
+// recorded as packets that carry the buffer handle and offset in a cell of their own (the packet's copy in the passive
+// producer's chunk), which the commit may rewrite (Speculation::RelocPatch: a registration that joined or replaced the
+// buffer since, the range's live buffer written in before the segment is spliced; nothing reads a passive producer's
+// chunk before its splice, and a discard reads none of it). Only over a game buffer; else (a ring copy, no worker
+// packets) the call is recorded as before.
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+namespace TableReloc {
+struct Packet {
+	VkCommandBuffer command = VK_NULL_HANDLE;
+	Spec::RelocCell cell;                 // (the copy's: RelocRef::cell points here)
+	uint32_t        op = 0, a = 0, b = 0; // 0 bind index (a: type); 1 draw indirect, 2 draw indexed indirect (a: count, b: stride)
+};
+static_assert(std::is_standard_layout_v<Packet> && std::is_trivially_copyable_v<Packet>);
+static void Replay(std::span<const LocalVulkanRecording::Segment> segments, const vk::detail::DispatchLoaderDynamic& dispatch) {
+	Packet packet;
+	std::memcpy(&packet, segments[0].data, sizeof(packet));
+	const auto command = LocalVulkanRecording::Resolve(packet.command);
+	const auto handle  = reinterpret_cast<VkBuffer>(packet.cell.buffer); // NOLINT (a 64-bit non-dispatchable handle)
+	if (packet.op == 0) dispatch.vkCmdBindIndexBuffer(command, handle, packet.cell.offset, static_cast<VkIndexType>(packet.a));
+	else if (packet.op == 1) dispatch.vkCmdDrawIndirect(command, handle, packet.cell.offset, packet.a, packet.b);
+	else dispatch.vkCmdDrawIndexedIndirect(command, handle, packet.cell.offset, packet.a, packet.b);
+}
+} // namespace TableReloc
+#endif
+// The call recorded as such a packet (true), with its reference noted in the speculation's state; false: record it plainly.
+// (A plain one over a game buffer, not a ring's copy (no guest address), is one more reference the commit cannot
+// relocate: noted as such, so the segment stops as before when a registration moved over its range.)
+// (No check that `used` is still the range's registered buffer: TableDraw found the registration epoch unmoved after its
+// lookups, and a registration after that moves it past the segment's base over the range, which the commit's Changed()
+// finds: the cell is then rewritten with the live buffer (RelocEligible / RelocPatch) or the segment stops.)
+// The caller calls it only with relocation on (a speculation's state with reloc_on).
+static bool TableRelocRecord(vk::CommandBuffer vk_buffer, Spec::State& spec, uint8_t kind,
+                             const std::pair<Buffer*, uint64_t>& used, uint64_t address, uint64_t size, uint32_t op,
+                             uint32_t a, uint32_t b) {
+	if (used.first == nullptr || size == 0 || used.first->CpuAddress() == 0) return false; // (a ring's copy: as before)
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	if (LocalVulkanRecording::Passive()) {
+		TableReloc::Packet packet {static_cast<VkCommandBuffer>(vk_buffer), {}, op, a, b};
+		packet.cell.buffer = reinterpret_cast<uint64_t>(static_cast<VkBuffer>(used.first->Handle())); // NOLINT
+		packet.cell.offset = used.second;
+		// (The cell is the packet's copy in the chunk: it stays there, unread, until the segment is spliced (replayed
+		// after) or discarded. The commit writes it on the GPU thread before the splice, the worker never after.)
+		const LocalVulkanRecording::Segment segment {&packet, sizeof(packet)};
+		void*                               copy = nullptr;
+		if (LocalVulkanRecording::EnqueuePacketCopy(TableReloc::Replay, segment, &copy) && copy != nullptr) {
+			auto* cell = reinterpret_cast<Spec::RelocCell*>(static_cast<std::byte*>(copy) + offsetof(TableReloc::Packet, cell));
+			spec.reloc_refs.push_back({address, address + size, kind, cell});
+			return true;
+		}
+	}
+#else
+	(void)vk_buffer, (void)kind, (void)op, (void)a, (void)b;
+#endif
+	spec.NoteUnrel(address, size);
+	return false;
+}
+
+// (Mode 4) A worker's table draw whose blocks, argument and index lookups saw the registration epoch move (the GPU thread's
+// registrations, anywhere: a speculation's lookups register nothing) is kept when no registration since reached the tracker
+// regions of a buffer range its open segment used (a superset of this draw's: its notes merge into them), and refused as
+// before otherwise. The commit's Changed() asks the same of those ranges since the speculation began.
+static bool TableWorkerKeepsMoved(const Spec::State& spec, const BufferCache& cache, uint64_t epoch) {
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return false;
+	for (size_t i = spec.Sealed().buffer_ranges; i < spec.buffer_ranges.size(); ++i) {
+		const auto& range = spec.buffer_ranges[i];
+		if (cache.RegisteredSince(range.begin, range.end - range.begin, epoch)) return false;
+	}
+	return true;
+}
+
+// (Mode 4, TableDraw's set: out of line, so the other modes' TableDraw carries none of it.) A set resolved under another
+// draw state, whose deps TableTransit's target tests refuse for this one's targets, is not the draw's: the words tagged with
+// the draw state's targets (TableTargetsKey, three words more than any words TableEvaluate makes, so no untagged lookup
+// compares equal) find, or resolve, the set made for them, in a slot of its own (TableSet: the same lookups, proofs and
+// publication, the tagged words the set's key); the untagged words back right after. The set found is tested again by
+// TableTransit as any. The memo's set is not offered to the second call: a first call that took the role's last set may
+// have run the collection, which can have destroyed it.
+RenderExecutor::TableImageSet* RenderExecutor::TableDrawStateSet(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
+                                                                 const NativeXprDrawState& draw_state, TableImageSet* set,
+                                                                 Spec::State* spec_state) {
+	auto& table = OwnTable();
+	if (TableTargetsDiffer(*set, draw_state)) {
+		const auto key  = TableTargetsKey(draw_state);
+		const auto size = table.words.size();
+		table.memo_set    = nullptr;
+		table.memo_verify = false;
+		table.words.push_back(TableTargetsTag);
+		table.words.push_back(static_cast<uint32_t>(key));
+		table.words.push_back(static_cast<uint32_t>(key >> 32u));
+		set = TableSet(buffer, pair, &variant, &draw_state);
+		// The tagged slot's set made for these targets and still not laid out for them (a worker's, published before its
+		// commit's completion refused such a slot, below): the owner retires it, as its own path retires a set found
+		// invalid, and resolves the slot's set afresh under this draw state. A speculation leaves it to the owner (its draw
+		// a hole). (A worker's only: the owner's own build is laid out for the draw state it ran under, and one that
+		// differed would be retired at every draw.)
+		if (set != nullptr && spec_state == nullptr && Role() == 0 && set->proposer != 0 && TableTargetsDiffer(*set, draw_state)) {
+			bool retired = false;
+			{
+				const auto write = CatalogWrite();
+				const auto found = pair.sets.find(XXH3_64bits(set->words.data(), set->words.size() * sizeof(uint32_t)));
+				if (found != pair.sets.end() && found->second.get() == set) {
+					if (table.last_set == set) table.last_set = nullptr;
+					pair.ClearSets();
+					++table.epoch;
+					NativeXprRetireSet(set->pool, set->set);
+					pair.sets.erase(found);
+					retired = true;
+				}
+			}
+			if (retired) set = TableSet(buffer, pair, &variant, &draw_state);
+		}
+		table.words.resize(size);
+	}
+	// A set this translation proposed with pending slots notes the draw's targets, which its commit's completion must not
+	// hold as textures (TableCompletePendingImages).
+	if (spec_state != nullptr && set != nullptr && !set->pending_images.empty() && set->proposer == spec_state->id)
+		for (const auto& target: draw_state.targets)
+			if (std::ranges::find(set->pending_targets, target.id) == set->pending_targets.end())
+				set->pending_targets.push_back(target.id);
+	return set;
+}
+
+// (Mode 4, TableDraw's spec_in_place: out of line, so the other modes' TableDraw carries none of it.) The speculation's
+// key of its executor's last table draw (TableXpr::spec_place) is this draw's: the same translation, segment, chain head,
+// images epoch, overlay and open-write generations and capture.
+template <typename Table>
+[[gnu::noinline]] static bool TableSpecInPlace(const Table& table, const Spec::State& spec, uint64_t images_epoch,
+                                               uint64_t capture_id) {
+	return table.spec_place.id == spec.id && table.spec_place.segment == spec.closed.size() &&
+	       table.spec_place.chain == spec.previous.load(std::memory_order_acquire) && table.spec_place.images == images_epoch &&
+	       table.spec_place.overlay == spec.overlay_gen && table.spec_place.open == spec.open_gen &&
+	       table.spec_place.capture == capture_id;
+}
+// The speculation's facts an emission can note (a meta answer, a left clear, a consumed clear): their count.
+[[gnu::noinline]] static size_t TableSpecFacts(const Spec::State& spec) {
+	return spec.meta_facts.size() + spec.left_clears.size() + spec.consume_pending.size();
+}
+// The draw's key for spec_in_place, its own transits and writes taken (`keyable`, and no fact noted since
+// `facts_before`), else none.
+template <typename Table>
+[[gnu::noinline]] static void TableSpecPlaceNote(Table& table, const Spec::State& spec, uint64_t images_epoch, uint64_t capture_id,
+                                                 size_t facts_before, bool keyable) {
+	if (TableSpecFacts(spec) == facts_before && keyable)
+		table.spec_place = {.id      = spec.id,
+		                    .images  = images_epoch,
+		                    .overlay = spec.overlay_gen,
+		                    .open    = spec.open_gen,
+		                    .capture = capture_id,
+		                    .segment = spec.closed.size(),
+		                    .chain   = spec.previous.load(std::memory_order_acquire)};
+	else
+		table.spec_place.id = 0;
+}
+
 RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
                                                       const NativeXprDrawState& draw_state,
                                                       std::span<const uint64_t> commands, uint64_t index_base,
@@ -2902,12 +3697,16 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
                                                       const NativeXprDirectDraw* direct) {
 	auto&       table  = OwnTable();
 	// (A speculative translation's state, read once behind a plain global: KYTY_SPECULATE unset, no thread-local
-	// reads in the draw.)
-	Spec::State* const spec_state =
-	    ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr;
+	// reads in the draw. The mode kept for the set's target test below.)
+	const auto         speculate_mode = ::kyty_local_speculate_mode.load(std::memory_order_relaxed);
+	Spec::State* const spec_state     = speculate_mode != 0 ? Spec::Current() : nullptr;
+	// (A speculation's relocatable index buffer and draw arguments, TableRelocRecord: nothing of it runs without one.)
+	const bool reloc = spec_state != nullptr && spec_state->reloc_on;
 	auto&       cache  = *m_native_xpr;
 	const auto& sh     = buffer.GetShaders();
 	const auto  stages = pair.programs[1] != nullptr ? 2u : 1u;
+	// (KYTY_SPEC_PAIR_PUSH_FIT's row, mode 4 only: the mode in a register, the pair's flag not read in the other modes.)
+	if (speculate_mode == 4 && pair.push_fit) [[unlikely]] LiveCounters::Add(LiveCounters::SpecPairPushFitDraws);
 	const std::array<std::span<const uint32_t>, 2> user_data {std::span<const uint32_t> {sh.GetVs().gs_user_sgpr.value},
 	                                                          std::span<const uint32_t> {sh.GetPs().ps_user_sgpr.value}};
 	// (The index buffer's held entry, a cold line of a 320 KiB table, loads while the tables are evaluated.)
@@ -2933,9 +3732,20 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 2);
 	auto* set = TableSet(buffer, pair, &variant, &draw_state);
+	// (Mode 4: a set resolved under another draw state, TableDrawStateSet, out of line.)
+	if (set != nullptr && speculate_mode == 4) [[unlikely]]
+		set = TableDrawStateSet(buffer, pair, variant, draw_state, set, spec_state);
 	if (spec_state != nullptr && set != nullptr)
 		spec_state->NoteSet(reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(set->set)));
 	if (set == nullptr) return LiveCounters::Add(LiveCounters::TableNoSet), Spec::Refuse("table: no set"), TableResult::Native;
+	// (Mode 4: a state a worker derived from a sibling's capture has that capture's attachment layouts, made for shaders that
+	// sampled no target: a set that holds a target leaves the table path, and an entry not yet published with it. The GPU
+	// thread's in-order draw: its caller takes the store path, t_store_derived.)
+	if (draw_state.derived && !TableSetApart(*set, draw_state)) {
+		if (t_entry_poison != nullptr) t_entry_poison->store(true, std::memory_order_relaxed);
+		if (spec_state == nullptr && Role() == 0 && Spec::Current() == nullptr) t_store_derived = true;
+		return Spec::Refuse("table: derived state, a target sampled"), TableResult::Native;
+	}
 
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 3);
@@ -2971,7 +3781,14 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		const auto registration_before = buffer_cache.RegistrationEpoch(); // (a speculation's: before its lookup)
 		std::optional<BufferCache::AheadSite> ahead_site; // (the lookup's site: read by a speculation's lookup only)
 		if (spec_state != nullptr) ahead_site.emplace(&held == &table.args ? 4 : 3);
-		const auto result = buffer_cache.ObtainBuffer(address, size, false);
+		// (Relocation on: these lookups' references are recorded relocatable, not noted as other references.)
+		struct RelocScope {
+			uint8_t old;
+			explicit RelocScope(uint8_t kind): old(std::exchange(Spec::t_reloc_scope, kind)) {}
+			~RelocScope() { Spec::t_reloc_scope = old; }
+		};
+		const auto lookup = [&] { return buffer_cache.ObtainBuffer(address, size, false); };
+		const auto result = reloc ? (RelocScope(&held == &table.args ? Spec::RelocArgs : Spec::RelocIndex), lookup()) : lookup();
 		region_epochs.fill({UINT64_MAX, 0}); // (its uploads may have moved them)
 		const auto owner  = spec_state != nullptr ? buffer_cache.RegisteredBuffer(address, size)
 		                                               : buffer_cache.FindBuffer(address, size);
@@ -3034,7 +3851,8 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		});
 		if (indices.first == nullptr) return TableResult::Native;
 	}
-	if (buffer_cache.RegistrationEpoch() != registration)
+	if (buffer_cache.RegistrationEpoch() != registration &&
+	    (spec_state == nullptr || !TableWorkerKeepsMoved(*spec_state, buffer_cache, registration)))
 		return LiveCounters::Add(LiveCounters::TableRegistered), TableResult::Native;
 	// (A speculation's lookups and preparation refuse without failing: nothing is recorded for a refused draw.)
 	if (spec_state != nullptr && spec_state->refused != nullptr) return TableResult::Native;
@@ -3053,9 +3871,29 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	    set->read_after_write && kyty_local_draw_read_after_write.load(std::memory_order_relaxed) != 0;
 	const bool in_place      = same_command && emit.state == &draw_state && table.last_set == set &&
 	                      table.images_epoch == images_epoch && own && !read_after_write;
+	// (Mode 4) A speculation's draw in place too (spec_in_place: NativeXprEmitTargets and TableTransit skipped) when its
+	// executor's last table draw (TableXpr::spec_place, taken at that draw's end) drew the same draw state (and capture)
+	// and set into the same command buffer, as the GPU thread's in_place, in the same translation, segment and chain
+	// before it, and since then:
+	// - TextureCache::ImagesEpoch has not moved from its value before that draw's checks (image states, registration,
+	//   metadata, CPU-written bytes: what the GPU thread's own in_place trusts for the cache's side);
+	// - no overlay entry was taken (State::overlay_gen: Image::SpeculativeEntry, through which every transition and every
+	//   read of the speculation's image states goes, its first touch in the segment included);
+	// - the open segment noted no write (State::open_gen: NoteWritten, Journal; OpenSegmentWrites* read only those).
+	// Then the two calls would read what they read for that draw and decide the same: no refusal (it passed), no
+	// transition (the overlay holds the layouts it left), and their notes are already the segment's: the entries' found
+	// states and used marks (per segment), the sampled levels (min / max of the same ranges), pending targets (in the
+	// segment already). A draw whose emission noted a meta answer, a left clear or a consumed clear leaves no key (those
+	// answers came from the cache, whose bits some changes move without moving ImagesEpoch), nor does a worker-captured
+	// draw state (its depth access follows its target's uniformity, which a partial transit splits).
+	// (TableSpecInPlace, TableSpecFacts, TableSpecPlaceNote: out of line.)
+	const bool spec_emit     = !own && speculate_mode == 4;
+	const bool spec_in_place = spec_emit && same_command && emit.state == &draw_state && table.last_set == set &&
+	                           !read_after_write && TableSpecInPlace(table, *spec_state, images_epoch, draw_state.capture_id);
+	const size_t spec_facts_before = spec_emit ? TableSpecFacts(*spec_state) : 0;
 	// KYTY_TABLE_SERIALS: the checks again only when a serial sum moved (1), or as before with the sums counted (2).
 	const auto serials = own ? TableSerialsMode() : 0u;
-	if (!in_place) {
+	if (!in_place && !spec_in_place) {
 		// The same for the targets apart, as this draw state's last emission left them, and the set's images, as its
 		// last transit under this state did (the passes alternate materials: another set or state in between).
 		const bool epoch_targets = !own || draw_state.emitted_epoch != images_epoch;
@@ -3096,15 +3934,27 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			}
 		}
 	}
-	m_context.GetCommandScheduler().BeginRendering(draw_state.rendering);
+	if (spec_state != nullptr && draw_state.virtual_targets != nullptr) {
+		// (Mode 4: its rendering names colour targets its commit makes: the begin recorded with view cells.)
+		const CommandBuffer::RenderingHookScope hook(&TableVirtualRendering, draw_state.virtual_targets.get());
+		m_context.GetCommandScheduler().BeginRendering(draw_state.rendering);
+	} else {
+		m_context.GetCommandScheduler().BeginRendering(draw_state.rendering);
+	}
 	if (same_command && emit.state != &draw_state && emit.state != nullptr &&
 	    emit.state->dynamic_hash == draw_state.dynamic_hash &&
 	    std::memcmp(&emit.state->dynamic, &draw_state.dynamic, sizeof(draw_state.dynamic)) == 0)
 		emit.state = &draw_state;
 	if (!same_command || emit.state != &draw_state) NativeXprEmitDynamic(cache, vk_buffer, draw_state, same_command);
 	const auto& pipeline = *variant.pipeline;
-	if (!same_command || emit.pipeline != &pipeline)
-		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, BindPipelineHandle(pipeline));
+	if (!same_command || emit.pipeline != &pipeline) {
+		// (Mode 4: a parked entry's stand-in (no handle): bound through a cell its commit writes.)
+		if (spec_state != nullptr && t_entry_parked != nullptr && &pipeline == t_entry_parked->parked_stand_in.get()) {
+			if (!TableParkedBind(vk_buffer, *t_entry_parked)) return Spec::Refuse("parked pipeline: bind not recorded"), TableResult::Native;
+		} else {
+			vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, BindPipelineHandle(pipeline));
+		}
+	}
 	if (!same_command || emit.pipeline != &pipeline || table.last_set != set)
 		vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline.pipeline_layout, 0, 1, &set->set, 0,
 		                             nullptr);
@@ -3120,7 +3970,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			const auto index = bindings.user_data_registers[i] - program.user_data_base;
 			push_data.dwords[bindings.push_data_start_dword + i] = index < user_data[st].size() ? user_data[st][index] : 0;
 		}
-		if (program.stage == ShaderType::Pixel)
+		// (KYTY_SPEC_PAIR_DENSE_INDIRECT: a program with its LOD statistics words in its block has none here: TableEvaluate
+		// put them there.)
+		if (program.stage == ShaderType::Pixel && !bindings.lod_stats_in_block)
 			for (size_t i = 0; i < table.lod_stats.size(); ++i)
 				push_data.dwords[bindings.push_data_start_dword + bindings.LodStatsDword() + i] = table.lod_stats[i];
 		push_data.dwords[bindings.push_data_start_dword + bindings.TableBlockDword()]     = static_cast<uint32_t>(blocks[st]);
@@ -3130,7 +3982,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
 		                        vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 		                        push_dwords * sizeof(uint32_t), push_data.dwords.data());
-	if (!same_index) vk_buffer.bindIndexBuffer(indices.first->Handle(), indices.second, index_type);
+	if (!same_index && !(reloc && TableRelocRecord(vk_buffer, *spec_state, Spec::RelocIndex, indices, index_base, index_bytes,
+	                                               0, static_cast<uint32_t>(static_cast<VkIndexType>(index_type)), 0)))
+		vk_buffer.bindIndexBuffer(indices.first->Handle(), indices.second, index_type);
 	if (direct != nullptr && !vertex_arguments) {
 		// This draw's offsets, as the normal path's ResolveVertexOffset/ResolveInstanceOffset give them: the index
 		// offset register, else (a vertex program that fetches) the user data its fetch adds.
@@ -3151,7 +4005,12 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	}
 	// (A draw of vertices of GPU-read arguments: their first vertex and instance from them, as the normal path's
 	// DrawAuto with gpu_args gives them (DrawOffsetSource::IndirectArgs), not from the index offset or user data.)
-	for (uint32_t group = 0; group < groups; ++group) {
+	for (uint32_t group = 0, group_first = 0; group < groups; group_first += group_sizes[group++]) {
+		// (Relocation: the group's guest address, its first command, the groups' sizes summed before it.)
+		if (reloc && TableRelocRecord(vk_buffer, *spec_state, Spec::RelocArgs, arguments[group], commands[group_first],
+		                              uint64_t {group_sizes[group]} * stride, vertex_arguments ? 1u : 2u, group_sizes[group],
+		                              static_cast<uint32_t>(stride)))
+			continue;
 		if (vertex_arguments)
 			vk_buffer.drawIndirect(arguments[group].first->Handle(), arguments[group].second, group_sizes[group],
 			                       static_cast<uint32_t>(stride));
@@ -3178,6 +4037,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	table.last_state   = &draw_state;
 	table.last_set     = set;
 	table.images_epoch = texture_cache.ImagesEpoch();
+	// (Mode 4: this draw's key for spec_in_place, its own transits and writes taken; none after an emission that noted a
+	// cache answer, or for a worker-captured state.)
+	if (spec_emit) [[unlikely]]
+		TableSpecPlaceNote(table, *spec_state, images_epoch, draw_state.capture_id, spec_facts_before,
+		                   !draw_state.worker_captured);
 	if (vertex_arguments && groups != 0) { // (KYTY_SPEC_DRAW_INDIRECT_VERIFY: what it read)
 		auto&       noted  = m_table_args_emit;
 		const auto* source = arguments[0].first;
@@ -3395,6 +4259,7 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 		{
 			const auto write = CatalogWrite();
 			pair->programs   = programs;
+			pair->push_fit   = Spec::On() && PipelineCache::t_push_fit_taken; // (the lookup above: mode 4 sets it)
 			TableRuns(*pair);
 			TableScoutPublish(*pair);
 		}
@@ -3460,7 +4325,7 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 		variant->mapping        = mapping;
 		variant->fetch_embedded = table_state.vs_input_info.fetch_embedded;
 	}
-	NativeXprCaptureState(buffer, state, rendering, table.store_state);
+	NativeXprCaptureState(buffer, state, rendering, table.store_state, topology, primitive_restart_enable);
 }
 
 // --- Table dispatches ---------------------------------------------------------------------------------------------
@@ -3648,24 +4513,51 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 3);
 	std::array<vk::DeviceAddress, 2> blocks {};
-	bool                             storage_writes = false;
-	auto&                            cache          = m_context.GetBufferCache();
-	TablePrepareBda(pair, user_data); // (as TableDraw's: before the blocks)
-	const auto                       registration   = cache.RegistrationEpoch(); // (as TableDraw's)
-	if (!TableBlocks(pair, user_data, blocks, &storage_writes)) return m_dispatch_declined = "table: blocks", false;
-	vk::Buffer indirect_buffer = nullptr;
-	uint64_t   indirect_offset = 0;
-	if (indirect_args != 0) {
-		// As DispatchDirect's: the arguments' owner, made current.
-		cache.EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
-		const auto id = cache.FindBuffer(indirect_args, 3u * sizeof(uint32_t));
-		if (Spec::Current() != nullptr && Spec::Current()->refused != nullptr) return false;
-		auto& owner     = cache.GetBuffer(id);
-		indirect_buffer = owner.Handle();
-		indirect_offset = owner.Offset(indirect_args);
+	bool                             storage_writes  = false;
+	auto&                            cache           = m_context.GetBufferCache();
+	vk::Buffer                       indirect_buffer = nullptr;
+	uint64_t                         indirect_offset = 0;
+	// (Mode 4) A speculation's dispatch whose lookups saw the buffer registration epoch move under them takes back its
+	// notes since its BDA preparation (State::RollbackTo) and takes its preparation, blocks and arguments once more at
+	// once, from the epoch then; a second move refuses as before. A first take that recorded work (RecordedWrites moved)
+	// is refused as before, never taken again, so no recorded work outlives its notes. What the first take did besides
+	// its notes (ring copies no command reads, posted ranges) is what a refused packet's Rollback leaves too.
+	auto* const retry_spec =
+	    kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? Spec::Current() : nullptr;
+	std::optional<Spec::Counts> retry_mark;
+	bool                        retry_bda  = false;
+	uint64_t                    retry_work = 0;
+	if (retry_spec != nullptr) {
+		retry_mark.emplace(retry_spec->Sizes());
+		retry_bda  = retry_spec->bda_all;
+		retry_work = LocalVulkanRecording::RecordedWrites();
 	}
-	if (cache.RegistrationEpoch() != registration)
+	for (uint32_t attempt = 0;; ++attempt) {
+		TablePrepareBda(pair, user_data); // (as TableDraw's: before the blocks)
+		const auto registration = cache.RegistrationEpoch(); // (as TableDraw's)
+		if (!TableBlocks(pair, user_data, blocks, &storage_writes)) return m_dispatch_declined = "table: blocks", false;
+		if (indirect_args != 0) {
+			// As DispatchDirect's: the arguments' owner, made current.
+			cache.EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
+			const auto id = cache.FindBuffer(indirect_args, 3u * sizeof(uint32_t));
+			if (Spec::Current() != nullptr && Spec::Current()->refused != nullptr) return false;
+			auto& owner     = cache.GetBuffer(id);
+			indirect_buffer = owner.Handle();
+			indirect_offset = owner.Offset(indirect_args);
+		}
+		if (cache.RegistrationEpoch() == registration) break;
+		if (attempt == 0 && retry_spec != nullptr && retry_spec->refused == nullptr &&
+		    LocalVulkanRecording::RecordedWrites() == retry_work) {
+			// (The blocks and arguments again, from the epoch now: what the commit checks is noted again by them.)
+			retry_spec->RollbackTo(*retry_mark, retry_bda);
+			blocks          = {};
+			storage_writes  = false;
+			indirect_buffer = nullptr;
+			indirect_offset = 0;
+			continue;
+		}
 		return LiveCounters::Add(LiveCounters::TableRegistered), m_dispatch_declined = "table: buffers registered meanwhile", false;
+	}
 	// (A speculation's lookups and preparation refuse without failing: nothing is recorded for a refused dispatch.)
 	if (const auto* spec = Spec::Current(); spec != nullptr && spec->refused != nullptr) return false;
 	phase.reset();
@@ -3738,4 +4630,1472 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	// (A later table draw binds its pipeline and set again: the graphics state is untouched.)
 	LiveCounters::Add(LiveCounters::TableDispatches);
 	return true;
+}
+
+// --- Mode 4: a worker's own capture of a draw state ---------------------------------------------------------------------
+//
+// A speculation's thread, TableWorkerEntry's state choice for a draw whose context no capture exists of (no sibling): the
+// state from the worker's own build of the draw's targets, as PrepareDrawRenderState resolves them (slice offset 0: the
+// table path's draws have none) and AcquireRenderTargets makes the rendering, but read only (TextureCache::ReadOnlyScope with
+// t_read_only_targets: FindImage takes FindTargetReadOnly, the resolvers bind nothing): each target an existing,
+// registered, current image already used as that kind of target, with an existing attachment view (FindTargetViewReadOnly);
+// a colour target whose in-order FindImage reuses an existing image, that image (its pick noted: `adopted`, proven again at
+// the commit); a colour target with no image on its pages, no metadata or DCC metadata, left to the commit to make
+// (`virtual_targets`); else null. Layouts attachment-optimal (a colour target's ColorAttachmentOptimal, the depth's
+// depth_attachment_layout), the depth's access as the normal path's acquisition gives it (DepthAttachmentAccess, from the
+// image's state as this speculation sees it at the draw: its overlay entry, the state at its first touch, which the commit
+// restores before the replay; no aspect sampled, a draw under this state whose shaders sample a target leaving the table
+// path: TableDraw), no clears (a draw that clears is refused, as a speculation refuses a DB clear), the acquisition left to
+// the commit as for any state (spec_commit_targets). Marked `derived`: the table path's only (the native record refuses it;
+// a set holding one of its targets leaves the table path, TableDraw, and the GPU thread's in-order draw then stores the
+// real state). The dynamic state as NativeXprCaptureState takes it (CaptureZeroed), its indexed viewports set by the caller
+// from the normal vertex program. The refusals decided by the registers alone come first (the MSAA resolve, the DB
+// clears; the depth target's own clear flags are DB_RENDER_CONTROL's too). `ctx_hash`: the caller's WorkerEntryContextHash.
+// The texture cache's lock is taken under the catalog's read lock (the order the workers' image sets keep); no guest
+// memory is read and nothing records.
+std::unique_ptr<RenderExecutor::NativeXprDrawState> RenderExecutor::WorkerCaptureTargets(CommandBuffer& buffer,
+                                                                                         vk::PrimitiveTopology topology,
+                                                                                         bool restart, uint64_t ctx_hash) {
+	const auto& hw = buffer.GetRegisters();
+	if (hw.GetColorControl().mode == 3) return nullptr; // (an MSAA resolve: the normal path's own copy)
+	if (hw.GetRenderControl().depth_clear_enable || hw.GetRenderControl().stencil_clear_enable) return nullptr;
+	auto* const spec = Spec::Current();
+	if (spec == nullptr) return nullptr;
+	// (The attempt's lookup flags, reset on every way out.)
+	struct Flags {
+		Flags() {
+			TextureCache::t_virtual_targets_ok = TableCellsRecordable();
+			TextureCache::t_adopt_targets_ok   = true;
+			if (!TextureCache::t_adopt_picks.empty()) TextureCache::t_adopt_picks.clear();
+		}
+		~Flags() {
+			TextureCache::t_read_only_targets  = false;
+			TextureCache::t_virtual_targets_ok = false;
+			TextureCache::t_virtual_hit        = false;
+			TextureCache::t_adopt_targets_ok   = false;
+			if (!TextureCache::t_adopt_picks.empty()) TextureCache::t_adopt_picks.clear();
+		}
+		Flags(const Flags&)            = delete;
+		Flags& operator=(const Flags&) = delete;
+	} flags;
+	uint32_t virtual_slots = 0; // (the colour attachments found with no image, a bit each)
+	auto     state_storage = std::make_unique<DrawRenderState>();
+	auto&    state         = *state_storage;
+	{
+		const TextureCache::ReadOnlyScope read_only;
+		TextureCache::t_read_only_targets = true;
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			if (slot == 0 || (render_target_mask_slot(hw.GetRenderTargetMask(), slot) != 0 && hw.GetRenderTarget(slot).base.addr != 0)) {
+				TextureCache::t_virtual_hit = false;
+				ResolveRenderColorTarget(buffer, state.color_info[state.color_count], 0, slot);
+				if (state.color_info[state.color_count].image_id) {
+					state.color_count++;
+				} else if (TextureCache::t_virtual_hit) { // (kept: the commit makes its image)
+					virtual_slots |= 1u << state.color_count;
+					state.color_info[state.color_count].image_id = NativeXprDrawState::VirtualId();
+					state.color_count++;
+				}
+			}
+		}
+		TextureCache::t_virtual_hit = false;
+		ResolveRenderDepthTarget(buffer, state.depth_info);
+		TextureCache::t_read_only_targets = false;
+		if (TextureCache::ReadOnlyFailed() != nullptr) return nullptr;
+		if (TextureCache::t_virtual_hit) return nullptr; // (a depth target is never left to the commit)
+	}
+	state.ps_active = DrawHasActivePixelShader(buffer);
+	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) return nullptr;
+	if (state.depth_info.depth_clear_enable || state.depth_info.stencil_clear_enable) return nullptr;
+	// The colour targets with no image, made by the commit ahead of the segment's replay (TableEntryResolveVirtual). Declined
+	// (refused, as with no image) when that is not where the in-order draw makes it: a pending image of the open segment
+	// (spec_worker_images: completed by the commit after this target's making, in order before it); its memory written by
+	// the open segment (the making's upload would read it before those writes); another such target over that memory in this
+	// translation or this draw (each commit makes its own: in order the second finds the first); a DCC one's metadata with a
+	// clear or consume fact of the open segment's own (from after this segment's packet: not in the records the commit's
+	// FindRenderTarget reads).
+	std::shared_ptr<NativeXprDrawState::Virtual> virt;
+	if (virtual_slots != 0) {
+		for (const auto& proposed: spec->proposed_sets)
+			if (proposed.segment == spec->closed.size() && proposed.complete) return nullptr;
+		auto& ranges = TextureCache::t_virtual_ranges;
+		ranges.Hold(spec->id);
+		virt                       = std::make_shared<NativeXprDrawState::Virtual>();
+		virt->segment              = spec->closed.size();
+		const auto sealed          = spec->Sealed();
+		virt->from_current         = sealed.current;
+		virt->from_written         = sealed.written;
+		virt->from_invalidated     = sealed.invalidated;
+		virt->from_texel_syncs     = sealed.texel_syncs;
+		virt->from_buffer_ranges   = sealed.buffer_ranges;
+		virt->from_cpu_copies      = sealed.cpu_copies;
+		virt->from_pending_buffers = sealed.pending_buffers;
+		virt->from_table_ranges    = sealed.table_ranges;
+		for (uint32_t i = 0; i < state.color_count; ++i) {
+			if (((virtual_slots >> i) & 1u) == 0) continue;
+			const auto& info = state.color_info[i].desc.info;
+			if (spec->OpenSegmentWritesAny() && spec->OpenSegmentWritesImage(info)) return nullptr;
+			if (ranges.Overlaps(info.data.address, info.data.size)) return nullptr;
+			for (const auto& other: virt->targets)
+				if (other.desc.info.data.address < info.data.address + info.data.size &&
+				    info.data.address < other.desc.info.data.address + other.desc.info.data.size)
+					return nullptr;
+			if (info.metadata.kind == ImageMetadataKind::Dcc)
+				for (const auto& fact: spec->meta_facts)
+					if (fact.address == info.metadata.range.address && fact.first > spec->closed.size()) return nullptr;
+			virt->targets.push_back({i, 0, state.color_info[i].desc});
+		}
+	}
+	uint32_t    virtual_index = 0; // (the next of virt->targets, in attachment order)
+	auto&       textures      = m_context.GetTextureCache();
+	const auto  metadata_of   = [](const TextureCache::ImageDesc& desc) {
+		return desc.info.metadata.kind == ImageMetadataKind::None ? uint64_t {0} : desc.info.metadata.range.address;
+	};
+	auto        made = std::make_unique<NativeXprDrawState>();
+	RenderState rendering {};
+	rendering.width                 = std::numeric_limits<uint32_t>::max();
+	rendering.height                = std::numeric_limits<uint32_t>::max();
+	rendering.num_layers            = std::numeric_limits<uint32_t>::max();
+	rendering.num_color_attachments = state.color_count;
+	uint32_t samples                = 0;
+	for (uint32_t i = 0; i < state.color_count; ++i) {
+		const auto&              target = state.color_info[i];
+		TextureCache::TargetView found;
+		if (((virtual_slots >> i) & 1u) != 0) { // (its view the commit's; a placeholder till then)
+			virt->targets[virtual_index].target = static_cast<uint32_t>(made->targets.size());
+			found.view                          = virt->Placeholder(virtual_index++);
+		} else if (!textures.FindTargetViewReadOnly(target.image_id, target.desc, found)) {
+			return nullptr;
+		}
+		if (samples == 0) samples = target.desc.info.samples;
+		else if (samples != target.desc.info.samples) return nullptr;
+		const auto& view   = target.desc.view_info;
+		const auto  layout = vk::ImageLayout::eColorAttachmentOptimal;
+		const auto  access = vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
+		const auto  extent = target.Extent();
+		rendering.width                             = std::min(rendering.width, extent.width);
+		rendering.height                            = std::min(rendering.height, extent.height);
+		rendering.num_layers                        = std::min(rendering.num_layers, view.layer_count);
+		rendering.color_attachments[i].image_view   = found.view;
+		rendering.color_attachments[i].image_layout = layout;
+		made->targets.push_back({target.image_id, layout, access,
+		                         {view.base_level, view.level_count, view.base_layer, view.layer_count},
+		                         metadata_of(target.desc), view.base_layer, found.serial, target.desc.info});
+	}
+	if (const auto& depth = state.depth_info; depth.image_id) {
+		TextureCache::TargetView found;
+		if (!textures.FindTargetViewReadOnly(depth.image_id, depth.desc, found)) return nullptr;
+		if (samples == 0) samples = depth.desc.info.samples;
+		else if (samples != depth.desc.info.samples) return nullptr;
+		const auto& view   = depth.desc.view_info;
+		const auto  layout = depth_attachment_layout(depth);
+		// (The access from this speculation's entry for the image: none to read, refused.)
+		auto* image = textures.m_slot_images.try_get(depth.image_id);
+		auto* entry = image != nullptr && image->serial == found.serial ? image->SpeculativeEntry() : nullptr;
+		if (entry == nullptr) return nullptr;
+		auto writable = depth.AttachmentWriteAspects() & vk::ImageAspectFlagBits::eStencil;
+		if (depth.depth_write_enable) writable |= vk::ImageAspectFlagBits::eDepth;
+		const auto access  = DepthAttachmentAccess(layout, entry->state, entry->subresources.empty(), vk::ImageAspectFlags {}, writable);
+		const auto aspects = ImageViewOps::DepthAspectMask(view.format);
+		rendering.width           = std::min(rendering.width, depth.desc.info.extent.width);
+		rendering.height          = std::min(rendering.height, depth.desc.info.extent.height);
+		rendering.num_layers      = std::min(rendering.num_layers, view.layer_count);
+		auto& attachment          = rendering.depth_stencil_attachment;
+		attachment.image_view     = found.view;
+		attachment.image_layout   = layout;
+		attachment.clear_value[0] = std::bit_cast<uint32_t>(depth.depth_clear_value);
+		attachment.clear_value[1] = depth.stencil_clear_value;
+		attachment.has_depth      = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eDepth);
+		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
+		made->targets.push_back({depth.image_id, layout, access,
+		                         {view.base_level, view.level_count, view.base_layer, view.layer_count},
+		                         metadata_of(depth.desc), view.base_layer, found.serial, depth.desc.info});
+	}
+	if (state.color_count == 0 && !state.depth_info.image_id) {
+		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
+		rendering.width    = limits.maxFramebufferWidth;
+		rendering.height   = limits.maxFramebufferHeight;
+	} else if (samples == 0 || vulkan_sample_count(samples) == vk::SampleCountFlagBits {}) {
+		return nullptr;
+	}
+	if (rendering.num_layers == std::numeric_limits<uint32_t>::max()) rendering.num_layers = 1;
+	if (rendering.width == 0 || rendering.height == 0 || rendering.num_layers == 0 ||
+	    rendering.width == std::numeric_limits<uint32_t>::max() || rendering.height == std::numeric_limits<uint32_t>::max())
+		return nullptr;
+	made->first_rendering = rendering;
+	made->rendering       = rendering;
+	made->meta_epoch      = 0;
+	made->capture_id      = g_xpr_captures.fetch_add(1, std::memory_order_relaxed) + 1;
+	for (const auto& target: made->targets)
+		if (target.id != NativeXprDrawState::VirtualId()) made->target_ids.push_back(target.id); // (no image: no serial to sum)
+	made->dynamic = LocalDrawRecording::CaptureZeroed(buffer, state.vs_input_info, state.color_info, state.color_count,
+	                                                  state.depth_info, m_context.GetGraphics().attachment_feedback_loop_enabled,
+	                                                  vk::ImageAspectFlags {});
+	if (Spec::DepthLayers2On()) made->depth_info = std::make_shared<const RenderDepthInfo>(state.depth_info);
+	auto inputs = std::make_shared<NativeXprDrawState::PipelineInputs>();
+	for (uint32_t i = 0; i < state.color_count; ++i) inputs->color_info[i] = state.color_info[i];
+	inputs->color_count              = state.color_count;
+	inputs->depth_info               = state.depth_info;
+	inputs->ps_active                = state.ps_active;
+	inputs->topology                 = topology;
+	inputs->primitive_restart_enable = restart;
+	made->pipeline_inputs            = std::move(inputs);
+	made->ctx_hash                   = ctx_hash;
+	made->derived                    = true;
+	made->worker_captured            = true;
+	made->virtual_targets            = std::move(virt); // (its memory noted once an entry is made on it)
+	made->adopted                    = TextureCache::t_adopt_picks;
+	return made;
+}
+
+// (Mode 4) A worker's refused captures in its open segment (this thread's: its translation's id and segment), by (state
+// key, context hash), with the texture cache's CaptureRefusalEpoch read before each attempt. The key and the hash cover the
+// shaders, the context registers and the user configuration WorkerCaptureTargets reads; the rest of a refusal is the
+// texture cache's (an image registered, given a view or first used as a target moves the epoch: every entry is dropped and
+// each refusal is tried again), and the speculation's own segment (its writes: the segment's end drops all). A refused
+// capture is not drawn either way: a kept refusal only refuses again what an attempt would have refused, until one of
+// those moves (an image's needs_rebind or depth alias alone does not: the segment's end then).
+struct CaptureRefusals {
+	struct Entry {
+		uint64_t key = 0, ctx_hash = 0;
+	};
+	static constexpr size_t MaxEntries = 256; // (all dropped when full)
+	uint64_t                spec_id = 0, epoch = 0;
+	size_t                  segment = SIZE_MAX;
+	std::vector<Entry>      entries;
+	// The entries of this segment at `now`, else none (and kept from here for this segment and epoch).
+	void Hold(const Spec::State& spec, uint64_t now) {
+		if (spec.id == spec_id && spec.closed.size() == segment && epoch == now) return;
+		entries.clear();
+		spec_id = spec.id;
+		segment = spec.closed.size();
+		epoch   = now;
+	}
+	[[nodiscard]] bool Holds(uint64_t key, uint64_t ctx_hash) const {
+		for (const auto& entry: entries)
+			if (entry.key == key && entry.ctx_hash == ctx_hash) return true;
+		return false;
+	}
+	void Note(uint64_t key, uint64_t ctx_hash) {
+		if (entries.size() >= MaxEntries) entries.clear();
+		entries.push_back({key, ctx_hash});
+	}
+};
+static thread_local CaptureRefusals t_capture_refusals;
+
+// --- Mode 4: the worker that meets the draw makes the table entry -----------------------------------------------------
+//
+// Under KYTY_SPECULATE=4 (WorkerEntryOn), a speculation's draw whose pair is not in the catalog, or whose pair lacks the
+// draw-state key's variant or the key's captured state, was refused ("table store"): the GPU thread ran it as a hole, the
+// normal draw, and TableStore made the entry. Here the worker makes what TableStore would, from the same inputs, or nothing:
+//  - THE GATE (the recording): the draw's normal programs are permutations in memory (GetGraphicsPrograms with t_find_only:
+//    none translated or recorded) and its normal pipeline is built in memory (FindGraphicsPipeline); so the normal draw this
+//    replaces would record nothing. Or the commit records for it what the normal draw would (below: adopted permutations,
+//    a private normal pipeline). Its vertex shader binds no vertex buffers and no mesh stage (TableStore's storable gate).
+//  - The draw state: the key's own capture if there is one; else DERIVED from a sibling's, the state captured last under the
+//    same context and user configuration hash (other shaders): the targets, layouts and rendering as captured (the context
+//    resolves them alike; the sibling's targets current, NativeXprTargetsCurrent), its dynamic state but for the vertex
+//    program's indexed viewports (LocalDrawRecording::Capture's one shader input: from the normal vertex program), its
+//    hash and resolution recomputed, a capture id of its own. Refused when the sibling's capture holds a feedback-loop or
+//    general layout or a feedback aspect (a pixel shader that sampled a target), and a set of a draw under a derived state
+//    that holds a target leaves the table path (TableDraw; the holder is then never published; the GPU thread's own draw
+//    under it takes the store path, which captures the state again): no feedback guess.
+//  - ps_active as the normal path computes it (DrawHasActivePixelShader), equal to the capture's.
+//  - The programs: GetGraphicsPrograms in table mode with the capture's export mapping and ps_active (a pair's own portable
+//    masks); table programs and ready now (else refused: TableStore's own refusals stay the GPU thread's); for a pair in the
+//    catalog, its programs (else another specialization: refused).
+//  - The variant: the pair's for the key when stored (its pipeline), else TryCreateGraphicsPipelineWorker as TableStore's
+//    TryCreateGraphicsPipeline (ready now; else its compile posted and this draw refused), its mapping and fetch_embedded as
+//    TableStore sets them.
+//  - A new pair: vs, ps, start instance, the programs, TableRuns; its variant in it; proven by this role (generation).
+// A normal program not in memory whose module the prefetch holds done is adopted by the worker (t_adopt_only), under the
+// pipeline cache's lock as the GPU thread's normal draw adopts it, but not recorded there: the entry's commit records it
+// from the lookup's own inputs (ProgramCache::NoteMet, AdoptedCommit) and, when the normal pipeline of the draw is not in
+// memory, puts in the one the worker made privately (CreatePrivateGraphicsPipeline: a Fast first build only, after the
+// table gates passed), with its recipe, as the in-order draw's create would have. Nothing is translated: a program the
+// prefetch does not hold done stays a refusal.
+// The lookups run with the catalog's read lock dropped (the RULE at TableResolveSet), relocked; then the catalog's epoch,
+// the pair (absent; or its programs and variant), the base state (its capture) are those held before, else refused. Drawn as
+// any worker table draw; proposed (Spec::State::proposed_sets, `pair` null) before the draw, checked at its segment's Before
+// (TableEntryCheck: the state's targets current, the pair's programs), published at its commit (TableEntrySettle, under the
+// owner's write): a new pair by node insert while the catalog has none for the key, a variant into the pair (as TableStore
+// stores one), a derived state into the states while none is there for the key. What is not published whole is kept until no
+// speculation is live (g_entry_orphans; TableRetireEntryOrphans retires a kept node's sets).
+std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(CommandBuffer& buffer, TablePair* existing,
+                                                                           uint64_t pair_hash, std::span<const uint64_t> commands,
+                                                                           uint64_t index_base, uint64_t index_bytes,
+                                                                           vk::IndexType index_type,
+                                                                           const NativeXprDirectDraw* direct) {
+	auto* const spec = Spec::Current();
+	if (spec == nullptr || Role() == 0 || GuestGpu::IsGpuThread() || CatalogTable() == nullptr ||
+	    Catalog().m_native_xpr == nullptr || m_native_xpr == nullptr || FrameGen::Enabled())
+		return std::nullopt;
+	const auto&    sh             = buffer.GetShaders();
+	const auto&    ctx            = buffer.GetRegisters();
+	const auto     vs_address     = sh.GetVs().es_regs.data_addr, ps_address = sh.GetPs().ps_regs.data_addr;
+	const auto     start_instance = sh.GetVs().start_instance_user_sgpr;
+	const auto     key            = m_native_xpr->state_key;
+	const uint64_t tag            = existing != nullptr ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(existing)) : pair_hash;
+	const uint64_t mix            = (tag * 0x9e3779b97f4a7c15ull) ^ key;
+	const auto     draw           = [&](TableEntryHolder& h) -> std::optional<TableResult> {
+		t_entry_variant = h.own_variant ? h.drawn_variant : nullptr;
+		t_entry_poison  = &h.poisoned;
+		// (A parked entry's: TableDraw binds its stand-in through a cell. Cleared on every way out, a refusal thrown through
+		// TableDraw too.)
+		struct ParkedScope {
+			explicit ParkedScope(TableEntryHolder* entry) noexcept { t_entry_parked = entry; }
+			~ParkedScope() { t_entry_parked = nullptr; }
+			ParkedScope(const ParkedScope&)            = delete;
+			ParkedScope& operator=(const ParkedScope&) = delete;
+		} parked_scope(h.parked != nullptr ? &h : nullptr);
+		const auto result = TableDraw(buffer, *h.pair, *h.drawn_variant, *h.drawn_state, commands, index_base, index_bytes,
+		                              index_type, direct);
+		t_entry_variant   = nullptr;
+		t_entry_poison    = nullptr;
+		OwnTable().last_pair = nullptr; // (TableContinue reads the role's last variant out of the pair's vector)
+		return result;
+	};
+	const auto& states = Catalog().NativeXprState().states;
+	// (The recording, per draw: a draw drawn with an entry made with records is served early as the entry's own draw is, so its
+	// own normal lookups (find-only, as the entry's: this draw's registers, the entry's export mapping and targets, this draw's
+	// topology and restart) must meet only what that entry's commit records and puts in: the unrecorded permutations among its
+	// records, the normal pipeline in memory or its own. Else (another specialization or key: what this draw's in-order normal
+	// draw would record is in no commit) it is not drawn with that entry; it makes its own below, whose commit holds its
+	// records and pipeline (or is refused, and the hole records them). Run with the catalog's read lock dropped, as the entry's
+	// lookups; false in `changed`: the catalog as it was (else refused, nothing held across the relock).)
+	const auto reuse_covered = [&](const TableEntryHolder& h, bool& changed) {
+		changed            = false;
+		const auto& inputs = *h.inputs;
+		const bool  ps_on  = DrawHasActivePixelShader(buffer);
+		if (ps_on != inputs.ps_active) return false;
+		vk::PrimitiveTopology topology = vk::PrimitiveTopology::eTriangleList;
+		bool                  restart  = false;
+		if (!WorkerEntryDrawTopology(buffer, direct != nullptr ? direct->indexed : index_bytes != 0, index_type, topology, restart))
+			return false;
+		const auto since    = CatalogTable()->epoch;
+		auto&      cache    = m_context.GetPipelineCache();
+		const bool unlocked = t_catalog_read != nullptr && t_catalog_read->owns_lock();
+		if (unlocked) t_catalog_read->unlock();
+		struct Flags {
+			bool reads = false, find_only = false;
+			~Flags() {
+				if (reads) PipelineCache::t_no_fault_reads = false, PipelineCache::t_strict_reads = false;
+				if (find_only) PipelineCache::t_find_only = false, PipelineCache::g_find_only_users.fetch_sub(1, std::memory_order_relaxed);
+			}
+		} flags;
+		PipelineCache::t_no_fault_reads  = true;
+		PipelineCache::t_strict_reads    = true; // (a specialization word not read clean fails the lookup: another entry)
+		flags.reads                      = true;
+		PipelineCache::t_no_fault_failed = false;
+		ShaderVertexInputInfo vertex;
+		ShaderPixelInputInfo  pixel;
+		ResetNativeVertexInput(vertex);
+		ResetNativeStageInput(pixel);
+		PipelineCache::g_find_only_users.fetch_add(1, std::memory_order_relaxed);
+		PipelineCache::t_find_only   = true;
+		flags.find_only              = true;
+		PipelineCache::t_adopt_ids_n = 0;
+		const auto normal = cache.GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx, buffer.GetUserConfig(),
+		                                              h.variant.mapping, ps_on, vertex, pixel);
+		PipelineCache::t_find_only = false;
+		PipelineCache::g_find_only_users.fetch_sub(1, std::memory_order_relaxed);
+		flags.find_only = false;
+		const bool own  = !PipelineCache::t_no_fault_failed && static_cast<bool>(normal.vertex) && vertex.stage.program != nullptr &&
+		                 (!ps_on || (static_cast<bool>(normal.pixel) && pixel.stage.program != nullptr)) &&
+		                 cache.AdoptedCovers(h.adopted.get(), {inputs.color_info, inputs.color_count}, inputs.depth_info, vertex, buffer,
+		                                     ps_on ? &pixel : nullptr, topology, restart, normal.vertex, normal.pixel);
+		PipelineCache::t_adopt_ids_n    = 0;
+		PipelineCache::t_no_fault_reads = false;
+		PipelineCache::t_strict_reads   = false;
+		flags.reads                     = false;
+		if (unlocked) {
+			CatalogGate(Catalog().m_catalog_writer_waiting, CatalogWriterFirst());
+			t_catalog_read->lock();
+		}
+		changed = spec->refused != nullptr || CatalogTable() == nullptr || CatalogTable()->epoch != since;
+		return own;
+	};
+	// (One this translation made already for this pair and key: drawn with again.)
+	for (const auto& p: spec->proposed_sets) {
+		if (p.pair != nullptr || p.hash != mix) continue;
+		auto& h = *static_cast<TableEntryHolder*>(p.set);
+		if (h.key != key || h.new_pair != (existing == nullptr) ||
+		    (existing != nullptr ? h.pair != existing : h.pair_hash != pair_hash))
+			continue;
+		// (An entry whose commit makes colour targets is drawn with in its own segment only: a later one's draws would start
+		// from the layout a hole between leaves; an entry of its own then, whose capture is refused over that memory.)
+		if (h.state != nullptr && h.state->virtual_targets != nullptr && h.state->virtual_targets->segment != spec->closed.size())
+			continue;
+		// (An entry made with records: this draw's own normal lookups in its commit, above; else the next, or an entry of its
+		// own.)
+		if (h.reuse_checked) {
+			bool       changed = false;
+			const bool own     = reuse_covered(h, changed);
+			if (changed) return std::nullopt;
+			if (!own) continue;
+		}
+		if (h.poisoned.load(std::memory_order_relaxed)) return std::nullopt;
+		if (h.pair->vs != vs_address || h.pair->ps != ps_address || h.pair->start_instance != start_instance) return std::nullopt;
+		if (existing != nullptr && (existing->programs != h.programs || existing->refused || existing->respecialize))
+			return std::nullopt;
+		if (h.state == nullptr) {
+			const auto again = states.find(key);
+			if (again == states.end() || again->second.get() != h.drawn_state || h.drawn_state->capture_id != h.capture)
+				return std::nullopt;
+		}
+		// (The pair's stored variant: found again, its vector may have grown since: TableStore pushes under its write.)
+		if (!h.new_pair && !h.own_variant) {
+			const auto v = std::ranges::find(existing->variants, key, &TableVariant::state);
+			if (v == existing->variants.end() || v->refused || v->pipeline != h.variant.pipeline) return std::nullopt;
+			h.drawn_variant = &*v;
+		}
+		if (!NativeXprTargetsCurrent(*h.drawn_state)) return std::nullopt;
+		return draw(h);
+	}
+	// (An entry a worker made that is not in the catalog yet, before one of its own: TableEntryOverlay.)
+	if (const auto drawn = TableEntryOverlay(buffer, existing, commands, index_base, index_bytes, index_type, direct)) return *drawn;
+	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> programs_held {};
+	bool push_fit_held = false; // (KYTY_SPEC_PAIR_PUSH_FIT: a new pair's programs the retry's: TablePair::push_fit)
+	std::array<uint32_t, 2>                                        portable {};
+	TableVariant*                                                  stored_variant = nullptr;
+	if (existing != nullptr) {
+		if (existing->programs[0] == nullptr || existing->refused || existing->respecialize) return std::nullopt;
+		programs_held = existing->programs;
+		portable      = existing->portable;
+		if (const auto v = std::ranges::find(existing->variants, key, &TableVariant::state); v != existing->variants.end()) {
+			if (v->refused) return std::nullopt;
+			if (v->pipeline != nullptr) stored_variant = &*v;
+		}
+	}
+	// The draw state: the key's own capture, else a sibling's to derive it from, else the worker's own capture (no capture of
+	// this context exists: WorkerCaptureTargets).
+	std::unique_ptr<NativeXprDrawState> captured;
+	const NativeXprDrawState*           base     = nullptr;
+	uint64_t                            base_key = key;
+	bool                                derive   = false;
+	if (const auto own = states.find(key); own != states.end()) {
+		base = own->second.get();
+	} else {
+		const auto  ctx_hash = WorkerEntryContextHash(buffer);
+		const auto& index    = Catalog().NativeXprState().sibling_index;
+		const auto  named    = index.find(ctx_hash);
+		const auto  sibling  = named != index.end() ? states.find(named->second) : states.end();
+		if (sibling == states.end() || sibling->second->ctx_hash != ctx_hash) {
+			vk::PrimitiveTopology capture_topology = vk::PrimitiveTopology::eTriangleList;
+			bool                  capture_restart  = false;
+			if (!WorkerEntryDrawTopology(buffer, direct != nullptr ? direct->indexed : index_bytes != 0, index_type, capture_topology,
+			                             capture_restart))
+				return std::nullopt;
+			// (A refusal of this key and context kept in this segment while the texture cache's targets did not move:
+			// refused again without the attempt. The epoch read before the attempt: one that moves during it drops what it
+			// keeps.)
+			auto& refusals = t_capture_refusals;
+			refusals.Hold(*spec, m_context.GetTextureCache().CaptureRefusalEpoch());
+			if (refusals.Holds(key, ctx_hash)) return std::nullopt;
+			captured = WorkerCaptureTargets(buffer, capture_topology, capture_restart, ctx_hash);
+			if (captured == nullptr) {
+				refusals.Note(key, ctx_hash);
+				return std::nullopt;
+			}
+			base = captured.get();
+		} else {
+			base     = sibling->second.get();
+			base_key = named->second;
+		}
+		derive = true;
+	}
+	const auto inputs = base->pipeline_inputs; // (shared: alive after the unlock)
+	if (!inputs) return std::nullopt;
+	if (derive) {
+		constexpr auto feedback = vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+		constexpr auto general  = vk::ImageLayout::eGeneral;
+		bool           loop     = base->dynamic.feedback_aspects != vk::ImageAspectFlags {};
+		for (const auto& target: base->targets) loop |= target.layout == feedback || target.layout == general;
+		for (const auto* rendering: {&base->rendering, &base->first_rendering}) {
+			for (const auto& attachment: rendering->color_attachments)
+				loop |= attachment.image_layout == feedback || attachment.image_layout == general;
+			loop |= rendering->depth_stencil_attachment.image_layout == feedback ||
+			        rendering->depth_stencil_attachment.image_layout == general;
+		}
+		if (loop) return std::nullopt;
+	}
+	if (!NativeXprTargetsCurrent(*base)) return std::nullopt;
+	const bool ps_active = DrawHasActivePixelShader(buffer);
+	if (ps_active != inputs->ps_active) return std::nullopt;
+	if (existing != nullptr && (programs_held[1] != nullptr) != ps_active) return std::nullopt;
+	// (This draw's topology and restart, as TableStore takes them: the capture's are its own draw's.)
+	vk::PrimitiveTopology topology = vk::PrimitiveTopology::eTriangleList;
+	bool                  restart  = false;
+	if (!WorkerEntryDrawTopology(buffer, direct != nullptr ? direct->indexed : index_bytes != 0, index_type, topology, restart))
+		return std::nullopt;
+	const auto                          base_capture = base->capture_id;
+	std::unique_ptr<NativeXprDrawState> derived;
+	// (Copied under the lock: a capture again rewrites it in place. The worker's own capture is its own already.)
+	if (derive) derived = captured != nullptr ? std::move(captured) : std::make_unique<NativeXprDrawState>(*base);
+	const bool worker_captured = derive && base == derived.get();
+	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX> mapping {};
+	for (uint32_t i = 0; i < inputs->color_count; ++i) mapping[inputs->color_info[i].target_slot] = inputs->color_info[i].export_mapping;
+	const auto since      = CatalogTable()->epoch;
+	const auto generation = ShaderMapGeneration(); // (before the lookups: a new pair is proven as of then)
+	auto&      pipelines  = m_context.GetPipelineCache();
+	// (The lookups with the catalog's read lock dropped; guest reads without a fault.)
+	// (The stored variant's pipeline, read under the lock: TableStore's push_back may move the vector while it is dropped.)
+	const PipelineCache::Pipeline* stored_pipeline = stored_variant != nullptr ? stored_variant->pipeline : nullptr;
+	const bool unlocked = t_catalog_read != nullptr && t_catalog_read->owns_lock();
+	if (unlocked) t_catalog_read->unlock();
+	// (The lookups' thread flags, cleared on the way out of a RecoverableExit through them too; each only if set here and not
+	// cleared on the normal way. The catalog's relock is not covered.)
+	struct LookupFlags {
+		bool reads = false, find_only = false, adopt_only = false, records = false;
+		~LookupFlags() {
+			if (reads) PipelineCache::t_no_fault_reads = false;
+			if (adopt_only) PipelineCache::t_adopt_only = false;
+			if (records) PipelineCache::t_adopt_records = false;
+			if (find_only) PipelineCache::t_find_only = false, PipelineCache::g_find_only_users.fetch_sub(1, std::memory_order_relaxed);
+		}
+	} flags;
+	PipelineCache::t_no_fault_reads  = true;
+	flags.reads                      = true;
+	PipelineCache::t_no_fault_failed = false;
+	ShaderVertexInputInfo normal_vertex;
+	ShaderPixelInputInfo  normal_pixel;
+	ResetNativeVertexInput(normal_vertex);
+	ResetNativeStageInput(normal_pixel);
+	PipelineCache::g_find_only_users.fetch_add(1, std::memory_order_relaxed);
+	PipelineCache::t_find_only   = true;
+	flags.find_only              = true;
+	PipelineCache::t_adopt_ids_n = 0; // (the unrecorded permutations this lookup finds, adopted earlier by a worker's lookup)
+	// (These lookups make the records of the unrecorded permutations they meet, from their own inputs, for the entry's commit.)
+	PipelineCache::t_adopt_records = true;
+	flags.records                  = true;
+	auto normal = pipelines.GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx, buffer.GetUserConfig(),
+	                                            mapping, ps_active, normal_vertex, normal_pixel);
+	uint32_t unrecorded_met     = PipelineCache::t_adopt_ids_n;
+	bool     normal_read_failed = PipelineCache::t_no_fault_failed;
+	bool gate_programs = !normal_read_failed && static_cast<bool>(normal.vertex) && normal_vertex.stage.program != nullptr &&
+	                     (!ps_active || (static_cast<bool>(normal.pixel) && normal_pixel.stage.program != nullptr));
+	// (A program not in memory whose module the prefetch holds done is adopted here, as the GPU thread's normal draw would
+	// adopt it: under the pipeline cache's lock (GetGraphicsPrograms takes it; the catalog's is dropped above), the permutation
+	// published but not recorded here: the entry's commit records it with these lookups' own inputs, else the first in-order
+	// lookup that finds it. Nothing is translated: a program the prefetch does not hold done stays a refusal, the GPU thread's
+	// draw makes it.)
+	if (!gate_programs && !normal_read_failed) {
+		ResetNativeVertexInput(normal_vertex);
+		ResetNativeStageInput(normal_pixel);
+		PipelineCache::t_adopt_only      = true;
+		flags.adopt_only                 = true;
+		PipelineCache::t_adopt_adopted   = 0;
+		PipelineCache::t_adopt_ids_n     = 0;
+		PipelineCache::t_no_fault_failed = false;
+		normal = pipelines.GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx, buffer.GetUserConfig(), mapping,
+		                                       ps_active, normal_vertex, normal_pixel);
+		PipelineCache::t_adopt_only = false;
+		flags.adopt_only            = false;
+		unrecorded_met              = PipelineCache::t_adopt_ids_n;
+		normal_read_failed          = PipelineCache::t_no_fault_failed;
+		gate_programs = !normal_read_failed && static_cast<bool>(normal.vertex) && normal_vertex.stage.program != nullptr &&
+		                (!ps_active || (static_cast<bool>(normal.pixel) && normal_pixel.stage.program != nullptr));
+	}
+	PipelineCache::t_find_only = false;
+	PipelineCache::g_find_only_users.fetch_sub(1, std::memory_order_relaxed);
+	flags.find_only                = false;
+	PipelineCache::t_adopt_records = false;
+	flags.records                  = false;
+	const bool storable      = gate_programs && normal_vertex.buffers_num == 0 && normal_vertex.mesh.threads_num[0] == 0;
+	bool       gate_pipeline = storable && pipelines.FindGraphicsPipeline({inputs->color_info, inputs->color_count}, inputs->depth_info,
+	                                                                       normal_vertex, buffer, ps_active ? &normal_pixel : nullptr,
+	                                                                       topology, restart, normal.vertex, normal.pixel) != nullptr;
+	// (The records of the unrecorded permutations met; the normal pipeline, when missing, is made privately below, once the
+	// table gates pass. Same inputs as the lookup above: this draw's normal programs and input infos, the capture's targets,
+	// this draw's topology and restart.)
+	std::shared_ptr<PipelineCache::AdoptedCommit> adopted_commit;
+	if (storable && unrecorded_met != 0) adopted_commit = pipelines.TakeAdoptedRecords();
+	// (Only where the private build may be made at all (a Fast first build: CreatePrivateGraphicsPipeline).)
+	const bool want_private = adopted_commit != nullptr && !gate_pipeline && pipelines.PrivateBuildsAllowed();
+	// (An entry on an unrecorded permutation only with its commit's records in hand.)
+	const bool unrecorded_held = unrecorded_met != 0 && adopted_commit == nullptr;
+	ShaderVertexInputInfo vertex_info;
+	ShaderPixelInputInfo  pixel_info;
+	ResetNativeVertexInput(vertex_info);
+	ResetNativeStageInput(pixel_info);
+	bool                                     read_failed = false, pending = false, table_mode = false, other = false;
+	const PipelineCache::Pipeline*           pipeline    = stored_pipeline;
+	std::shared_ptr<const std::atomic<bool>> compiling;
+	// (The compile of its table pipeline met, parked on (null: not), and the stand-in the entry's draws are recorded with.)
+	std::shared_ptr<PipelineCache::ParkedPipeline> parked;
+	std::unique_ptr<PipelineCache::Pipeline>       parked_stand_in;
+	// (An entry on an unrecorded permutation without its records is refused below: nothing made for it. One with its records
+	// goes on to the table gates before its private normal pipeline is made.)
+	if ((gate_pipeline || want_private) && !unrecorded_held) {
+		PipelineCache::t_no_fault_failed = false;
+		const auto programs = pipelines.GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx, buffer.GetUserConfig(),
+		                                                    mapping, ps_active, vertex_info, pixel_info, true, portable);
+		read_failed        = PipelineCache::t_no_fault_failed;
+		pending            = pipelines.TablePending();
+		const auto* vertex = vertex_info.stage.program;
+		const auto* pixel  = ps_active ? pixel_info.stage.program : nullptr;
+		table_mode = !read_failed && !pending && static_cast<bool>(programs.vertex) && vertex != nullptr && vertex->table_mode &&
+		             vertex->stage == ShaderType::Vertex && vertex_info.buffers_num == 0 &&
+		             (!ps_active || (static_cast<bool>(programs.pixel) && pixel != nullptr && pixel->table_mode));
+		if (table_mode && existing != nullptr && (vertex != programs_held[0] || pixel != programs_held[1])) table_mode = false, other = true;
+		if (table_mode && pipeline == nullptr)
+			pipeline = pipelines.TryCreateGraphicsPipelineWorker({inputs->color_info, inputs->color_count}, inputs->depth_info, vertex_info,
+			                                                     buffer, ps_active ? &pixel_info : nullptr, topology, restart,
+			                                                     programs.vertex, programs.pixel, true, compiling);
+		// (Its table pipeline still compiling: the entry made anyway, parked on that compile (the job held for the commit:
+		// PipelineCache::ParkCompiling, which takes the cache's m_mutex, the catalog's read lock dropped here), its draws
+		// recorded with a stand-in that has the pipeline's layouts and binding it through a cell (TableParkedBind); the
+		// commit's check binds the compiled one (TableEntryResolveParked) or stops the segment.)
+		if (table_mode && pipeline == nullptr && compiling != nullptr && TableCellsRecordable()) {
+			parked_stand_in = std::make_unique<PipelineCache::Pipeline>();
+			parked          = pipelines.ParkCompiling(compiling, *parked_stand_in);
+			if (parked == nullptr) parked_stand_in.reset();
+		}
+		if (existing == nullptr) programs_held = {vertex, pixel}, push_fit_held = PipelineCache::t_push_fit_taken;
+		// (The normal pipeline made privately only now, the table gates passed: a refused entry makes none. Not made because
+		// the cache has the key by now (made meanwhile): found, the records alone committed. A parked entry's too.)
+		if (want_private && table_mode && (pipeline != nullptr || parked != nullptr)) {
+			gate_pipeline = pipelines.CreatePrivateGraphicsPipeline(*adopted_commit, {inputs->color_info, inputs->color_count},
+			                                                        inputs->depth_info, normal_vertex, buffer,
+			                                                        ps_active ? &normal_pixel : nullptr, topology, restart,
+			                                                        normal.vertex, normal.pixel) ||
+			                pipelines.FindGraphicsPipeline({inputs->color_info, inputs->color_count}, inputs->depth_info, normal_vertex,
+			                                               buffer, ps_active ? &normal_pixel : nullptr, topology, restart,
+			                                               normal.vertex, normal.pixel) != nullptr;
+		}
+	}
+	PipelineCache::t_no_fault_reads = false;
+	flags.reads                     = false;
+	if (unlocked) {
+		CatalogGate(Catalog().m_catalog_writer_waiting, CatalogWriterFirst());
+		t_catalog_read->lock();
+	}
+	// (A Spec::Refuse during the lookups, e.g. SyncGpuCleanBackingSpec's "GPU-written guest memory" (its read then goes on):
+	// the packet is refused, and what the lookups read may not be the in-order memory: no entry.)
+	if (spec->refused != nullptr) return std::nullopt;
+	if (pipeline == nullptr && parked != nullptr) pipeline = parked_stand_in.get(); // (its commit binds the compiled one)
+	if (!gate_programs || !storable || !gate_pipeline || unrecorded_held || read_failed || pending || other || !table_mode ||
+	    pipeline == nullptr)
+		return std::nullopt;
+	// (After the relock: the catalog, the pair and the base state as they were.)
+	if (CatalogTable() == nullptr || CatalogTable()->epoch != since) return std::nullopt;
+	if (existing == nullptr) {
+		if (CatalogTable()->pairs.contains(pair_hash)) return std::nullopt;
+	} else {
+		if (existing->programs != programs_held || existing->refused || existing->respecialize) return std::nullopt;
+		const auto v = std::ranges::find(existing->variants, key, &TableVariant::state);
+		if (stored_variant != nullptr ? (v == existing->variants.end() || &*v != stored_variant || v->pipeline != pipeline || v->refused)
+		                              : (v != existing->variants.end() && (v->refused || v->pipeline != nullptr)))
+			return std::nullopt;
+	}
+	if (const auto again = states.find(base_key);
+	    !worker_captured && (again == states.end() || again->second.get() != base || base->capture_id != base_capture ||
+	                         base->pipeline_inputs != inputs))
+		return std::nullopt;
+	if (derive && states.contains(key)) return std::nullopt;
+	if (!NativeXprTargetsCurrent(*base)) return std::nullopt;
+	// The entry.
+	auto  holder             = std::make_shared<TableEntryHolder>();
+	auto& h                  = *holder;
+	h.key                    = key;
+	// (Its programs proven as of: a new pair's lookups, else the pair's proof by this role, TableTry's: TableEntryOverlay.)
+	h.generation             = existing != nullptr ? existing->Generation(Role()) : generation;
+	h.reuse_checked          = adopted_commit != nullptr; // (its later draws' own lookups checked, above)
+	h.inputs                 = inputs;
+	h.pair_hash              = pair_hash;
+	h.new_pair               = existing == nullptr;
+	h.programs               = programs_held;
+	h.adopted                = std::move(adopted_commit);
+	h.variant.state          = key;
+	h.variant.pipeline       = pipeline;
+	h.variant.mapping        = mapping;
+	h.variant.fetch_embedded = vertex_info.fetch_embedded;
+	if (parked != nullptr && pipeline == parked_stand_in.get()) {
+		h.parked          = std::move(parked);
+		h.parked_stand_in = std::move(parked_stand_in);
+	}
+	if (derive) {
+		auto& made           = *derived;
+		made.capture_id      = g_xpr_captures.fetch_add(1, std::memory_order_relaxed) + 1;
+		made.meta_epoch      = 0;
+		made.targets_epoch   = 0;
+		// (A state whose commit makes some of its targets is never marked checked: NativeXprTargetsCurrent's own branch.)
+		made.targets_checked = made.virtual_targets != nullptr ? UINT64_MAX : 0;
+		made.targets_erased = 0, made.targets_span_begin = 0, made.targets_span_end = 0;
+		made.emitted_epoch   = UINT64_MAX;
+		made.emitted_serials = UINT64_MAX;
+		made.used_frame      = 0;
+		made.derived         = true;
+		// (Its first rendering without the sibling's clears: those were the sibling draw's own; the rendering has none.)
+		made.first_rendering           = made.rendering;
+		made.dynamic.indexed_viewports = UsesIndexedViewports(normal_vertex);
+		made.dynamic_hash              = XXH3_64bits(&made.dynamic, sizeof(made.dynamic));
+		made.resolved = ResolveGraphicsDynamicParams(made.dynamic.buffer, made.dynamic.indexed_viewports, made.dynamic.colors,
+		                                             made.dynamic.color_count, made.dynamic.depth);
+		h.state       = std::move(derived);
+		h.drawn_state = h.state.get();
+		// (A capture whose commit makes colour targets: their memory noted for the rest of the translation (in order their
+		// images are there from this draw on: TextureCache::t_virtual_ranges); a DCC one's clear, consumed by the commit's
+		// acquisition as NativeXprEmitTargets leaves a colour DCC one, asked (a not-cleared answer noted, checked at the
+		// commit) and consumed by the speculation, every layer of the view as PrepareDccClear does: its later lookups see the
+		// surface as after the draw. The consume is a fact from the next segment on: later lookups of this open segment would
+		// still read the cache's "cleared", which none makes: every lookup over the target's memory is refused, and the
+		// metadata's memory is checked by the making.)
+		if (const auto& virt = h.state->virtual_targets; virt != nullptr) {
+			auto& ranges = TextureCache::t_virtual_ranges;
+			ranges.Hold(spec->id);
+			for (const auto& target: virt->targets) ranges.Note(target.desc.info.data.address, target.desc.info.data.size);
+			for (const auto& target: virt->targets) {
+				const auto& meta = target.desc.info.metadata;
+				const auto& view = target.desc.view_info;
+				if (meta.kind != ImageMetadataKind::Dcc) continue;
+				for (uint32_t at = view.base_layer; at < std::min(view.base_layer + view.layer_count, 32u); ++at)
+					if (m_context.GetTextureCache().IsMetaCleared(meta.range.address, at, nullptr, nullptr, true))
+						spec->ConsumeMeta(meta.range.address, at);
+			}
+		}
+	} else {
+		h.drawn_state = base;
+	}
+	h.capture = h.drawn_state->capture_id;
+	if (existing == nullptr) {
+		auto& pair          = h.node.try_emplace(pair_hash).first->second;
+		pair.vs             = vs_address;
+		pair.ps             = ps_address;
+		pair.start_instance = start_instance;
+		pair.programs       = programs_held;
+		pair.push_fit       = push_fit_held;
+		TableRuns(pair);
+		pair.variants.push_back(h.variant);
+		pair.Generation(Role()) = generation; // (its programs are those of the code at its addresses as of the lookups)
+		h.pair          = &pair;
+		h.drawn_variant = &pair.variants.back();
+		h.own_variant   = false; // (in the node pair's vector: TableResolveSet finds it there)
+	} else {
+		h.pair = existing;
+		if (stored_variant != nullptr) {
+			h.drawn_variant = stored_variant;
+		} else {
+			h.drawn_variant = &h.variant;
+			h.own_variant   = true;
+		}
+	}
+	auto* const owner = &Catalog();
+	auto* const raw   = holder.get();
+	spec->proposed_sets.push_back({nullptr, mix, raw, spec->closed.size(), false,
+	                               [owner, holder](bool commit) { owner->TableEntrySettle(holder, commit); }});
+	spec->proposed_sets.back().check = [owner, raw] { return owner->TableEntryCheck(*raw); };
+	// (Its segment re-run as a hole drew the draw in order, maybe through the table without a normal lookup: what its commit
+	// would do for the draw is not done at a later segment's (records, private pipeline dropped here).)
+	if (raw->adopted != nullptr) spec->proposed_sets.back().on_hole = [raw] { raw->adopted.reset(); };
+	// (A capture whose commit makes colour targets: made after every check of the segment passed (Speculation::Before's
+	// resolve pass); the memory they cover for the completions' write test (resolve_over); its segment run as a hole: none
+	// made later (only that segment draws with it), the state never published.)
+	if (raw->state != nullptr && raw->state->virtual_targets != nullptr) {
+		auto& proposed        = spec->proposed_sets.back();
+		proposed.resolve      = [owner, raw, spec] { return owner->TableEntryResolveVirtual(*raw, spec); };
+		proposed.resolve_over = [raw](uint64_t address, uint64_t size) {
+			const auto* state = raw->state.get();
+			if (state == nullptr || state->virtual_targets == nullptr || raw->virtual_hole) return false;
+			const auto meets = [&](uint64_t begin, uint64_t bytes) { return bytes != 0 && begin < address + size && address < begin + bytes; };
+			for (const auto& made: state->virtual_targets->targets) {
+				const auto& info = made.desc.info;
+				if (meets(info.data.address, info.data.size) ||
+				    (info.HasMetadata() && meets(info.metadata.range.address, info.metadata.range.size)) ||
+				    (info.HasStencil() && meets(info.stencil.address, info.stencil.size)))
+					return true;
+			}
+			return false;
+		};
+		spec->any_resolve = true;
+		proposed.on_hole  = [raw, before = std::move(proposed.on_hole)] {
+			if (before) before();
+			raw->virtual_hole = true;
+		};
+	}
+	// (Its segment re-run as a hole: never in the overlay, and a draw drawn with it through the overlay fails its check (the
+	// views a capture made may go with its translation).)
+	{
+		auto& proposed   = spec->proposed_sets.back();
+		proposed.on_hole = [raw, before = std::move(proposed.on_hole)] {
+			if (before) before();
+			raw->ran_as_hole.store(true, std::memory_order_release);
+		};
+	}
+	// (Its commit's settle: the in-order part at once, the catalog part when the owner's write is had; committed, into the
+	// overlay while that part waits: TableEntryOverlayAdd.)
+	spec->proposed_sets.back().settle_now = [owner, raw, overlay = std::weak_ptr<TableEntryHolder>(holder)] {
+		owner->TableEntrySettleInOrder(*raw);
+		if (const auto held = overlay.lock()) owner->TableEntryOverlayAdd(held);
+	};
+	spec->proposed_sets.back().catalog_owner = owner;
+	return draw(h);
+}
+
+// (Mode 4) At the entry's segment's Before, the GPU thread (the catalog's owner): the state drawn with still current, the
+// pair's programs those it was made with. False: the segment is not committed as recorded (Speculation: images_failed).
+bool RenderExecutor::TableEntryCheck(TableEntryHolder& h) {
+	// (A capture whose commit makes colour targets, its segment run as a hole: no later segment draws with it (never
+	// published); a test failing here would stop a segment for nothing. Parked: its own resolution still runs below.)
+	if (h.virtual_hole && h.parked == nullptr) return true;
+	if (m_table_xpr == nullptr || m_native_xpr == nullptr || h.drawn_state == nullptr) return false;
+	if (!h.new_pair && (h.pair->programs != h.programs || h.pair->refused || h.pair->respecialize)) return false;
+	if (h.state == nullptr) {
+		const auto& states = NativeXprState().states;
+		const auto  again  = states.find(h.key);
+		if (again == states.end() || again->second.get() != h.drawn_state || h.drawn_state->capture_id != h.capture) return false;
+	}
+	if (!NativeXprTargetsCurrent(*h.drawn_state) || !TableAdoptedCurrent(*h.drawn_state)) return false;
+	// (Parked on its table pipeline's compile: the compiled pipeline bound in its cells, after the tests above.)
+	return h.parked == nullptr || h.parked_resolved || TableEntryResolveParked(h);
+}
+
+// (Mode 4) Each colour target a worker's capture took as the in-order FindImage's reuse of an existing image, still that
+// reuse (TextureCache::AdoptedTargetCurrent, the GPU thread).
+bool RenderExecutor::TableAdoptedCurrent(const NativeXprDrawState& draw_state) {
+	for (const auto& pick: draw_state.adopted) {
+		const auto at = std::ranges::find_if(draw_state.targets, [&pick](const NativeXprDrawState::Target& t) {
+			return t.id == pick.id && t.requested.data.address == pick.address;
+		});
+		if (at == draw_state.targets.end() || !m_context.GetTextureCache().AdoptedTargetCurrent(at->requested, pick)) return false;
+	}
+	return true;
+}
+
+// (Mode 4) A worker entry whose table pipeline was still compiling, parked on the compile (TableWorkerEntry): the commit's
+// check (the GPU thread, the segment's Before) takes, once the compile is done, the pipeline the in-order lookup of its key
+// gives (PipelineCache::ResolveParked), writes its handle in every cell of the segments to be spliced (a segment run as a
+// hole took its cells with it: never written) and puts it in the variant the settle publishes. EXACT:
+// - A pipeline is a pure function of its key: the key the job was posted under is the one this draw's own lookup built
+//   (TryCreateGraphicsPipelineWorker named that job), and the pipeline bound is the one the cache holds for it (the job's,
+//   moved in as the next lookup of the key would move it). Its layouts are the stand-in's: the same bindings give the same
+//   shared layouts (checked again here), so the descriptor set (allocated on the stand-in's set layout), the binds of the
+//   set and the push constants (on its pipeline layout) are those the compiled pipeline takes.
+// - Everything else recorded for the draw is what is recorded with the pipeline ready: only the handle is late, and
+//   nothing reads a passive producer's chunk before its splice. The packet's replay ends the draws' replays' reuse of the
+//   pipeline they bound last (InvalidateReplayState), as a recorded bind does.
+// - Not resolved (the compile not done at the commit, or the key dropped): the check fails and the segment stops before its
+//   splice, as any failed check; the entry is never published with the stand-in (TableEntrySettle). The GPU thread never
+//   waits for the compile: the in-order path at such a draw does not wait either (its table store finds the pipeline
+//   compiling and draws on the normal path). Nothing is done once a check before this one failed.
+bool RenderExecutor::TableEntryResolveParked(TableEntryHolder& h) {
+	if (h.parked == nullptr || h.parked_stand_in == nullptr) return false;
+	if (Spec::t_checks_failed || !PipelineCache::ParkedDone(*h.parked)) return false;
+	auto* const compiled = m_context.GetPipelineCache().ResolveParked(*h.parked);
+	if (compiled == nullptr || compiled->pipeline_layout != h.parked_stand_in->pipeline_layout ||
+	    compiled->descriptor_set_layout != h.parked_stand_in->descriptor_set_layout ||
+	    compiled->native_bindings != h.parked_stand_in->native_bindings)
+		return false;
+	const auto handle = reinterpret_cast<uint64_t>(static_cast<VkPipeline>(BindPipelineHandle(*compiled))); // NOLINT
+	if (handle == 0) return false;
+	// (Only the cells of this segment on: those of segments before it are in chunks their holes discarded.)
+	for (const auto& [segment, cell]: h.parked_cells)
+		if (segment >= Spec::t_check_segment) *cell = handle;
+	// (The variant the settle publishes, and the one the draws were drawn with: a new pair's copy in its node.)
+	if (h.drawn_variant != nullptr && h.drawn_variant->pipeline == h.parked_stand_in.get()) h.drawn_variant->pipeline = compiled;
+	h.variant.pipeline = compiled;
+	h.parked_resolved  = true;
+	return true;
+}
+
+// (Mode 4) A worker's capture that took a colour target no image exists for yet (nothing on any of its pages; no metadata or
+// DCC metadata): the worker records the draw with a placeholder view (NativeXprDrawState::Virtual), its rendering's begin
+// as a packet whose view is a cell (TableVirtualRendering); the target gets no transition from the worker
+// (NativeXprEmitTargets leaves it). The commit (TableEntryResolveVirtual, the GPU thread, the segment's Before, once every
+// check of the segment passed: Speculation::Before's resolve pass) makes and acquires it as the in-order draw does
+// (FindImage, then FindRenderTarget, whose PrepareDccClear applies a DCC target's pending clear:
+// AcquireVirtualTargetAtCommit), moves it to the attachment layout as AcquireRenderTargets does (recorded ahead of the
+// splice), writes its view in every cell and puts the image in the state its settle publishes. EXACT:
+// - What the draw lacks is the image's handles alone: the pipeline takes the target's format and samples only (from the
+//   desc the worker resolved, the one the in-order FindImage is asked with, checked unmoved by it at the commit), the
+//   rendering's area and layers come from that desc, and no other command names the image.
+// - Its making sits ahead of the segment's replay instead of at the draw. Nothing of the segment before the draw meets it:
+//   the worker found nothing on its pages; the segment does not write its memory or its metadata's (declined: the
+//   making's upload would read it first); no pending image of the segment is completed after it at the commit (declined);
+//   FindImage makes it fresh, with no overlap to resolve and no alias to free (tested again at the commit: nothing on its
+//   pages, or the one exact image made since by the GPU thread's own work, which the in-order lookup takes); a reclaim of
+//   memory during the making (which could free an image the segment's earlier draws would have touched first) stops the
+//   segment. What the commits after see (the image, its first use as a target, its GPU write, the attachment layout, a DCC
+//   clear consumed) is what they see after the in-order draw; the worker consumed that clear in its own facts.
+// - Nothing of the translation after the draw is translated against the missing image: a read-only lookup over its memory
+//   is refused, an image GPU-written and tracked there is answered, a range lookup refuses its packet (SpecVirtualOverlap);
+//   a GPU write, buffer or texel read, pending V# or table range, or journaled CPU copy over its memory or its metadata's
+//   from the capture's segment on stops the segment here; an open-segment write over it refuses a later draw of the
+//   entry; a completion of the segment whose memory it meets stops the segment before Before (resolve_over).
+// - A target drawn into again by a later segment after a hole would need the hole's layout: the entry is drawn with in its
+//   own segment only, and its memory stays held for the rest of the translation.
+// - Not made (any test fails at the commit): the segment stops before its splice, as any failed check; a state not made is
+//   never published. The steps of Before after the making that can still stop the segment leave the image made, which the
+//   in-order re-run then finds (the same image and bytes).
+bool RenderExecutor::TableEntryResolveVirtual(TableEntryHolder& h, const void* spec_state) {
+	auto* const state = h.state.get();
+	if (state != nullptr && state->virtual_targets == nullptr) return true; // (made already: a Before run again)
+	if (h.virtual_hole) return true; // (its segment ran as a hole: nothing to make for a later one; never published)
+	// (No draw recorded with it (its first draw refused after the entry was proposed): nothing made, never published.)
+	if (state != nullptr && state->virtual_targets->cells.empty()) return true;
+	if (state == nullptr || spec_state == nullptr || state->pipeline_inputs == nullptr || !GuestGpu::IsGpuThread()) return false;
+	auto& v = *state->virtual_targets;
+	// (What the speculation's work did from the capture's segment on over a target's memory, which the in-order path does
+	// with the image there (a GPU write invalidating it, a buffer or texel read synchronized from it, a pending V# or table
+	// range obtained over it, a CPU copy journaled over it or reading from it), while Before made those ranges ready with no
+	// image there: refused. Conservative: every later segment's too, and the capture segment's before the draw.)
+	const auto& spec  = *static_cast<const Spec::State*>(spec_state);
+	const auto  meets = [&](uint64_t address, uint64_t size) {
+		const auto in = [&](const std::vector<Spec::Range>& list, size_t from) {
+			for (size_t i = from; i < list.size(); ++i)
+				if (list[i].begin < address + size && address < list[i].end) return true;
+			return false;
+		};
+		for (size_t i = v.from_pending_buffers; i < spec.pending_buffers.size(); ++i)
+			if (const auto& entry = spec.pending_buffers[i]; entry.address < address + size && address < entry.address + entry.size)
+				return true;
+		return in(spec.current, v.from_current) || in(spec.written, v.from_written) || in(spec.invalidated, v.from_invalidated) ||
+		       in(spec.texel_syncs, v.from_texel_syncs) || in(spec.buffer_ranges, v.from_buffer_ranges) ||
+		       in(spec.cpu_copies, v.from_cpu_copies) || in(spec.table_ranges, v.from_table_ranges) ||
+		       spec.journal_set.Intersects(address, size) || spec.open_journal_set.Intersects(address, size);
+	};
+	for (const auto& made: v.targets) {
+		if (meets(made.desc.info.data.address, made.desc.info.data.size)) return false;
+		if (const auto& meta = made.desc.info.metadata; meta.kind != ImageMetadataKind::None && meets(meta.range.address, meta.range.size))
+			return false;
+	}
+	auto&                      textures = m_context.GetTextureCache();
+	auto                       inputs   = std::make_shared<NativeXprDrawState::PipelineInputs>(*state->pipeline_inputs);
+	std::vector<vk::ImageView> views(v.targets.size());
+	for (size_t j = 0; j < v.targets.size(); ++j) {
+		const auto&   made = v.targets[j];
+		auto          desc = made.desc;
+		vk::ImageView view;
+		uint64_t      serial = 0;
+		const auto    id     = textures.AcquireVirtualTargetAtCommit(desc, view, serial);
+		if (!id) return false;
+		auto& image = textures.GetImage(id);
+		if (image.backing.samples != desc.info.samples) return false;
+		// (AcquireRenderTargets' transition of a colour target the draw does not sample (a fresh image is bound as no
+		// texture of it): attachment-optimal, read and write, over the view's subresources, ahead of the splice.)
+		const auto& vi = desc.view_info;
+		image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+		              vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite,
+		              ImageSubresourceRange {vi.base_level, vi.level_count, vi.base_layer, vi.layer_count},
+		              m_context.GetCommandScheduler().Current().Handle());
+		auto& target     = state->targets[made.target];
+		target.id        = id;
+		target.serial    = serial;
+		target.requested = desc.info;
+		state->rendering.color_attachments[made.attachment].image_view       = view;
+		state->first_rendering.color_attachments[made.attachment].image_view = view;
+		inputs->color_info[made.attachment].image_id = id;
+		inputs->color_info[made.attachment].desc     = desc;
+		views[j]                                     = view;
+	}
+	for (const auto& [j, cell]: v.cells) *cell = reinterpret_cast<uint64_t>(static_cast<VkImageView>(views[j])); // NOLINT
+	state->target_ids.clear();
+	for (const auto& target: state->targets) state->target_ids.push_back(target.id);
+	state->pipeline_inputs = inputs;
+	if (h.inputs != nullptr) h.inputs = inputs;
+	state->targets_checked = 0;
+	state->virtual_targets.reset(); // (made: a state as any capture's from here on)
+	return true;
+}
+
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+namespace TableVirtual {
+// A rendering's begin as CommandBuffer::BeginRendering makes it, its views cells (a no-image target's: written by the commit).
+struct Attachment {
+	uint64_t view   = 0;
+	int32_t  layout = 0, load = 0, store = 0;
+	uint32_t clear[4] {};
+};
+struct Packet {
+	VkCommandBuffer command = VK_NULL_HANDLE;
+	int32_t         x = 0, y = 0;
+	uint32_t        width = 0, height = 0, layers = 0, colors = 0, has_depth = 0, has_stencil = 0;
+	Attachment      color[RENDER_COLOR_ATTACHMENTS_MAX] {};
+	Attachment      depth {}, stencil {};
+};
+static_assert(std::is_standard_layout_v<Packet> && std::is_trivially_copyable_v<Packet>);
+static Attachment Pack(const vk::RenderingAttachmentInfo& in) {
+	Attachment out;
+	out.view   = reinterpret_cast<uint64_t>(static_cast<VkImageView>(in.imageView)); // NOLINT
+	out.layout = static_cast<int32_t>(in.imageLayout);
+	out.load   = static_cast<int32_t>(in.loadOp);
+	out.store  = static_cast<int32_t>(in.storeOp);
+	static_assert(sizeof(out.clear) == sizeof(VkClearValue));
+	std::memcpy(out.clear, &in.clearValue, sizeof(out.clear));
+	return out;
+}
+static VkRenderingAttachmentInfo Unpack(const Attachment& in) {
+	VkRenderingAttachmentInfo out {};
+	out.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+	out.imageView   = reinterpret_cast<VkImageView>(in.view); // NOLINT
+	out.imageLayout = static_cast<VkImageLayout>(in.layout);
+	out.resolveMode = VK_RESOLVE_MODE_NONE;
+	out.loadOp      = static_cast<VkAttachmentLoadOp>(in.load);
+	out.storeOp     = static_cast<VkAttachmentStoreOp>(in.store);
+	std::memcpy(&out.clearValue, in.clear, sizeof(out.clearValue));
+	return out;
+}
+static void Replay(std::span<const LocalVulkanRecording::Segment> segments, const vk::detail::DispatchLoaderDynamic& dispatch) {
+	Packet packet;
+	std::memcpy(&packet, segments[0].data, sizeof(packet));
+	std::array<VkRenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
+	for (uint32_t i = 0; i < packet.colors; ++i) colors[i] = Unpack(packet.color[i]);
+	const auto      depth = Unpack(packet.depth), stencil = Unpack(packet.stencil);
+	VkRenderingInfo info {};
+	info.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
+	info.renderArea.offset    = {packet.x, packet.y};
+	info.renderArea.extent    = {packet.width, packet.height};
+	info.layerCount           = packet.layers;
+	info.colorAttachmentCount = packet.colors;
+	info.pColorAttachments    = colors.data();
+	info.pDepthAttachment     = packet.has_depth != 0 ? &depth : nullptr;
+	info.pStencilAttachment   = packet.has_stencil != 0 ? &stencil : nullptr;
+	const auto begin = dispatch.vkCmdBeginRendering != nullptr ? dispatch.vkCmdBeginRendering : dispatch.vkCmdBeginRenderingKHR;
+	begin(LocalVulkanRecording::Resolve(packet.command), &info);
+}
+} // namespace TableVirtual
+#endif
+
+// (CommandBuffer::RenderingHook, set around a no-image capture's BeginRendering, TableDraw.) True: recorded here, as a
+// packet whose views are cells its commit writes. A begin that names a placeholder is never recorded raw: the translation
+// is refused instead.
+bool RenderExecutor::TableVirtualRendering(void* data, vk::CommandBuffer command, const vk::RenderingInfo& rendering) {
+	auto&                                             v = *static_cast<NativeXprDrawState::Virtual*>(data);
+	std::array<int32_t, RENDER_COLOR_ATTACHMENTS_MAX> which {};
+	which.fill(-1);
+	bool any = false;
+	for (uint32_t i = 0; i < std::min<uint32_t>(rendering.colorAttachmentCount, RENDER_COLOR_ATTACHMENTS_MAX); ++i)
+		for (uint32_t j = 0; j < v.targets.size(); ++j)
+			if (rendering.pColorAttachments[i].imageView == v.Placeholder(j)) which[i] = static_cast<int32_t>(j), any = true;
+	if (!any) return false;
+	using Refusal = CommandScheduler::RecorderRefusal;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	if (!LocalVulkanRecording::Passive()) throw Refusal {"no-image target: not a passive recording"};
+	if (rendering.pNext != nullptr || rendering.flags != vk::RenderingFlags {} || rendering.viewMask != 0 ||
+	    rendering.colorAttachmentCount > RENDER_COLOR_ATTACHMENTS_MAX)
+		throw Refusal {"no-image target: a rendering the packet does not hold"};
+	TableVirtual::Packet packet {};
+	packet.command = static_cast<VkCommandBuffer>(command);
+	packet.x       = rendering.renderArea.offset.x;
+	packet.y       = rendering.renderArea.offset.y;
+	packet.width   = rendering.renderArea.extent.width;
+	packet.height  = rendering.renderArea.extent.height;
+	packet.layers  = rendering.layerCount;
+	packet.colors  = rendering.colorAttachmentCount;
+	const auto plain = [](const vk::RenderingAttachmentInfo& a) {
+		return a.pNext == nullptr && a.resolveMode == vk::ResolveModeFlagBits::eNone;
+	};
+	for (uint32_t i = 0; i < packet.colors; ++i) {
+		if (!plain(rendering.pColorAttachments[i])) throw Refusal {"no-image target: a rendering the packet does not hold"};
+		packet.color[i] = TableVirtual::Pack(rendering.pColorAttachments[i]);
+	}
+	if (rendering.pDepthAttachment != nullptr) {
+		if (!plain(*rendering.pDepthAttachment)) throw Refusal {"no-image target: a rendering the packet does not hold"};
+		packet.has_depth = 1, packet.depth = TableVirtual::Pack(*rendering.pDepthAttachment);
+	}
+	if (rendering.pStencilAttachment != nullptr) {
+		if (!plain(*rendering.pStencilAttachment)) throw Refusal {"no-image target: a rendering the packet does not hold"};
+		packet.has_stencil = 1, packet.stencil = TableVirtual::Pack(*rendering.pStencilAttachment);
+	}
+	const LocalVulkanRecording::Segment segment {&packet, sizeof(packet)};
+	void*                               copy = nullptr;
+	if (!LocalVulkanRecording::EnqueuePacketCopy(TableVirtual::Replay, segment, &copy) || copy == nullptr)
+		throw Refusal {"no-image target: rendering not recorded"};
+	auto* stored = static_cast<TableVirtual::Packet*>(copy);
+	for (uint32_t i = 0; i < packet.colors; ++i)
+		if (which[i] >= 0) v.cells.emplace_back(static_cast<uint32_t>(which[i]), &stored->color[i].view);
+	return true;
+#else
+	(void)command;
+	throw Refusal {"no-image target: no recording"};
+#endif
+}
+
+// (Mode 4) A worker's draw whose pair and draw state key have no entry in the catalog (TableWorkerEntry, before it makes
+// one), or whose catalog pair has no programs yet (a store compiling: TableTry), is drawn with an entry a worker made that
+// is not in the catalog yet, where there is one (nullopt: none, or refused: the path as before):
+//  - its own translation's entry for a new pair, though the catalog has a pair for the key since (the GPU thread's): the
+//    reuse in TableWorkerEntry looks for an entry of that pair, not this one;
+//  - an entry of an earlier translation whose segment committed (Speculation::After, its in-order part: settle_now, where
+//    TableEntryOverlayAdd puts it in the overlay) while its catalog part waits (the settle queue); out of the overlay once
+//    that part begins (TableEntrySettle: overlay_settled).
+// Exact: an entry is a pure function of the pair's key (vs, ps, start instance), the draw state key and the programs the code
+// at those addresses translates to: the table programs and pipeline its lookups found, the variant made of them, the key's
+// base draw state (the catalog's capture) or the state derived for it. A draw drawn with it is what the in-order path draws
+// for that key once the entry, or the GPU thread's store of the same key, is in the catalog. What the catalog path tests is
+// tested here, under the catalog's read lock TableTry holds across the lookup and the draw (an entry's catalog part takes
+// the write: it cannot run meanwhile): the code at the addresses still its programs' (hashed again when the shader map's
+// generation moved since the entry's proof), its pair not refused, respecialized or given other programs, the catalog's
+// own pair or variant for the key not refused, its variant (or the pair's stored one, with the same pipeline), its base
+// state still the catalog's same capture, its state's targets current, the entry not poisoned and not run as a hole. Only
+// a committed entry is in the overlay: a proposing segment cancelled or never committed never puts it there, and one run as
+// a hole is never added; a poisoned, parked, no-image-target or recorded-permutation entry is not added. The draw's own
+// commit checks the entry again (TableEntryOverlayCheck, at the segment's Before, the GPU thread: the same conditions, a
+// poisoning since included): a check that fails stops the segment and the draw is made in order as before. Published or kept
+// aside, the objects drawn with stay where they are (a new pair's node moved whole into the catalog's map, the derived
+// state's unique_ptr moved, the variant found again by key), and none is freed while a speculation is live
+// (TableSweepPairs, TableRetireEntryOrphans); the holder is held by the draw's proposal (a settle that does nothing). An
+// earlier translation's committed entry is drawn with a poison flag of its own: a draw of this uncommitted translation
+// does not change what that commit publishes (the draw is refused either way). The GPU thread waits for no worker here: its
+// add only tries the overlay's lock.
+std::optional<RenderExecutor::TableResult> RenderExecutor::TableEntryOverlay(CommandBuffer& buffer, const TablePair* existing,
+                                                                            std::span<const uint64_t> commands, uint64_t index_base,
+                                                                            uint64_t index_bytes, vk::IndexType index_type,
+                                                                            const NativeXprDirectDraw* direct) {
+	auto* const spec = Spec::Current();
+	if (spec == nullptr || spec->refused != nullptr || Role() == 0 || GuestGpu::IsGpuThread() || CatalogTable() == nullptr ||
+	    Catalog().m_native_xpr == nullptr || m_native_xpr == nullptr || t_catalog_read == nullptr || !t_catalog_read->owns_lock())
+		return std::nullopt;
+	const auto& sh             = buffer.GetShaders();
+	const auto  vs_address     = sh.GetVs().es_regs.data_addr, ps_address = sh.GetPs().ps_regs.data_addr;
+	const auto  start_instance = sh.GetVs().start_instance_user_sgpr;
+	const auto  key            = m_native_xpr->state_key;
+	const auto& states         = Catalog().NativeXprState().states;
+	// (What the catalog path tests, read under the catalog's read lock; the variant drawn with. False: refused.)
+	const auto usable = [&](TableEntryHolder& h, TableVariant*& variant) {
+		if (h.poisoned.load(std::memory_order_relaxed) || h.reuse_checked || h.ran_as_hole.load(std::memory_order_acquire))
+			return false;
+		// (The catalog's own pair for the key, refused or its variant for the key refused: the in-order path refuses.)
+		if (existing != nullptr) {
+			if (existing->refused) return false;
+			const auto refused = std::ranges::find(existing->variants, key, &TableVariant::state);
+			if (refused != existing->variants.end() && refused->refused) return false;
+		}
+		if (h.parked != nullptr || h.pair == nullptr || h.drawn_state == nullptr || h.programs[0] == nullptr || h.key != key)
+			return false;
+		auto& pair = *h.pair;
+		if (pair.vs != vs_address || pair.ps != ps_address || pair.start_instance != start_instance) return false;
+		if (pair.programs != h.programs || pair.refused || pair.respecialize) return false;
+		if (ShaderMapGeneration() != h.generation &&
+		    (ShaderHashNoFaultScope {true}, ShaderHashAt(vs_address) != h.programs[0]->shader_hash ||
+		                                        (h.programs[1] != nullptr && ShaderHashAt(ps_address) != h.programs[1]->shader_hash)))
+			return false;
+		if (h.state == nullptr) {
+			const auto again = states.find(key);
+			if (again == states.end() || again->second.get() != h.drawn_state || h.drawn_state->capture_id != h.capture)
+				return false;
+		}
+		const auto v = std::ranges::find(pair.variants, key, &TableVariant::state);
+		if (h.own_variant) {
+			if (v != pair.variants.end() && v->refused) return false;
+			variant = &h.variant;
+		} else {
+			if (v == pair.variants.end() || v->refused || v->pipeline != h.variant.pipeline) return false;
+			variant = &*v;
+		}
+		return NativeXprTargetsCurrent(*h.drawn_state);
+	};
+	const auto draw = [&](TableEntryHolder& h, TableVariant& variant, std::atomic<bool>* poison) {
+		struct EntryScope { // (cleared on every way out, a refusal thrown through TableDraw too)
+			EntryScope(const void* v, std::atomic<bool>* p) noexcept { t_entry_variant = v, t_entry_poison = p; }
+			~EntryScope() { t_entry_variant = nullptr, t_entry_poison = nullptr; }
+			EntryScope(const EntryScope&)            = delete;
+			EntryScope& operator=(const EntryScope&) = delete;
+		} scope(h.own_variant ? &variant : nullptr, poison);
+		const auto result = TableDraw(buffer, *h.pair, variant, *h.drawn_state, commands, index_base, index_bytes, index_type, direct);
+		OwnTable().last_pair = nullptr; // (TableContinue reads the role's last variant out of the pair's vector)
+		return result;
+	};
+	// (The draw's commit checks the entry (TableEntryOverlayCheck), once a segment; the proposal holds an earlier
+	// translation's holder while this translation is (its own's is held by its own proposal), its settle nothing.)
+	const auto note_check = [&](TableEntryHolder& h, std::shared_ptr<TableEntryHolder> held, TableResult result) {
+		if (result == TableResult::Native || Spec::Current() != spec || spec->refused != nullptr) return;
+		auto* const raw     = &h;
+		const auto  segment = spec->closed.size();
+		for (const auto& p: spec->proposed_sets)
+			if (p.pair == nullptr && p.hash == 0 && p.set == raw && p.segment == segment) return;
+		auto* const owner = &Catalog();
+		spec->proposed_sets.push_back({nullptr, 0, raw, segment, false, [held = std::move(held)](bool) { (void)held; }});
+		spec->proposed_sets.back().check = [owner, raw] { return owner->TableEntryOverlayCheck(*raw); };
+	};
+	// (Its own translation's entry for a new pair, the catalog's pair for the key made since: proposed with the mix
+	// TableWorkerEntry gives a new pair's.)
+	if (existing != nullptr) {
+		const std::array<uint64_t, 3> pair_key {vs_address, ps_address, static_cast<uint32_t>(start_instance)};
+		const auto                    content = XXH3_64bits(pair_key.data(), sizeof(pair_key));
+		const uint64_t                mix     = (content * 0x9e3779b97f4a7c15ull) ^ key;
+		for (const auto& p: spec->proposed_sets) {
+			if (p.pair != nullptr || p.hash != mix) continue;
+			auto& h = *static_cast<TableEntryHolder*>(p.set);
+			if (!h.new_pair || h.key != key || h.pair_hash != content) continue;
+			// (A capture whose commit makes colour targets: as the reuse, only in the segment that made it.)
+			if (h.state != nullptr && h.state->virtual_targets != nullptr && h.state->virtual_targets->segment != spec->closed.size())
+				continue;
+			TableVariant* variant = nullptr;
+			if (!usable(h, variant)) return std::nullopt;
+			const auto result = draw(h, *variant, &h.poisoned);
+			note_check(h, nullptr, result);
+			return result;
+		}
+	}
+	// (An earlier translation's committed entry whose catalog part waits.)
+	if (g_entry_overlay_n.load(std::memory_order_relaxed) == 0) return std::nullopt;
+	std::shared_ptr<TableEntryHolder> later;
+	{
+		const std::lock_guard lock(g_entry_overlay_mutex);
+		for (const auto& entry: g_entry_overlay) {
+			const auto& h = *entry;
+			if (h.key != key || h.overlay_settled.load(std::memory_order_acquire)) continue;
+			if (h.pair->vs != vs_address || h.pair->ps != ps_address || h.pair->start_instance != start_instance) continue;
+			later = entry;
+			break;
+		}
+	}
+	if (later == nullptr) return std::nullopt;
+	TableVariant* variant = nullptr;
+	if (!usable(*later, variant)) return std::nullopt;
+	std::atomic<bool> poison_aside {false};
+	const auto        result = draw(*later, *variant, &poison_aside);
+	note_check(*later, later, result);
+	return result;
+}
+
+// (Mode 4) At an entry's segment's commit, its in-order part done (settle_now, the GPU thread): into the overlay, unless its
+// catalog part began already; the settled ones trimmed (released after the lock).
+void RenderExecutor::TableEntryOverlayAdd(const std::shared_ptr<TableEntryHolder>& holder) {
+	auto& h = *holder;
+	if (h.overlay_added || h.overlay_settled.load(std::memory_order_relaxed)) return;
+	if (h.poisoned.load(std::memory_order_relaxed) || h.parked != nullptr || h.reuse_checked || h.virtual_hole ||
+	    h.ran_as_hole.load(std::memory_order_relaxed) || h.drawn_state == nullptr ||
+	    (h.state != nullptr && h.state->virtual_targets != nullptr))
+		return;
+	std::vector<std::shared_ptr<TableEntryHolder>> released;
+	{
+		std::unique_lock<std::mutex> lock(g_entry_overlay_mutex, std::try_to_lock);
+		if (!lock.owns_lock()) return;
+		for (auto it = g_entry_overlay.begin(); it != g_entry_overlay.end();) {
+			if ((*it)->overlay_settled.load(std::memory_order_relaxed) || g_entry_overlay.size() >= 256) {
+				released.push_back(std::move(*it));
+				it = g_entry_overlay.erase(it);
+			} else {
+				++it;
+			}
+		}
+		g_entry_overlay.push_back(holder);
+		g_entry_overlay_n.store(static_cast<uint32_t>(g_entry_overlay.size()), std::memory_order_relaxed);
+	}
+	h.overlay_added = true;
+}
+
+// (Mode 4) At the segment's Before (the GPU thread, the catalog's owner) of a draw drawn with an entry of the overlay: what
+// TableEntryOverlay tested, again (a poisoning or a run as a hole since included). False: the segment is not committed as
+// recorded.
+bool RenderExecutor::TableEntryOverlayCheck(TableEntryHolder& h) {
+	if (m_table_xpr == nullptr || m_native_xpr == nullptr || h.pair == nullptr || h.drawn_state == nullptr || h.programs[0] == nullptr)
+		return false;
+	if (h.poisoned.load(std::memory_order_relaxed) || h.ran_as_hole.load(std::memory_order_acquire)) return false;
+	const auto& pair = *h.pair;
+	if (pair.programs != h.programs || pair.refused || pair.respecialize) return false;
+	// (The catalog's pair for the key, refused or its variant for the key refused: the in-order path refuses. A new pair's
+	// entry: the catalog's pair for its hash, when another; else its own pair, above and below.)
+	const TablePair* catalog_pair = h.pair;
+	if (h.new_pair)
+		if (const auto found = m_table_xpr->pairs.find(h.pair_hash); found != m_table_xpr->pairs.end()) catalog_pair = &found->second;
+	if (catalog_pair->refused) return false;
+	if (const auto v = std::ranges::find(catalog_pair->variants, h.key, &TableVariant::state);
+	    v != catalog_pair->variants.end() && v->refused)
+		return false;
+	if (ShaderMapGeneration() != h.generation &&
+	    (ShaderHashAt(pair.vs) != h.programs[0]->shader_hash ||
+	     (h.programs[1] != nullptr && ShaderHashAt(pair.ps) != h.programs[1]->shader_hash)))
+		return false;
+	if (h.state == nullptr) {
+		const auto& states = NativeXprState().states;
+		const auto  again  = states.find(h.key);
+		if (again == states.end() || again->second.get() != h.drawn_state || h.drawn_state->capture_id != h.capture) return false;
+	}
+	if (!h.own_variant) {
+		const auto v = std::ranges::find(pair.variants, h.key, &TableVariant::state);
+		if (v == pair.variants.end() || v->refused || v->pipeline != h.variant.pipeline) return false;
+	}
+	return NativeXprTargetsCurrent(*h.drawn_state) && TableAdoptedCurrent(*h.drawn_state);
+}
+
+// (Mode 4) The commit's settle never waits for the workers' reads of the catalog: a proposal's catalog part runs under its
+// owner's write had with a try-lock; else it waits in g_settle_pending (the GPU thread's alone, in order: a part waits
+// while one before it does). The list runs at the next commit's settle while its tries succeed (SettleDrain(false)), and
+// under a write that waits (SettleDrain(true): the writer-first gate raised, as any write) at each guest flip
+// (CommandProcessor::Flip), before a sweep of the catalog (TableSweepPairs, which may free the pairs a waiting part
+// names), before a live mode 0, and after a settle that must not wait past its commit. A part runs with its owner's write
+// held for it (t_settle_held): its own CatalogWrite calls take nothing more. What a waiting part holds (the holder, the
+// set) its closure holds. Late publishing is safe by the checks each part makes under its write: a new pair only while
+// the catalog has none for its key, a variant only into a pair whose programs are the entry's and that is not refused or
+// respecialized, a state only while the key has none, an image set only while the catalog's epoch is the one it was built
+// under and its slot empty; else kept, as before.
+struct SettlePendingPart {
+	const RenderExecutor* owner = nullptr;
+	std::function<void()> work;
+};
+static std::vector<SettlePendingPart> g_settle_pending; // (the GPU thread's; a short list, taken from its front)
+
+void RenderExecutor::SettleOrQueue(const void* owner_opaque, std::function<void()> work) {
+	const auto* owner = static_cast<const RenderExecutor*>(owner_opaque);
+	if (owner == nullptr) return work();
+	if (g_settle_pending.empty()) {
+		std::unique_lock<std::shared_mutex> lock(owner->m_catalog_mutex, std::try_to_lock);
+		if (lock.owns_lock()) {
+			t_settle_held = &owner->m_catalog_mutex;
+			struct Release {
+				~Release() { t_settle_held = nullptr; }
+			} release;
+			work();
+			return;
+		}
+	}
+	g_settle_pending.push_back({owner, std::move(work)});
+	s_settle_pending_n.store(static_cast<uint32_t>(g_settle_pending.size()), std::memory_order_relaxed);
+}
+
+void RenderExecutor::SettleDrain(bool blocking) {
+	while (!g_settle_pending.empty()) {
+		const auto* owner = g_settle_pending.front().owner;
+		std::unique_lock<std::shared_mutex> lock;
+		if (blocking) {
+			lock = owner->CatalogWrite(); // (outside mode 4 an empty lock: no reader then)
+		} else {
+			lock = std::unique_lock<std::shared_mutex>(owner->m_catalog_mutex, std::try_to_lock);
+			if (!lock.owns_lock()) return;
+		}
+		t_settle_held = &owner->m_catalog_mutex;
+		struct Release {
+			~Release() { t_settle_held = nullptr; }
+		} release;
+		// (Every waiting part of this owner at the front, in order, under the one write.)
+		while (!g_settle_pending.empty() && g_settle_pending.front().owner == owner) {
+			auto part = std::move(g_settle_pending.front());
+			g_settle_pending.erase(g_settle_pending.begin());
+			s_settle_pending_n.store(static_cast<uint32_t>(g_settle_pending.size()), std::memory_order_relaxed);
+			part.work();
+		}
+	}
+}
+
+void RenderExecutor::SettleClear() {
+	// (The parts dropped below never settle their entries: none stays in the overlay.)
+	if (g_entry_overlay_n.load(std::memory_order_relaxed) != 0) {
+		std::vector<std::shared_ptr<TableEntryHolder>> released;
+		{
+			const std::lock_guard lock(g_entry_overlay_mutex);
+			released.swap(g_entry_overlay);
+			g_entry_overlay_n.store(0, std::memory_order_relaxed);
+		}
+	}
+	if (g_settle_pending.empty()) return;
+	g_settle_pending.clear();
+	s_settle_pending_n.store(0, std::memory_order_relaxed);
+}
+
+static void TableEntryOrphan(const std::shared_ptr<RenderExecutor::TableEntryHolder>& holder) {
+	const std::lock_guard lock(g_entry_orphans_mutex);
+	g_entry_orphans.push_back(holder);
+	g_entry_orphans_n.store(static_cast<uint32_t>(g_entry_orphans.size()), std::memory_order_relaxed);
+}
+
+// (Mode 4) What an entry's commit does in order, before its catalog part (Speculation::After runs it at the commit, the
+// catalog part when the owner's write is had: SettleOrQueue): what the in-order draw would have done for this draw, which
+// the commit spares it, in stream order: the records, then the normal pipeline and its recipe (published whole or not:
+// the draw is committed; the cache's m_mutex only, no other lock held); then, unless poisoned, the metadata notes of a
+// derived state's targets (as NativeXprCaptureState notes its own). Once each.
+void RenderExecutor::TableEntrySettleInOrder(TableEntryHolder& h) {
+	if (h.adopted != nullptr) {
+		m_context.GetPipelineCache().CommitAdopted(*h.adopted);
+		h.adopted.reset();
+	}
+	if (h.meta_noted || h.poisoned.load(std::memory_order_relaxed)) return;
+	h.meta_noted = true;
+	if (h.state != nullptr) {
+		auto& textures = m_context.GetTextureCache();
+		for (const auto& target: h.state->targets) textures.NoteMetaUse(target.metadata, target.id.index);
+	}
+}
+
+// (Mode 4) At the entry's segment's commit (`commit`; false: never committed), the GPU thread, under the owner's write:
+// published as TableStore stores, while the catalog has nothing there; what is not published whole is kept
+// (TableEntryOrphan).
+void RenderExecutor::TableEntrySettle(const std::shared_ptr<TableEntryHolder>& holder, bool commit) {
+	auto& h = *holder;
+	// (Out of the overlay from here: TableEntryOverlay; the objects a worker drew with stay where they are.)
+	h.overlay_settled.store(true, std::memory_order_release);
+	// (Never committed: its records and private pipeline go (destroyed here, on the GPU thread).)
+	if (!commit) return h.adopted.reset(), TableEntryOrphan(holder);
+	TableEntrySettleInOrder(h); // (done at the commit already when the rest waited: SettleOrQueue)
+	if (h.poisoned.load(std::memory_order_relaxed)) return TableEntryOrphan(holder);
+	// (Never published with a parked entry's stand-in (only once its commit's check bound the compiled pipeline), nor with a
+	// state whose colour targets its commit did not make.)
+	if (h.parked != nullptr && !h.parked_resolved) return TableEntryOrphan(holder);
+	if (h.state != nullptr && h.state->virtual_targets != nullptr) return TableEntryOrphan(holder);
+	bool whole = true;
+	{
+		const auto write = CatalogWrite();
+		auto*      table = m_table_xpr.get();
+		auto&      cache = NativeXprState();
+		const auto frame = m_context.FrameNumber();
+		if (table == nullptr) {
+			whole = false;
+		} else if (h.new_pair) {
+			if (!table->pairs.contains(h.pair_hash)) {
+				auto node                = h.node.extract(h.pair_hash);
+				node.mapped().used_frame = frame;
+				auto inserted            = table->pairs.insert(std::move(node));
+				TableScoutPublish(inserted.position->second);
+			} else {
+				whole = false;
+			}
+		} else if (h.own_variant) {
+			auto& pair = *h.pair;
+			if (pair.programs != h.programs || pair.refused || pair.respecialize) {
+				whole = false;
+			} else {
+				auto stored = std::ranges::find(pair.variants, h.key, &TableVariant::state);
+				if (stored == pair.variants.end()) {
+					pair.variants.push_back(h.variant);
+				} else if (!stored->refused && stored->pipeline == nullptr) {
+					stored->pipeline       = h.variant.pipeline;
+					stored->mapping        = h.variant.mapping;
+					stored->fetch_embedded = h.variant.fetch_embedded;
+				} else if (stored->refused || stored->pipeline != h.variant.pipeline) {
+					whole = false;
+				}
+			}
+		}
+		if (h.state != nullptr) {
+			if (whole && !cache.states.contains(h.key)) {
+				auto& slot = cache.states[h.key];
+				slot       = std::move(h.state);
+				slot->Use(frame);
+			} else {
+				whole = false;
+			}
+		}
+	}
+	if (!whole) TableEntryOrphan(holder);
+}
+
+// (Mode 4) The kept holders go once no speculation translates or has a result unfinished (TableSweepPairs, the catalog's
+// owner): a kept node's sets retired as a swept pair's; the executors' and the sets' pointers into a kept state dropped as
+// when states leave (TableForgetStates).
+void RenderExecutor::TableRetireEntryOrphans() {
+	if (Role() != 0 || m_table_xpr == nullptr) return;
+	std::vector<std::shared_ptr<TableEntryHolder>> list;
+	{
+		const std::lock_guard lock(g_entry_orphans_mutex);
+		list.swap(g_entry_orphans);
+		g_entry_orphans_n.store(0, std::memory_order_relaxed);
+	}
+	if (list.empty()) return;
+	const auto write = CatalogWrite();
+	if (kyty_local_speculations_live.load(std::memory_order_seq_cst) != 0) {
+		const std::lock_guard lock(g_entry_orphans_mutex);
+		g_entry_orphans.insert(g_entry_orphans.end(), list.begin(), list.end());
+		g_entry_orphans_n.store(static_cast<uint32_t>(g_entry_orphans.size()), std::memory_order_relaxed);
+		return;
+	}
+	for (auto& holder: list)
+		for (auto& [hash, pair]: holder->node)
+			for (auto& [words, set]: pair.sets) NativeXprRetireSet(set->pool, set->set);
+	list.clear();
+	auto& cache          = NativeXprState();
+	cache.emit           = {};
+	cache.last_state     = nullptr;
+	cache.last_state_key = 0;
+	TableForgetStates();
 }

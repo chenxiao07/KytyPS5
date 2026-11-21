@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 
 #include <atomic>
+#include <chrono>
 #include <immintrin.h>
 #include <mutex>
 #include <utility>
@@ -60,6 +61,15 @@ public:
 		m_seq.store(m_seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 		std::atomic_thread_fence(std::memory_order_release);
 	}
+	// A take that never waits (spec_pool_layers): false while anyone holds it, this thread too (no recursion check, no
+	// spin); else lock()'s acquisition (the owner, the sequence odd), released by unlock().
+	[[nodiscard]] bool try_lock() noexcept {
+		if (m_lock.test(std::memory_order_relaxed) || m_lock.test_and_set(std::memory_order_acquire)) return false;
+		m_owner.store(CurrentThread(), std::memory_order_relaxed);
+		m_seq.store(m_seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
+		return true;
+	}
 	void unlock() noexcept {
 		if (m_owner.load(std::memory_order_relaxed) != CurrentThread()) {
 			EXIT("region tracking lock released by non-owner\n");
@@ -69,6 +79,8 @@ public:
 		m_lock.clear(std::memory_order_release);
 	}
 	[[nodiscard]] bool OwnedByCurrentThread() const noexcept { return m_owner.load(std::memory_order_relaxed) == CurrentThread(); }
+	// (TextureCacheLock's readers: whether any thread holds it, a sequentially consistent load.)
+	[[nodiscard]] bool Held() const noexcept { return m_lock.test(std::memory_order_seq_cst); }
 	// A read of state only holders of this lock write, without taking it: valid when no holder
 	// was inside while it ran (the sequence even and unchanged), else done again under the lock.
 	// The query then costs no locked instruction and leaves the lock's line to the writers.
@@ -118,6 +130,141 @@ private:
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
 
+// The texture cache's m_lock: TrackingSpinLock's exclusive take (the same lock / unlock code, recursion and owner checks,
+// ReadShared) and, in its shared mode (KYTY_SPEC_TEXCACHE_SHARED: turned on once, never off, by EnableShared under the
+// flag; TextureCache::ApplySharedMode at a mode-4 boot or a live `mode 4`, before the speculation threads are made),
+// shared takes as well:
+// - lock_shared: a reader count raised, then the exclusive flag tested (both sequentially consistent); taken when no one
+//   holds the flag, or its holder lets readers in (OpenWindow); else the count is lowered again and it waits.
+// - lock (exclusive), in the shared mode: the flag taken, then the readers inside waited out (a fence, then the count).
+//   Of a reader's raise-then-test and a taker's take-then-count, one sees the other: no reader is inside an exclusive
+//   hold, except in a window its holder opened.
+// - OpenWindow / CloseWindow (the exclusive holder): readers let in while the holder keeps the flag (no other exclusive
+//   taker gets in), then shut out and waited out again before it writes.
+// Without the shared mode an exclusive take is TrackingSpinLock's plus two relaxed loads of the mode's byte (in the line
+// the take writes), and nothing takes it shared.
+class alignas(64) TextureCacheLock final {
+public:
+	void lock() noexcept {
+		// (Before the flag: a shared holder's nested take would wait on a writer that waits for it.)
+		if (m_shared.load(std::memory_order_relaxed) && t_shared_depth != 0) [[unlikely]]
+			EXIT("texture cache lock taken exclusively while held shared\n");
+		m_exclusive.lock();
+		// (The mode read under the flag: EnableShared writes it under the flag, so every take after it drains, whenever
+		// the taker began.)
+		if (m_shared.load(std::memory_order_relaxed)) [[unlikely]] DrainReaders();
+	}
+	void unlock() noexcept {
+		if (m_shared.load(std::memory_order_relaxed) && m_window) [[unlikely]]
+			EXIT("texture cache lock released with readers let in\n");
+		m_exclusive.unlock();
+	}
+	// (spec_pool_layers) The exclusive take that never waits: the flag only if free, then the mode read under it (as
+	// lock()); in the shared mode, readers inside (lock()'s fence, then the count): released, false, where lock() would
+	// wait them out. Released by unlock().
+	[[nodiscard]] bool try_lock() noexcept {
+		if (!m_exclusive.try_lock()) return false;
+		if (m_shared.load(std::memory_order_relaxed)) {
+			std::atomic_thread_fence(std::memory_order_seq_cst);
+			if (m_readers.load(std::memory_order_acquire) != 0) {
+				m_exclusive.unlock();
+				return false;
+			}
+		}
+		return true;
+	}
+	void lock_shared() noexcept {
+		if (m_exclusive.OwnedByCurrentThread() || t_shared_depth != 0) EXIT("texture cache lock taken shared while held\n");
+		uint32_t spins = 0;
+		for (;;) {
+			m_readers.fetch_add(1, std::memory_order_seq_cst);
+			if (!m_exclusive.Held() || m_admit.load(std::memory_order_seq_cst)) break;
+			m_readers.fetch_sub(1, std::memory_order_release);
+			while (m_exclusive.Held() && !m_admit.load(std::memory_order_relaxed)) {
+				if (++spins < 512) _mm_pause();
+				else TrackingSpinLock::YieldCpu();
+			}
+		}
+		++t_shared_depth;
+	}
+	// (spec_pool_layers) One shared take that never waits: the count raised, then the flag tested as lock_shared does
+	// (both sequentially consistent); held by anyone (who may be draining the readers) and no window open: the count
+	// lowered again, false. Released by unlock_shared().
+	[[nodiscard]] bool try_lock_shared() noexcept {
+		if (m_exclusive.OwnedByCurrentThread() || t_shared_depth != 0) EXIT("texture cache lock taken shared while held\n");
+		m_readers.fetch_add(1, std::memory_order_seq_cst);
+		if (m_exclusive.Held() && !m_admit.load(std::memory_order_seq_cst)) {
+			m_readers.fetch_sub(1, std::memory_order_release);
+			return false;
+		}
+		++t_shared_depth;
+		return true;
+	}
+	void unlock_shared() noexcept {
+		--t_shared_depth;
+		m_readers.fetch_sub(1, std::memory_order_release);
+	}
+	[[nodiscard]] bool        OwnedByCurrentThread() const noexcept { return m_exclusive.OwnedByCurrentThread(); }
+	[[nodiscard]] static bool HeldSharedHere() noexcept { return t_shared_depth != 0; }
+	[[nodiscard]] bool        SharedMode() const noexcept { return m_shared.load(std::memory_order_relaxed); }
+	// The shared mode on (once; never off), under the flag: no exclusive holder is inside meanwhile, and every exclusive
+	// take after it reads the mode under the flag and drains the readers. No reader before it (lock_shared is taken only
+	// after SharedMode() answered true). Not from a holder (the flag's own recursion check ends the emulator).
+	void EnableShared() noexcept {
+		m_exclusive.lock();
+		m_shared.store(true, std::memory_order_relaxed);
+		m_exclusive.unlock();
+	}
+	// The exclusive holder (the shared mode only): readers let in while it keeps the flag, until CloseWindow.
+	void OpenWindow() noexcept {
+		if (!m_shared.load(std::memory_order_relaxed) || !m_exclusive.OwnedByCurrentThread() || m_window)
+			EXIT("texture cache window misused\n");
+		m_window = true;
+		m_admit.store(true, std::memory_order_seq_cst);
+	}
+	// Readers shut out, and those inside waited out (none inside once it returns). Nothing open: nothing done.
+	void CloseWindow() noexcept {
+		if (!m_window) return;
+		m_admit.store(false, std::memory_order_seq_cst);
+		DrainReaders();
+		m_window = false;
+	}
+	[[nodiscard]] bool WindowOpen() const noexcept { return m_window; } // (the holder's)
+	// (Its first try reads unlocked; the fallback takes the flag alone: a read, beside any readers. Not from a shared
+	// holder: its fallback would wait on a writer that waits for it.)
+	template <typename Read>
+	auto ReadShared(Read&& read) {
+		if (m_shared.load(std::memory_order_relaxed) && t_shared_depth != 0) [[unlikely]]
+			EXIT("texture cache lock read (ReadShared) while held shared\n");
+		return m_exclusive.ReadShared(std::forward<Read>(read));
+	}
+
+private:
+	void DrainReaders() noexcept {
+		std::atomic_thread_fence(std::memory_order_seq_cst);
+		if (m_readers.load(std::memory_order_acquire) == 0) return;
+		// (Readers inside: waited out, counted with the wait: texcache_drains_n, texcache_drain_ns.)
+		const auto from  = std::chrono::steady_clock::now();
+		uint32_t   spins = 0;
+		while (m_readers.load(std::memory_order_acquire) != 0) {
+			if (++spins < 512) _mm_pause();
+			else TrackingSpinLock::YieldCpu();
+		}
+		LiveCounters::Add(LiveCounters::TexcacheDrainsN);
+		LiveCounters::Add(LiveCounters::TexcacheDrainNs, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                                     std::chrono::steady_clock::now() - from)
+		                                                     .count()));
+	}
+
+	TrackingSpinLock  m_exclusive;
+	std::atomic<bool> m_shared {false};
+	bool             m_window = false; // (the exclusive holder's)
+	// The readers' RMWs on a line of their own: not the one the exclusive takes and ReadShared's lock-free read use.
+	alignas(64) std::atomic<uint32_t>   m_readers {0};
+	std::atomic<bool>                   m_admit {false};
+	static inline thread_local uint32_t t_shared_depth = 0;
+};
+
 // Advances whenever pages become CPU-dirty (ChangeState<Cpu, true>, a new region's pages). A region's LastDirtyClock is
 // the value of its last such change: the CPU-dirty pages of a region whose clock is not above a value read earlier were
 // dirty all the time since (nothing made them clean: see CommandScheduler::UploadPrologue).
@@ -149,6 +296,15 @@ public:
 		if (m_deferred_protects.load(std::memory_order_acquire) != 0) return 0;
 		return m_cpu_epoch.load(std::memory_order_acquire);
 	}
+	// KYTY_SPEC_BDA_CLEAN_SKIP (the caller holds `lock`): the region's CPU epoch when no page of [vaddr, vaddr + size) is
+	// CPU-dirty (m_cpu_dirty: the test SynchronizeBuffer makes before it uploads anything) and the epoch proves something
+	// (no write protection queued: CpuModificationEpoch); else 0.
+	[[nodiscard]] uint64_t CleanRangeEpoch(uint64_t vaddr, uint64_t size) const noexcept {
+		const auto epoch = CpuModificationEpoch();
+		if (epoch == 0) return 0;
+		const auto [start, end] = GetPageRange(vaddr, size);
+		return m_cpu_dirty.AnyInRange(start, end) ? 0 : epoch;
+	}
 	// KYTY_ASYNC_REPROTECT: a write protection of pages in this region is queued.
 	void BeginDeferredProtection() noexcept { m_deferred_protects.fetch_add(1, std::memory_order_acq_rel); }
 	[[nodiscard]] bool DeferredProtectionPending() const noexcept {
@@ -159,6 +315,26 @@ public:
 		m_page_manager.ReapplyProtection(vaddr, size);
 		m_cpu_epoch.fetch_add(1, std::memory_order_acq_rel);
 		m_deferred_protects.fetch_sub(1, std::memory_order_acq_rel);
+	}
+	// KYTY_SPEC_UPLOAD_PIPE: `count` queued deferred protections of this region over adjacent ranges, [vaddr, vaddr + size)
+	// together, as one: the pages' protection as each would give it (it is read per page when it runs), the epoch and the
+	// pending count moved by `count`, as `count` calls would.
+	void ApplyDeferredProtections(uint64_t vaddr, uint64_t size, uint32_t count) {
+		m_page_manager.ReapplyProtection(vaddr, size);
+		m_cpu_epoch.fetch_add(count, std::memory_order_acq_rel);
+		m_deferred_protects.fetch_sub(count, std::memory_order_acq_rel);
+	}
+	// KYTY_SPEC_PROTECT_ASYNC: the two above for an upload of a buffer GPU work writes (PageManager::
+	// ReapplyWrittenProtection: a page whose no access is still pending on the GPU thread gets read-only, not it early).
+	void ApplyDeferredWrittenProtection(uint64_t vaddr, uint64_t size) {
+		m_page_manager.ReapplyWrittenProtection(vaddr, size, 1);
+		m_cpu_epoch.fetch_add(1, std::memory_order_acq_rel);
+		m_deferred_protects.fetch_sub(1, std::memory_order_acq_rel);
+	}
+	void ApplyDeferredWrittenProtections(uint64_t vaddr, uint64_t size, uint32_t count) {
+		m_page_manager.ReapplyWrittenProtection(vaddr, size, count);
+		m_cpu_epoch.fetch_add(count, std::memory_order_acq_rel);
+		m_deferred_protects.fetch_sub(count, std::memory_order_acq_rel);
 	}
 
 	template <DirtySource source, bool all = false>

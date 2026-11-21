@@ -47,6 +47,20 @@ bool ResumeGuardedCopy(void* context) noexcept {
 	return true;
 }
 
+bool ResumeGuardedCopyAtGuard(void* context, uint64_t address) noexcept {
+	if (!ResumeGuardedCopy(context)) {
+		return false;
+	}
+	MEMORY_BASIC_INFORMATION region {};
+	// (Private memory only, as guest and host stacks are: never a view another mapping put there meanwhile.)
+	if (VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) != 0 && region.State == MEM_COMMIT &&
+	    region.Type == MEM_PRIVATE && (region.Protect & PAGE_GUARD) == 0) {
+		DWORD old = 0;
+		VirtualProtect(reinterpret_cast<void*>(address & ~uint64_t {4095}), 4096, region.Protect | PAGE_GUARD, &old);
+	}
+	return true;
+}
+
 } // namespace Common
 
 #else

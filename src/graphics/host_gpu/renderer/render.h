@@ -13,6 +13,7 @@
 #include "live-switch.h"
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -133,6 +134,17 @@ public:
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
+	// (Mode 4, a speculation's thread, around one BeginRendering: RenderingHookScope) The begin's call recorded by the hook
+	// instead when it returns true (a rendering naming a view its commit makes: table-xpr.inc's TableVirtualRendering).
+	using RenderingHook = bool (*)(void* data, vk::CommandBuffer command, const vk::RenderingInfo& rendering);
+	static inline thread_local RenderingHook t_rendering_hook      = nullptr;
+	static inline thread_local void*         t_rendering_hook_data = nullptr;
+	struct RenderingHookScope {
+		RenderingHookScope(RenderingHook hook, void* data) noexcept { t_rendering_hook = hook, t_rendering_hook_data = data; }
+		~RenderingHookScope() { t_rendering_hook = nullptr, t_rendering_hook_data = nullptr; }
+		RenderingHookScope(const RenderingHookScope&)            = delete;
+		RenderingHookScope& operator=(const RenderingHookScope&) = delete;
+	};
 	void EndRendering() const;
 	// The render pass `state` again after an interruption (a copy of an attachment): its attachments loaded, not
 	// cleared, and `state` kept as the current one, so that the next BeginRendering with it continues the pass.
@@ -391,6 +403,9 @@ private:
 	[[nodiscard]] bool NativeXprDraw(CommandBuffer& buffer, const NativeXprDrawArgs& args);
 
 public:
+	// (Mode 4; table-xpr.inc) What a worker made for a draw until its commit publishes it (public: the kept holders' list is
+	// a file-level static there).
+	struct TableEntryHolder;
 	// Runtime entry points for the command processor (kyty_local_native_xpr_mode).
 	// A direct indexed draw (DRAW_INDEX_2 / DRAW_INDEX_OFFSET_2): its indices, count and instances; or a direct draw
 	// of vertices (DRAW_INDEX_AUTO, not `indexed`: the count is of vertices; table draws only). `indirect` (not
@@ -449,6 +464,18 @@ public:
 	// changed it since (TableXpr::epoch; table-xpr.inc).
 	void ForgetStaleCatalog();
 	static constexpr uint32_t Roles = 13; // (the GPU thread, Spec::MaxPacketSlots speculation threads)
+	// (Mode 4, the GPU thread) A segment's commit settles each proposal's catalog part under its owner's catalog write
+	// taken with a try-lock (SettleOrQueue; `owner`: the proposal's catalog owner, Spec::State::ProposedSet::catalog_owner,
+	// null: run at once, its own writes taken); held by a worker's read, or a part already waiting, the part waits in a list
+	// of the GPU thread's, in order, run at the next commit's try that succeeds (SettleDrain(false)) and under a write that
+	// waits (SettleDrain(true)) at each guest flip, before a sweep of the catalog (TableSweepPairs), before a live mode 0,
+	// and where a settle must not wait past its commit. table-xpr.inc.
+	static void SettleOrQueue(const void* owner, std::function<void()> work);
+	static void SettleDrain(bool blocking);
+	// (The renderer's teardown, the GPU thread stopped, the device still there: the parts still waiting dropped, so none
+	// outlives the device in the static list.)
+	static void SettleClear();
+	static inline std::atomic<uint32_t> s_settle_pending_n {0}; // (the parts waiting)
 
 private:
 	// Table draws (src/local/table-xpr.inc).
@@ -471,6 +498,9 @@ private:
 	// The catalog's owner changes its pairs and dispatches, image sets, draw states and compute clears under its lock
 	// exclusively (CatalogWrite); another executor reads them under it shared (CatalogRead, on its own thread).
 	mutable std::shared_mutex m_catalog_mutex;
+	// (The GPU thread: the catalog whose write a settle part runs under, held for it by SettleOrQueue / SettleDrain; null:
+	// none.)
+	static inline thread_local const std::shared_mutex* t_settle_held = nullptr;
 	// catalog_writer_first (under KYTY_SPECULATE=4, the only mode with readers): the owner raises this while it waits for
 	// the lock exclusively, and a worker waits for it to fall before its table try takes the lock shared. std::shared_mutex gives a waiting writer no priority: in an
 	// area transition the workers' table tries, taking it shared in turns, held the owner's writes 123-193 us each.
@@ -481,6 +511,9 @@ private:
 	// (Outside KYTY_SPECULATE=4 no other executor reads the catalog: no lock. The mode changes only between submissions.)
 	[[nodiscard]] std::unique_lock<std::shared_mutex> CatalogWrite() const {
 		if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return std::unique_lock<std::shared_mutex>();
+		// (A settle part run with this catalog's write held for it, SettleOrQueue / SettleDrain: no second take.)
+		if (t_settle_held == &m_catalog_mutex) [[unlikely]]
+			return std::unique_lock<std::shared_mutex>();
 		std::unique_lock lock(m_catalog_mutex, std::try_to_lock);
 		if (!lock.owns_lock()) {
 			const bool first = CatalogWriterFirst();
@@ -527,8 +560,40 @@ private:
 	                      const NativeXprDrawState& draw_state, std::span<const uint64_t> commands,
 	                      uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
 	                      const NativeXprDirectDraw* direct);
+	[[gnu::noinline]] TableImageSet* TableDrawStateSet(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
+	                                                   const NativeXprDrawState& draw_state, TableImageSet* set,
+	                                                   Spec::State* spec_state);
 	// spec_worker_images: a worker's set's pending slots completed by the GPU thread at its commit (Speculation::Before).
 	[[nodiscard]] bool TableCompletePendingImages(TableImageSet& set);
+	// (Mode 4; table-xpr.inc) A speculation makes the table entry a draw lacks (a new pair, a new draw state from a
+	// sibling's capture, a variant), draws with it, and its commit publishes it (nullopt: not made, refused as before).
+	[[nodiscard]] std::optional<TableResult> TableWorkerEntry(CommandBuffer& buffer, TablePair* existing, uint64_t pair_hash,
+	                                                          std::span<const uint64_t> commands, uint64_t index_base,
+	                                                          uint64_t index_bytes, vk::IndexType index_type,
+	                                                          const NativeXprDirectDraw* direct);
+	[[nodiscard]] bool TableEntryCheck(TableEntryHolder& holder);
+	void               TableEntrySettle(const std::shared_ptr<TableEntryHolder>& holder, bool commit);
+	void               TableEntrySettleInOrder(TableEntryHolder& holder);
+	void               TableRetireEntryOrphans();
+	// (Mode 4; table-xpr.inc) A worker's own capture of a draw state no capture of whose context exists (its targets
+	// resolved read only); the commit's resolution of an entry parked on its table pipeline's compile; the commit's making
+	// of a captured state's colour targets no image existed for, and the hook that records a rendering's begin naming them.
+	[[nodiscard]] std::unique_ptr<NativeXprDrawState> WorkerCaptureTargets(CommandBuffer& buffer, vk::PrimitiveTopology topology,
+	                                                                       bool restart, uint64_t ctx_hash);
+	[[nodiscard]] bool TableEntryResolveParked(TableEntryHolder& holder);
+	[[nodiscard]] bool TableEntryResolveVirtual(TableEntryHolder& holder, const void* spec_state);
+	static bool        TableVirtualRendering(void* data, vk::CommandBuffer command, const vk::RenderingInfo& rendering);
+	// (Mode 4; table-xpr.inc) A worker's draw drawn with an entry not in the catalog yet (its translation's own new pair's,
+	// the catalog's pair made since; or one whose segment committed, its catalog part waiting), the commit's add of such
+	// an entry, and the check at the commit of a draw drawn with one.
+	[[nodiscard]] std::optional<TableResult> TableEntryOverlay(CommandBuffer& buffer, const TablePair* existing,
+	                                                           std::span<const uint64_t> commands, uint64_t index_base,
+	                                                           uint64_t index_bytes, vk::IndexType index_type,
+	                                                           const NativeXprDirectDraw* direct);
+	void               TableEntryOverlayAdd(const std::shared_ptr<TableEntryHolder>& holder);
+	[[nodiscard]] bool TableEntryOverlayCheck(TableEntryHolder& holder);
+	// (Mode 4) Whether a captured state's adopted targets are still what the in-order FindImage would reuse.
+	[[nodiscard]] bool TableAdoptedCurrent(const NativeXprDrawState& draw_state);
 	[[nodiscard]] TableImageSet* TableResolveSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
 	                                             const NativeXprDrawState* draw_state, std::span<const uint32_t> words);
 	[[nodiscard]] bool           TableValidateSet(TableImageSet& set);
@@ -546,7 +611,7 @@ private:
 	void TableStore(CommandBuffer& buffer, const DrawRenderState& state, vk::PrimitiveTopology topology,
 	                bool primitive_restart_enable, const RenderState& rendering, bool storable);
 	void NativeXprCaptureState(CommandBuffer& buffer, const DrawRenderState& state, const RenderState& rendering,
-	                           uint64_t state_key);
+	                           uint64_t state_key, vk::PrimitiveTopology topology, bool primitive_restart_enable);
 	[[nodiscard]] bool NativeXprTargetsCurrent(const NativeXprDrawState& draw_state);
 	// (`command`: the draw's command buffer, its registers for spec_depth_layers2; none: no target is left to the commit.)
 	[[nodiscard]] bool NativeXprEmitTargets(const NativeXprDrawState& draw_state, vk::CommandBuffer vk_buffer,

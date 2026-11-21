@@ -80,6 +80,7 @@ switch acts only in mode 4. A verify switch N checks every Nth use against the p
 | speculate_flush_every | a commit's held buffers flushed every Nth commit | - | 8 | |
 | speculate_keep_pass | a segment that recorded nothing keeps the open render pass | - | 1 | |
 | serve_in_waits (changed) | guest commands served while the render thread waits (bits); mode 4 adds 2 and 4 | 1 | 7 | |
+| spec_gpu_affinity | the GPU thread's CPUs less every core the workers run on (SMT siblings with them), set at the next flip and given back out of mode 4; not changed where fewer than 2 performance cores would be left (the log says why) | - | 1 | |
 | **The write guard** | | | | |
 | KYTY_WRITE_GUARD (changed in mode 4) | a guest write lands at once, hidden from the game until older uploads are done (off in mode 0 as upstream: the protection churn behind #5 / #50) | 0 | 1 | |
 | write_guard_spec | the guard in mode 4 too | - | 1 | |
@@ -89,9 +90,18 @@ switch acts only in mode 4. A verify switch N checks every Nth use against the p
 | eager_feedback (upstream, #300; off in mode 0 as upstream, cfbf1148) | completed copy-feedback snapshots written back before the game faults on them | 0 | 1 | eager_feedback_verify N |
 | feedback_batch (upstream, #301; off in mode 0 as upstream, cfbf1148) | copy-feedback snapshots copied together as the open buffer closes | 0 | 1 | |
 | table_learn_portable (live; KYTY_TABLE_LEARN_PORTABLE) | 1: an image set refused for another specialization that only a buffer's V# format makes, and a draw state stored with such other programs (the variant store), learn that buffer as portable and the pair compiles again; 2: also a refused set's retry that finds its program translating waits for it (Demon's Souls' view save: ~38 refused draws a frame gone, s1-10 fps +2.4, settled +2.2) | - | 2 | |
+| **The pipeline cache** | | | | |
+| spec_pipecache_split | the GPU thread's lookup that must translate a program builds it with the pipeline cache's lock released and publishes it under the lock, the first publish winning (a dispatch's too); a worker's lookup reads a program's plan back from its file and materializes with the lock released, then finds or adopts under it; the "Shaders:" line from running counts | 0 | 1 | |
+| spec_preload_fix | a preload never displaces a plan a lookup used: the plan sweep sends the preloaded plans no lookup used yet out first, the oldest first, and one sent out so is not preloaded again until its own lookup reads it; a plan whose worker read an erase made stale is listed out again | 0 | 1 | |
 | **Compute** | | | | |
 | fill_buffer_clears | an image-clear dispatch over plain buffer memory made as a transfer fill | 0 | 1 | |
 | **The table path** | | | | |
 | KYTY_TABLE_TARGET_READ (changed) | a table image set may hold a target its shaders sample | 0 | 1 | |
 | table_serials (upstream, #302; off in mode 0 as upstream, cfbf1148) | a table draw's target and set checks skipped while the images' serial sums hold | 0 | 1 | table_serials 2 |
 | table_memo (upstream, #303; off in mode 0 as upstream, cfbf1148) | a table draw reuses its pair's last variant, state and set while nothing they depend on moved | 0 | 1 | table_memo_verify N |
+| **Guest memory** | | | | |
+| spec_upload_pipe | the upload worker's batches pipelined: one walker runs the queue's protections and calls in order and hands each copy, as it comes, to seven copy threads in 256 KiB chunks (no fork-join a run of copies, no run cut at a lift or a Read); adjacent queued protections of the same call and manager run as one call | 0 | 1 | |
+| spec_backing_range_lock | a locked read of the guest memory's backing store (an upload's source, a texture's staging copy) that one mapping covers holds a read slot over its pages instead of both writers' locks: a writer of other pages (the GPU thread's labels) no longer waits for the whole copy, a writer over its pages waits for it (asleep after ~50 us); a partly unmapped read the same, a mapping at a time | 0 | 1 | |
+| spec_bda_clean_skip | a BDA preparation's sync of a region the CPU wrote passes over each of its requests proven before, whose buffers did not move and none of whose pages is CPU-dirty (its visit would copy nothing), and proves it at the region's epoch | 0 | 1 | |
+| spec_label_known_writer | the GPU thread's own guest writes into pages the memory tracker watches (a commit's labels, WRITE_DATA and end-of-pipe labels, a linear copy's CPU-dirty runs) made through the backing view, the pages marked CPU-dirty with their write protection kept: no write fault releasing the watch, no upload arming it again | 0 | 1 | |
+| spec_protect_async (mode 4 only) | the no-access ranges the GPU thread holds pending at a submission handed to the upload worker as jobs ahead of the submission's upload sequence, applied by the worker or by the GPU thread's next other flush, whichever comes first; and a written buffer's upload arms its write watch on the upload worker ahead of its copies, as a read-only buffer's does, a no access still pending left to the GPU thread's flush | 0 | 1 | |

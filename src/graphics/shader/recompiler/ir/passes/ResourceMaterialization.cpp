@@ -460,7 +460,7 @@ bool MaterializeDenseIndirectImage(const DescriptorSource::IndirectImage& indire
                                    const ImageResource&   image,
                                    const DescriptorValue& heap_value,
                                    const DescriptorValue* bound_value, const SrtRuntime& runtime,
-                                   IndirectImage& result, std::string* reason) {
+                                   IndirectImage& result, std::string* reason, bool span_first = false) {
 	const auto note = [reason](const char* why) {
 		if (reason != nullptr) {
 			*reason = why;
@@ -487,8 +487,26 @@ bool MaterializeDenseIndirectImage(const DescriptorSource::IndirectImage& indire
 		entries = count;
 	}
 	const uint32_t enumerated = std::max(entries, 1u);
-	MakeRangeReadable(runtime, base + indirect.table_offset,
-	                  static_cast<uint64_t>(enumerated) << DenseDescriptorShift);
+	// `span_first` (EnumerateDense, the table path's per-draw enumeration; the normal path's call leaves it false: as
+	// before): the entries' words from one clean span read of the table first (a refused span: the sync and the reads
+	// below, as without it). A clean span read succeeds only where every word reads clean, so its words are the ones the
+	// entry reads return; nothing GPU-written is there for the sync to read back, and a speculation's sync would only
+	// refuse a read-watched page whose bytes read clean.
+	thread_local std::vector<uint32_t> dense_span;
+	bool                               spanned = false;
+	if (span_first && entries > 1u && runtime.try_read_memory_span != nullptr) {
+		const auto first = base + indirect.table_offset;
+		const auto words = static_cast<uint64_t>(entries) << (DenseDescriptorShift - 2u);
+		if (words <= 1024u && first <= AddressMask - (words - 1u) * sizeof(uint32_t)) {
+			dense_span.resize(words);
+			spanned = runtime.try_read_memory_span(runtime.userdata, first, dense_span.data(),
+			                                       static_cast<uint32_t>(words), true);
+		}
+	}
+	if (!spanned) {
+		MakeRangeReadable(runtime, base + indirect.table_offset,
+		                  static_cast<uint64_t>(enumerated) << DenseDescriptorShift);
+	}
 	IndirectImage next;
 	std::vector<DescriptorValue> probed;
 	probed.reserve(enumerated);
@@ -498,7 +516,10 @@ bool MaterializeDenseIndirectImage(const DescriptorSource::IndirectImage& indire
 		candidate.dword_count = 8u;
 		const auto entry      = static_cast<uint64_t>(indirect.table_offset) +
 		                   (static_cast<uint64_t>(key) << DenseDescriptorShift);
-		if (key < entries && !ReadSpecializationDescriptor(runtime, base + entry, candidate.dwords)) {
+		if (key < entries && spanned) {
+			std::copy_n(dense_span.begin() + (static_cast<size_t>(key) << (DenseDescriptorShift - 2u)),
+			            candidate.dword_count, candidate.dwords.begin());
+		} else if (key < entries && !ReadSpecializationDescriptor(runtime, base + entry, candidate.dwords)) {
 			return note("dense table entry is not readable");
 		}
 		if (key >= entries || NullImageDescriptor(candidate) ||
@@ -889,13 +910,85 @@ bool EnumerateAddressProbe(const DescriptorSource::IndirectImage& probe, const I
 	return true;
 }
 
-bool TableIndirectForm(ResourceSpecialization& specialization, std::vector<DescriptorValue>* snapshot_images) {
+bool EnumerateDense(const DescriptorSource::IndirectImage& probe, const ImageResource& root, uint64_t heap_base,
+                    const SrtRuntime& runtime, AddressProbeCandidates& result) {
+	// (The normal path's evaluation gives the heap's two words; no loop bound: MaterializeDenseIndirectImage refuses a
+	// form with one when not given its value.)
+	DescriptorValue heap {.dword_count = 2u};
+	heap.dwords[0] = static_cast<uint32_t>(heap_base);
+	heap.dwords[1] = static_cast<uint32_t>(heap_base >> 32u);
+	IndirectImage enumerated;
+	if (!MaterializeDenseIndirectImage(probe, root, heap, nullptr, runtime, enumerated, nullptr, true)) return false;
+	result.keys           = std::move(enumerated.keys);
+	result.candidates     = std::move(enumerated.candidates);
+	result.descriptors    = std::move(enumerated.descriptors);
+	result.dropped_shapes = enumerated.dropped_shapes;
+	return true;
+}
+
+// KYTY_SPEC_PAIR_DENSE_INDIRECT (TableIndirectForm's `multiple_roots`): a specialization with several indirect roots
+// (a vertex or pixel program's dense tables), each root's group of candidates padded to TablePlan::IndirectCapacity
+// elements as the one root's is (copies of its last candidate; the snapshot's with null descriptors). The groups follow
+// every other image in the order of their roots (BuildResourceSpecialization appends them table by table, the tables in
+// image order). False, unchanged, where table mode takes none: fmask images, more roots than IndirectMaxRoots, a group
+// out of place, empty or with more candidates, more images than ShaderInfo::MaxImages.
+static bool TableIndirectFormRoots(ResourceSpecialization& specialization, std::vector<DescriptorValue>* snapshot_images) {
+	auto&                 images = specialization.images;
+	std::vector<uint32_t> roots;
+	size_t                candidates = 0;
+	for (uint32_t index = 0; index < images.size(); index++) {
+		if (images[index].fmask) return false;
+		if (images[index].indirect_root == index) roots.push_back(index);
+		else if (images[index].indirect_root != ImageResource::NoIndirectImage) candidates++;
+	}
+	constexpr uint32_t capacity = TablePlan::IndirectCapacity;
+	if (roots.size() < 2u || roots.size() > TablePlan::IndirectMaxRoots || candidates == 0 || images.size() < candidates ||
+	    (snapshot_images != nullptr && snapshot_images->size() != images.size()))
+		return false;
+	const size_t base = images.size() - candidates;
+	if (base + roots.size() * (capacity - 1u) > ShaderInfo::MaxImages) return false;
+	std::vector<std::pair<size_t, size_t>> groups; // (begin, end) of each root's candidates, the roots in order
+	size_t                                 at = base;
+	for (const auto root: roots) {
+		const auto begin = at;
+		while (at < images.size() && images[at].indirect_root == root) at++;
+		if (at == begin || at - begin + 1u > capacity) return false;
+		groups.emplace_back(begin, at);
+	}
+	if (at != images.size()) return false;
+	std::vector<ResourceSpecialization::Image> next(images.begin(), images.begin() + static_cast<ptrdiff_t>(base));
+	std::vector<DescriptorValue>               snapshot;
+	if (snapshot_images != nullptr)
+		snapshot.assign(snapshot_images->begin(), snapshot_images->begin() + static_cast<ptrdiff_t>(base));
+	for (const auto& [begin, end]: groups) {
+		for (size_t index = begin; index < end; index++) {
+			next.push_back(images[index]);
+			if (snapshot_images != nullptr) snapshot.push_back((*snapshot_images)[index]);
+		}
+		for (size_t pad = end - begin; pad < capacity - 1u; pad++) {
+			next.push_back(images[end - 1]);
+			if (snapshot_images != nullptr) snapshot.push_back(DescriptorValue {.dword_count = 8u});
+		}
+	}
+	images = std::move(next);
+	for (const auto root: roots) {
+		images[root].indirect_mapping_offset    = 0; // (EnterTableMode names each root's mapping in the block)
+		images[root].indirect_search_iterations = ImageResource::RuntimeIndirectSearch;
+	}
+	if (snapshot_images != nullptr) *snapshot_images = std::move(snapshot);
+	return true;
+}
+
+bool TableIndirectForm(ResourceSpecialization& specialization, std::vector<DescriptorValue>* snapshot_images,
+                       bool multiple_roots) {
 	auto&    images = specialization.images;
 	uint32_t root = ImageResource::NoIndirectImage, candidates = 0;
 	for (uint32_t index = 0; index < images.size(); index++) {
 		if (images[index].fmask) return false;
 		if (images[index].indirect_root == index) {
-			if (root != ImageResource::NoIndirectImage) return false;
+			// (A second root: refused, unchanged; with `multiple_roots`, each root's group padded.)
+			if (root != ImageResource::NoIndirectImage)
+				return multiple_roots && TableIndirectFormRoots(specialization, snapshot_images);
 			root = index;
 		} else if (images[index].indirect_root != ImageResource::NoIndirectImage) {
 			candidates++;

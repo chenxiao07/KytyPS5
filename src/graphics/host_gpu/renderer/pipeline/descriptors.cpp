@@ -1310,6 +1310,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	prepared.buffers.clear();
 	prepared.buffers.reserve(program.info.buffers.size());
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
+	// (KYTY_SPEC_PAIR_DENSE_INDIRECT: a program whose LOD statistics words are in its table block has no shader-data words
+	// for them (TableBlockDword). Only a table program has them there (BindingLayout), and the table path binds through
+	// PrepareBindingsInto and RebindImages, never here: one reaching here is a table program on the normal path.)
+	EXIT_IF(layout.lod_stats_in_block);
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
 	for (uint32_t i = 0; i < layout.lod_stats_count; ++i) {

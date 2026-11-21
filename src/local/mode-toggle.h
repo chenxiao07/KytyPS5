@@ -35,7 +35,12 @@ inline constexpr Row Table[] = {
     {"spec_chunk_in_order", 1, 0},      {"serve_in_waits", 7, 1},        {"write_guard_spec", 1, 0},
     {"eager_feedback", 1, 0},           {"feedback_batch", 1, 0},        {"table_serials", 1, 0},
     {"table_memo", 1, 0},               {"spec_worker_packets", 1, 0},  {"table_learn_portable", 2, 0},
-    {"table_dead_user_data", 1, 0},
+    {"table_dead_user_data", 1, 0},     {"spec_gpu_affinity", 1, 0},
+    {"spec_backing_range_lock", 1, 0},  {"spec_upload_pipe", 1, 0},      {"spec_pipecache_split", 1, 0},
+    {"spec_bda_clean_skip", 1, 0},      {"spec_preload_fix", 1, 0},      {"spec_label_known_writer", 1, 0},
+    {"spec_protect_async", 1, 0},       {"spec_completed_snapshot", 1, 0}, {"spec_texcache_shared", 1, 0},
+    {"spec_texcache_upload_unlocked", 0, 0}, {"spec_pool_layers", 1, 0},
+    {"spec_pair_push_fit", 1, 0},       {"spec_pair_dense_indirect", 1, 0},
 };
 // KYTY_TABLE_TARGET_READ (not a live switch: read where image sets are made): on under mode 4.
 inline constexpr uint32_t TableTargetRead4 = 1, TableTargetRead0 = 0;

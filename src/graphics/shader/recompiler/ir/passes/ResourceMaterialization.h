@@ -113,17 +113,27 @@ struct AddressProbeCandidates {
 	std::vector<uint32_t>        keys;
 	std::vector<uint32_t>        candidates;
 	std::vector<DescriptorValue> descriptors;
+	uint32_t                     dropped_shapes = 0; // (EnumerateDense: the classes other than the dominant one nulled)
 };
 bool EnumerateAddressProbe(const DescriptorSource::IndirectImage& probe, const ImageResource& root,
                            uint64_t records_base, uint64_t heap_base, const SrtRuntime& runtime,
                            AddressProbeCandidates& result);
+// A dense indirect image's candidates (DescriptorSource::IndirectImage with a key bound and no loop bound:
+// KYTY_SPEC_PAIR_DENSE_INDIRECT's vertex and pixel programs) as resource materialization enumerates them
+// (MaterializeDenseIndirectImage, the same function): the keys 0..key_bound-1 in order, each key's candidate, the
+// candidates' descriptors (unreadable entries fail it; invalid ones null; those of other classes than the dominant one
+// null), each once. For table mode, the heap's address evaluated by the renderer, over the guest memory `runtime` reads.
+bool EnumerateDense(const DescriptorSource::IndirectImage& probe, const ImageResource& root, uint64_t heap_base,
+                    const SrtRuntime& runtime, AddressProbeCandidates& result);
 
 // The table form of a specialization's indirect image (TablePlan::IndirectImage): the root with
 // TablePlan::IndirectCapacity elements whatever its candidates' count, so one table program takes any count (the
 // draw's or dispatch's own null past them), and with the search a table program makes from its block. The snapshot's
 // images (when given) are padded with null descriptors alike. False, unchanged, where table mode takes none: other
-// than one table, fmask images, more candidates.
-bool TableIndirectForm(ResourceSpecialization& specialization, std::vector<DescriptorValue>* snapshot_images);
+// than one table, fmask images, more candidates. `multiple_roots` (KYTY_SPEC_PAIR_DENSE_INDIRECT, the pipeline cache's
+// switch): several tables, each root's group so (TableIndirectFormRoots); without it, refused as before.
+bool TableIndirectForm(ResourceSpecialization& specialization, std::vector<DescriptorValue>* snapshot_images,
+                       bool multiple_roots = false);
 
 // The buffer word (BufferWord) of a materialized V#.
 uint32_t BufferDescriptorWord(const DescriptorValue& descriptor);

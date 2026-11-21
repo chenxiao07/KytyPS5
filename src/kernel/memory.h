@@ -152,6 +152,10 @@ bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean)
 // A speculation thread's raw read of guest memory without a fault (spec_worker_sets' program lookup): what the GPU
 // thread would read, or false (the caller refuses).
 bool TryReadGuestNoFault(uint64_t vaddr, void* data, uint64_t size);
+// (Mode 4, a speculation's SRT word it could not read without a fault) The range holds a registered buffer's GPU-dirty
+// bytes and no image (GPU-modified or not, or a no-image target the calling speculation's capture leaves to its commit):
+// a buffer word GPU work wrote, whose in-order read is that buffer's readback.
+bool SrtVerifyEligible(uint64_t vaddr, uint64_t size);
 // batch_busy_once: the calling batch thread's busy section closed while it waits for the GPU thread (true: it had one).
 bool BatchBusySuspend();
 void BatchBusyResume();

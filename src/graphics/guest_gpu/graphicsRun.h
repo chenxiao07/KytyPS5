@@ -99,6 +99,9 @@ private:
 		bool                      command_complete  = false;
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
+		// KYTY_SPECULATE=4: requeued by a yield (Speculation::Outcome::Yield), not blocked: passed over once while
+		// another front is runnable (GuestGpu::m_yields counts the queued ones).
+		bool                      yielded           = false;
 		uint64_t                  flip_request_id   = 0;
 		uint64_t                  frame_epoch       = 0;
 		uint64_t                  scout_sequence    = 0; // queue 0's graphics submissions, numbered (scout.h)
@@ -113,6 +116,17 @@ private:
 	void              Enqueue(Submission submission);
 	void              WaitForIdle();
 	bool              CanProcessSubmission(const Submission& submission) const;
+
+public:
+	// KYTY_SPECULATE=4, on the GPU thread (Speculation::CommitReady, holding no speculation's lock): another queue's
+	// compute front runnable now: 1 the async speculation's front with its chunk translated, 2 another (unspeculated)
+	// one; 0 none.
+	[[nodiscard]] static int ReadyFrontElsewhere() noexcept;
+
+private:
+	// KYTY_SPECULATE=4, on the GPU thread holding m_queue_mutex (released for the reads, taken again): the blocked fronts
+	// whose stored WAIT_REG_MEM (m_failed_waits) passes now unblocked; how many.
+	uint32_t          RetestBlockedFronts();
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
@@ -141,6 +155,15 @@ private:
 	// Under m_queue_mutex: the last graphics submission's number, and a reset a flip preparation carried (the next one's).
 	uint64_t                                       m_scout_sequence    = 0;
 	bool                                           m_scout_reset       = false;
+	// Under m_queue_mutex, KYTY_SPECULATE=4 only (0 / empty otherwise): the queued submissions a yield marked; and for a
+	// compute front requeued blocked at a WAIT_REG_MEM, that wait with the front's serial (size 0: none), and how many.
+	struct FailedWait {
+		uint64_t serial = 0, address = 0, reference = 0, mask = 0;
+		uint32_t function = 0, size = 0;
+	};
+	uint32_t                                       m_yields            = 0;
+	std::array<FailedWait, QueueCount>             m_failed_waits {};
+	uint32_t                                       m_failed_waits_n    = 0;
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	// KYTY_SPECULATE (speculation.h): made at the first graphics command buffer it translates.

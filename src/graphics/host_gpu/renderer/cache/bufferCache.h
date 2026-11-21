@@ -83,6 +83,8 @@ public:
 	void                   EnsureTexelContents(uint64_t vaddr, uint64_t size);
 	// The start of each range shaders read through pointers held by a buffer with the guest's bytes (see the definition).
 	void                   EnsureBdaReadable(std::span<const GuestRange> ranges);
+	// Every page EnsureBdaReadable looks at for `range` (its head) held by a buffer now.
+	[[nodiscard]] bool     BdaHeadHeld(const GuestRange& range) const;
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
@@ -149,6 +151,18 @@ public:
 	                bool src_gds);
 	// CopyBuffer's copy on the CPU: only the destination pages whose bytes differ are written.
 	void CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size);
+	// A commit's copy bytes written by a guarded write (speculation.cpp, GuardedCopy): the regions' epochs move, as
+	// CopyGuestMemory's writes move them.
+	void NoteGuardedCopyWrite(uint64_t vaddr, uint64_t size);
+	// KYTY_SPEC_LABEL_KNOWN_WRITER (live spec_label_known_writer; on under KYTY_SPECULATE=4, 0 otherwise: mode-toggle.h;
+	// set, it acts in either mode; the GPU thread only): the GPU thread's own write of guest bytes into watched memory
+	// made through the backing view, its pages marked CPU-dirty with their write protection kept (CopyGuestMemory's
+	// form), in place of the write fault that released the watch (and the upload that armed it again). True: written,
+	// the caller writes nothing. False: not written, the caller writes as before (images over the range may have been
+	// invalidated and its pages marked CPU-dirty: both exact before a write). `source_in_guest`: `data` may be guest
+	// memory (a packet's bytes): read into a local copy first, so a fault reading it is served before the backing write's
+	// locks are taken (GuardedWrite's order).
+	[[nodiscard]] bool WriteGuestKnownWriter(uint64_t vaddr, const void* data, uint64_t size, bool source_in_guest = false);
 	// Called after an identified small GPU copy; it never submits or publishes guest data.
 	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
 	// KYTY_EAGER_FEEDBACK (live eager_feedback, default off: fps flat in PR #300): GPU thread, the copy-feedback
@@ -176,6 +190,18 @@ public:
 	[[nodiscard]] bool IsRegionCpuDirty(uint64_t vaddr, uint64_t size) {
 		return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 	}
+	// The same, read only: no region manager made (an untracked region answers CPU-dirty, as a made one would).
+	[[nodiscard]] bool IsRegionCpuDirtyNoCreate(uint64_t vaddr, uint64_t size) const {
+		return m_memory_tracker.IsRegionCpuModifiedNoCreate(vaddr, size);
+	}
+	// The commit (on the GPU thread): a relocated reference's CPU-dirty range uploaded into its live buffer `id` as the
+	// in-order draw's lookup of it (ObtainBuffer, read, not texel) does: SynchronizeBuffer, into the open command buffer
+	// or its upload prologue, barriers its own. Refused with nothing done when the range holds GPU-written bytes (tracker
+	// or exact ranges), a guest readback is pending over it, the texture offload must restore or wait for its bytes, or
+	// the caller is not the GPU thread outside a speculative translation; StillDirty: the sync ran and pages stay
+	// CPU-dirty (unmapped ones).
+	enum class RelocUpload : uint8_t { Uploaded, Refused, StillDirty };
+	[[nodiscard]] RelocUpload UploadRelocated(BufferId id, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
@@ -229,6 +255,10 @@ public:
 	[[nodiscard]] bool DeferredProtectionPending(uint64_t vaddr) const {
 		return m_memory_tracker.DeferredProtectionPending(vaddr);
 	}
+	// KYTY_SPEC_BDA_CLEAN_SKIP: MemoryTracker::CleanRangeEpoch (GpuResourceManager::SynchronizeDirtyBdaRegions).
+	[[nodiscard]] uint64_t CleanRangeEpoch(uint64_t vaddr, uint64_t size) const {
+		return m_memory_tracker.CleanRangeEpoch(vaddr, size);
+	}
 	[[nodiscard]] uint64_t CpuModificationEpoch(uint64_t vaddr, uint64_t size) const {
 		if (!GuestRange {vaddr, size}.Valid()) return 0;
 		constexpr uint64_t MaxRegions = 64;
@@ -275,14 +305,32 @@ public:
 	};
 	// Then a buffer the range holds in part, mapped in no more than half of it now, is cut to its mapped parts; the bytes cut
 	// off. With `free_blocks` (a freed range, DropFreedRange), the game's free blocks over it count as unmapped too.
+	// (`read_back_over`: false, a buffer over other free blocks with GPU-written bytes stays as it is, nothing read back.)
 	uint64_t SplitUnmappedBuffers(uint64_t vaddr, uint64_t size, FreeBlocksQuery free_blocks = nullptr,
-	                              FreeBlockSplits* splits = nullptr);
+	                              FreeBlockSplits* splits = nullptr, bool read_back_over = true);
 	// The game freed [vaddr, vaddr + size) and keeps it mapped (GpuResourceManager::FreedByGame): its GPU-written bytes read
 	// back (`read_back`) or dropped, then its buffers go as an unmapped range's do (the range, and the game's other free
 	// blocks a buffer over it spans, count as unmapped for SplitUnmappedBuffers); the bytes of buffers let go. Nothing when
-	// no buffer is registered there.
+	// no buffer is registered there. A read-back range may be left pending instead (BeginFreedReadback): 0 then, its
+	// buffers let go later (ServiceFreedReadback).
 	uint64_t DropFreedRange(uint64_t vaddr, uint64_t size, bool read_back, FreeBlocksQuery free_blocks,
 	                        FreeBlockSplits* splits);
+	// GPU thread. The oldest freed range left pending by DropFreedRange whose copies completed: true when there is one.
+	[[nodiscard]] bool FreedReadbackReady();
+	// A pending freed range whose copies were submitted (FreedReadbackReady will be true without new work).
+	[[nodiscard]] bool   FreedReadbackSubmitted() const;
+	[[nodiscard]] size_t FreedReadbackPendingCount() const { return m_freed_readbacks.size(); }
+	// GPU thread. That range's bytes written back where the GPU still owns their pages and wrote nothing since, then its
+	// buffers let go as DropFreedRange's are (none where GPU-written bytes stayed in it: in use again); `let_go` adds the
+	// bytes of buffers let go. False when no pending range was ready.
+	bool ServiceFreedReadback(FreeBlocksQuery free_blocks, FreeBlockSplits* splits, uint64_t* let_go);
+	// The pending freed ranges' counts since the last call (the 30 s report): ranges left pending, their GPU-written bytes,
+	// ranges read back at the free instead (no room in the ring), ranges serviced, ranges whose buffers stayed (GPU-written
+	// bytes left), bytes not written back (written by the GPU since, or given back to the CPU by a fault's readback).
+	struct FreedReadbackCounts {
+		uint64_t pending = 0, pending_bytes = 0, at_free = 0, serviced = 0, kept = 0, stale_bytes = 0;
+	};
+	[[nodiscard]] FreedReadbackCounts TakeFreedReadbackCounts() { return std::exchange(m_freed_counts, {}); }
 	// The mapped parts of registered buffers in [begin, end), adjacent ones merged.
 	// The mapped parts of guest [vaddr, vaddr + size) (GpuResourceManager::MappedRanges), added to `out`.
 	void MappedRanges(uint64_t vaddr, uint64_t size, RangeSet& out) const;
@@ -573,6 +621,19 @@ private:
 	// request's copy may still be pending on either queue when its slot is reused.
 	std::array<uint64_t, GuestReadbackSlots> m_download_queue_values {};
 	std::array<uint64_t, GuestReadbackSlots> m_download_ticks {};
+
+	// Freed ranges whose GPU-written bytes are on their way to guest memory (DropFreedRange, BeginFreedReadback), oldest
+	// first, and the ring in host memory their copies write (m_freed_ring_head/tail: byte counts allocated and given back,
+	// in order). m_freed_lo/hi: the pages they span, NoteGpuWrite's test (an empty span when none is pending).
+	struct FreedReadback;
+	std::deque<std::unique_ptr<FreedReadback>> m_freed_readbacks;
+	std::unique_ptr<Buffer>                    m_freed_ring;
+	uint64_t                                   m_freed_ring_head = 0, m_freed_ring_tail = 0;
+	uint64_t                                   m_freed_lo = UINT64_MAX, m_freed_hi = 0;
+	FreedReadbackCounts                        m_freed_counts;
+	[[nodiscard]] bool                         BeginFreedReadback(uint64_t vaddr, uint64_t size);
+	void                                       NoteFreedWrite(uint64_t vaddr, uint64_t size);
+	void                                       UpdateFreedBounds();
 
 	// Last member: destroyed (queue idle) before the buffers its copies use.
 	std::unique_ptr<ReadbackQueue::Queue> m_readback_queue;

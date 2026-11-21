@@ -787,8 +787,14 @@ static bool GuestStackOverflow(uint64_t address, void* native_context) {
 	    (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0)
 		top = std::min(reinterpret_cast<uint64_t>(region.BaseAddress) + region.RegionSize, rsp + (uint64_t {8} << 20u));
 	const auto* self = g_pthread_self;
-	OverflowAdd("GUEST STACK OVERFLOW: thread %lu '%s' touched the stack guard at 0x%llx: rip", GetCurrentThreadId(),
-	            self != nullptr ? self->name.c_str() : "?", static_cast<unsigned long long>(address));
+	// The stack's own thread has rsp at or above the guard page, less than 1 MiB above it; else another thread's stray
+	// access (or a frame over 1 MiB): reported as such, and the process ends as for an overflow.
+	const uint64_t guard_page = address & ~uint64_t {4095};
+	const bool     own        = rsp >= guard_page && rsp - guard_page < (uint64_t {1} << 20u);
+	OverflowAdd(own ? "GUEST STACK OVERFLOW: thread %lu '%s' touched the stack guard at 0x%llx: rip"
+	                : "GUEST STACK GUARD TOUCHED: thread %lu '%s', rsp not within the 1 MiB above the guard (another stack's "
+	                  "guard, or a frame over 1 MiB), touched the guard at 0x%llx: rip",
+	            GetCurrentThreadId(), self != nullptr ? self->name.c_str() : "?", static_cast<unsigned long long>(address));
 	OverflowAddress(context->Rip);
 	OverflowAdd(" rsp 0x%llx rbp 0x%llx; stack 0x%llx..0x%llx (%llu KiB)", static_cast<unsigned long long>(rsp),
 	            static_cast<unsigned long long>(context->Rbp), static_cast<unsigned long long>(rsp),

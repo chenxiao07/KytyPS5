@@ -152,6 +152,7 @@ void Image::LockStateContended() const noexcept {
 Spec::ImageEntry* Image::SpeculativeEntry() {
 	auto* spec = Spec::Current();
 	if (spec == nullptr) return nullptr;
+	++spec->overlay_gen; // (any entry taken: a worker's table draw in place, TableDraw)
 	const auto [found, inserted] = spec->overlay_index.try_emplace(this, spec->overlay.size());
 	Spec::ImageEntry* entry      = nullptr;
 	if (inserted) {
@@ -172,6 +173,22 @@ Spec::ImageEntry* Image::SpeculativeEntry() {
 		}
 	} else {
 		entry = &spec->overlay[found->second];
+		// An entry of another image object that had this address (its slot erased and taken again within the
+		// translation, after an area travel's unmap: slot chunks do not move): its states are that image's, sized for its
+		// levels and layers. Refused (RecorderRefusal): from a draw's path the translation is dropped and its packets done
+		// in order (Speculation::Translate); from inside a handler's packet (a dispatch's storage image, say) that packet is
+		// refused (ProcessPm4Spec: Spec::Refuse, a hole when nothing was recorded).
+		if (entry->serial != serial) [[unlikely]] {
+			static std::atomic<uint64_t> refused {0}; // (one line each of the first 16, then every 256th)
+			if (const auto n = refused.fetch_add(1, std::memory_order_relaxed) + 1; n <= 16 || n % 256 == 0) {
+				std::printf("Image: a speculation's overlay entry of another image at the same object (serial %llu, now %llu, "
+				            "addr=0x%llx): refused, %llu times\n",
+				            static_cast<unsigned long long>(entry->serial), static_cast<unsigned long long>(serial),
+				            static_cast<unsigned long long>(info.data.address), static_cast<unsigned long long>(n));
+				std::fflush(stdout);
+			}
+			throw CommandScheduler::RecorderRefusal {"image overlay entry of another image"};
+		}
 	}
 	if (!entry->used) {
 		entry->used               = true;
@@ -188,6 +205,12 @@ Spec::ImageEntry* Image::SpeculativeEntry() {
 		entry->sample_lo             = UINT32_MAX; // (redo_level_precise: the segment's accesses, from its first)
 		entry->sample_hi             = 0;
 		entry->sample_other          = false;
+		entry->layer_lo              = UINT32_MAX; // (spec_pool_layers: the segment's accesses' layers, from its first)
+		entry->layer_hi              = 0;
+		entry->layer_other           = false;
+		entry->layer_nontarget       = 0;
+		entry->writes                = 0;
+		entry->not_sampled           = false;
 		spec->used.push_back(found->second);
 	}
 	return entry;
@@ -214,6 +237,54 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 		} else {
 			entry->sample_other = true;
 		}
+		if (destination_layout != vk::ImageLayout::eShaderReadOnlyOptimal ||
+		    destination_access != vk::AccessFlags2 {vk::AccessFlagBits2::eShaderRead})
+			entry->not_sampled = true; // (Spec::ImageUse::not_sampled)
+		// (spec_pool_layers: every access's layers, whatever the switch; no range, or none counted: the whole image.)
+		if (range && range->layer_count != 0) {
+			entry->layer_lo = std::min(entry->layer_lo, range->base_layer);
+			entry->layer_hi = std::max(entry->layer_hi, range->base_layer + range->layer_count);
+		} else {
+			entry->layer_other = true;
+		}
+		// (spec_pool_layers: an access not as a depth attachment: a depth layout with attachment access only, else not; the
+		// first such access's kind kept.)
+		if (entry->layer_nontarget == 0) {
+			using Layout             = vk::ImageLayout;
+			using Access             = vk::AccessFlagBits2;
+			using Use                = Spec::ImageUse;
+			constexpr auto attach    = Access::eDepthStencilAttachmentRead | Access::eDepthStencilAttachmentWrite;
+			const auto     has       = [&](vk::AccessFlags2 bits) { return static_cast<bool>(destination_access & bits); };
+			const bool     depth_lay = destination_layout == Layout::eDepthStencilAttachmentOptimal ||
+			                       destination_layout == Layout::eDepthAttachmentOptimal ||
+			                       destination_layout == Layout::eDepthStencilReadOnlyOptimal ||
+			                       destination_layout == Layout::eDepthReadOnlyOptimal ||
+			                       destination_layout == Layout::eDepthAttachmentStencilReadOnlyOptimal ||
+			                       destination_layout == Layout::eDepthReadOnlyStencilAttachmentOptimal;
+			if (!depth_lay || !static_cast<bool>(destination_access) || has(~vk::AccessFlags2 {attach})) {
+				if (destination_layout == Layout::eGeneral)
+					entry->layer_nontarget = Use::NontargetGeneral;
+				else if (has(Access::eShaderWrite | Access::eShaderStorageWrite | Access::eShaderStorageRead))
+					entry->layer_nontarget = Use::NontargetStorage;
+				else if (has(Access::eTransferRead | Access::eTransferWrite) || destination_layout == Layout::eTransferSrcOptimal ||
+				         destination_layout == Layout::eTransferDstOptimal)
+					entry->layer_nontarget = Use::NontargetTransfer;
+				else if (depth_lay && has(attach) && has(Access::eShaderRead | Access::eShaderSampledRead))
+					entry->layer_nontarget = Use::NontargetFolded;
+				else if (has(Access::eShaderRead | Access::eShaderSampledRead))
+					entry->layer_nontarget = Use::NontargetSampled;
+				else
+					entry->layer_nontarget = Use::NontargetOther;
+			}
+		}
+		// (Its write accesses, by kind: Spec::ImageUse::writes.)
+		using Access = vk::AccessFlagBits2;
+		if (static_cast<bool>(destination_access & (Access::eColorAttachmentWrite | Access::eDepthStencilAttachmentWrite)))
+			entry->writes |= Spec::ImageUse::WriteTarget;
+		if (static_cast<bool>(destination_access & (Access::eShaderWrite | Access::eShaderStorageWrite)))
+			entry->writes |= Spec::ImageUse::WriteStorage;
+		if (static_cast<bool>(destination_access & (Access::eTransferWrite | Access::eHostWrite | Access::eMemoryWrite)))
+			entry->writes |= Spec::ImageUse::WriteOther;
 	}
 	const bool partial =
 	    range && (range->base_level != 0 || range->level_count != info.resources.levels ||
@@ -280,14 +351,42 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 	auto&      group                  = entry != nullptr ? entry->group : transit_group;
 	const bool has_subresource_states = !subresource_states.empty();
 	if (partial || has_subresource_states) {
-		if (!has_subresource_states) {
-			subresource_states.resize(info.resources.levels * info.resources.layers, state);
-		}
-
 		const uint32_t base_level  = partial ? range->base_level : 0;
 		const uint32_t level_count = partial ? range->level_count : info.resources.levels;
 		const uint32_t base_layer  = partial ? range->base_layer : 0;
 		const uint32_t layer_count = partial ? range->layer_count : info.resources.layers;
+		// The range's last state (the loop's largest index) past the states held (or made below): tested once, before
+		// any state changes. A speculative transition (the entry's overlay states) is refused (RecorderRefusal: from a
+		// draw's path the translation is dropped and its packets done in order, Speculation::Translate; from inside a
+		// handler's packet that packet is refused, ProcessPm4Spec's Spec::Refuse) with none of the overlay's states
+		// changed (the entry's first-use notes and access records above have run: they only make its commit more
+		// cautious); the GPU thread's keeps the fatal exit the loop's test made, on the same condition.
+		if (level_count != 0 && layer_count != 0) {
+			const uint64_t states = has_subresource_states ? subresource_states.size()
+			                                               : uint64_t {info.resources.levels} * info.resources.layers;
+			const uint64_t last = uint64_t {base_level + level_count - 1} * info.resources.layers + base_layer + layer_count - 1;
+			if (last >= states) [[unlikely]] {
+				if (entry != nullptr) {
+					static std::atomic<uint64_t> refused {0}; // (one line each of the first 16, then every 256th)
+					if (const auto n = refused.fetch_add(1, std::memory_order_relaxed) + 1; n <= 16 || n % 256 == 0) {
+						std::printf("Image: a speculative transition past its subresource states (state %llu of %llu, %u levels x "
+						            "%u layers, addr=0x%llx): refused, %llu times\n",
+						            static_cast<unsigned long long>(last), static_cast<unsigned long long>(states),
+						            info.resources.levels, info.resources.layers,
+						            static_cast<unsigned long long>(info.data.address), static_cast<unsigned long long>(n));
+						std::fflush(stdout);
+					}
+					throw CommandScheduler::RecorderRefusal {"image transition past its subresource states"};
+				}
+				EXIT("Image: subresource state %llu past the %llu states of %u levels x %u layers\n",
+				     static_cast<unsigned long long>(last), static_cast<unsigned long long>(states), info.resources.levels,
+				     info.resources.layers);
+			}
+		}
+		if (!has_subresource_states) {
+			subresource_states.resize(info.resources.levels * info.resources.layers, state);
+		}
+
 		for (uint32_t level = base_level; level < base_level + level_count; level++) {
 			for (uint32_t layer = base_layer; layer < base_layer + layer_count; layer++) {
 				const auto index = level * info.resources.layers + layer;
@@ -351,7 +450,8 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 
 const VulkanImageState& Image::CurrentState() const {
 	if (const auto* spec = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr) {
-		if (const auto found = spec->overlay_index.find(this); found != spec->overlay_index.end())
+		if (const auto found = spec->overlay_index.find(this);
+		    found != spec->overlay_index.end() && spec->overlay[found->second].serial == serial) // (this image's only)
 			return spec->overlay[found->second].state;
 		if (const auto* chain = spec->ChainImage(this, serial)) return chain->state;
 	}
@@ -497,13 +597,29 @@ static void ZeroNewImage(vk::Image image, vk::ImageAspectFlags aspect, vk::Comma
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
                     bool read_after_write) {
-	if (backing.state.layout == vk::ImageLayout::eUndefined && backing.subresource_states.empty() &&
-	    destination_layout != vk::ImageLayout::eUndefined && backing.image && ZeroNewImages() &&
+	// On a speculation's thread the zero is decided on its overlay entry (the state at its first touch, under the state
+	// lock or from the chain, then its own transitions: what its recorded commands start from, and what its commit
+	// restores the image to, ImageEntry::found) and leaves the entry in the clear's state; the backing, which only the GPU
+	// thread writes, is neither read nor written here. The segment's commands then hold the clear exactly where the
+	// in-order Transit makes it when the commit finds the image as the segment found it (Speculation::Before stops the
+	// segment otherwise). Without a speculation: the backing's, as before.
+	auto* const       zero_spec  = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr;
+	Spec::ImageEntry* zero_entry = nullptr;
+	if (zero_spec != nullptr && destination_layout != vk::ImageLayout::eUndefined && backing.image && ZeroNewImages() &&
 	    vk::blockExtent(info.pixel_format)[0] == 1) {
+		auto* const entry = SpeculativeEntry(); // (the entry GetBarriers below takes)
+		if (entry->state.layout == vk::ImageLayout::eUndefined && entry->subresources.empty()) zero_entry = entry;
+	}
+	if (zero_entry != nullptr ||
+	    (zero_spec == nullptr && backing.state.layout == vk::ImageLayout::eUndefined && backing.subresource_states.empty() &&
+	     destination_layout != vk::ImageLayout::eUndefined && backing.image && ZeroNewImages() &&
+	     vk::blockExtent(info.pixel_format)[0] == 1)) {
 		m_scheduler.EndRendering();
 		ZeroNewImage(backing.image, FullAspectMask(info.pixel_format), command_buffer);
-		backing.state = {vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
-		                 vk::ImageLayout::eTransferDstOptimal};
+		const VulkanImageState zeroed {vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+		                               vk::ImageLayout::eTransferDstOptimal};
+		if (zero_entry != nullptr) zero_entry->state = zeroed;
+		else backing.state = zeroed;
 	}
 	if (LiveTrace::WriteTicks()) {
 		constexpr auto writes = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |

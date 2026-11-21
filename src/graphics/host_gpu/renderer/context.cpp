@@ -298,7 +298,11 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
-	Handle().beginRendering(rendering);
+	// (Mode 4: a hook set around this call (RenderingHookScope, a worker's table draw under a captured state whose commit
+	// makes a colour target) records it instead when it names a view the commit makes. The global first.)
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 0 || t_rendering_hook == nullptr ||
+	    !t_rendering_hook(t_rendering_hook_data, Handle(), rendering))
+		Handle().beginRendering(rendering);
 	LiveCounters::Add(LiveCounters::RenderPasses);
 	m_render_state = state;
 	m_rendering    = true;

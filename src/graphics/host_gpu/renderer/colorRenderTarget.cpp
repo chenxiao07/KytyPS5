@@ -360,7 +360,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	r.guest_array_layer        = view.base_layer;
 	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
-	BindRenderTarget(r.image_id);
+	// (Mode 4, a worker's capture: its read-only resolution binds nothing: the draw's binding state is the GPU thread's.)
+	if (!TextureCache::ReadOnly()) BindRenderTarget(r.image_id);
 }
 
 } // namespace Libs::Graphics

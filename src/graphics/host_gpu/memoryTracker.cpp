@@ -83,6 +83,24 @@ bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+bool MemoryTracker::IsRegionCpuModifiedNoCreate(uint64_t vaddr, uint64_t size) const {
+	CheckNotInUploadCallback();
+	ValidateRange(vaddr, size);
+	uint64_t remaining = size;
+	uint64_t index     = vaddr / TRACKER_REGION_SIZE;
+	uint64_t offset    = vaddr % TRACKER_REGION_SIZE;
+	while (remaining != 0) {
+		const auto bytes   = std::min(TRACKER_REGION_SIZE - offset, remaining);
+		auto*      manager = m_regions[index].load(std::memory_order_acquire);
+		if (manager == nullptr) return true; // (never tracked: CPU-dirty, as a new manager's pages start)
+		if (QueryRegion(manager, [&] { return manager->IsModified<DirtySource::Cpu>(offset, bytes); })) return true;
+		remaining -= bytes;
+		offset = 0;
+		index++;
+	}
+	return false;
+}
+
 bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -107,7 +125,7 @@ bool MemoryTracker::IsRegionFullyGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool MemoryTracker::TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size,
-                                                std::unique_lock<TrackingSpinLock>* handoff) noexcept {
+                                                std::unique_lock<TextureCacheLock>* handoff) noexcept {
 	CheckNotInUploadCallback();
 	if (!GuestRange {begin, size}.Valid() || size <= TRACKER_PAGE_SIZE ||
 	    begin % TRACKER_PAGE_SIZE || size % TRACKER_PAGE_SIZE || fault < begin ||

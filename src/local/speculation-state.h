@@ -62,6 +62,14 @@ namespace Libs::Graphics::Spec {
 struct Range {
 	uint64_t begin = 0, end = 0;
 };
+// (KYTY_SPECULATE=4, State::read_values_on) The bytes a clean read of at most MaxBytes gave the translation, at their
+// guest address.
+struct ReadValue {
+	static constexpr uint32_t     MaxBytes = 64;
+	uint64_t                      address  = 0;
+	uint32_t                      size     = 0;
+	std::array<uint8_t, MaxBytes> bytes {};
+};
 
 // A guest memory write of the command processor (a label) or a copy made on the CPU (a linear copy:
 // BufferCache::CopyBuffer), applied at commit in order.
@@ -70,6 +78,7 @@ struct MemoryWrite {
 	uint64_t value   = 0; // a copy's source address
 	uint32_t size    = 0; // 4 or 8; a copy's bytes
 	bool     copy    = false;
+	bool     gpu     = false; // (a copy its commit makes as the in-order GPU copy, BufferCache::CopyBuffer: mode 4)
 };
 
 // A word read from the pending guest memory writes of a speculation before it (State::previous), and a wait
@@ -96,7 +105,8 @@ struct Counts {
 	size_t current = 0, written = 0, bda = 0, invalidated = 0, writes = 0, touched_images = 0, touched_buffers = 0,
 	       clean_reads = 0, feedbacks = 0, buffer_ranges = 0, sets = 0, chain_reads = 0, waits = 0, cpu_copies = 0,
 	       late_reads = 0, texel_syncs = 0, pending_buffers = 0, table_ranges = 0, pending_targets = 0, indexed_draws = 0,
-	       scenes = 0, used_pairs = 0, left_clears = 0, journal_reads = 0, journal_words = 0;
+	       scenes = 0, used_pairs = 0, left_clears = 0, journal_reads = 0, journal_words = 0, reloc_refs = 0, reloc_unrel = 0,
+	       covered_waits = 0, read_values = 0, unvalued_reads = 0, srt_verify = 0;
 };
 
 // spec_pending_buffers (under KYTY_SPECULATE=4 only): a table V#'s range with no
@@ -122,6 +132,22 @@ struct PendingBuffer {
 inline thread_local bool t_pending_ok  = false; // (TableBlocks: a missing buffer may be left pending)
 inline thread_local bool t_pending_hit = false; // (ObtainBufferSpec: it was)
 inline thread_local bool t_no_range    = false; // (spec_reloc_refs: the V#'s lookups note no buffer range; the caller records it)
+// (Mode 4, the GPU thread, Speculation::Before's proposed checks) The segment whose checks run (a worker entry parked on
+// its table pipeline's compile writes only the cells of that segment on: those of segments before it went with their
+// holes), and whether a check before the one running failed (the segment stops: nothing of the running one is done).
+inline thread_local size_t t_check_segment = 0;
+inline thread_local bool   t_checks_failed = false;
+// Relocatable buffer references (KYTY_SPECULATE=4, the mode read as a translation begins: State::reloc_on): the table
+// path's index-buffer bind and indirect draws a worker records as packets that carry the buffer handle and offset in a
+// cell of their own (State::reloc_refs), which the commit rewrites with the range's live buffer when a registration
+// joined or replaced it since (Speculation::RelocEligible / RelocPatch), where the segment stopped.
+inline constexpr uint8_t RelocIndex = 1, RelocArgs = 2;
+// (TableDraw's lookups of those two kinds, set only while relocation is on: ObtainBufferSpec notes the others.)
+inline thread_local uint8_t t_reloc_scope = 0;
+// A relocatable reference's cell: the handle (the vk::Buffer as its 64-bit value) and offset its packet's replay reads.
+struct RelocCell {
+	uint64_t buffer = 0, offset = 0;
+};
 // spec_nofault_journal: CopyGuest's reader while a no-fault read is served through the journal (the page's clean backing,
 // never a fault; a failure refuses the read, not the speculation).
 inline thread_local bool (*t_backing_copy)(void* out, uint64_t address, uint64_t bytes) = nullptr;
@@ -299,6 +325,20 @@ inline bool ReadOneSetOn() {
 	static auto& on = LiveSwitch::Find("spec_read_one_set", ModeToggle::Default("spec_read_one_set"));
 	return on.load(std::memory_order_relaxed) != 0;
 }
+// (KYTY_SPECULATE=4, State::before_merge: a noted range's key, by list, for the open segment's ranges noted once.)
+struct NoteSeenKey {
+	uint64_t begin = 0, end = 0;
+	uint32_t list  = 0;
+	bool     operator==(const NoteSeenKey&) const = default;
+};
+struct NoteSeenHash {
+	size_t operator()(const NoteSeenKey& key) const noexcept {
+		uint64_t h = key.begin * 0x9E3779B97F4A7C15ull;
+		h ^= (key.end + 0x632BE59BD9B4E019ull) + (h << 6u) + (h >> 2u);
+		h ^= key.list * 0xD6E8FEB86659FD93ull;
+		return static_cast<size_t>(h ^ (h >> 31u));
+	}
+};
 // spec_inherit_lazy (under KYTY_SPECULATE=4 only, the mode read at each Inherit): State::Inherit
 // takes the chain's union from the state before it (its own chain union and its own sets) when the chain beyond that state
 // is still the one it inherited, in place of merging every state of the chain (~20 at a spike: ~0.6 us a worker table
@@ -335,6 +375,15 @@ inline int64_t CommitVerifyEvery() {
 	return every.load(std::memory_order_relaxed);
 }
 
+// KYTY_SPEC_COMPLETED_SNAPSHOT (live spec_completed_snapshot; on under KYTY_SPECULATE=4, off in mode 0): a completion
+// (ProposedSet::complete) keeps a snapshot of each image it completed (ProposedSet::Completed::state, subresources), and
+// Before's K1 test keeps the state of a no-barrier use of a completed-now image while its state equals that snapshot,
+// part-transited too (Speculation::Before). Off: only while whole in the completion's layout with shader read, as before.
+[[nodiscard]] inline bool CompletedSnapshotOn() {
+	static auto& on = LiveSwitch::Find("spec_completed_snapshot", ModeToggle::Default("spec_completed_snapshot"));
+	return on.load(std::memory_order_relaxed) != 0;
+}
+
 // KYTY_SPEC_SET_CPU_DIRTY_STOP (live spec_set_cpu_dirty_stop; -1, the default: on under KYTY_SPECULATE=4; 1 on, 0 off):
 // a commit stops at an image the CPU wrote since its segment found it (Speculation::CommitSegments), the entry of a set's
 // image made before its refresh test (TableTransit, TableValidateSet). Off: neither, as before.
@@ -342,6 +391,16 @@ inline int64_t CommitVerifyEvery() {
 	static auto& stop  = LiveSwitch::Find("spec_set_cpu_dirty_stop", -1);
 	const auto   value = stop.load(std::memory_order_relaxed);
 	return value > 0 || (value < 0 && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4);
+}
+// Changed's stamps (KYTY_SPECULATE=4 only): Speculation::Changed()'s per-item tests answered from stamps, each only where
+// the per-item test would answer "unchanged" too (every refusal kept): an image's StillResolvedExact from its overlap
+// epoch (Image::overlap_epoch, kept by TextureCache::StampRegistrationPages); the unmap tests of the segment's buffer
+// ranges, table ranges, clean and late reads skipped when the merged unmap list says no unmap since meets their one hull
+// (made in Changed, on the GPU thread, only when an unmap moved the mapping epoch); the call after Before checks from the
+// epochs read just before the first call, when that passed. (A range answered by its live buffer is not one of them: it
+// passes ranges the region and granule tests refuse.) Other modes: none of it, the overlap stamps not kept either.
+[[nodiscard]] inline bool ChangedStampsOn() {
+	return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 }
 // KYTY_SPEC_COPY_IMAGE_REFUSE (live spec_copy_image_refuse; the same rule): a speculation's copy (journaled or on the GPU)
 // or GPU fill over image memory is refused (BufferCache::CopyBuffer, FillBuffer: a hole when its packet is a dispatch's
@@ -369,6 +428,36 @@ struct ImageUse {
 	bool                          found_cpu_dirty = false; // (Image::IsCpuDirty, maybe-dirty too, when the segment found it)
 	uint64_t                      found_validity  = 0;     // (Image::validity then, read before it)
 	bool                          found_stencil_modified = false; // (Image::IsStencilModified then: spec_copy_image_refuse)
+	// The write accesses among the segment's accesses to it (Image::GetBarriers, every transition): WriteTarget a colour
+	// or depth / stencil attachment write, WriteStorage a shader (storage) write, WriteOther any other write (a transfer:
+	// a copy, a clear, an upload; a host or memory write). Its commit's pending-slot test reads them.
+	static constexpr uint8_t      WriteTarget = 1, WriteStorage = 2, WriteOther = 4;
+	uint8_t                       writes = 0;
+	// Its segment's Before left the image's state as it was (no restore), and After leaves it too (no left state
+	// written): a use with no barrier recorded, found wholly Undefined (Speculation::Before's restore loop).
+	bool                          keep_state = false;
+	// Any access of the segment's not a shader read in the shader-read-only layout (Image::GetBarriers): an image a set of
+	// the segment completed in its Before is restored only when the replay keeps it in that layout.
+	bool                          not_sampled = false;
+	// GPU work wrote it through a buffer since the segment found it: its commit's Before refreshes it as the normal path's
+	// binding does (Speculation::Before, mode 4).
+	bool                          refresh = false;
+	// (spec_pool_layers) The layers its accesses spanned, [layer_lo, layer_hi), and whether any access named no range
+	// (ImageEntry's, from Image::GetBarriers); layer_nontarget: the first access not as a depth attachment, by kind
+	// (LayerNontarget; 0: none): a binding the normal path refreshes through FindTexture / RefreshImage.
+	uint32_t                      layer_lo = UINT32_MAX, layer_hi = 0;
+	bool                          layer_other = false;
+	uint8_t                       layer_nontarget = 0;
+	// (spec_pool_layers' refusal counters: this use counted already, at most once per use whatever the calls.)
+	mutable bool                  pool_counted = false;
+	enum LayerNontarget : uint8_t {
+		NontargetSampled = 1, // a shader read (sampled) access
+		NontargetStorage,     // a shader write or storage access
+		NontargetTransfer,    // a transfer access or layout
+		NontargetGeneral,     // the General layout
+		NontargetFolded,      // a depth attachment access with a shader read folded in
+		NontargetOther,       // any other (a non-depth layout, no access)
+	};
 };
 
 // The 64 KiB granules ranges were added over, hashed into 4096 bits, and up to BigRanges ranges over 64 granules or
@@ -478,6 +567,13 @@ struct ImageEntry {
 	bool                          found_cpu_dirty = false; // (spec_set_cpu_dirty_stop)
 	uint64_t                      found_validity  = 0;
 	bool                          found_stencil_modified = false; // (spec_copy_image_refuse)
+	uint8_t                       writes = 0; // (the open segment's write accesses: ImageUse::writes)
+	bool                          not_sampled = false; // (ImageUse::not_sampled)
+	// (spec_pool_layers) The open segment's accesses' layer span, [layer_lo, layer_hi); layer_other: one with no range (the
+	// whole image). Recorded whatever the switch, as sample_lo / sample_hi.)
+	uint32_t                      layer_lo = UINT32_MAX, layer_hi = 0;
+	bool                          layer_other = false;
+	uint8_t                       layer_nontarget = 0; // (ImageUse::layer_nontarget: the first such access's kind)
 };
 
 // (spec_predict_dcc=3.) The fast clears speculations' holes will consume, by surface and slice, until that speculation
@@ -526,6 +622,23 @@ struct State {
 	// - the ranges of the game buffers it uses on the GPU (their buffers registered over them still: none registered
 	//   or unregistered in their tracker regions since it began);
 	std::vector<Range> buffer_ranges;
+	// - under KYTY_SPECULATE=4 (reloc_on, read as the translation begins: a live mode change cannot split a segment's
+	//   notes): its relocatable buffer references (the table path's index buffer and draw arguments), each a cell in its
+	//   packet's copy in the passive producer's chunk, valid until the segment's splice or discard (the commit writes it
+	//   before the splice: RelocPatch; RelocCellsRelease lets go of it after), and the ranges of the other buffer
+	//   references its lookups gave the work, which it records plainly (merged as buffer_ranges are: a union moved when a
+	//   part of it did). A segment holding any a registration moved over is not relocated.
+	struct RelocRef {
+		uint64_t   begin = 0, end = 0;
+		uint8_t    kind  = 0;       // RelocIndex / RelocArgs
+		RelocCell* cell  = nullptr;
+	};
+	std::vector<RelocRef> reloc_refs;
+	std::vector<Range>    reloc_unrel;
+	bool                  reloc_on = false;
+	void NoteUnrel(uint64_t address, uint64_t size) {
+		if (reloc_on) (void)Note(reloc_unrel, Sealed().reloc_unrel, address, size);
+	}
 	// - the descriptor sets it binds (a hole that retires one stops the commit before it: it may be reused under it);
 	std::vector<uint64_t> sets;
 	// - words it read from a previous speculation's pending writes, and the waits it found satisfied (ChainRead);
@@ -537,6 +650,14 @@ struct State {
 	std::vector<JournalRead> journal_reads;
 	std::vector<uint32_t>    journal_words;
 	bool                     journal_reads_on = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+	// - under KYTY_SPECULATE=4 (read_values_on, as the state is made or cleared): the bytes of its small clean reads made
+	//   through ReadJournaled (ReadValue), and the clean reads it made any other way (command words, the buffer cache's
+	//   reads, the kernel's plain one, the table path's, a copy's source read through its destination, and those over
+	//   ReadValue::MaxBytes), which keep no bytes: a range one of those touched is never passed by value at the commit
+	//   (Speculation::ReadValuesHold).
+	std::vector<ReadValue> read_values;
+	std::vector<Range>     unvalued_reads;
+	bool                   read_values_on = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 	// - the sources and destinations of the copies it makes on the CPU at its commit (in order: what the guest or the
 	//   processor writes there before is copied, or copied over): no GPU work may have written them since.
 	std::vector<Range> cpu_copies;
@@ -554,7 +675,20 @@ struct State {
 	std::vector<Range>         table_ranges;    // (their ranges, merged as notes are: the commit's host-write and unmap checks)
 	std::vector<PendingTarget> pending_targets; // (spec_commit_targets)
 	bool                       target_failed = false; // (spec_commit_targets: the commit's Before could not acquire one)
+	const char*                target_failed_why = nullptr; // (its first site's stop reason: Speculation's TargetFailed)
 	bool                       images_failed = false; // (spec_worker_images: a set's pending slot not completed)
+	bool                       any_resolve   = false; // (mode 4: a proposed set has a resolve, Before's pass for it)
+	// (Mode 4) The raw SRT words a translation read from the stale clean backing where GPU work had written them into a
+	// buffer (the in-order read is that buffer's readback), and the specialization words whose read failed as the in-order
+	// one fails (`expect_fail`: GPU-written, no clean read on any thread; the lookup went on unspecialized): each checked at
+	// its segment's commit (Speculation::SrtVerifyHolds); one that differs stops the segment (srt_failed).
+	struct SrtVerifyRead {
+		uint64_t address     = 0;
+		uint32_t value       = 0;
+		bool     expect_fail = false;
+	};
+	std::vector<SrtVerifyRead> srt_verify;
+	bool                       srt_failed = false;
 	std::vector<LateRead>        late_reads;
 	const std::atomic<uint64_t>* log_end    = nullptr; // (the effects log's end: Speculation::m_log)
 	bool                         late       = false;   // (ReadWord: the word it read was such a read; late_since before it)
@@ -576,7 +710,44 @@ struct State {
 		bool                      settled = false;
 		std::function<void(bool)> settle;
 		std::function<bool()>     complete; // (spec_worker_images: its pending slots, at its segment's commit; empty: none)
+		// (With `complete`, read only, at its segment's commit before it: whether `written` holds any of the memory its
+		// completion uploads from: each pending slot's own desc range (data, metadata range, stencil plane) and every
+		// image over the slot's bytes as FindImage would meet them (TextureCache::ImagesOverWritten).)
+		std::function<bool(const std::function<bool(uint64_t, uint64_t)>&)> pending_written;
+		// (With `complete`, spec_pool_layers, read only, the GPU thread: whether any pending slot's own data range meets
+		// [address, address + size): the only images its completion's FindTexture can resolve to are over those bytes.)
+		std::function<bool(uint64_t, uint64_t)> pending_over;
+		// (The images `complete` made its pending slots', each as it was then (its serial), the set's descriptor set handle
+		// as State::sets notes it and the layout it transited each to: its segment's Before restores them only as the
+		// replay binds them; the commits of later segments that bind the set test them, spec_set_cpu_dirty_stop off.)
+		struct Completed {
+			const Image*    image  = nullptr;
+			uint64_t        serial = 0;
+			uint64_t        set    = 0;
+			vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+			// (spec_completed_snapshot: the image's barrier state as `complete` left it, read under its StateLock once the
+			// set's TableCompletePendingImages returned: the whole state and the per-subresource vector. Before's K1 keep
+			// test compares the state then with it.)
+			bool                          snapshot = false;
+			VulkanImageState              state;
+			std::vector<VulkanImageState> subresources;
+		};
+		std::vector<Completed> completed;
 		std::function<bool()>     check; // (spec_proposed_check: still current at its segment's commit)
+		std::function<void()>     on_hole; // (its segment re-run as a hole, the GPU thread: what must not move to the next one)
+		// (Its commit's settle, Speculation::After: what must run at once, in order (settle_now: an entry's records, pipeline
+		// and metadata notes; empty: nothing), the catalog's owner whose write the rest takes (RenderExecutor, opaque here;
+		// null: settled at once, as before), and whether that rest must not wait past its commit (settle_must_now: it
+		// retires a set; empty: it may wait).)
+		std::function<void()>     settle_now;
+		const void*               catalog_owner = nullptr;
+		std::function<bool()>     settle_must_now;
+		// (Mode 4, a worker's capture of colour targets no image existed for: what its commit makes once every check of the
+		// segment passed, before the pending images are completed; false stops the segment. Empty: nothing. With it, read
+		// only before its segment's Before: whether a target `resolve` makes meets [address, address + size), by its desc's
+		// data, metadata range or stencil plane (SegmentWritesRange: the completion's write test).)
+		std::function<bool()>                   resolve;
+		std::function<bool(uint64_t, uint64_t)> resolve_over;
 	};
 	std::vector<ProposedSet> proposed_sets;
 	void SettleProposedSets(size_t committed_segment, bool all) {
@@ -598,6 +769,10 @@ struct State {
 	std::vector<ImageEntry>                  overlay;
 	std::unordered_map<const Image*, size_t> overlay_index;
 	std::vector<size_t>                      used; // overlay entries the open segment transitioned
+	// (Mode 4) moved by every overlay entry taken (Image::SpeculativeEntry: every transition, first touch, read of an
+	// entry) and by every write the open segment notes (NoteWritten, Journal): a worker's table draw in place while
+	// neither moved since its last one (TableDraw, TableXpr::spec_place). Never reset: they only grow.
+	uint64_t overlay_gen = 0, open_gen = 0;
 	// The upload rings its work reads (BufferCache::GetTableUploadBuffer, GetShaderUploadBuffer): its own, what they
 	// fence gets the commit's tick.
 	StreamBuffer* table_upload  = nullptr;
@@ -614,6 +789,9 @@ struct State {
 	// Set by the GPU thread when it would rather translate the rest itself (Speculation::CommitReady): the translation
 	// stops at its next packet. Null: never.
 	const std::atomic<bool>* cancel = nullptr;
+	// (Mode 4) set when it sees `cancel` (ProcessPm4Spec's poll; Speculation::Translator::cancel_seen): the GPU thread's
+	// spin goes on through the tail. Null: none.
+	std::atomic<bool>* cancel_seen = nullptr;
 	RangeSet                  chain_journal, chain_written;
 	// (spec_inherit_lazy) The chain Inherit merged, from `previous` on, and whether Inherit ran since Clear: the next
 	// state's Inherit takes this one's union when its chain beyond this one is still these, in order.
@@ -636,12 +814,22 @@ struct State {
 	// speculation (the switch as it began).
 	RangeSet pending_set;
 	bool     one_set = false;
+	// KYTY_SPECULATE=4 (taken with one_set, when a speculation begins or its state is cleared): a range the open segment
+	// already noted in the same list (the same bytes, anywhere in the segment, not only its last few) is not noted again,
+	// for the lists the commit's Before walks one call a range (written: ObtainBuffer; current: EnsureBufferContents;
+	// texel syncs; BDA read ranges). The open segment's noted ranges by list: cleared when it closes and on a rollback
+	// (a truncated note must not hide its repeat).
+	bool                                          before_merge = false;
+	std::unordered_set<NoteSeenKey, NoteSeenHash> note_seen;
 	uint32_t one_set_verify_n = 0, one_set_verified = 0; // (KYTY_SPEC_READ_ONE_SET_VERIFY; added 64 at a time)
 	// The notes as the packet being translated found them (Mark): a refused packet leaves none (Rollback). (Its image
 	// transitions stay: they are recorded, the overlay holds where they leave the images.)
 	Counts   checkpoint;
 	bool     checkpoint_bda_all = false;
 	uint64_t checkpoint_work    = 0; // LocalVulkanRecording::RecordedWrites()
+	uint64_t rollbacks          = 0; // (mode 4: Rollbacks so far, it only grows: TableBlocks' shared ring copies)
+	// (Mode 4: the current register packet's Mark not taken yet; ProcessPm4Spec.)
+	bool light_unmarked = false;
 	// (NoteCommandWords: the run of command words not noted yet.)
 	uint64_t command_begin = 0, command_end = 0;
 	// What the GPU thread notes for the presenter as it runs the packets (FrameGen), noted here off it and noted by the
@@ -650,6 +838,10 @@ struct State {
 	// (FrameGen::NoteScene: the game's 3D view). Noted at the commit only: a speculation's thread translates ahead,
 	// past flips; a segment not committed is translated again the normal way, which notes them itself.
 	size_t indexed_draws = 0, scenes = 0;
+	// The satisfied waits it pushed no WaitCheck for, every word of them given by pending writes (its own or a previous
+	// speculation's): a segment with one runs as a hole through its waits, as one with a WaitCheck does, blocking where the
+	// in-order path blocks (Speculation::SegmentAsHole).
+	size_t covered_waits = 0;
 	// The catalog's table pairs its table draws and dispatches looked up (TableTry, TableDispatch): their used_frame,
 	// which only the GPU thread writes, stamped by the commit of the segment they are in (Speculation::After) as the GPU
 	// thread's own lookup stamps it. Unstamped, a pair only speculations' threads used was swept as unused past
@@ -670,7 +862,8 @@ struct State {
 		        sets.size(),           chain_reads.size(),     waits.size(),       cpu_copies.size(),
 		        late_reads.size(),     texel_syncs.size(),     pending_buffers.size(), table_ranges.size(), pending_targets.size(),
 		        indexed_draws,         scenes,                 used_pairs.size(),      left_clears.size(),
-		        journal_reads.size(),  journal_words.size()};
+		        journal_reads.size(),  journal_words.size(),   reloc_refs.size(),  reloc_unrel.size(),
+		        covered_waits,         read_values.size(),     unvalued_reads.size(), srt_verify.size()};
 	}
 	// Its pending guest memory writes or a previous speculation's over the range; the ranges its work or a previous
 	// one's writes.
@@ -699,6 +892,8 @@ struct State {
 		chain.clear();
 		for (const State* state = previous.load(); state != nullptr; state = state->previous.load()) chain.push_back(state);
 		one_set = ReadOneSetOn();
+		before_merge = ModeFour();
+		note_seen.clear();
 		const State* before = chain.empty() ? nullptr : chain.front();
 		// (The chain beyond the state before it still the one that state inherited: compared only for a switch that uses it.)
 		const bool   beyond_same = (InheritLazyOn() || OwnerIndexOn()) && before != nullptr && before->chain_ready &&
@@ -845,17 +1040,35 @@ struct State {
 	}
 
 	void NoteCurrent(uint64_t address, uint64_t size) {
-		if (Note(current, Sealed().current, address, size)) current_set.Add(address, size);
+		if (NoteOnce(1, current, Sealed().current, address, size)) current_set.Add(address, size);
 	}
 	void NoteWritten(uint64_t address, uint64_t size) {
-		if (Note(written, Sealed().written, address, size)) {
+		++open_gen;
+		if (NoteOnce(0, written, Sealed().written, address, size)) {
 			written_set.Add(address, size);
 			pending.Add(address, size);
 			if (one_set) pending_set.Add(address, size);
 		}
 	}
 	void NoteInvalidated(uint64_t address, uint64_t size) { (void)Note(invalidated, Sealed().invalidated, address, size); }
-	void NoteCleanRead(uint64_t address, uint64_t size) { (void)Note(clean_reads, Sealed().clean_reads, address, size); }
+	void NoteCleanRead(uint64_t address, uint64_t size) {
+		(void)Note(clean_reads, Sealed().clean_reads, address, size);
+		if (read_values_on) (void)Note(unvalued_reads, Sealed().unvalued_reads, address, size);
+	}
+	// A clean read made through ReadJournaled, `data` the bytes it gave the translation (read_values_on: kept).
+	void NoteCleanReadValue(uint64_t address, uint64_t size, const void* data) {
+		if (!read_values_on || size == 0 || size > ReadValue::MaxBytes) return NoteCleanRead(address, size);
+		(void)Note(clean_reads, Sealed().clean_reads, address, size);
+		// (The same bytes read again in the open segment: one record.)
+		if (read_values.size() > Sealed().read_values && read_values.back().address == address &&
+		    read_values.back().size == size && std::memcmp(read_values.back().bytes.data(), data, size) == 0)
+			return;
+		ReadValue value;
+		value.address = address;
+		value.size    = static_cast<uint32_t>(size);
+		std::memcpy(value.bytes.data(), data, size);
+		read_values.push_back(value);
+	}
 	void NoteBufferRange(uint64_t address, uint64_t size) { (void)Note(buffer_ranges, Sealed().buffer_ranges, address, size); }
 	// The command words a speculation's thread translated (ProcessPm4Spec, at their guest addresses): clean reads of
 	// the segment they are in, a range for each run of consecutive packets (no command word was in any read set, so a
@@ -875,7 +1088,13 @@ struct State {
 	}
 	void NoteTableRange(uint64_t address, uint64_t size) { (void)Note(table_ranges, Sealed().table_ranges, address, size); }
 	void NoteCpuCopy(uint64_t address, uint64_t size) { (void)Note(cpu_copies, Sealed().cpu_copies, address, size); }
-	void NoteTexelSync(uint64_t address, uint64_t size) { (void)Note(texel_syncs, Sealed().texel_syncs, address, size); }
+	void NoteTexelSync(uint64_t address, uint64_t size) { (void)NoteOnce(2, texel_syncs, Sealed().texel_syncs, address, size); }
+	// A BDA read range for the commit's preparation (GpuResourceManager::PrepareBdaReadRanges under a speculation); under
+	// before_merge not again when the open segment noted the same range.
+	void NoteBda(const GuestRange& range) {
+		if (before_merge && !note_seen.insert({range.address, range.address + range.size, 3}).second) return;
+		bda.push_back(range);
+	}
 	void NoteLateRead(uint64_t address, uint64_t size, uint64_t since) {
 		if (late_reads.size() > Sealed().late_reads && late_reads.back().end == address && late_reads.back().since == since)
 			late_reads.back().end = address + size;
@@ -973,6 +1192,7 @@ struct State {
 		if (one_set) pending_set.Add(address, size);
 		open_journal_set.Add(address, size);
 		if (copy) open_copy_sources.Add(value, size);
+		++open_gen;
 	}
 	// The words at `address` as the translation reads them: as the processor's pending writes leave them (in order it
 	// writes before the commands after it; a copy's word is its source's), its own, then a previous speculation's;
@@ -984,7 +1204,7 @@ struct State {
 		const uint64_t bytes = uint64_t {4} * count;
 		if (bytes != 0 && !pending.MayHold(address, bytes)) {
 			if (!CopyGuest(out, address, bytes)) return false;
-			if (clean) NoteCleanRead(address, bytes);
+			if (clean) NoteCleanReadValue(address, bytes, out);
 			return true;
 		}
 		// (KYTY_SPEC_READ_ONE_SET: none of the four sets over it, one search; one of them over it, the chain unlinked
@@ -1003,7 +1223,7 @@ struct State {
 			const uint64_t since = read_late ? log_end->load(std::memory_order_acquire) : 0;
 			if (!CopyGuest(out, address, bytes)) return false;
 			if (read_late) NoteLateRead(address, bytes, since);
-			else if (clean) NoteCleanRead(address, bytes);
+			else if (clean) NoteCleanReadValue(address, bytes, out);
 			return true;
 		}
 		// (KYTY_SPECULATE_COPY_RUNS, live speculate_copy_runs 0: word by word, as before.)
@@ -1015,7 +1235,7 @@ struct State {
 			const State*   by = nullptr;
 			if (!ReadWord(at, out[i], by)) return false;
 			if (by == nullptr && clean && std::exchange(late, false)) NoteLateRead(at, 4, late_since);
-			else if (by == nullptr && clean) NoteCleanRead(at, 4);
+			else if (by == nullptr && clean) NoteCleanReadValue(at, 4, &out[i]);
 			else if (by != nullptr && by != this) chain_reads.push_back({at, out[i]});
 		}
 		return true;
@@ -1142,6 +1362,9 @@ struct State {
 		const auto source = latest->value + (address - latest->address);
 		if (owner->JournalIntersects(source, bytes) || owner->WrittenIntersects(source, bytes)) return Run::Refused;
 		if (!CopyGuest(out, source, bytes)) return Run::Refused;
+		// (Unvalued: the copy may be an earlier segment's; in order the reader gets the source's bytes as that segment's
+		// commit copies them, not as the reading segment's commit finds them, where a by-value check would compare; any
+		// write logged over the source since the speculation began stops it.)
 		if (owner == this) {
 			NoteCleanRead(source, bytes);
 			const auto entry = static_cast<size_t>(latest.base() - writes.cbegin()) - 1;
@@ -1152,12 +1375,16 @@ struct State {
 		return Run::Read;
 	}
 	// The word `state`'s latest pending write over it gives (a copy: its source's, with no write of that speculation
-	// or an earlier one pending over the source).
+	// or an earlier one pending over the source). The latest write over any of its bytes must hold the whole word: one over
+	// part of it (an odd-sized or unaligned copy after an earlier write over the whole word) leaves the word made of two
+	// writes' bytes, which none gives: not served (before, the earlier whole write's word was served, its bytes that the
+	// later write changed stale).
 	[[nodiscard]] bool Resolve(const State& state, uint64_t at, uint32_t& value, const State*& by) {
 		const auto latest = std::find_if(state.writes.rbegin(), state.writes.rend(), [&](const MemoryWrite& write) {
-			return write.address <= at && at + 4 <= write.address + write.size;
+			return write.address < at + 4 && at < write.address + write.size;
 		});
 		if (latest == state.writes.rend()) return false;
+		if (latest->address > at || at + 4 > latest->address + latest->size) return false;
 		by = &state;
 		const auto entry = static_cast<size_t>(latest.base() - state.writes.begin()) - 1;
 		if (!latest->copy) {
@@ -1204,8 +1431,28 @@ struct State {
 		checkpoint_bda_all = bda_all;
 		checkpoint_work    = work;
 	}
+	// (Mode 4, a table dispatch taken again: RenderExecutor::TableDispatch) The notes since `mark` (taken within the
+	// packet: Sizes, bda_all) taken back as Rollback takes back the packet's; the packet's own checkpoint kept.
+	void RollbackTo(const Counts& mark, bool mark_bda_all) {
+		const auto packet         = checkpoint;
+		const bool packet_bda_all = checkpoint_bda_all;
+		checkpoint                = mark;
+		checkpoint_bda_all        = mark_bda_all;
+		Rollback();
+		checkpoint         = packet;
+		checkpoint_bda_all = packet_bda_all;
+		// (NoteJournalRead grows the last record when it was noted since the packet's Mark, which `mark` may be after: a
+		// record from before `mark` grown since keeps its words only to `mark`, so its bytes are cut to them.)
+		if (journal_reads.size() == mark.journal_reads && mark.journal_reads > 0) {
+			auto&        last  = journal_reads.back();
+			const size_t words = journal_words.size() - std::min<size_t>(journal_words.size(), last.words);
+			last.bytes         = static_cast<uint32_t>(std::min<size_t>(last.bytes, words * 4));
+		}
+	}
 	// (The cumulative sets keep what the packet noted: they only make later decisions more careful.)
 	void Rollback() {
+		++rollbacks;
+		note_seen.clear(); // (before_merge)
 		current.resize(std::min(current.size(), checkpoint.current));
 		written.resize(std::min(written.size(), checkpoint.written));
 		bda.resize(std::min(bda.size(), checkpoint.bda));
@@ -1231,6 +1478,12 @@ struct State {
 		left_clears.resize(std::min(left_clears.size(), checkpoint.left_clears));
 		journal_reads.resize(std::min(journal_reads.size(), checkpoint.journal_reads));
 		journal_words.resize(std::min(journal_words.size(), checkpoint.journal_words));
+		reloc_refs.resize(std::min(reloc_refs.size(), checkpoint.reloc_refs));
+		reloc_unrel.resize(std::min(reloc_unrel.size(), checkpoint.reloc_unrel));
+		covered_waits = std::min(covered_waits, checkpoint.covered_waits);
+		read_values.resize(std::min(read_values.size(), checkpoint.read_values));
+		unvalued_reads.resize(std::min(unvalued_reads.size(), checkpoint.unvalued_reads));
+		srt_verify.resize(std::min(srt_verify.size(), checkpoint.srt_verify));
 		bda_all = checkpoint_bda_all;
 	}
 
@@ -1257,18 +1510,30 @@ struct State {
 		journal_reads.clear();
 		journal_words.clear();
 		journal_reads_on = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+		read_values.clear();
+		unvalued_reads.clear();
+		read_values_on = journal_reads_on;
+		covered_waits  = 0;
 		cpu_copies.clear();
 		late_reads.clear();
 		texel_syncs.clear();
 		pending_buffers.clear();
 		table_ranges.clear();
 		pending_targets.clear();
-		target_failed = false;
-		images_failed = false;
+		target_failed     = false;
+		target_failed_why = nullptr;
+		images_failed     = false;
+		any_resolve       = false;
+		srt_verify.clear();
+		srt_failed = false;
 		draw_verifies.clear();
 		indexed_draws = 0;
 		scenes        = 0;
+		light_unmarked = false;
 		used_pairs.clear();
+		reloc_refs.clear();
+		reloc_unrel.clear();
+		reloc_on = false;
 		late = false;
 		bda.clear();
 		bda_all = false;
@@ -1300,6 +1565,8 @@ struct State {
 		pending.Clear();
 		pending_set.Clear();
 		one_set = ReadOneSetOn();
+		before_merge = ModeFour();
+		note_seen.clear();
 		if (one_set_verified != 0)
 			LiveCounters::Add(LiveCounters::SpecOneSetVerified, std::exchange(one_set_verified, 0));
 	}
@@ -1317,16 +1584,29 @@ struct State {
 			                          std::move(entry.found_subresources), entry.subresources, entry.found_group,
 			                          entry.group, entry.found_buffer_modified, entry.sample_lo, entry.sample_hi,
 			                          entry.sample_other, entry.found_cpu_dirty, entry.found_validity,
-			                          entry.found_stencil_modified});
+			                          entry.found_stencil_modified, entry.writes, false, entry.not_sampled, false,
+			                          entry.layer_lo, entry.layer_hi, entry.layer_other, entry.layer_nontarget});
 			entry.used = false;
 		}
 		used.clear();
 		bda_all = false;
+		note_seen.clear(); // (before_merge: the next segment's own)
 		open_journal_set.Clear();
 		open_copy_sources.Clear();
 	}
 
 private:
+	// Under before_merge: Note, and a range the open segment already noted in that list (list 0 written, 1 current, 2
+	// texel syncs) is a repeat (false, as Note's own repeat: the sets beside the list already hold it). The key is the
+	// range as noted; the list entry that holds it only grows (Note's extension) until the segment closes or a rollback
+	// clears it. Exact: Before walks each list in order, and every call it makes (an obtain written, an ensure, a texel
+	// sync, a BDA preparation) is idempotent for the same range when only the same list's other entries run between the
+	// two calls (an obtain or ensure of another range may make or join a buffer, which copies the bytes it covers).
+	bool NoteOnce(uint32_t list, std::vector<Range>& ranges, size_t sealed, uint64_t address, uint64_t size) {
+		if (!before_merge || size == 0) return Note(ranges, sealed, address, size);
+		if (!note_seen.insert({address, address + size, list}).second) return false;
+		return Note(ranges, sealed, address, size);
+	}
 	// A range noted, merged into the open segment's last one when it extends it (draws mostly read consecutive
 	// ranges); false when one of the open segment's last few covers it (a repeat only costs the commit a lookup).
 	static bool Note(std::vector<Range>& ranges, size_t sealed, uint64_t address, uint64_t size) {
@@ -1363,6 +1643,10 @@ inline thread_local State* t_record = nullptr;
 	return On() ? t_record : nullptr;
 }
 
+// The table path's refusal of a draw whose pair (vertex and pixel table programs) is refused: one object (an inline
+// constexpr array: one address in every translation unit), so a hole's reason is told by its pointer
+// (spec_pair_refused_holes_n, Speculation::RunHole).
+inline constexpr char TablePairRefusedText[] = "table: pair refused";
 inline void Refuse(const char* why) noexcept {
 	if (!On()) return;
 	if (t_state != nullptr && t_state->refused == nullptr) t_state->refused = why;
@@ -1537,6 +1821,9 @@ struct EffectsLog {
 	std::unordered_map<uint64_t, std::vector<uint64_t>> index;
 	std::vector<uint64_t>                               index_wide;
 	uint64_t                                            index_from = UINT64_MAX, index_pruned = 0;
+	// (Under KYTY_SPECULATE=4, kept with `index`:) the indices of the RetiredSet entries, ascending, from index_from on, so
+	// that a stamped Effects::Take visits those alone.
+	std::vector<uint64_t> retired;
 	[[nodiscard]] static int64_t IndexSwitch() {
 		return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 1 : 0;
 	}
@@ -1544,6 +1831,7 @@ struct EffectsLog {
 		                  if (IndexSwitch() != 0) {
 			                  const uint64_t at = base + entries.size();
 			                  if (index_from == UINT64_MAX) index_from = at;
+			                  if (kind == Kind::RetiredSet) retired.push_back(at);
 			                  if (kind != Kind::RetiredSet && size != 0) {
 				                  const uint64_t g0 = address >> IndexGranuleBits, g1 = (address + size - 1) >> IndexGranuleBits;
 				                  if (g1 - g0 >= IndexWideGranules) index_wide.push_back(at);
@@ -1551,7 +1839,7 @@ struct EffectsLog {
 					                  for (uint64_t g = g0; g <= g1; ++g) index[g].push_back(at);
 			                  }
 		                  } else if (index_from != UINT64_MAX) {
-			                  index_from = UINT64_MAX, index.clear(), index_wide.clear(); // (off: the next on starts afresh)
+			                  index_from = UINT64_MAX, index.clear(), index_wide.clear(), retired.clear(); // (off: the next on starts afresh)
 		                  }
 		                  if (kind != Kind::RetiredSet) stamps.Stamp(address, size, base + entries.size() + 1);
 		                  if (kind == Kind::HostWrite) host_stamps.Stamp(address, size, base + entries.size() + 1);
@@ -1644,6 +1932,9 @@ struct EffectsLog {
 			entries.pop_front();
 			++base;
 		}
+		// (The dropped entries' RetiredSet indices out.)
+		if (!retired.empty() && retired.front() < base)
+			retired.erase(retired.begin(), std::lower_bound(retired.begin(), retired.end(), base));
 		// (spec_log_index: the dropped indices out of the granules' lists, now and then.)
 		if (index_from != UINT64_MAX && base >= index_pruned + 4096) {
 			index_pruned = base;
@@ -1672,6 +1963,16 @@ struct Effects {
 		next = from;
 	}
 	void Take(const EffectsLog& log) {
+		// (Under KYTY_SPECULATE=4) Stamped, a Take keeps only the RetiredSet entries (the writes are looked up in the stamps):
+		// when the log's index covers where this walk starts (every Add from index_from on appended its RetiredSet index),
+		// those entries alone, through it, in log order: the same list the walk below makes, and `next` where it ends.
+		if (const uint64_t from = std::max(next, log.base), end = log.base + log.entries.size();
+		    stamped && log.index_from != UINT64_MAX && from >= log.index_from) {
+			for (auto it = std::lower_bound(log.retired.begin(), log.retired.end(), from); it != log.retired.end() && *it < end; ++it)
+				retired_sets.push_back(log.entries[*it - log.base].address);
+			next = std::max(from, end);
+			return;
+		}
 		for (next = std::max(next, log.base); next < log.base + log.entries.size(); ++next) {
 			const auto& entry = log.entries[next - log.base];
 			switch (entry.kind) {
@@ -1746,7 +2047,9 @@ struct HostWriteParts {
 	uint32_t count = 0;
 	uint64_t address = 0, size = 0;
 	bool     whole = true;
-	void Find(uint64_t dst, const void* src, uint64_t bytes) {
+	// (`current`: where the destination's bytes are read when not at `dst` itself: its backing view, for a destination
+	// whose guest mapping a write guard holds; a commit's guarded copy, speculation.cpp's GuardedCopy.)
+	void Find(uint64_t dst, const void* src, uint64_t bytes, const void* current = nullptr) {
 		// (KYTY_SPECULATE_WRITE_PARTS, live speculate_write_parts: 0 logs every write whole, as before.)
 		static auto& on = LiveSwitch::Find("speculate_write_parts", 1);
 		address = dst, size = bytes, count = 0;
@@ -1754,9 +2057,10 @@ struct HostWriteParts {
 		        on.load(std::memory_order_relaxed) == 0;
 		if (whole) return;
 		const auto* from = static_cast<const uint8_t*>(src);
+		const auto* now  = current != nullptr ? static_cast<const uint8_t*>(current) : reinterpret_cast<const uint8_t*>(dst);
 		for (uint64_t at = 0; at < bytes;) {
 			const auto n = std::min(Granule - (dst + at) % Granule, bytes - at);
-			if (std::memcmp(reinterpret_cast<const void*>(dst + at), from + at, n) != 0) {
+			if (std::memcmp(now + at, from + at, n) != 0) {
 				if (count != 0 && parts[count - 1].first + parts[count - 1].second == dst + at) {
 					parts[count - 1].second += n;
 				} else if (count == parts.size()) {

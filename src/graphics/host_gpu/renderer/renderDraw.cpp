@@ -695,6 +695,123 @@ static DynamicState Capture(const CommandBuffer& buffer, const ShaderVertexInput
     state.feedback_aspects = aspects;
     return state;
 }
+// (Mode 4) A captured draw state's dynamic state (NativeXprCaptureState's, a worker's WorkerCaptureTargets'): Capture's
+// values with every byte set. The state is zeroed, then each field assigned by itself (the structs with padding field by
+// field, Copy*Fields; those without, whole: sizes asserted), so its padding is zero on any thread and two captures of the
+// same values are the same bytes, which TableDraw's same-dynamic test compares (dynamic_hash, memcmp). Assigning a struct
+// copies the padding of the temporary or register it came from: a thread's stack. (The packet path's per-draw Capture is
+// left as it is: its bytes go to the packet's replay only.)
+static void CopyViewportFields(HW::Viewport& d, const HW::Viewport& s) {
+    static_assert(sizeof(HW::Viewport) == 52, "HW::Viewport changed: copy its new fields here");
+    d.zmin = s.zmin;
+    d.zmax = s.zmax;
+    d.xscale = s.xscale;
+    d.xoffset = s.xoffset;
+    d.yscale = s.yscale;
+    d.yoffset = s.yoffset;
+    d.zscale = s.zscale;
+    d.zoffset = s.zoffset;
+    d.viewport_scissor_left = s.viewport_scissor_left;
+    d.viewport_scissor_top = s.viewport_scissor_top;
+    d.viewport_scissor_right = s.viewport_scissor_right;
+    d.viewport_scissor_bottom = s.viewport_scissor_bottom;
+    d.viewport_scissor_window_offset_enable = s.viewport_scissor_window_offset_enable;
+}
+static void CopyScreenViewportFields(HW::ScreenViewport& d, const HW::ScreenViewport& s) {
+    static_assert(sizeof(HW::ScreenViewport) == 996, "HW::ScreenViewport changed: copy its new fields here");
+    for (size_t i = 0; i < std::size(d.viewports); ++i) CopyViewportFields(d.viewports[i], s.viewports[i]);
+    d.transform_control = s.transform_control;
+    d.screen_scissor_left = s.screen_scissor_left;
+    d.screen_scissor_top = s.screen_scissor_top;
+    d.screen_scissor_right = s.screen_scissor_right;
+    d.screen_scissor_bottom = s.screen_scissor_bottom;
+    d.window_scissor_left = s.window_scissor_left;
+    d.window_scissor_top = s.window_scissor_top;
+    d.window_scissor_right = s.window_scissor_right;
+    d.window_scissor_bottom = s.window_scissor_bottom;
+    d.window_scissor_window_offset_enable = s.window_scissor_window_offset_enable;
+    d.generic_scissor_left = s.generic_scissor_left;
+    d.generic_scissor_top = s.generic_scissor_top;
+    d.generic_scissor_right = s.generic_scissor_right;
+    d.generic_scissor_bottom = s.generic_scissor_bottom;
+    d.generic_scissor_window_offset_enable = s.generic_scissor_window_offset_enable;
+    d.window_offset_x = s.window_offset_x;
+    d.window_offset_y = s.window_offset_y;
+    d.hw_offset_x = s.hw_offset_x;
+    d.hw_offset_y = s.hw_offset_y;
+    d.guard_band_horz_clip = s.guard_band_horz_clip;
+    d.guard_band_vert_clip = s.guard_band_vert_clip;
+    d.guard_band_horz_discard = s.guard_band_horz_discard;
+    d.guard_band_vert_discard = s.guard_band_vert_discard;
+    d.clip_rect_rule = s.clip_rect_rule;
+    for (size_t i = 0; i < 4; ++i) {
+        d.clip_rect_left[i] = s.clip_rect_left[i];
+        d.clip_rect_top[i] = s.clip_rect_top[i];
+        d.clip_rect_right[i] = s.clip_rect_right[i];
+        d.clip_rect_bottom[i] = s.clip_rect_bottom[i];
+        d.clip_rect_window_offset_enable[i] = s.clip_rect_window_offset_enable[i];
+    }
+}
+static void CopyPolyOffsetFields(HW::PolyOffset& d, const HW::PolyOffset& s) {
+    static_assert(sizeof(HW::PolyOffset) == 24, "HW::PolyOffset changed: copy its new fields here");
+    d.neg_num_db_bits = s.neg_num_db_bits;
+    d.db_is_float_fmt = s.db_is_float_fmt;
+    d.clamp = s.clamp;
+    d.front_scale = s.front_scale;
+    d.front_offset = s.front_offset;
+    d.back_scale = s.back_scale;
+    d.back_offset = s.back_offset;
+}
+static DynamicState CaptureZeroed(const CommandBuffer& buffer, const ShaderVertexInputInfo& input,
+                                  const RenderColorInfo* colors, uint32_t color_count,
+                                  const RenderDepthInfo& depth, bool feedback,
+                                  vk::ImageAspectFlags aspects) {
+    // (Whole: no padding in them, their fields' sizes summing to theirs.)
+    static_assert(sizeof(HW::ClipControl) == 12 && sizeof(HW::ScanModeControl) == 3 && sizeof(HW::ModeControl) == 11 &&
+                  sizeof(HW::BlendColor) == 16 && sizeof(PipelineStencilDynamicState) == 12);
+    // (Field by field below: a field added fails here.)
+    static_assert(sizeof(Color) == 16 && sizeof(Depth) == 44 && sizeof(Limits) == 16 && sizeof(Registers) == 1076 &&
+                  sizeof(DynamicState) == 1276, "LocalDrawRecording's state changed: set its new fields here");
+    DynamicState state;
+    std::memset(static_cast<void*>(&state), 0, sizeof(state));
+    const auto& ctx = buffer.GetRegisters();
+    auto& registers = state.buffer.registers;
+    CopyScreenViewportFields(registers.viewport, ctx.GetScreenViewport());
+    registers.clip = ctx.GetClipControl();
+    registers.scan = ctx.GetScanModeControl();
+    registers.mode = ctx.GetModeControl();
+    CopyPolyOffsetFields(registers.offset, ctx.GetPolyOffset());
+    registers.blend = ctx.GetBlendColor();
+    registers.line_width = ctx.GetLineWidth();
+    registers.target_mask = ctx.GetRenderTargetMask();
+    registers.shader_mask = ctx.GetShaderRegisters().m_cbShaderMask;
+    const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
+    auto& held = state.buffer.graphics.properties.limits;
+    held.maxFramebufferWidth = limits.maxFramebufferWidth;
+    held.maxFramebufferHeight = limits.maxFramebufferHeight;
+    held.maxViewportDimensions[0] = limits.maxViewportDimensions[0];
+    held.maxViewportDimensions[1] = limits.maxViewportDimensions[1];
+    state.color_count = color_count;
+    for (uint32_t i = 0; i < color_count; ++i) {
+        state.colors[i].extent = colors[i].Extent();
+        state.colors[i].target_slot = colors[i].target_slot;
+        state.colors[i].image_id = bool(colors[i].image_id);
+    }
+    state.depth.desc.info.extent = vk::Extent2D {depth.desc.info.extent.width, depth.desc.info.extent.height};
+    state.depth.desc.view_info.format = depth.desc.view_info.format;
+    state.depth.stencil_dynamic_front = depth.stencil_dynamic_front;
+    state.depth.stencil_dynamic_back = depth.stencil_dynamic_back;
+    state.depth.depth_compare_op = depth.depth_compare_op;
+    state.depth.image_id = bool(depth.image_id);
+    state.depth.depth_test_enable = depth.depth_test_enable;
+    state.depth.depth_write_enable = depth.depth_write_enable;
+    state.depth.stencil_test_enable = depth.stencil_test_enable;
+    // (No vertex program: a worker's capture, whose caller sets them from the normal vertex program.)
+    state.indexed_viewports = input.stage.program != nullptr && UsesIndexedViewports(input);
+    state.feedback_enabled = feedback;
+    state.feedback_aspects = aspects;
+    return state;
+}
 } // namespace LocalDrawRecording
 #endif
 
@@ -708,6 +825,22 @@ static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& 
 	const auto& db = sh_regs.db_shader_control;
 	return db.shader_kill_enable || db.shader_z_export_enable || db.shader_mask_export_enable ||
 	       db.shader_dual_export_enable || db.shader_execute_on_noop;
+}
+
+// The depth attachment's access: its attachment reads and writes (the attachment store writes even when guest depth /
+// stencil tests do not). A target shaders sampled in this layout keeps the shader reads in its access while no aspect they
+// sample is written as an attachment (no hazard between the two uses): draws alternating between them (the decal pass: a
+// stencil mark, then a decal sampling depth) need no barrier, nor a render pass break, each. `current` and `uniform`: the
+// image's state and whether its subresources share it; `sampled`: the aspects this draw's shaders sample. One rule for the
+// normal path's acquisition (AcquireRenderTargets) and, in mode 4, a worker's capture and the emission of its state
+// (WorkerCaptureTargets, NativeXprEmitTargets).
+static vk::AccessFlags2 DepthAttachmentAccess(vk::ImageLayout layout, const VulkanImageState& current, bool uniform,
+                                              vk::ImageAspectFlags sampled, vk::ImageAspectFlags writable) {
+	auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+	if (uniform && current.layout == layout && static_cast<bool>(current.access_mask & vk::AccessFlagBits2::eShaderRead) &&
+	    !static_cast<bool>(sampled & writable))
+		access |= vk::AccessFlagBits2::eShaderRead;
+	return access;
 }
 
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
@@ -848,18 +981,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    static_cast<bool>(image.binding.other_sampled_aspects & writable)) {
 			layout = vk::ImageLayout::eGeneral;
 		}
-		// The attachment store writes even when guest depth/stencil tests do not.
-		auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-		              vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
-		// A target shaders sampled in this layout keeps the shader reads in its access while no aspect they sample
-		// is written as an attachment (no hazard between the two uses): draws alternating between them (the decal
-		// pass: a stencil mark, then a decal sampling depth) need no barrier, nor a render pass break, each.
-		if (const auto& current = image.backing.state;
-		    image.backing.subresource_states.empty() && current.layout == layout &&
-		    static_cast<bool>(current.access_mask & vk::AccessFlagBits2::eShaderRead) &&
-		    !static_cast<bool>((image.binding.pixel_sampled_aspects | image.binding.other_sampled_aspects) & writable)) {
-			access |= vk::AccessFlagBits2::eShaderRead;
-		}
+		// The attachment store writes even when guest depth/stencil tests do not (DepthAttachmentAccess, the one rule).
+		const auto access = DepthAttachmentAccess(layout, image.backing.state, image.backing.subresource_states.empty(),
+		                                          image.binding.pixel_sampled_aspects | image.binding.other_sampled_aspects,
+		                                          writable);
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access = access;
 		const auto& view                = depth.desc.view_info;

@@ -2,6 +2,7 @@
 #include "live-census.h"
 #include "write-guard.h"
 #include "live-counters.h"
+#include "mode-toggle.h"
 #include "async-upload.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 
@@ -11,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
+#include <unordered_set>
 #include <utility>
 #include <x86intrin.h>
 
@@ -351,6 +353,25 @@ void GpuResourceManager::PostLevelUploadAhead(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+// What the engine-free hook did, reported every 30 s it happened (the GPU thread's own counts: all of its time at the frees,
+// a freed block's read back there included when nothing went; and its time on the freed ranges left pending, while it had
+// nothing else to do).
+namespace {
+struct FreedReport {
+	BufferCache::FreeBlockSplits          splits;
+	uint64_t                              blocks = 0, bytes = 0, let_go = 0, ns = 0, max_ns = 0, idle_ns = 0, idle_max_ns = 0;
+	std::chrono::steady_clock::time_point next {};
+};
+FreedReport& Freed() {
+	static FreedReport report;
+	return report;
+}
+uint64_t NsSince(std::chrono::steady_clock::time_point start) {
+	return static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+} // namespace
+
 void GpuResourceManager::FreedByGame(uint64_t vaddr, uint64_t size) {
 	static const uint32_t mode = [] {
 		const char* value = std::getenv("KYTY_ENGINE_FREE_BUFFERS");
@@ -360,36 +381,55 @@ void GpuResourceManager::FreedByGame(uint64_t vaddr, uint64_t size) {
 	(void)m_gpu->TrySendCommand([this, vaddr, size] {
 		// (Unmapped meanwhile: UnmapMemory dealt with its buffers.)
 		if (!IsMapped(vaddr, size)) return;
-		const auto start = std::chrono::steady_clock::now();
-		// What went, reported every 30 s it happened (the GPU thread's own counts: all of its time here, a freed block's read
-		// back included when nothing went).
-		static BufferCache::FreeBlockSplits splits;
-		static uint64_t                     blocks = 0, bytes = 0, let_go = 0, ns = 0, max_ns = 0;
-		static auto                         next   = start + std::chrono::seconds(30);
-		const auto lists = splits.lists;
-		const auto freed = m_buffer_cache.DropFreedRange(vaddr, size, mode != 2, &Loader::DemonsSoulsPageFree::FreeBlocksIn, &splits);
-		const auto took  = static_cast<uint64_t>(
-		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
-		ns += took;
-		max_ns = std::max(max_ns, took);
-		if (freed != 0) {
-			blocks++;
-			bytes += size;
-			let_go += freed;
+		const auto start  = std::chrono::steady_clock::now();
+		auto&      report = Freed();
+		if (report.next == std::chrono::steady_clock::time_point {}) report.next = start + std::chrono::seconds(30);
+		const auto lists   = report.splits.lists;
+		const auto pending = m_buffer_cache.FreedReadbackPendingCount();
+		const auto freed = m_buffer_cache.DropFreedRange(vaddr, size, mode != 2, &Loader::DemonsSoulsPageFree::FreeBlocksIn,
+		                                                 &report.splits);
+		const auto took = NsSince(start);
+		report.ns += took;
+		report.max_ns = std::max(report.max_ns, took);
+		if (freed != 0 || m_buffer_cache.FreedReadbackPendingCount() > pending) {
+			report.blocks++;
+			report.bytes += size;
+			report.let_go += freed;
 		}
-		if ((freed == 0 && splits.lists == lists) || start < next) return;
+		if ((freed == 0 && report.splits.lists == lists && m_buffer_cache.FreedReadbackPendingCount() <= pending) ||
+		    start < report.next)
+			return;
+		const auto counts = m_buffer_cache.TakeFreedReadbackCounts();
 		std::printf("Engine frees: %llu freed blocks (%.0f MiB) had buffers over them: %.0f MiB of buffers let go (%.0f MiB cut off "
 		            "buffers over other free blocks too, the allocator's lists read %llu times), %.1f ms on the GPU thread (at most "
-		            "%.2f ms a block); BDA reads of unbuffered pages so far %llu (KYTY_ENGINE_FREE_BUFFERS)\n",
-		            static_cast<unsigned long long>(blocks), static_cast<double>(bytes) / 1048576.0,
-		            static_cast<double>(let_go) / 1048576.0, static_cast<double>(splits.cut) / 1048576.0,
-		            static_cast<unsigned long long>(splits.lists), static_cast<double>(ns) / 1e6, static_cast<double>(max_ns) / 1e6,
-		            static_cast<unsigned long long>(LiveCounters::Value(LiveCounters::BdaFaultPages)));
+		            "%.2f ms a block); BDA reads of unbuffered pages so far %llu (KYTY_ENGINE_FREE_BUFFERS); read back later %llu "
+		            "(%.1f MiB; %llu at the free), %llu done in %.1f ms of the idle GPU thread (at most %.2f ms), %llu kept "
+		            "(written again), %.2f MiB not written back (written since)\n",
+		            static_cast<unsigned long long>(report.blocks), static_cast<double>(report.bytes) / 1048576.0,
+		            static_cast<double>(report.let_go) / 1048576.0, static_cast<double>(report.splits.cut) / 1048576.0,
+		            static_cast<unsigned long long>(report.splits.lists), static_cast<double>(report.ns) / 1e6,
+		            static_cast<double>(report.max_ns) / 1e6,
+		            static_cast<unsigned long long>(LiveCounters::Value(LiveCounters::BdaFaultPages)),
+		            static_cast<unsigned long long>(counts.pending), static_cast<double>(counts.pending_bytes) / 1048576.0,
+		            static_cast<unsigned long long>(counts.at_free), static_cast<unsigned long long>(counts.serviced),
+		            static_cast<double>(report.idle_ns) / 1e6, static_cast<double>(report.idle_max_ns) / 1e6,
+		            static_cast<unsigned long long>(counts.kept), static_cast<double>(counts.stale_bytes) / 1048576.0);
 		std::fflush(stdout);
-		blocks = bytes = let_go = ns = max_ns = 0;
-		splits = {};
-		next   = start + std::chrono::seconds(30);
+		const auto next = start + std::chrono::seconds(30);
+		report          = {};
+		report.next     = next;
 	});
+}
+
+void GpuResourceManager::ServiceFreedReadback() {
+	const auto start  = std::chrono::steady_clock::now();
+	auto&      report = Freed();
+	uint64_t   let_go = 0;
+	if (!m_buffer_cache.ServiceFreedReadback(&Loader::DemonsSoulsPageFree::FreeBlocksIn, &report.splits, &let_go)) return;
+	const auto took = NsSince(start);
+	report.idle_ns += took;
+	report.idle_max_ns = std::max(report.idle_max_ns, took);
+	report.let_go += let_go;
 }
 
 thread_local bool t_unmap_list_site = false; // (spec_unmap_list: set while the commit's Changed runs)
@@ -532,11 +572,18 @@ bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges
 		// Prepared when it is committed (and its guest memory writes made after its work).
 		if (std::ranges::any_of(ranges, [&](const auto& range) { return spec->open_journal_set.Intersects(range.address, range.size); }))
 			Spec::Refuse("memory the processor writes");
-		spec->bda.insert(spec->bda.end(), ranges.begin(), ranges.end());
+		for (const auto& range: ranges) spec->NoteBda(range); // (KYTY_SPECULATE=4: a repeat in its segment not again)
 		return true;
 	}
 	// (Before the lock: making buffers asks for it.)
-	m_buffer_cache.EnsureBdaReadable(ranges);
+	// KYTY_SPECULATE=4: a range whose head pages this thread found all held by registered buffers at the registration
+	// epoch that still stands is not walked again (EnsureBdaReadableMemo): EnsureBdaReadable acts only on pages no buffer
+	// holds, and a page's owner changes only in BufferCache::ChangeRegister, which moves the epoch (the page table's one
+	// writer). The dirty-region syncs below run as before.
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) [[unlikely]]
+		EnsureBdaReadableMemo(ranges);
+	else
+		m_buffer_cache.EnsureBdaReadable(ranges);
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	RefreshBdaRanges();
 	LiveCounters::Add(LiveCounters::BdaRangeCalls);
@@ -560,10 +607,49 @@ bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges
 	return true;
 }
 
+// KYTY_SPECULATE=4: EnsureBdaReadable for the ranges not known all held at the current registration epoch; those found
+// all held after it, at an epoch read before and after the look, remembered (this thread's, cleared when the epoch
+// moves).
+void GpuResourceManager::EnsureBdaReadableMemo(std::span<const GuestRange> ranges) {
+	struct Key {
+		uint64_t address = 0, size = 0;
+		bool     operator==(const Key&) const = default;
+	};
+	struct Hash {
+		size_t operator()(const Key& key) const noexcept {
+			const uint64_t h = key.address * 0x9E3779B97F4A7C15ull ^ (key.size + 0x632BE59BD9B4E019ull);
+			return static_cast<size_t>(h ^ (h >> 29u));
+		}
+	};
+	thread_local uint64_t                      memo_epoch = 0;
+	thread_local std::unordered_set<Key, Hash> held;
+	thread_local std::vector<GuestRange>       todo;
+	if (const auto epoch = m_buffer_cache.RegistrationEpoch(); epoch != memo_epoch) {
+		held.clear();
+		memo_epoch = epoch;
+	}
+	todo.clear();
+	for (const auto& range: ranges)
+		if (!held.contains({range.address, range.size})) todo.push_back(range);
+	if (todo.empty()) return;
+	m_buffer_cache.EnsureBdaReadable(todo);
+	const auto before = m_buffer_cache.RegistrationEpoch();
+	if (before != memo_epoch) {
+		held.clear();
+		memo_epoch = before;
+	}
+	for (const auto& range: todo)
+		if (m_buffer_cache.BdaHeadHeld(range) && m_buffer_cache.RegistrationEpoch() == before) held.insert({range.address, range.size});
+}
+
 void GpuResourceManager::SynchronizeDirtyBdaRegions(GuestRange range) {
 	const auto first = range.address / TRACKER_REGION_SIZE;
 	if (first >= BdaDirtyRegions::Regions) return;
 	const auto last = std::min((range.End() - 1) / TRACKER_REGION_SIZE, BdaDirtyRegions::Regions - 1);
+	// KYTY_SPEC_BDA_CLEAN_SKIP (live spec_bda_clean_skip; on under KYTY_SPECULATE=4, 0 otherwise: mode-toggle.h; set, it
+	// acts in either mode): in a region synced, a request with no page CPU-dirty is not visited (below).
+	static auto& clean_skip_switch = LiveSwitch::Find("spec_bda_clean_skip", ModeToggle::Default("spec_bda_clean_skip"));
+	const bool   clean_skip        = clean_skip_switch.load(std::memory_order_relaxed) != 0;
 	for (auto word = first / 64; word <= last / 64; ++word) {
 		auto mask = ~uint64_t {0};
 		if (word == first / 64) mask &= ~uint64_t {0} << (first % 64);
@@ -578,6 +664,21 @@ void GpuResourceManager::SynchronizeDirtyBdaRegions(GuestRange range) {
 			    [](const auto& request, uint64_t begin) { return request.address + request.size <= begin; });
 			bool unproven = false;
 			for (; it != m_bda_region_requests.end() && it->address < region_begin + TRACKER_REGION_SIZE; ++it) {
+				// KYTY_SPEC_BDA_CLEAN_SKIP: a request proven before (not new, not unproven: cpu_epoch set), its region's
+				// registrations unchanged since, whose visit would sync (its region's CPU epoch moved), and no page of which
+				// is CPU-dirty under the region's lock: its visit would copy nothing (SynchronizeBuffer's read-only sync
+				// uploads only what IsRegionCpuModified finds; DrainGuestReadback returns at once for it; a sync stamp left
+				// older only makes a later visit look again; the sync index is rebuilt lazily by the next call that needs
+				// it). Skipped, it is proven at the epoch read under that lock, as the visit would have proven it; a
+				// dirtying after it moves the epoch. A forced request (a registration since, or cpu_epoch 0) is visited.
+				if (clean_skip && it->cpu_epoch != 0 &&
+				    it->registration_epoch == m_buffer_cache.RegionRegistrationEpoch(it->address)) {
+					if (const auto now = m_buffer_cache.CpuModificationEpoch(it->address, it->size); now != 0 && now != it->cpu_epoch)
+						if (const auto clean = m_buffer_cache.CleanRangeEpoch(it->address, it->size); clean != 0) {
+							it->cpu_epoch = clean;
+							continue;
+						}
+				}
 				m_buffer_cache.SynchronizeRegionRequest(*it);
 				unproven |= it->cpu_epoch == 0;
 			}

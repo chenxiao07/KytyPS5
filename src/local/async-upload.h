@@ -12,6 +12,7 @@
 #include "live-census.h"
 #include "live-counters.h"
 #include "local-platform.h"
+#include "mode-toggle.h"
 #include "parallel-pages.h"
 #include "spin-gate.h"
 #include "write-guard.h"
@@ -23,16 +24,20 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 #include <x86intrin.h>
 
 extern "C" {
 extern volatile std::atomic<uint32_t> kyty_local_async_upload_mode;
+extern volatile std::atomic_uint32_t  kyty_local_speculate_threads; // (KYTY_SPECULATE_THREADS: PipeCopyThreads)
 // KYTY_UPLOAD_LANES (live 1..3, default 1; PR #287): 2 = a run's write protections split by
 // guest region (4 MiB, the trackers' and the page manager's region: their per-region locks) over the worker and a second thread
 // (Kyty.Upload2), which sleeps on a futex between runs and never spins; the run's copies still start only after both lanes are done,
@@ -60,6 +65,11 @@ inline volatile std::atomic<uint32_t> kyty_local_upload_help {[] {
 
 namespace AsyncUpload {
 
+// Whether mode 4 made the state pass its own thread (graphicsRun.cpp start_speculation; -1: not made yet, then the same
+// test is repeated with SpecPacketSlots, Spec::MaxPacketSlots: static_assert there). Read by Worker::PipeCopyThreads.
+inline std::atomic<int32_t>      g_spec_pass_made {-1};
+inline constexpr uint32_t        SpecPacketSlots = 12;
+
 // True on the worker's thread (a fault there cannot wait for the render thread, which may wait for the worker).
 inline thread_local bool t_worker = false;
 
@@ -73,6 +83,9 @@ inline bool (*g_serve_hook)(bool serve) = nullptr;
 class Worker {
 public:
 	static constexpr uint64_t Capacity = 1u << 16;
+	// What a call job is, set where it is pushed (KYTY_SPEC_UPLOAD_PIPE: a lift's or a Read's pages are known; any other
+	// call holds the pipe's walk until it has run).
+	enum class JobKind : uint8_t { Other, Lift, Read };
 	// KYTY_UPLOAD_LANES: the guest region a lane is chosen by: the trackers' region managers' and the page manager's region,
 	// whose locks protections take (bufferCache.cpp asserts it is TRACKER_REGION_SIZE).
 	static constexpr uint64_t LaneRegion = uint64_t {4} << 20u;
@@ -95,19 +108,23 @@ public:
 	// Render thread only: copies the backing of guest [guest, guest + size). Returns the sequence number
 	// that covers this copy.
 	uint64_t Push(uint8_t* destination, const uint8_t* source, uint64_t size, uint64_t guest) {
-		return Add({destination, source, size, nullptr, nullptr, guest, size, false});
+		return Add({destination, {source}, size, nullptr, nullptr, guest, size, false});
 	}
 	// Render thread only: runs call(context, a, b) on the worker in queue order; it works on guest
-	// [guest, guest + guest_size).
+	// [guest, guest + guest_size). `kind`: a lift (`a` its page) or a Read (`a`, `b` its staging slice), else Other.
 	uint64_t PushCall(void (*call)(void*, uint64_t, uint64_t), void* context, uint64_t a, uint64_t b, uint64_t guest,
-	                  uint64_t guest_size) {
-		return Add({reinterpret_cast<uint8_t*>(a), nullptr, b, call, context, guest, guest_size, false});
+	                  uint64_t guest_size, JobKind kind = JobKind::Other) {
+		return Add({reinterpret_cast<uint8_t*>(a), {nullptr}, b, call, context, guest, guest_size, false, kind});
 	}
 	// Render thread only: as PushCall, for a write protection of guest pages the copies pushed after it read
 	// (KYTY_ASYNC_REPROTECT): it may run before copies pushed ahead of it too (Run).
+	// `merge` (KYTY_SPEC_UPLOAD_PIPE; nullptr: never merged): merge(context, a, b, count) does what `count` of these calls
+	// over adjacent ranges joined into [a, a + b) would.
+	using MergeCall = void (*)(void* context, uint64_t a, uint64_t b, uint64_t count);
 	uint64_t PushProtection(void (*call)(void*, uint64_t, uint64_t), void* context, uint64_t a, uint64_t b,
-	                        uint64_t guest, uint64_t guest_size) {
-		return Add({reinterpret_cast<uint8_t*>(a), nullptr, b, call, context, guest, guest_size, true});
+	                        uint64_t guest, uint64_t guest_size, MergeCall merge = nullptr) {
+		Job job {reinterpret_cast<uint8_t*>(a), {.merge = merge}, b, call, context, guest, guest_size, true};
+		return Add(job);
 	}
 	// Render thread only: wakes the worker after a batch of pushes.
 	void Kick() {
@@ -174,7 +191,7 @@ public:
 #endif
 				const uint64_t done = m_done.load(std::memory_order_relaxed);
 				const uint64_t head = m_head.load(std::memory_order_acquire);
-				const uint64_t ran  = done < head ? Process(done, head, true) : done;
+				const uint64_t ran  = done < head ? Process(done, head, true, PipeOn()) : done;
 				m_process.unlock();
 				if (ran == done) break; // (the next job is the worker's)
 				continue;
@@ -192,15 +209,21 @@ public:
 	}
 
 private:
+	// (64 bytes: `merge` shares the copy's `source`, `kind` sits in the padding after `protection`.)
 	struct Job {
-		uint8_t*       destination;
-		const uint8_t* source;
-		uint64_t       size;
+		uint8_t* destination;
+		union {
+			const uint8_t* source; // a copy's
+			MergeCall      merge;  // a protection's (PushProtection)
+		};
+		uint64_t size;
 		void (*call)(void*, uint64_t, uint64_t); // with destination as `a`, size as `b`
 		void*    context;
 		uint64_t guest, guest_size;
-		bool     protection; // a call PushProtection queued
+		bool     protection;              // a call PushProtection queued
+		JobKind  kind = JobKind::Other;   // a call's (PushCall)
 	};
+	static_assert(sizeof(Job) == 64);
 
 	uint64_t Add(const Job& job) {
 		const uint64_t head = m_head.load(std::memory_order_relaxed);
@@ -261,13 +284,433 @@ private:
 			std::lock_guard process(m_process);
 			done = m_done.load(std::memory_order_relaxed);
 			head = m_head.load(std::memory_order_acquire);
-			if (done < head) Process(done, head, false);
+			if (done < head) {
+				if (PipeOn()) PipeSession();
+				else Process(done, head, false, false);
+			}
+		}
+	}
+
+	// KYTY_SPEC_UPLOAD_PIPE (live spec_upload_pipe; on under KYTY_SPECULATE=4, 0 otherwise: mode-toggle.h; set, it acts in
+	// either mode), read at each batch: the worker's batches as pipe sessions (PipeSession) in place of Process's runs, and
+	// the queued protections a batch runs merged where adjacent (RunProtectionMerged). Off: one relaxed load a batch. With
+	// no copy threads (PipeCopyThreads 0) it stays off as if the switch were 0.
+	static bool PipeOn() {
+		static auto& on = LiveSwitch::Find("spec_upload_pipe", ModeToggle::Default("spec_upload_pipe"));
+		return on.load(std::memory_order_relaxed) != 0 && PipeCopyThreads() != 0;
+	}
+
+	// KYTY_SPEC_UPLOAD_PIPE_THREADS=<n> (0-16, digits only): the pipe's copy threads; 0: none, the walker only, which is
+	// the pipe off (Process's runs, no merged protections: KYTY_SPEC_UPLOAD_PIPE=0); anything else is not a count, said,
+	// and the rule decides. Unset: the physical cores left after the threads that are busy, at most 7 (every pipe measure
+	// ran with 7): the cores the process may run on, every efficiency class (LocalPlatform::CoresIn), less 3 (the GPU,
+	// record and upload threads), and under KYTY_SPECULATE=4 less the workers' (KYTY_SPECULATE_THREADS, at most the
+	// cores of their CPU list: speculate_cpu_mask, else KYTY_SPECULATE_CPUS, else LocalPlatform::SpeculationCpuList; a
+	// core each where there is no list) and 1 for the state pass thread where it has one (g_spec_pass_made, or
+	// start_speculation's test). The async queue's 2 speculation threads are not counted. 8 P-cores (16 CPUs) + 8
+	// E-cores, workers on CPUs 8-15: 16 - 4 - 3 - 1 = 8, so 7. 8 cores alike (16 CPUs; the workers on 8-15), or that
+	// part held to CPUs 0-15: 8 - 4 - 3 - 1 = 0, the walker only (an 8-core 7800X3D measured +5 % with the pipe off).
+	// Cores not known: 7. Worked out once, at the first batch the pipe switch is on for, and said with its sum (the count
+	// fixed for the run: the threads are made once).
+	static constexpr uint32_t PipeThreadsMax = 7;
+	static uint32_t PipeCopyThreads() {
+		static const uint32_t threads = [] {
+			char        why[256] = {};
+			uint32_t    count    = PipeThreadsMax;
+			const char* value    = std::getenv("KYTY_SPEC_UPLOAD_PIPE_THREADS");
+			const bool  set      = value != nullptr && *value != '\0';
+			const bool  digits   = set && std::strlen(value) <= 9 && std::strspn(value, "0123456789") == std::strlen(value);
+			if (digits) {
+				count = static_cast<uint32_t>(std::min<unsigned long>(std::strtoul(value, nullptr, 10), 16ul));
+				std::snprintf(why, sizeof(why), "KYTY_SPEC_UPLOAD_PIPE_THREADS=%s", value);
+			} else {
+				const bool        spec      = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+				static auto&      live_cpus = LiveSwitch::Find("speculate_cpu_mask", 0);
+				const int64_t     live      = live_cpus.load(std::memory_order_relaxed);
+				const char*       named     = std::getenv("KYTY_SPECULATE_CPUS");
+				const std::string list = named != nullptr && *named != '\0' ? std::string(named) : LocalPlatform::SpeculationCpuList();
+				const uint64_t    mask = live != 0 ? static_cast<uint64_t>(live) : LocalPlatform::CpuListMask(list.c_str());
+				const uint32_t    cores        = LocalPlatform::CoresIn(~uint64_t {0});
+				const uint32_t    workers      = ::kyty_local_speculate_threads.load(std::memory_order_relaxed);
+				const uint32_t    list_cores   = mask != 0 ? LocalPlatform::CoresIn(mask) : 0;
+				const uint32_t    worker_cores = !spec ? 0u : list_cores != 0 ? std::min(workers, list_cores) : workers;
+				const char*       pass_env     = std::getenv("KYTY_SPEC_PASS_THREAD");
+				const int32_t     made         = g_spec_pass_made.load(std::memory_order_relaxed);
+				const bool        pass_test    = (pass_env == nullptr || std::atoi(pass_env) > 0) && workers + 1 < SpecPacketSlots;
+				const uint32_t    pass         = spec && (made >= 0 ? made > 0 : pass_test) ? 1u : 0u;
+				const int64_t     left = int64_t {cores} - int64_t {worker_cores} - 3 - int64_t {pass};
+				char              rejected[96] = {};
+				if (set)
+					std::snprintf(rejected, sizeof(rejected), "KYTY_SPEC_UPLOAD_PIPE_THREADS='%.40s' not a count: the rule; ", value);
+				if (cores == 0) {
+					std::snprintf(why, sizeof(why), "%sthe cores not known: %u", rejected, PipeThreadsMax);
+				} else if (!spec) {
+					count = static_cast<uint32_t>(std::clamp<int64_t>(left, 0, PipeThreadsMax));
+					std::snprintf(why, sizeof(why),
+					              "%s%u cores - 3 GPU, record, upload = %lld, at most %u (no speculation threads: not mode 4); "
+					              "KYTY_SPEC_UPLOAD_PIPE_THREADS sets it",
+					              rejected, cores, static_cast<long long>(left), PipeThreadsMax);
+				} else {
+					count = static_cast<uint32_t>(std::clamp<int64_t>(left, 0, PipeThreadsMax));
+					std::snprintf(why, sizeof(why),
+					              "%s%u cores - %u of the %u workers' - 3 GPU, record, upload - %u state pass = %lld, at most %u; "
+					              "KYTY_SPEC_UPLOAD_PIPE_THREADS sets it",
+					              rejected, cores, worker_cores, workers, pass, static_cast<long long>(left), PipeThreadsMax);
+				}
+			}
+			if (count == 0) std::printf("Upload pipe: off, the walker only: no copy threads (%s)\n", why);
+			else std::printf("Upload pipe: %u copy threads (%s)\n", count, why);
+			std::fflush(stdout);
+			return count;
+		}();
+		return threads;
+	}
+
+	// KYTY_SPEC_UPLOAD_PIPE: one session (the worker, holding m_process: Help waits for the prefix meanwhile). One walker
+	// (this thread) walks [m_done, head) in queue order, rereading head: it runs the protections there in order, keeps each
+	// call (a lift, a Read) for its turn (m_done reaching it), and posts each copy to the copy threads (Kyty.UploadPipe),
+	// which run it in 256 KiB chunks as it comes, not in fork-joined runs; it runs chunks itself whenever it has nothing
+	// due. Every job is flagged done in its slot by whoever finishes it (a copy: its last chunk's thread); m_done is the
+	// prefix of those flags, moved by every finisher (AdvancePrefix). The session ends caught up: every walked job done,
+	// the copy threads idle. Exactness:
+	// - m_done stays a prefix; every reader of it (submissions, Drain, the unmap's DrainRange, slot reuse, the idle tests,
+	//   the write guard's cycle detector) is unchanged.
+	// - No job runs twice: the walker runs each protection and call, and posts each copy once; a protection merged into an
+	//   earlier one's call is flagged done by it and passed.
+	// - A copy follows its pages' earlier protections: the walker runs every protection in order and posts a copy only
+	//   once it has passed every job before it; a page's protections keep their queue order (one walker, no lanes).
+	// - Staging order: a copy (or Read) whose staging bytes overlap an earlier one not done waits for it.
+	// - Calls: a lift or a Read runs on the walker at its turn. Copies after it may run before it (they were pushed after the
+	//   guarded write: a guarded copy stops at the armed page and reads the backing, the new bytes, as after the lift). A
+	//   protection after it runs before it only over other 4 KiB pages; over its pages it waits. Any other call holds the
+	//   walk until it has run.
+	// - Read jobs run on the walker only (t_worker). Help runs Process as before, between sessions.
+	// - The copy threads are t_worker (a texture-offload fault is a miss, as on the worker); a guarded copy's fault is
+	//   resumed before the guest handler on any thread.
+	void PipeSession() {
+		EnsurePipe();
+		const auto start = std::chrono::steady_clock::now();
+		uint64_t pos = m_done.load(std::memory_order_acquire), stall_ns = 0, call_ns = 0;
+		m_pipe_calls.clear();
+		m_pipe_barriers = 0;
+		m_pipe_staging.clear();
+		for (;;) {
+			call_ns += RunDueCalls();
+			const uint64_t head = m_head.load(std::memory_order_acquire);
+			if (pos < head) {
+				if (WalkOne(pos, call_ns)) {
+					++pos;
+					// (The copy threads asleep, the spin gate shut or the feed short of a wake: the walker's own share now.)
+					if (FeedQueued() != 0 && m_copy_busy.load(std::memory_order_relaxed) == 0 && !WakeCopiers(true))
+						(void)RunOneChunk();
+					continue;
+				}
+			} else if (m_pipe_calls.empty() && m_done.load(std::memory_order_seq_cst) >= pos && FeedQueued() == 0 &&
+			           m_copy_running.load(std::memory_order_seq_cst) == 0) {
+				// (No copy thread holds a chunk, or is still moving the prefix after one: none touches m_done after this.)
+				break;
+			}
+			if (RunOneChunk()) continue;
+			const auto waiting = std::chrono::steady_clock::now();
+			PipeWait(pos);
+			stall_ns += static_cast<uint64_t>((std::chrono::steady_clock::now() - waiting).count());
+		}
+		m_pipe_staging.clear();
+		// (The rows Process keeps: the walker's busy time, its calls' and protections' time.)
+		const auto wall = static_cast<uint64_t>((std::chrono::steady_clock::now() - start).count());
+		LiveCounters::Add(LiveCounters::UploadBusyUs, (wall - std::min(wall, stall_ns)) / 1000u);
+		LiveCounters::Add(LiveCounters::UploadCallUs, call_ns / 1000u);
+	}
+
+	// KYTY_SPEC_UPLOAD_PIPE: the job at `pos`, the walker's step. True: done, posted, run, or kept for its turn; false: held
+	// (a staging overlap, or a kept call over its pages).
+	bool WalkOne(uint64_t pos, uint64_t& call_ns) {
+		if (SlotDone(pos)) { // (a protection merged into an earlier one's call: its flag moves the prefix)
+			if (m_done.load(std::memory_order_acquire) == pos) AdvancePrefix();
+			return true;
+		}
+		if (m_pipe_barriers != 0) return false;
+		const Job& job = m_jobs[pos % Capacity];
+		if (job.call == nullptr) {
+			const uint64_t size = job.size, begin = reinterpret_cast<uint64_t>(job.destination), end = begin + size;
+			if (size == 0) {
+				MarkDone(pos);
+				AdvancePrefix();
+				return true;
+			}
+			if (StagingBusy(begin, end)) return false;
+			PostCopy(pos, job);
+			if (!SpinGate::g_open.load(std::memory_order_relaxed)) {
+				// (CPUs short: the copy threads stay asleep; the walker copies, as Process did.)
+				while (RunOneChunk()) {}
+			} else {
+				(void)WakeCopiers(false);
+			}
+			// (Its staging bytes busy until its flag. Read from locals: once done, its slot may be refilled.)
+			m_pipe_staging.insert_or_assign(begin, std::pair<uint64_t, uint64_t> {end, pos});
+			return true;
+		}
+		if (job.protection) {
+			const auto pages = Pages(job.guest, job.guest_size);
+			if (CallBlocks(pages.first, pages.second)) return false;
+			(void)WakeCopiers(true); // (copies run under the protection's system call)
+			const auto protecting = std::chrono::steady_clock::now();
+			RunProtectionMerged(pos, std::min(m_head.load(std::memory_order_acquire), pos + MergeWindow), true);
+			call_ns += static_cast<uint64_t>((std::chrono::steady_clock::now() - protecting).count());
+			AdvancePrefix();
+			return true;
+		}
+		// A call, kept for its turn.
+		PipeCall kept {pos, 0, 0, false};
+		if (job.kind == JobKind::Lift) {
+			const auto page = Pages(reinterpret_cast<uint64_t>(job.destination), 1); // (its page: `a`)
+			kept.begin = page.first, kept.end = page.second;
+		} else if (job.kind == JobKind::Read) {
+			const uint64_t begin = reinterpret_cast<uint64_t>(job.destination), end = begin + job.size;
+			if (job.size != 0 && StagingBusy(begin, end)) return false;
+			const auto pages = Pages(job.guest, job.guest_size);
+			kept.begin = pages.first, kept.end = pages.second;
+			if (job.size != 0) m_pipe_staging.insert_or_assign(begin, std::pair<uint64_t, uint64_t> {end, pos});
+		} else {
+			kept.barrier = true; // (any other call: the walk waits until it has run)
+			++m_pipe_barriers;
+		}
+		m_pipe_calls.push_back(kept);
+		return true;
+	}
+
+	// KYTY_SPEC_UPLOAD_PIPE: the kept calls whose turn came (m_done at them), in order, on the walker. Returns their time, ns.
+	uint64_t RunDueCalls() {
+		uint64_t ns = 0;
+		while (!m_pipe_calls.empty()) {
+			const PipeCall call = m_pipe_calls.front();
+			if (m_done.load(std::memory_order_acquire) < call.sequence) break;
+			const auto called = std::chrono::steady_clock::now();
+			CallJob(m_jobs[call.sequence % Capacity]);
+			ns += static_cast<uint64_t>((std::chrono::steady_clock::now() - called).count());
+			MarkDone(call.sequence);
+			AdvancePrefix();
+			if (call.barrier) --m_pipe_barriers;
+			m_pipe_calls.pop_front();
+		}
+		return ns;
+	}
+
+	// KYTY_SPEC_UPLOAD_PIPE: whether a kept call is over the 4 KiB pages [begin, end) (any other call: over every page).
+	[[nodiscard]] bool CallBlocks(uint64_t begin, uint64_t end) const {
+		for (const auto& call: m_pipe_calls)
+			if (call.barrier || (call.begin < end && begin < call.end)) return true;
+		return false;
+	}
+
+	// KYTY_SPEC_UPLOAD_PIPE: whether the staging bytes [begin, end) overlap a posted copy (or kept Read) not done. Done ones
+	// met are dropped. (The set's ranges are disjoint: one overlapping a new range is done before the new one goes in.)
+	bool StagingBusy(uint64_t begin, uint64_t end) {
+		auto it = m_pipe_staging.upper_bound(begin);
+		if (it != m_pipe_staging.begin()) --it;
+		while (it != m_pipe_staging.end() && it->first < end) {
+			if (it->second.first > begin) {
+				if (!SlotDone(it->second.second)) return true;
+				it = m_pipe_staging.erase(it);
+				continue;
+			}
+			++it;
+		}
+		// (Kept small: the done ones dropped once it grows.)
+		if (m_pipe_staging.size() > 8192)
+			for (auto at = m_pipe_staging.begin(); at != m_pipe_staging.end();)
+				at = SlotDone(at->second.second) ? m_pipe_staging.erase(at) : std::next(at);
+		return false;
+	}
+
+	// KYTY_SPEC_UPLOAD_PIPE: the walker can go no further now and has no chunk to run: the copy threads woken if they can
+	// take some, then a wait for the prefix's front job when it is a posted copy, its flag then moving the prefix.
+	void PipeWait(uint64_t pos) {
+		(void)WakeCopiers(true);
+		AdvancePrefix();
+		const uint64_t front = m_done.load(std::memory_order_acquire);
+		// (Caught up and a copy thread finishing; or the front a kept call whose turn just came, or just done.)
+		if (front >= pos || SlotWord(front).load(std::memory_order_acquire) != (SlotTag(front) | 1u)) {
+			_mm_pause();
+			return;
+		}
+		AwaitDone(front);
+		AdvancePrefix();
+	}
+
+	// KYTY_SPEC_UPLOAD_PIPE: m_done moved over the slots flagged done after it (any finisher, after its flag; monotonic).
+	void AdvancePrefix() {
+		uint64_t at = m_done.load(std::memory_order_seq_cst);
+		for (;;) {
+			uint64_t end = at;
+			while (TaggedDone(end)) ++end; // (a slot not pushed yet holds an earlier sequence's tag: never done)
+			if (end == at) return;
+			if (m_done.compare_exchange_weak(at, end, std::memory_order_seq_cst, std::memory_order_seq_cst)) {
+				if (m_waiters.load(std::memory_order_seq_cst) != 0) m_done.notify_all();
+				at = end;
+			}
+		}
+	}
+
+	// KYTY_SPEC_UPLOAD_PIPE: a slot's word, ((sequence + 1) << 2) | state (1 posted, a copy whose chunks are out; 2 done); a
+	// word of another sequence (an earlier use of the slot, or 0) is neither. Tagged, a late flag of a slot's earlier job
+	// never reads as the new job's. Written in a session only (the walker, and the copy threads for its copies), made by
+	// the first session before its copy threads start.
+	[[nodiscard]] static constexpr uint64_t SlotTag(uint64_t sequence) { return (sequence + 1) << 2u; }
+	[[nodiscard]] std::atomic<uint64_t>& SlotWord(uint64_t sequence) const { return m_slot_words[sequence % Capacity]; }
+	// (The walker or a copy's last chunk; wakes the walker asleep on the word: AwaitDone. Before the prefix can pass the
+	// slot, so before the slot can be refilled.)
+	void MarkDone(uint64_t sequence) {
+		SlotWord(sequence).store(SlotTag(sequence) | 2u, std::memory_order_seq_cst);
+		if (m_slot_waiters.load(std::memory_order_seq_cst) != 0) SlotWord(sequence).notify_all();
+	}
+	[[nodiscard]] bool TaggedDone(uint64_t sequence) const {
+		return SlotWord(sequence).load(std::memory_order_acquire) == (SlotTag(sequence) | 2u);
+	}
+	[[nodiscard]] bool SlotDone(uint64_t sequence) const {
+		return m_done.load(std::memory_order_acquire) > sequence || TaggedDone(sequence);
+	}
+	// (The walker.) A posted copy: a short spin, then asleep on the slot's word until its last chunk flags it done (m_done
+	// passing it ends the wait too).
+	void AwaitDone(uint64_t sequence) {
+		for (int spin = 0; spin < 4000; ++spin) {
+			if (SlotDone(sequence)) return;
+			_mm_pause();
+		}
+		auto&          word   = SlotWord(sequence);
+		const uint64_t posted = SlotTag(sequence) | 1u;
+		m_slot_waiters.fetch_add(1, std::memory_order_seq_cst);
+		while (word.load(std::memory_order_seq_cst) == posted && m_done.load(std::memory_order_acquire) <= sequence)
+			word.wait(posted, std::memory_order_seq_cst);
+		m_slot_waiters.fetch_sub(1, std::memory_order_relaxed);
+	}
+
+	// KYTY_SPEC_UPLOAD_PIPE: the copy threads, the feed of copy chunks and each posted copy's chunks left (made once).
+	static constexpr uint64_t PipeChunk     = uint64_t {256} << 10u;
+	static constexpr uint64_t PipeWakeBytes = uint64_t {128} << 10u; // (less queued: no wake but the walker's force)
+	static constexpr uint64_t FeedCapacity  = uint64_t {1} << 12u;
+	struct FeedSlot {
+		std::atomic<uint64_t> sequence {0}, offset {0}, size {0};
+	};
+	struct FeedItem {
+		uint64_t sequence = 0, offset = 0, size = 0;
+	};
+	void EnsurePipe() {
+		if (m_pipe_started) return;
+		m_pipe_started = true;
+		m_slot_words   = std::make_unique<std::atomic<uint64_t>[]>(Capacity);
+		m_chunks_left  = std::make_unique<std::atomic<uint32_t>[]>(Capacity);
+		m_feed         = std::make_unique<FeedSlot[]>(FeedCapacity);
+		const uint32_t threads = PipeCopyThreads();
+		for (uint32_t i = 0; i < threads; ++i) std::thread([this] { PipeCopyRun(); }).detach(); // (never stopped)
+		std::printf("Upload pipe: on (KYTY_SPEC_UPLOAD_PIPE: one walker runs protections and calls in order, %u copy threads "
+		            "take the copies as they come)\n",
+		            threads);
+		std::fflush(stdout);
+	}
+	[[nodiscard]] uint64_t FeedQueued() const {
+		const uint64_t posted = m_feed_posted.load(std::memory_order_acquire), next = m_feed_next.load(std::memory_order_acquire);
+		return posted > next ? posted - next : 0;
+	}
+	// (The walker only.) The copy's slot flagged posted and its chunks into the feed; a full feed: chunks run here until
+	// there is room.
+	void PostCopy(uint64_t sequence, const Job& job) {
+		const uint64_t size = job.size, chunks = (size + PipeChunk - 1) / PipeChunk;
+		m_chunks_left[sequence % Capacity].store(static_cast<uint32_t>(chunks), std::memory_order_relaxed);
+		SlotWord(sequence).store(SlotTag(sequence) | 1u, std::memory_order_relaxed); // (published by the feed's store)
+		uint64_t posted = m_feed_posted.load(std::memory_order_relaxed);
+		for (uint64_t chunk = 0; chunk < chunks; ++chunk) {
+			while (posted - m_feed_next.load(std::memory_order_acquire) >= FeedCapacity)
+				if (!RunOneChunk()) _mm_pause();
+			const uint64_t offset = chunk * PipeChunk, bytes = std::min(PipeChunk, size - offset);
+			auto&          slot   = m_feed[posted % FeedCapacity];
+			slot.sequence.store(sequence, std::memory_order_relaxed);
+			slot.offset.store(offset, std::memory_order_relaxed);
+			slot.size.store(bytes, std::memory_order_relaxed);
+			m_feed_bytes.fetch_add(bytes, std::memory_order_relaxed);
+			m_feed_posted.store(++posted, std::memory_order_seq_cst);
+		}
+	}
+	// (Any feed taker.) The next chunk, or false when none is queued. Its fields are read before the take: a slot is
+	// written again only once the take index has passed it, so a take that succeeds read this chunk's.
+	bool TakeFeed(FeedItem& item) {
+		uint64_t next = m_feed_next.load(std::memory_order_acquire);
+		for (;;) {
+			if (next >= m_feed_posted.load(std::memory_order_acquire)) return false;
+			const auto& slot = m_feed[next % FeedCapacity];
+			item             = {slot.sequence.load(std::memory_order_relaxed), slot.offset.load(std::memory_order_relaxed),
+			                    slot.size.load(std::memory_order_relaxed)};
+			if (m_feed_next.compare_exchange_weak(next, next + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+				m_feed_bytes.fetch_sub(item.size, std::memory_order_relaxed);
+				return true;
+			}
+		}
+	}
+	// A chunk copied (through CopyFrom, as every copy); the copy's last chunk flags it done and moves the prefix.
+	void RunChunk(const FeedItem& item) {
+		const Job& job = m_jobs[item.sequence % Capacity];
+		CopyFrom(job.destination + item.offset, job.source + item.offset, job.guest + item.offset, item.size);
+		if (m_chunks_left[item.sequence % Capacity].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+			MarkDone(item.sequence);
+			AdvancePrefix();
+		}
+	}
+	// (The walker.)
+	bool RunOneChunk() {
+		FeedItem item;
+		if (!TakeFeed(item)) return false;
+		RunChunk(item);
+		return true;
+	}
+	// (The walker.) Copy threads woken for the queued chunks: as many as the queued chunks when a wake's worth of bytes is
+	// queued; `force` (before a protection, or a stall): one, when none is at the feed. Never with the spin gate shut.
+	// True when it woke one.
+	bool WakeCopiers(bool force) {
+		if (!SpinGate::g_open.load(std::memory_order_relaxed)) return false;
+		const uint32_t sleepers = m_feed_sleepers.load(std::memory_order_seq_cst);
+		const uint64_t queued   = FeedQueued();
+		if (sleepers == 0 || queued == 0) return false;
+		uint64_t want = m_feed_bytes.load(std::memory_order_relaxed) >= PipeWakeBytes ? queued : 0;
+		if (want == 0 && force && m_copy_busy.load(std::memory_order_relaxed) == 0) want = 1;
+		want = std::min<uint64_t>(want, sleepers);
+		for (uint64_t i = 0; i < want; ++i) m_feed_posted.notify_one();
+		return want != 0;
+	}
+	// A copy thread: the feed's chunks while there are any, a short spin (the spin gate open), then asleep until a wake.
+	void PipeCopyRun() {
+		LocalPlatform::SetThreadName("Kyty.UploadPipe");
+		LocalPlatform::AvoidCpuList(std::getenv("KYTY_RENDER_CPUS"));
+		t_worker = true; // (a texture-offload fault is a miss, as on the worker: the render thread may wait for these)
+		for (;;) {
+			m_copy_busy.fetch_add(1, std::memory_order_seq_cst);
+			for (uint32_t spin = 0;;) {
+				if (FeedQueued() != 0) {
+					// (Counted from before the take to after the prefix moved: the session's end waits for none.)
+					m_copy_running.fetch_add(1, std::memory_order_seq_cst);
+					FeedItem   item;
+					const bool took = TakeFeed(item);
+					if (took) RunChunk(item);
+					m_copy_running.fetch_sub(1, std::memory_order_seq_cst);
+					if (took) {
+						spin = 0;
+						continue;
+					}
+				}
+				if (++spin > 500 || !SpinGate::g_open.load(std::memory_order_relaxed)) break;
+				_mm_pause();
+			}
+			m_copy_busy.fetch_sub(1, std::memory_order_seq_cst);
+			const uint64_t seen = m_feed_posted.load(std::memory_order_seq_cst);
+			m_feed_sleepers.fetch_add(1, std::memory_order_seq_cst);
+			if (m_feed_next.load(std::memory_order_seq_cst) >= seen) m_feed_posted.wait(seen, std::memory_order_seq_cst);
+			m_feed_sleepers.fetch_sub(1, std::memory_order_seq_cst);
 		}
 	}
 
 	// Jobs [done, head) in queue order (the caller holds m_process), m_done published as they finish; `helper`: stops at a
-	// call other than a write protection. Returns the jobs' new end.
-	uint64_t Process(uint64_t done, uint64_t head, bool helper) {
+	// call other than a write protection; `merge` (KYTY_SPEC_UPLOAD_PIPE): adjacent queued protections merged. Returns the
+	// jobs' new end.
+	uint64_t Process(uint64_t done, uint64_t head, bool helper, bool merge) {
 		const auto start = std::chrono::steady_clock::now();
 		const auto since = [](std::chrono::steady_clock::time_point from) {
 			return static_cast<uint64_t>((std::chrono::steady_clock::now() - from).count()) / 1000u;
@@ -277,6 +720,7 @@ private:
 		// thread, the stall Help exists to avoid, and the second thread takes its creator's priority and CPUs.)
 		const uint32_t lanes = helper ? 1u : kyty_local_upload_lanes.load(std::memory_order_relaxed);
 		m_progress           = !helper && ProgressOn(); // (KYTY_UPLOAD_PROGRESS: the worker's batches)
+		m_merge              = merge;
 		while (done < head) {
 			if (const Job& job = m_jobs[done % Capacity]; job.call != nullptr && !job.protection) {
 				if (helper) break;
@@ -364,8 +808,78 @@ private:
 				return;
 			}
 		}
-		for (uint64_t i = first; i < last; ++i)
-			if (const Job& next = m_jobs[i % Capacity]; next.call != nullptr) CallJob(next);
+		if (!m_merge) {
+			for (uint64_t i = first; i < last; ++i)
+				if (const Job& next = m_jobs[i % Capacity]; next.call != nullptr) CallJob(next);
+			return;
+		}
+		// (KYTY_SPEC_UPLOAD_PIPE: a member merged into an earlier call is passed.)
+		m_merged_ahead.clear();
+		for (uint64_t i = first; i < last; ++i) {
+			if (m_jobs[i % Capacity].call == nullptr) continue;
+			if (std::binary_search(m_merged_ahead.begin(), m_merged_ahead.end(), i)) continue;
+			RunProtectionMerged(i, last, false);
+		}
+	}
+
+	// KYTY_SPEC_UPLOAD_PIPE: the protection at `first` (a serial run's, or the pipe walker's: `walking`), with the queued
+	// protections after it in [first + 1, last) (at most MergeWindow jobs on, MergeMembers in all) that continue its range,
+	// run as one call. A member must have the same call, manager (context) and merged form (the same purpose and the same
+	// Honour path: the call reads each page's state when it runs), lie address-adjacent to the range so far, and no job
+	// between `first` and it may be over its 4 KiB pages: a copy reading them, another protection, a lift (its page), a
+	// Read; any other call ends the search. So a page's protections keep their order, and no member's pages see a job
+	// between run on the other side of it. (A guarded write's arm comes with its lift: a job between.) On the walker a
+	// member must not be under a kept call either, and the lead and its members are flagged done; in a serial run the
+	// members are passed (m_merged_ahead).
+	static constexpr uint64_t MergeWindow = 32, MergeMembers = 16;
+	void RunProtectionMerged(uint64_t first, uint64_t last, bool walking) {
+		const Job& lead = m_jobs[first % Capacity];
+		using Range     = std::pair<uint64_t, uint64_t>;
+		thread_local std::vector<uint64_t> members;
+		thread_local std::vector<Range>    touched;
+		members.clear(), touched.clear();
+		uint64_t   low = reinterpret_cast<uint64_t>(lead.destination), high = low + lead.size;
+		const auto over = [&](const Range& pages) {
+			for (const auto& other: touched)
+				if (pages.first < other.second && other.first < pages.second) return true;
+			return false;
+		};
+		for (uint64_t j = first + 1; lead.merge != nullptr && j < last && j < first + MergeWindow && members.size() + 1 < MergeMembers;
+		     ++j) {
+			if (walking ? SlotDone(j) : std::binary_search(m_merged_ahead.begin(), m_merged_ahead.end(), j)) continue;
+			const Job& job = m_jobs[j % Capacity];
+			if (job.call != nullptr && !job.protection) {
+				if (job.kind == JobKind::Lift) touched.push_back(Pages(reinterpret_cast<uint64_t>(job.destination), 1));
+				else if (job.kind == JobKind::Read) touched.push_back(Pages(job.guest, job.guest_size));
+				else break;
+				continue;
+			}
+			const auto pages = Pages(job.guest, job.guest_size);
+			if (job.protection && job.call == lead.call && job.context == lead.context && job.merge == lead.merge) {
+				const uint64_t at = reinterpret_cast<uint64_t>(job.destination), size = job.size;
+				if ((at == high || at + size == low) && !over(pages) && !(walking && CallBlocks(pages.first, pages.second))) {
+					members.push_back(j);
+					low  = std::min(low, at);
+					high = std::max(high, at + size);
+					continue;
+				}
+			}
+			touched.push_back(pages);
+		}
+		if (members.empty()) CallJob(lead);
+		else lead.merge(lead.context, low, high - low, members.size() + 1);
+		if (walking) {
+			for (const uint64_t j: members) MarkDone(j);
+			MarkDone(first); // (last: its slot may be refilled once the prefix passes it)
+		} else {
+			for (const uint64_t j: members) m_merged_ahead.insert(std::lower_bound(m_merged_ahead.begin(), m_merged_ahead.end(), j), j);
+		}
+	}
+
+	// A guest range's 4 KiB pages [begin, end) (an empty one its first page).
+	[[nodiscard]] static std::pair<uint64_t, uint64_t> Pages(uint64_t at, uint64_t size) {
+		constexpr uint64_t Page = 4096;
+		return {at & ~(Page - 1), (at + std::max<uint64_t>(size, 1) + Page - 1) & ~(Page - 1)};
 	}
 
 	// Lane 1's jobs to the second thread, lane 0's here, then waits for the second (a short spin: the lanes are about even;
@@ -557,6 +1071,31 @@ private:
 		Publish(std::prev(it)->job);
 	}
 	bool                                     m_progress = false; // (the batch's KYTY_UPLOAD_PROGRESS, under m_process)
+	// KYTY_SPEC_UPLOAD_PIPE (under m_process): whether the batch merges protections, and a serial run's members merged
+	// into an earlier call, sorted. The walker's kept calls, how many of them are barriers, the staging bytes of posted
+	// copies and kept Reads (begin -> end, sequence), and whether the copy threads exist; the slots' words, each posted
+	// copy's chunks left and the feed (made once); the feed's post and take indexes, its queued bytes, its sleepers, the
+	// copy threads awake and those taking or running a chunk; the walker asleep on a slot's word.
+	struct PipeCall {
+		uint64_t sequence, begin, end; // (begin, end: its 4 KiB pages)
+		bool     barrier;
+	};
+	bool                                              m_merge = false;
+	std::vector<uint64_t>                             m_merged_ahead;
+	std::deque<PipeCall>                              m_pipe_calls;
+	uint32_t                                          m_pipe_barriers = 0;
+	std::map<uint64_t, std::pair<uint64_t, uint64_t>> m_pipe_staging;
+	bool                                              m_pipe_started = false;
+	std::unique_ptr<std::atomic<uint64_t>[]>          m_slot_words;
+	std::unique_ptr<std::atomic<uint32_t>[]>          m_chunks_left;
+	std::unique_ptr<FeedSlot[]>                       m_feed;
+	alignas(64) std::atomic<uint64_t>                 m_feed_posted {0};
+	alignas(64) std::atomic<uint64_t>                 m_feed_next {0};
+	alignas(64) std::atomic<uint64_t>                 m_feed_bytes {0};
+	std::atomic<uint32_t>                             m_feed_sleepers {0};
+	std::atomic<uint32_t>                             m_copy_busy {0};    // (awake: at the feed or spinning)
+	std::atomic<uint32_t>                             m_copy_running {0}; // (holding a chunk, or about to take one)
+	std::atomic<uint32_t>                             m_slot_waiters {0};
 	std::unique_ptr<std::atomic<uint8_t>[]>  m_chunk_flags;
 	uint64_t                                 m_chunk_flags_size = 0, m_run_chunks = 0;
 	alignas(64) std::atomic<uint64_t>        m_chunk_prefix {0};
