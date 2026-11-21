@@ -4742,6 +4742,9 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX> mapping {};
 	for (uint32_t i = 0; i < state.color_count; i++)
 		mapping[state.color_info[i].target_slot] = state.color_info[i].export_mapping;
+	// (spec_format_ahead, mode 4 only: the pair's birth lookup takes its recorded pair's mask: PipelineCache::t_fa_birth.)
+	const bool fa_birth = pair->programs[0] == nullptr && FormatAheadOn();
+	if (fa_birth) [[unlikely]] PipelineCache::t_fa_birth = true;
 	table_state.programs = pipelines.GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx,
 	                                                     buffer.GetUserConfig(), mapping, state.ps_active,
 	                                                     table_state.vs_input_info, table_state.ps_input_info, true,
@@ -4773,6 +4776,9 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 			const Weave::Hold hold;
 			pair->programs   = programs;
 			pair->push_fit   = Spec::On() && PipelineCache::t_push_fit_taken; // (the lookup above: mode 4 sets it)
+			// (spec_format_ahead: the buffers its recorded pair's mask made portable, kept as learned bits: every later
+			// lookup of the pair passes them in, so gets the form it was born on.)
+			if (fa_birth) [[unlikely]] pair->portable[0] |= PipelineCache::t_fa_pair_bits;
 			TableRuns(*pair);
 			TableScoutPublish(*pair);
 		}
@@ -5578,6 +5584,7 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(Comm
 	if (const auto drawn = TableEntryOverlay(buffer, existing, commands, index_base, index_bytes, index_type, direct)) return *drawn;
 	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> programs_held {};
 	bool push_fit_held = false; // (KYTY_SPEC_PAIR_PUSH_FIT: a new pair's programs the retry's: TablePair::push_fit)
+	uint32_t fa_pair_bits_held = 0; // (spec_format_ahead: a new pair's recorded-pair bits: PipelineCache::t_fa_pair_bits)
 	std::array<uint32_t, 2>                                        portable {};
 	TableVariant*                                                  stored_variant = nullptr;
 	if (existing != nullptr) {
@@ -5750,6 +5757,8 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(Comm
 	// goes on to the table gates before its private normal pipeline is made.)
 	if ((gate_pipeline || want_private) && !unrecorded_held) {
 		PipelineCache::t_no_fault_failed = false;
+		const bool fa_birth = existing == nullptr && FormatAheadOn(); // (spec_format_ahead: a new pair's birth lookup)
+		if (fa_birth) [[unlikely]] PipelineCache::t_fa_birth = true;
 		const auto programs = pipelines.GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx, buffer.GetUserConfig(),
 		                                                    mapping, ps_active, vertex_info, pixel_info, true, portable);
 		read_failed        = PipelineCache::t_no_fault_failed;
@@ -5774,6 +5783,7 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(Comm
 			if (parked == nullptr) parked_stand_in.reset();
 		}
 		if (existing == nullptr) programs_held = {vertex, pixel}, push_fit_held = PipelineCache::t_push_fit_taken;
+		if (fa_birth) [[unlikely]] fa_pair_bits_held = PipelineCache::t_fa_pair_bits;
 		// (The normal pipeline made privately only now, the table gates passed: a refused entry makes none. Not made because
 		// the cache has the key by now (made meanwhile): found, the records alone committed. A parked entry's too.)
 		if (want_private && table_mode && (pipeline != nullptr || parked != nullptr)) {
@@ -5887,6 +5897,8 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(Comm
 		pair.start_instance = start_instance;
 		pair.programs       = programs_held;
 		pair.push_fit       = push_fit_held;
+		if (fa_pair_bits_held != 0) [[unlikely]] // (spec_format_ahead: kept as learned bits, as TableStore keeps them)
+			pair.portable[0] |= fa_pair_bits_held;
 		TableRuns(pair);
 		pair.variants.push_back(h.variant);
 		pair.Generation(Role()) = generation; // (its programs are those of the code at its addresses as of the lookups)

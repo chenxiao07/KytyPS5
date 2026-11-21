@@ -17,7 +17,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <string>
+
+inline std::optional<uint32_t> ParsePerformanceSwitch(const char* text, uint32_t minimum, uint32_t maximum) {
+	if (text == nullptr || *text == '\0') return std::nullopt;
+	char* end = nullptr;
+	const auto value = std::strtoul(text, &end, 10);
+	if (*end != '\0' || value < minimum || value > maximum) return std::nullopt;
+	return static_cast<uint32_t>(value);
+}
 
 extern "C" {
 extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
@@ -204,19 +213,18 @@ inline void InitializePerformanceSwitches() {
 		if (text == nullptr || *text == '\0') { // (an empty value keeps the default, as run_ds.sh's ${NAME:-default} did)
 			continue;
 		}
-		char*      end   = nullptr;
-		const auto value = std::strtoul(text, &end, 10);
-		if (*text == '\0' || *end != '\0' || value < setting.minimum || value > setting.maximum) {
+		const auto value = ParsePerformanceSwitch(text, setting.minimum, setting.maximum);
+		if (!value) {
 			std::fprintf(stderr, "%s must be a value from %u to %u\n", setting.environment,
 			             setting.minimum, setting.maximum);
 			std::abort();
 		}
 		// (KYTY_SPECULATE: 0 or 4, the modes measured and kept.)
-		if (setting.value == &kyty_local_speculate_mode && value != 0 && value != 4) {
+		if (setting.value == &kyty_local_speculate_mode && *value != 0 && *value != 4) {
 			std::fprintf(stderr, "%s must be 0 or 4\n", setting.environment);
 			std::abort();
 		}
-		setting.value->store(static_cast<uint32_t>(value), std::memory_order_relaxed);
+		setting.value->store(*value, std::memory_order_relaxed);
 		enabled += std::string(enabled.empty() ? "" : " ") + setting.environment + "=" + text;
 	}
 	// KYTY_SPECULATE=4 on a PC with less memory than KYTY_SPECULATE_RAM_GB (default 28 GiB; 0: no gate): mode 4 stands

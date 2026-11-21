@@ -1627,6 +1627,8 @@ void GuestGpu::ThreadRun(void* data) {
 	gpu->m_renderer.GetTextureCache().ApplySharedMode(mode == 4);
 	if (mode == 4) {
 		ModeToggle::ApplyTable(4);
+		// (spec_format_ahead: after the table sets the switch; before the threads that birth pairs exist.)
+		gpu->m_renderer.GetPipelineCache().ApplyFormatAhead();
 		start_speculation();
 	}
 	// (Tooling: the live mode toggle (mode-toggle.h), applied between submissions when no speculated queue has one started
@@ -1656,6 +1658,9 @@ void GuestGpu::ThreadRun(void* data) {
 				old       = std::move(gpu->m_speculation);
 				old_async = std::move(gpu->m_speculation_async);
 			} else {
+				// (spec_format_ahead: as at a mode-4 boot; before the mode reads 4. No hints and the warmup not done with the
+				// recording: the one fold is here, under m_queue_mutex. With hints to read: one stat and a thread.)
+				gpu->m_renderer.GetPipelineCache().ApplyFormatAhead();
 				mode = 4;
 				kyty_local_speculate_mode.store(mode, std::memory_order_relaxed);
 #if defined(__linux__)

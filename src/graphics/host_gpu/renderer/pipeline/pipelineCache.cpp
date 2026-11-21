@@ -36,8 +36,11 @@
 #include "device-fault.h"
 #include "local-platform.h"
 #include "mode-toggle.h"
+#include "format-ahead.h"
 #include "slow-log.h"
 #include "speculation-state.h"
+#include "performance-switches.h"
+#include "speculation-ram-gate.h"
 #include "spin-gate.h"
 #include "startup-progress.h"
 
@@ -71,8 +74,11 @@
 #include <utility>
 #include <vector>
 #include <xxhash.h>
+#include <zstd.h>
 
 extern "C" {
+// (spec_format_ahead's preparation at the warmup's load: the workers mode 4's CPU check counts, FormatAheadBootAsked.)
+extern volatile std::atomic_uint32_t kyty_local_speculate_threads;
 // 1: find graphics pipelines through a block-hashed index of the full key.
 volatile std::atomic<uint32_t> kyty_local_pipeline_index_mode {1};
 // (speculation.cpp, KYTY_SPECULATE) Speculative translations going on and results unfinished, and EvictIdlePipelines
@@ -82,6 +88,9 @@ extern volatile std::atomic_uint32_t kyty_local_pipelines_evicting;
 }
 
 namespace Libs::Graphics {
+
+thread_local bool     PipelineCache::t_fa_birth     = false;
+thread_local uint32_t PipelineCache::t_fa_pair_bits = 0;
 
 namespace {
 
@@ -619,6 +628,59 @@ static bool TableDenseIndirectOn() {
 	return on.load(std::memory_order_relaxed) != 0;
 }
 
+// The buffers a program's records differ in the format of (bits by buffer: a buffer's descriptor format or dst_sel
+// against the first record with buffers; a record without buffers passed over), fed record by record. The static
+// precompile's `varying` (its portable sets) and spec_format_ahead's recorded pair masks (ProgramCache::
+// ComputeRecordedPairs) are both this fold.
+struct SeedVarying {
+	std::vector<ShaderRecompiler::IR::ResourceSpecialization::Buffer> first;
+	bool                                                              have_first = false;
+	uint32_t                                                          bits       = 0;
+	void Add(const std::vector<ShaderRecompiler::IR::ResourceSpecialization::Buffer>& buffers) {
+		if (buffers.empty()) return;
+		if (!have_first) {
+			first      = buffers;
+			have_first = true;
+			return;
+		}
+		for (size_t b = 0; b < std::min<size_t>({buffers.size(), first.size(), 32}); b++) {
+			if (buffers[b].descriptor_format != first[b].descriptor_format ||
+			    buffers[b].descriptor_swizzle != first[b].descriptor_swizzle)
+				bits |= 1u << b;
+		}
+	}
+};
+
+// spec_format_ahead's fold of the shipped hints (ProgramCache::FoldRecordedPairs): the buffers shown in two real formats.
+// As SeedVarying, but a value without a format (kInvalid) is no evidence. The hints hold canonical records beside recorded
+// ones (a formatted buffer as IR::PortableFormats leaves it: kInvalid with the identity dst_sel), and a null V# reads as
+// no format too: neither shows that a draw's V# changes format.
+struct HintVarying {
+	std::vector<ShaderRecompiler::IR::ResourceSpecialization::Buffer> first; // (by buffer: its first value with a format)
+	uint32_t                                                          bits = 0;
+	void Add(const std::vector<ShaderRecompiler::IR::ResourceSpecialization::Buffer>& buffers) {
+		const auto count = std::min<size_t>(buffers.size(), 32);
+		if (first.size() < count) first.resize(count);
+		for (size_t b = 0; b < count; b++) {
+			const auto& value = buffers[b];
+			if (value.descriptor_format == Prospero::BufferFormat::kInvalid) continue;
+			if (first[b].descriptor_format == Prospero::BufferFormat::kInvalid) {
+				first[b] = value;
+			} else if (value.descriptor_format != first[b].descriptor_format ||
+			           value.descriptor_swizzle != first[b].descriptor_swizzle) {
+				bits |= 1u << b;
+			}
+		}
+	}
+};
+
+// The shipped hints (src/local/shader-hints.h) as spec_format_ahead folds them (ReadFormatHints): the body, with each
+// record's and each recipe's words viewed in it.
+struct FormatHints {
+	std::vector<uint32_t>                  body;
+	std::vector<std::span<const uint32_t>> records, recipes;
+};
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -682,6 +744,10 @@ struct PipelineCache::ProgramCache {
 		bool                           taken  = false;
 		vk::Device                     device = nullptr;
 		std::function<void(TableJob&)> after, after_done;
+		// (Mode 4, under the cache's m_mutex) The pipelines of other recorded pairs whose vertex seed's table form is this job's
+		// (spec_format_ahead: seeds of one program a pair's recorded mask made one form), put in while it is not done and run by
+		// its after_done (PostTableAhead's post_vertex).
+		std::vector<std::function<void()>> after_more;
 		TableJob() = default;
 		KYTY_CLASS_NO_COPY(TableJob);
 		~TableJob() {
@@ -794,6 +860,10 @@ struct PipelineCache::ProgramCache {
 		// met it since.
 		bool     keep_met   = false;
 		uint32_t keep_scene = SceneTags::None;
+		// spec_format_ahead: its plan's runtime-format buffers (RuntimeFormatBits), noted as the plan goes out of memory with
+		// the switch on in mode 4 (SweepPlans), for the ahead pool's form of a seed whose plan is out (AheadFormatAhead).
+		uint32_t fa_runtime       = 0;
+		bool     fa_runtime_known = false;
 	};
 	// (Mode 4) The pinned plans (AheadJob): released at their first lookup (EnsurePlan), when the entry leaves the programs,
 	// and at each scene change (SceneLoop, WarmScene).
@@ -1098,6 +1168,11 @@ struct PipelineCache::ProgramCache {
 				if (writes >= PlanWritesPerSweep || !SpillPlanBytes(source.resource_plan, source.plan_spilled)) continue;
 				writes++;
 			}
+			// (spec_format_ahead: what the ahead pool's form of a seed of it needs of the plan while it is out.)
+			if (FormatAheadOn()) [[unlikely]] {
+				source.fa_runtime       = RuntimeFormatBits(source.resource_plan.info.buffers);
+				source.fa_runtime_known = true;
+			}
 			source.plan_linear = std::move(source.resource_plan.linear_srt);
 			freed->push_back(std::move(source.resource_plan));
 			source.resource_plan = {};
@@ -1189,6 +1264,12 @@ struct PipelineCache::ProgramCache {
 	// cursor because the shader data did not fit the push constants. Cleared by GetGraphicsPrograms before the vertex
 	// lookup it reads it after.
 	static inline thread_local bool t_push_overflow = false;
+	// spec_format_ahead: this thread's GetGraphicsPrograms is a pair's birth (PipelineCache::t_fa_birth taken in mode 4 with
+	// the switch on; cleared as it returns), and its pixel lookup's program (FaProgramId) once Get's table form reached it
+	// (pending: a pixel stage not reached yet; the vertex lookup then takes no mask).
+	static inline thread_local bool     t_fa_birth_lookup  = false;
+	static inline thread_local bool     t_fa_pixel_pending = false;
+	static inline thread_local uint64_t t_fa_pixel_id      = 0;
 	void                                      ClearTable() noexcept {
 		if (Spec::On()) {
 			t_table_pending = false;
@@ -1214,6 +1295,19 @@ struct PipelineCache::ProgramCache {
 			return hash;
 		}
 	};
+	// spec_format_ahead: a program by its key and code digest (the recording's records and the runtime's entries alike,
+	// WarmKey / SourceDigest), and a pair of them (pixel 0: none). Hashes: two programs or pairs that collide share a mask,
+	// which costs a portable decode or a learn, never exactness (a portable buffer is exact for every format).
+	static uint64_t FaProgramId(const ProgramKey& key, uint64_t digest) {
+		const std::array<uint64_t, 4> head {static_cast<uint64_t>(key.stage), key.hash,
+		                                    (uint64_t {key.user_data_count} << 32u) | key.code_size, digest};
+		return XXH3_64bits_withSeed(key.static_state.data(), key.static_state.size() * sizeof(uint32_t),
+		                            XXH3_64bits(head.data(), sizeof(head)));
+	}
+	static uint64_t FaPairId(uint64_t vertex, uint64_t pixel) {
+		const std::array<uint64_t, 2> ids {vertex, pixel};
+		return XXH3_64bits(ids.data(), sizeof(ids));
+	}
 
 	// KYTY_SHADER_PREFETCH (default on; 0 off): the programs of the static precompile's inputs
 	// (StaticInputsPath: every shader the game ships, with the resource specialization it most likely
@@ -2822,15 +2916,32 @@ struct PipelineCache::ProgramCache {
 		const auto table_form = [&](const ShaderRecompiler::IR::ResourceSpecialization& value) {
 			table_specialization = value;
 			const auto& buffers  = entry->second.resource_plan.info.buffers;
+			// spec_format_ahead (local/format-ahead.h): a pair's birth lookup (t_fa_birth_lookup: mode 4, the switch on) makes
+			// its vertex program portable over its recorded pair's mask besides `table_portable`, the pixel program's id
+			// noted first (GetGraphicsPrograms looks it up first); its caller keeps the bits applied in the pair's `portable`,
+			// so the pair's later lookups pass them in as learned bits. Every other lookup: `table_portable` alone, as before.
+			uint32_t ahead = 0;
+			if (t_fa_birth_lookup) [[unlikely]] {
+				if (stage == ShaderType::Pixel) {
+					t_fa_pixel_id      = FaProgramId(entry->first, entry->second.source_digest);
+					t_fa_pixel_pending = false;
+				} else if (stage == ShaderType::Vertex && !t_fa_pixel_pending) {
+					ahead = RecordedPairMask(FaProgramId(entry->first, entry->second.source_digest), t_fa_pixel_id).value_or(0u);
+				}
+			}
+			const uint32_t portable = table_portable | ahead;
+			uint32_t       applied  = 0; // (spec_format_ahead: the bits of `ahead` its program decodes at run time)
 			for (size_t i = 0; i < table_specialization.buffers.size(); ++i) {
 				auto& buffer            = table_specialization.buffers[i];
 				buffer.byte_base_offset = false;
-				if (i < 32 && ((table_portable >> i) & 1u) != 0 && i < buffers.size() &&
+				if (i < 32 && ((portable >> i) & 1u) != 0 && i < buffers.size() &&
 				    ShaderRecompiler::IR::RuntimeBufferFormat(buffers[i])) {
+					applied |= ahead & (1u << i);
 					buffer.descriptor_format  = Prospero::BufferFormat::kInvalid;
 					buffer.descriptor_swizzle = DstSel(4, 5, 6, 7);
 				}
 			}
+			if (t_fa_birth_lookup && stage == ShaderType::Vertex) [[unlikely]] PipelineCache::t_fa_pair_bits = applied;
 			// An indirect image with the table program's elements (its candidates' count is the draw's or dispatch's:
 			// one program takes any), the snapshot it binds from padded alike (TableResolveSet).
 			(void)ShaderRecompiler::IR::TableIndirectForm(table_specialization, &resources.images,
@@ -3459,6 +3570,9 @@ struct PipelineCache::ProgramCache {
 		PipelineCacheLog("Shader warmup: loaded {} shader inputs and {} pipeline recipes", warmup.records.size(), warmup.pipelines.size());
 		warm_records.assign(warmup.records.begin(), warmup.records.end());
 		warm_recipes = warmup.pipelines;
+		// (spec_format_ahead: what a fold after the warmup let these go reads the same recording again by: FoldRecordingFile.)
+		warm_recording_size    = {warm_records.size(), warm_recipes.size()};
+		warm_recording_adopted = adopt_from;
 	}
 
 	// The recording's records translated (warm_permutations: each record's permutation). In front of the game
@@ -3547,17 +3661,205 @@ struct PipelineCache::ProgramCache {
 		                                                  (stage == ShaderType::Vertex || stage == ShaderType::Pixel));
 		return table_specialization;
 	}
+	// spec_format_ahead: the buffers of a plan that decode their V#'s format at run time when asked to (bits by buffer).
+	static uint32_t RuntimeFormatBits(const std::vector<ShaderRecompiler::IR::BufferResource>& buffers) {
+		uint32_t bits = 0;
+		for (size_t i = 0; i < buffers.size() && i < 32; ++i)
+			if (ShaderRecompiler::IR::RuntimeBufferFormat(buffers[i])) bits |= 1u << i;
+		return bits;
+	}
+	// spec_format_ahead (under the cache's m_mutex): a vertex seed's table form with its recorded pair's mask `pair_mask`
+	// (AheadPair::fa_mask), less the buffers its plan does not decode at run time, as Get's table_form makes it at that pair's
+	// birth (table_portable 0; the masked buffers decode their V#'s format: kInvalid, DstSel(4, 5, 6, 7)). False: the plan
+	// out of memory and its runtime-format buffers not noted (the seed passed over). A pixel seed, or a mask of 0: the form
+	// unchanged.
+	bool AheadFormatAhead(ShaderRecompiler::IR::ResourceSpecialization& table_specialization, const SourceEntry& source,
+	                      const AheadSeed& seed, uint32_t pair_mask) {
+		if (seed.record.stage != ShaderType::Vertex || pair_mask == 0) return true;
+		uint32_t mask = pair_mask;
+		if (!source.plan_out) mask &= RuntimeFormatBits(source.resource_plan.info.buffers);
+		else if (source.fa_runtime_known) mask &= source.fa_runtime;
+		else return false;
+		for (size_t i = 0; mask != 0 && i < table_specialization.buffers.size() && i < 32; ++i) {
+			if (((mask >> i) & 1u) == 0) continue;
+			auto& buffer              = table_specialization.buffers[i];
+			buffer.descriptor_format  = Prospero::BufferFormat::kInvalid;
+			buffer.descriptor_swizzle = DstSel(4, 5, 6, 7);
+		}
+		return true;
+	}
+	// spec_format_ahead: each table recipe (no vertex buffers, no compute, as PostTableAhead takes them) with a vertex
+	// record (and a pixel one, or none): `fold`(its pair's FaPairId, the vertex record's index, that record's buffers).
+	// `program_id`: a decoded record's program (none: its recipes are passed over).
+	template <typename Recipes, typename ProgramId, typename Fold>
+	static void ForEachTableRecipe(std::span<const std::span<const uint32_t>> records, const Recipes& table_recipes,
+	                                 const ProgramId& program_id, const Fold& fold) {
+		struct Seen { // (a record decoded once: its program, and a vertex record's buffers)
+			uint64_t                                                          id = 0;
+			bool                                                              ok = false;
+			std::vector<ShaderRecompiler::IR::ResourceSpecialization::Buffer> buffers;
+			ShaderType                                                        stage = ShaderType::Unknown;
+		};
+		std::unordered_map<uint32_t, Seen> seen;
+		const auto seen_of = [&](uint32_t index, ShaderType stage) -> const Seen* {
+			auto [found, inserted] = seen.try_emplace(index);
+			if (inserted && index < records.size()) {
+				LocalShaderWarmup::Record record;
+				LocalShaderWarmup::Reader reader {records[index]};
+				if (LocalShaderWarmup::Visit(reader, record)) {
+					found->second.stage = record.stage;
+					if (const auto id = program_id(record)) {
+						found->second.id = *id;
+						found->second.ok = true;
+						if (record.stage == ShaderType::Vertex) found->second.buffers = std::move(record.specialization.buffers);
+					}
+				}
+			}
+			return found->second.ok && found->second.stage == stage ? &found->second : nullptr;
+		};
+		for (const auto& words: table_recipes) {
+			LocalShaderWarmup::PipelineRecord recipe;
+			LocalShaderWarmup::Reader         reader {words};
+			if (!LocalShaderWarmup::VisitPipeline(reader, recipe) || recipe.compute != LocalShaderWarmup::NoShader) continue;
+			if (recipe.vertex_input.binding_count != 0) continue; // (a table pair's vertex shader fetches no vertex buffer)
+			const auto* vertex = seen_of(recipe.vertex, ShaderType::Vertex);
+			if (vertex == nullptr) continue;
+			uint64_t pixel = 0;
+			if (recipe.pixel != LocalShaderWarmup::NoShader) {
+				const auto* found = seen_of(recipe.pixel, ShaderType::Pixel);
+				if (found == nullptr) continue;
+				pixel = found->id;
+			}
+			fold(FaPairId(vertex->id, pixel), recipe.vertex, vertex->buffers);
+		}
+	}
+	// spec_format_ahead: the program a shipped hint names, as FaProgramId names the live one: a hint holds its code's word
+	// count and XXH3-64 for the code, and no static key (made here from its input info, as --apply-hints makes it). None
+	// for a program with back code: SourceDigest hashes that seeded by the code's hash, which the hint's own hash of it
+	// cannot give.
+	static std::optional<uint64_t> HintProgramId(LocalShaderWarmup::Record& record) {
+		if (record.code.size() != 3 || record.back_code.size() != 3 || record.back_code[0] != 0) return std::nullopt;
+		ProgramKey key;
+		key.stage           = record.stage;
+		key.hash            = record.hash;
+		key.user_data_count = record.user_data_count;
+		key.code_size       = record.code[0];
+		if (record.stage == ShaderType::Vertex) {
+			BuildStageStaticKey(record.vertex, key.static_state);
+		} else if (record.stage == ShaderType::Pixel) {
+			BuildStageStaticKey(record.pixel, key.static_state);
+		} else {
+			return std::nullopt;
+		}
+		const uint64_t code = (uint64_t {record.code[2]} << 32u) | record.code[1];
+		return FaProgramId(key, XXH3_64bits_withSeed(record.back_code.data(), 0, code)); // (SourceDigest, no back code)
+	}
+	// spec_format_ahead (once, by one thread: the warmup's load, or the one PipelineCache::ApplyFormatAhead gave it to):
+	// the recorded mask of each recorded table PAIR (its vertex and pixel programs by FaProgramId, pixel 0 where none),
+	// made into recorded_pairs, unpublished:
+	// - this PC's warmup recording (`records` / `recorded_recipes`, as LoadWarmup loaded it: the static store's records
+	//   are format-canonical): folded over the vertex records of that pair's recipes alone (SeedVarying: every state of
+	//   the pair, the runtime pair's draws);
+	// - the shipped hints (`hints`; null: none): the same pairs' fold by HintVarying, real formats only, and OR'd in with
+	//   the buffers where the two sources hold two real formats. A mask only grows by them.
+	// Kept for every pair of either, mask 0 too (a pair that never varied is born specialised; one not kept is in
+	// neither). A hint's program this PC does not have is in no lookup: RecordedPairMask is asked by a live program's own
+	// key and code digest, and the ahead pool posts this PC's recording's pairs only.
+	void FoldRecordedPairs(std::span<const std::span<const uint32_t>> records,
+	                       std::span<const std::vector<uint32_t>> recorded_recipes, const FormatHints* hints) {
+		struct Pair {
+			SeedVarying           fold;
+			std::vector<uint32_t> folded; // (vertex record indices folded in)
+		};
+		std::unordered_map<uint64_t, Pair> pairs;
+		ForEachTableRecipe(
+		    records, recorded_recipes,
+		    [](const LocalShaderWarmup::Record& record) {
+			    return std::optional<uint64_t> {FaProgramId(WarmKey(record), SourceDigest(record.code, record.back_code))};
+		    },
+		    [&](uint64_t id, uint32_t index, const auto& buffers) {
+			    auto& pair = pairs[id];
+			    if (std::ranges::find(pair.folded, index) != pair.folded.end()) return;
+			    pair.folded.push_back(index);
+			    pair.fold.Add(buffers);
+		    });
+		recorded_pairs.clear();
+		recorded_pairs.reserve(pairs.size());
+		for (const auto& [id, pair]: pairs) {
+			recorded_pairs.emplace(id, pair.fold.bits);
+		}
+		if (hints == nullptr) return;
+		std::unordered_map<uint64_t, HintVarying> hinted;
+		ForEachTableRecipe(
+		    hints->records, hints->recipes, [](LocalShaderWarmup::Record& record) { return HintProgramId(record); },
+		    [&](uint64_t id, uint32_t, const auto& buffers) { hinted[id].Add(buffers); });
+		for (auto& [id, hint]: hinted) {
+			// (The recording's own value, where it has a format, against the hints': two real formats. A buffer the
+			// recording varies in has its bit already.)
+			if (const auto own_pair = pairs.find(id); own_pair != pairs.end()) hint.Add(own_pair->second.fold.first);
+			recorded_pairs[id] |= hint.bits;
+		}
+	}
+	// spec_format_ahead (the thread PairFold::Folding was claimed for): the pairs FoldRecordedPairs made published, once a
+	// run (recorded_pairs_fold: Folded).
+	void PublishRecordedPairs() {
+		recorded_pairs_fold.store(PairFold::Folded, std::memory_order_release);
+	}
+	void ComputeRecordedPairs(std::span<const std::span<const uint32_t>> records,
+	                          std::span<const std::vector<uint32_t>> recorded_recipes, const FormatHints* hints) {
+		FoldRecordedPairs(records, recorded_recipes, hints);
+		PublishRecordedPairs();
+	}
+	// spec_format_ahead (the warmup's thread, before it posts a scene's table pairs in mode 4, no lock held): until mode 4's
+	// masks are settled (folded, off or unreadable). Mode 4 reads on from InitializePerformanceSwitches, a moment before
+	// ApplyFormatAhead; a stood-down request reads 0 again. Never the GPU thread's, which waits for nothing of this. Whether
+	// to post them: the mode and `stop` tested again after the state, so false once mode 4 is left or the warmup stops.
+	[[nodiscard]] bool AwaitRecordedPairs(const std::atomic<bool>& stop) const {
+		for (;;) {
+			const auto fold = recorded_pairs_fold.load(std::memory_order_acquire);
+			if (stop.load(std::memory_order_relaxed) || ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4)
+				return false;
+			if (fold != PairFold::NotApplied && fold != PairFold::Folding) return true;
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	}
+	// spec_format_ahead: a recorded pair's mask by its programs (FaProgramId; pixel 0: none); none: not in the recording
+	// nor the hints, or the pairs not published (the switch off as mode 4 was applied, their fold still running, or the
+	// recording unreadable with no hints).
+	std::optional<uint32_t> RecordedPairMask(uint64_t vertex, uint64_t pixel) const {
+		if (recorded_pairs_fold.load(std::memory_order_acquire) != PairFold::Folded) return std::nullopt;
+		const auto found = recorded_pairs.find(FaPairId(vertex, pixel));
+		if (found == recorded_pairs.end()) return std::nullopt;
+		return found->second;
+	}
+	// spec_format_ahead (under the cache's m_mutex): the ahead pool's job of `seed`'s table form at `cursor` that another seed
+	// of the program posted and that is not done yet (its after_done not run: it runs after_more), when the pair's recorded
+	// mask `pair_mask` made their forms one. Null otherwise (a mask of 0, the switch off: always).
+	std::shared_ptr<TableJob> AheadSharedJob(const AheadSeed& seed, uint32_t cursor, uint32_t pair_mask) {
+		if (seed.record.stage != ShaderType::Vertex || pair_mask == 0 || !FormatAheadOn()) return nullptr;
+		const auto entry = programs.find(seed.key);
+		if (entry == programs.end() || entry->second.source_digest != seed.digest) return nullptr;
+		auto table_specialization = AheadSpecialization(seed);
+		if (!AheadFormatAhead(table_specialization, entry->second, seed, pair_mask)) return nullptr;
+		for (const auto& job: entry->second.table_jobs)
+			if (job->ahead && job->after_done && !job->done.load(std::memory_order_acquire) && job->push_data_cursor == cursor &&
+			    !job->table_reduced && job->specialization == table_specialization)
+				return job;
+		return nullptr;
+	}
 	// The job of `seed`'s table program at `cursor`, put into its entry as Get's table branch makes one (under the cache's
 	// m_mutex): the same inputs, but for the user data's values, which the translation does not read (the count only:
 	// Translate's user_data_base / count, DetectEmbeddedVertexFetch's size; the values are the SRT walker's at the draw).
 	// Null where the entry is not there or holds other code, or the job or a table permutation of it is there already.
-	std::shared_ptr<TableJob> AheadJob(const AheadSeed& seed, uint32_t cursor) {
+	// (spec_format_ahead: a vertex seed's form with its recorded pair's mask, `pair_mask`; not ready: null.)
+	std::shared_ptr<TableJob> AheadJob(const AheadSeed& seed, uint32_t cursor, uint32_t pair_mask = 0) {
 		const auto& record = seed.record;
 		if (record.stage != ShaderType::Vertex && record.stage != ShaderType::Pixel) return nullptr;
 		const auto entry = programs.find(seed.key);
 		if (entry == programs.end() || entry->second.source_digest != seed.digest) return nullptr;
 		auto& source               = entry->second;
 		auto  table_specialization = AheadSpecialization(seed);
+		if (!AheadFormatAhead(table_specialization, source, seed, pair_mask)) return nullptr; // (spec_format_ahead)
 		// (KYTY_SPEC_PAIR_PUSH_FIT's reduced forms are not the plain program's: passed over; so is a refusal for push
 		// constants made at another cursor, as Get's find passes it over.)
 		for (const auto& job: source.table_jobs)
@@ -3636,6 +3938,7 @@ struct PipelineCache::ProgramCache {
 	struct AheadPair {
 		std::shared_ptr<AheadSeed>                     vertex, pixel; // (pixel null: a pair without a pixel shader)
 		std::vector<LocalShaderWarmup::PipelineRecord> recipes;
+		uint32_t fa_mask = 0; // (spec_format_ahead: its recorded pair's mask, RecordedPairMask; 0: none)
 	};
 	// (The pipeline cache's, set in its constructor; called under its m_mutex.)
 	std::function<void(const std::vector<LocalShaderWarmup::PipelineRecord>&, const Permutation&, const ShaderVertexInputInfo&,
@@ -3645,11 +3948,13 @@ struct PipelineCache::ProgramCache {
 	// the draw's Get publishes it (its table branch: the job out of the entry's jobs, the permutation finished from its
 	// result and stored), which the draw then finds as one made. Null: not made yet (a job of a draw's own or still running),
 	// refused, or the entry gone.
-	Permutation* AheadPermutation(const AheadSeed& seed, uint32_t cursor) {
+	// (spec_format_ahead: a vertex seed's form with its recorded pair's mask, `pair_mask`; not ready: null.)
+	Permutation* AheadPermutation(const AheadSeed& seed, uint32_t cursor, uint32_t pair_mask = 0) {
 		const auto entry = programs.find(seed.key);
 		if (entry == programs.end() || entry->second.source_digest != seed.digest) return nullptr;
-		auto&      source               = entry->second;
-		const auto table_specialization = AheadSpecialization(seed);
+		auto& source               = entry->second;
+		auto  table_specialization = AheadSpecialization(seed);
+		if (!AheadFormatAhead(table_specialization, source, seed, pair_mask)) return nullptr; // (spec_format_ahead)
 		const auto found                = std::ranges::find_if(source.table_jobs, [&](const auto& job) {
             return job->push_data_cursor == cursor && job->specialization == table_specialization && !job->table_reduced;
         });
@@ -3721,7 +4026,7 @@ struct PipelineCache::ProgramCache {
 	// pool by the pipeline cache (table_pipelines_ahead) where none is there for the key.
 	void PipelinesAhead(const AheadPair& pair, uint32_t cursor) {
 		if (!table_pipelines_ahead || ahead_stopping || pair.recipes.empty()) return;
-		Permutation* vertex = AheadPermutation(*pair.vertex, cursor);
+		Permutation* vertex = AheadPermutation(*pair.vertex, cursor, pair.fa_mask);
 		if (vertex == nullptr) return;
 		Permutation* pixel = pair.pixel != nullptr ? AheadPermutation(*pair.pixel, 0) : nullptr;
 		if (pair.pixel != nullptr && pixel == nullptr) return;
@@ -3754,7 +4059,8 @@ struct PipelineCache::ProgramCache {
 			}
 			return seeds[index] = seed;
 		};
-		// (A pair once per vertex seed, its recipes gathered.)
+		// (A pair once per vertex seed, its recipes gathered. spec_format_ahead: its recorded pair's mask.)
+		const bool pair_masks = FormatAheadOn();
 		const auto pair_in = [&](Pairs& pairs, const std::shared_ptr<AheadSeed>& vertex, const std::shared_ptr<AheadSeed>& pixel,
 		                         const LocalShaderWarmup::PipelineRecord& recipe) {
 			auto found = std::ranges::find_if(pairs, [&](const auto& pair) { return pair->vertex == vertex; });
@@ -3762,6 +4068,10 @@ struct PipelineCache::ProgramCache {
 				auto pair    = std::make_shared<AheadPair>();
 				pair->vertex = vertex;
 				pair->pixel  = pixel;
+				if (pair_masks) [[unlikely]]
+					pair->fa_mask = RecordedPairMask(FaProgramId(vertex->key, vertex->digest),
+					                                 pixel != nullptr ? FaProgramId(pixel->key, pixel->digest) : 0)
+					                    .value_or(0u);
 				found        = pairs.insert(pairs.end(), std::move(pair));
 			}
 			(*found)->recipes.push_back(recipe);
@@ -3790,14 +4100,21 @@ struct PipelineCache::ProgramCache {
 		// (A pair's vertex seed at `cursor`, under the lock; its pipelines from the job's after_done, or at once where no job
 		// is posted (its table program there already, or another's job).)
 		const auto post_vertex = [self, lock_of](const std::shared_ptr<AheadPair>& pair, uint32_t cursor) -> size_t {
-			const auto job = self->AheadJob(*pair->vertex, cursor);
+			const auto job = self->AheadJob(*pair->vertex, cursor, pair->fa_mask);
 			if (job == nullptr) {
+				// (spec_format_ahead: another seed's job of the same form still to run: this pair's pipelines after it.)
+				if (const auto shared = self->AheadSharedJob(*pair->vertex, cursor, pair->fa_mask)) [[unlikely]] {
+					shared->after_more.emplace_back([self, pair, cursor] { self->PipelinesAhead(*pair, cursor); });
+					return 0;
+				}
 				self->PipelinesAhead(*pair, cursor);
 				return 0;
 			}
-			job->after_done = [self, lock_of, pair, cursor](TableJob&) {
+			job->after_done = [self, lock_of, pair, cursor](TableJob& made) {
 				Common::LockGuard relock(*lock_of);
 				self->PipelinesAhead(*pair, cursor);
+				for (const auto& more: made.after_more) more(); // (spec_format_ahead: the pairs that share its form)
+				made.after_more.clear();
 			};
 			self->PushAhead(job);
 			return 1;
@@ -3980,6 +4297,25 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	// spec_format_ahead: each recorded table pair's mask by FaPairId (0 too), written once by FoldRecordedPairs (the
+	// warmup's load, before the GPU thread exists, or else the one thread that PairFold::Folding was claimed for) before
+	// Folded (release), read only once that is seen (acquire).
+	// NotApplied: mode 4 not applied yet; Off: applied with the switch off (a later live `mode 4` may fold still);
+	// Unreadable: no masks this run.
+	enum class PairFold : uint8_t { NotApplied, Off, Folding, Folded, Unreadable };
+	std::unordered_map<uint64_t, uint32_t> recorded_pairs;
+	std::atomic<PairFold>                  recorded_pairs_fold {PairFold::NotApplied};
+	// (PipelineCache::PrepareFormatAhead, before the GPU thread exists: the hints looked for; the union made from them.)
+	bool                                   hints_looked            = false;
+	bool                                   recorded_pairs_prepared = false;
+	// The start-up recording (warm_records, warm_recipes) is written by LoadWarmup, before the warmup and the GPU thread
+	// exist, then by nothing until the warmup sets warm_recording_released, under warm_recording_mutex, and only then lets
+	// it go. A fold of it holds that mutex: the GPU thread only tries it, the warmup waits for it. After the release the
+	// fold reads the file's first warm_recording_size records and recipes (FoldRecordingFile).
+	std::mutex                             warm_recording_mutex;
+	bool                                   warm_recording_released = false;
+	std::array<size_t, 2>                  warm_recording_size {};
+	std::filesystem::path                  warm_recording_adopted;
 	// While a warmup runs beside the game (PipelineCache::RunWarmup): programs whose recorded code the game no longer
 	// has (Get) wait here, their modules alive, until it is done (it may be making their pipelines).
 	bool                                       warming = false;
@@ -4533,10 +4869,14 @@ void PipelineCache::ReportSession() {
 void PipelineCache::StopWarmup() {
 	m_warmup_stop.store(true, std::memory_order_relaxed);
 	if (m_warmup_thread.joinable()) m_warmup_thread.join();
+	// (spec_format_ahead: a fold reading the recording's file again done with it, before a save replaces that file.)
+	while (m_program_cache->recorded_pairs_fold.load(std::memory_order_acquire) == ProgramCache::PairFold::Folding)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 
 void PipelineCache::FinishCompileWorkers() {
 	StopWarmup();
+	if (m_format_ahead_thread.joinable()) m_format_ahead_thread.join(); // (the GPU thread, which starts it, is gone)
 	m_table_cache_saver = {}; // (stops and joins it)
 	ReportSession();
 	m_program_cache->prefetch_live.store(nullptr, std::memory_order_release);
@@ -4706,6 +5046,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		if (low_ram && std::string_view(warmup) == "1")
 			PipelineCacheLog("Shader warmup: recording only (RAM {} MiB)", ram >> 20u);
 		m_program_cache->LoadWarmup(path, title + device, adopt_from);
+		PrepareFormatAhead(); // (spec_format_ahead: before the warmup, which lets the recording go)
 		// The warmup by scene (local/scene-tags.h): Demon's Souls reports the map it loads (libAmpr); KYTY_SCENE_WARMUP=0
 		// makes every recorded pipeline at start-up, as before.
 		const char* by_scene = std::getenv("KYTY_SCENE_WARMUP");
@@ -4756,7 +5097,10 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 			RunWarmup(settings);
 		}
 	}
-	if (!prefetch_by_warmup) StartShaderPrefetch({});
+	if (!prefetch_by_warmup) {
+		PrepareFormatAhead(); // (spec_format_ahead: no recording, the hints alone)
+		StartShaderPrefetch({});
+	}
 #endif
 }
 
@@ -4812,6 +5156,11 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 		// the cache saver, once compiles settle: MainPipelineDone.)
 		if (!settings.background && std::chrono::steady_clock::now() - pipelines_begin > std::chrono::seconds(5)) (void)Save();
 	}
+	{
+		// (spec_format_ahead: from here on a fold reads the file; one reading these is done first: ApplyFormatAhead.)
+		std::lock_guard lock(programs.warm_recording_mutex);
+		programs.warm_recording_released = true;
+	}
 	programs.warm_permutations = {};
 	programs.warm_recipes      = {};
 	programs.warm_records      = {};
@@ -4861,6 +5210,174 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 		return;
 	}
 	if (!m_warmup_stop.load(std::memory_order_relaxed)) StartShaderPrefetch(std::move(recorded_inputs));
+}
+
+static std::filesystem::path StaticHintsPath();
+
+// spec_format_ahead: the GPU thread as mode 4 is applied (GuestGpu::ThreadRun: a mode-4 boot, a live `mode 4`), the switch's
+// value the mode's by then, before the speculation threads are made. One fold a run, by the side that has the recording:
+// - the warmup not done with it (loading or waiting for its first scene): this thread folds warm_records / warm_recipes
+//   here (~5 ms), published before any packet or worker of this mode 4;
+// - the warmup done with it (an inline warmup always is; a live switch later), or letting go of it now: a thread of its
+//   own reads the file again and folds it (FoldRecordingFile); pairs born until then are born as before.
+// This thread waits for neither the warmup nor that thread (try_lock).
+// With the shipped hints (PrepareFormatAhead, ReadFormatHints) this thread reads and folds nothing:
+// - this boot asked for mode 4 (the usual one): both were folded at the warmup's load; this thread only publishes them,
+//   before start_speculation makes the threads that birth pairs and before its first packet, a recording or none;
+// - it did not (a live `mode 4`) and a hints file is there (one stat here): the short thread reads and folds both;
+//   pairs born until it publishes are born as before.
+// No hints: the recording's fold as above.
+void PipelineCache::ApplyFormatAhead() {
+	using PairFold = ProgramCache::PairFold;
+	auto& programs = *m_program_cache;
+	auto  fold     = programs.recorded_pairs_fold.load(std::memory_order_relaxed);
+	if (fold != PairFold::NotApplied && fold != PairFold::Off) return; // (folded, or being folded: once a run)
+	const bool on = FormatAheadSwitch().load(std::memory_order_relaxed) != 0;
+	if (!programs.recorded_pairs_fold.compare_exchange_strong(fold, on ? PairFold::Folding : PairFold::Off,
+	                                                          std::memory_order_acq_rel) ||
+	    !on)
+		return;
+	if (programs.recorded_pairs_prepared) {
+		programs.PublishRecordedPairs();
+		return;
+	}
+	std::error_code error;
+	const bool      read_hints = !programs.hints_looked && std::filesystem::is_regular_file(StaticHintsPath(), error);
+	if (!read_hints) {
+		std::unique_lock recording(programs.warm_recording_mutex, std::try_to_lock);
+		if (recording.owns_lock() && !programs.warm_recording_released) {
+			programs.ComputeRecordedPairs(programs.warm_records, programs.warm_recipes, nullptr);
+			return;
+		}
+	}
+	m_format_ahead_thread = std::thread([this, read_hints] { FoldRecordingFile(read_hints); });
+}
+
+// Whether this boot will apply mode 4 with spec_format_ahead on, told before the GPU thread exists, where the mode still
+// reads 0: the request as InitializePerformanceSwitches will judge it (its memory and CPU stand-downs too), the switch as
+// ApplyTable(4) will set it. It only chooses where the hints are read (PrepareFormatAhead); ApplyFormatAhead's own test,
+// after those two, alone turns the masks on.
+static bool FormatAheadBootAsked() {
+	if (ParsePerformanceSwitch(std::getenv("KYTY_SPECULATE"), 0, 4) != 4 || SpeculationRamGate::StandsDown()) return false;
+	const char* threads = std::getenv("KYTY_SPECULATE_THREADS");
+	const auto requested_workers = ParsePerformanceSwitch(threads, 1, 12);
+	if (threads != nullptr && *threads != '\0' && !requested_workers) return false;
+	if (const char* named = std::getenv("KYTY_SPECULATE_CPUS"); named == nullptr || *named == '\0') {
+		const uint32_t workers = requested_workers.value_or(::kyty_local_speculate_threads.load(std::memory_order_relaxed));
+		const uint32_t cpus = LocalPlatform::PerformanceLogicalCpus();
+		if (cpus != 0 && cpus < 3u + workers + 2u) return false;
+	}
+	const char* value = std::getenv("KYTY_SPEC_FORMAT_AHEAD");
+	return value == nullptr || *value == '\0' || std::strtoll(value, nullptr, 10) != 0; // (unset: the row's 1)
+}
+
+// The shipped hints of this game version (StaticHintsPath, beside the working directory's _PipelineCache): none where
+// the file is missing, and, logged, where it is unreadable, damaged or another game version's.
+static std::optional<FormatHints> ReadFormatHints() {
+	const auto    path = StaticHintsPath();
+	std::ifstream file(path, std::ios::binary | std::ios::ate);
+	if (!file) return std::nullopt;
+	const auto refused = [&]() -> std::optional<FormatHints> {
+		PipelineCacheLog("Format ahead: {} not taken (unreadable, damaged or another game version's)",
+		                 Common::PathToString(path));
+		return std::nullopt;
+	};
+	using Cache           = LocalShaderWarmup::Cache;
+	const auto identity   = "KytyShaderHints1:" + PipelineCacheGameId() + "\n";
+	const auto file_bytes = static_cast<std::streamoff>(file.tellg());
+	if (file_bytes <= static_cast<std::streamoff>(identity.size() + sizeof(uint64_t)) ||
+	    file_bytes > static_cast<std::streamoff>(Cache::MaxBytes))
+		return refused();
+	std::vector<char> data(static_cast<size_t>(file_bytes));
+	file.seekg(0);
+	if (!file.read(data.data(), static_cast<std::streamsize>(data.size())) ||
+	    std::string_view(data.data(), identity.size()) != identity)
+		return refused();
+	uint64_t checksum = 0;
+	std::memcpy(&checksum, data.data() + identity.size(), sizeof(checksum));
+	const auto packed = std::span<const char>(data).subspan(identity.size() + sizeof(checksum));
+	const auto bytes  = ZSTD_getFrameContentSize(packed.data(), packed.size());
+	if (bytes == ZSTD_CONTENTSIZE_UNKNOWN || bytes == ZSTD_CONTENTSIZE_ERROR || bytes > Cache::MaxBytes || bytes < 8 ||
+	    bytes % sizeof(uint32_t) != 0)
+		return refused();
+	FormatHints hints;
+	hints.body.resize(static_cast<size_t>(bytes / sizeof(uint32_t)));
+	if (!ZstdUnpack(packed, hints.body.data(), static_cast<size_t>(bytes)) ||
+	    XXH3_64bits(hints.body.data(), static_cast<size_t>(bytes)) != checksum)
+		return refused();
+	// (A seed file's body: each list its count, then each entry its word count and words.)
+	const std::span<const uint32_t> body {hints.body};
+	size_t                          cursor = 0;
+	for (auto* list: {&hints.records, &hints.recipes}) {
+		if (cursor == body.size()) return refused();
+		const uint32_t count = body[cursor++];
+		if (count > Cache::MaxPipelines) return refused();
+		list->reserve(count);
+		for (uint32_t i = 0; i < count; ++i) {
+			if (cursor == body.size()) return refused();
+			const uint32_t words = body[cursor++];
+			if (words > body.size() - cursor) return refused();
+			list->push_back(body.subspan(cursor, words));
+			cursor += words;
+		}
+	}
+	if (cursor != body.size()) return refused();
+	return hints;
+}
+
+// spec_format_ahead at the warmup's load (the constructor's thread, the main one, before the warmup and the GPU thread
+// exist; a boot that asks for mode 4 only): the hints read once and folded with the recording just loaded, if any.
+// ApplyFormatAhead publishes them. No hints: nothing made, the recording folded there as before.
+void PipelineCache::PrepareFormatAhead() {
+	if (!FormatAheadBootAsked()) return;
+	auto& programs        = *m_program_cache;
+	programs.hints_looked = true;
+	const auto hints      = ReadFormatHints();
+	if (!hints) return;
+	programs.FoldRecordedPairs(programs.warm_records, programs.warm_recipes, &*hints);
+	programs.recorded_pairs_prepared = true;
+}
+
+// spec_format_ahead (its own thread, the recording let go by the warmup: ApplyFormatAhead): the recording read again from
+// its file, as a later scene's warmup reads it (WarmScene), and the part LoadWarmup loaded folded: the file's records and
+// recipes are only appended to. The adopted file while this device's is not written yet. `read_hints`: the shipped hints
+// read here and folded in, then the recording from the warmup's memory where it still holds it (the warmup waits for that
+// fold, as for the GPU thread's).
+void PipelineCache::FoldRecordingFile(bool read_hints) {
+	LocalPlatform::SetThreadName("Kyty.FmtAhead");
+	auto&      programs = *m_program_cache;
+	const auto read_now = read_hints ? ReadFormatHints() : std::nullopt;
+	const auto hints    = read_now ? &*read_now : nullptr;
+	if (read_hints) {
+		std::lock_guard recording(programs.warm_recording_mutex);
+		if (!programs.warm_recording_released) {
+			programs.ComputeRecordedPairs(programs.warm_records, programs.warm_recipes, hints);
+			return;
+		}
+	}
+	const size_t record_count = programs.warm_recording_size[0];
+	const size_t recipe_count = programs.warm_recording_size[1];
+	if (recipe_count == 0) {
+		programs.ComputeRecordedPairs({}, {}, hints);
+		return;
+	}
+	std::vector<std::vector<uint32_t>> records, recipes;
+	const auto read = [&](const std::filesystem::path& file) {
+		return !file.empty() && LocalShaderWarmup::Cache::ReadInputs(file, records, recipes) &&
+		       records.size() >= record_count && recipes.size() >= recipe_count;
+	};
+	if (m_warmup_stop.load(std::memory_order_relaxed) || (!read(m_warmup_path) && !read(programs.warm_recording_adopted))) {
+		if (hints != nullptr && !m_warmup_stop.load(std::memory_order_relaxed)) {
+			programs.ComputeRecordedPairs({}, {}, hints);
+			return;
+		}
+		PipelineCacheLog("Format ahead: no masks, the recording could not be read again");
+		programs.recorded_pairs_fold.store(ProgramCache::PairFold::Unreadable, std::memory_order_release);
+		return;
+	}
+	const std::vector<std::span<const uint32_t>> loaded(records.begin(),
+	                                                    records.begin() + static_cast<std::ptrdiff_t>(record_count));
+	programs.ComputeRecordedPairs(loaded, std::span(recipes).first(recipe_count), hints);
 }
 
 void PipelineCache::WarmScene(uint32_t scene, uint64_t compute_video, bool in_memory) {
@@ -4926,7 +5443,10 @@ void PipelineCache::WarmScene(uint32_t scene, uint64_t compute_video, bool in_me
 	// (Mode 4) The scene's recorded table pairs' table programs queued on the ahead pool now, before its draws meet them,
 	// ahead of its pipelines, and their table pipelines once both programs of a pair are made (ProgramCache::PostTableAhead).
 	// The plans an earlier scene's jobs pinned that no lookup released let go first (ProgramCache::AheadJob).
-	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+	// (spec_format_ahead: the pairs' masks awaited before the pool takes them. Mode 4 left or the warmup stopped by then:
+	// the block skipped, as for a scene warmed in mode 0: ReleasePlanPins and KeepScenePlans (the pins and marks count in
+	// mode 4 only: SweepPlans), PostTableAhead and its log. WarmPipelines below, all a mode-0 scene needs, runs as before.)
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && programs.AwaitRecordedPairs(m_warmup_stop)) {
 		{
 			Common::LockGuard lock(m_mutex);
 			programs.ReleasePlanPins();
@@ -5884,6 +6404,23 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	// (spec_pair_push_fit_draws_n's mark: cleared first, so no way out (PrepareUnread, an adopt-only miss) leaves the last
 	// lookup's.)
 	if (table_mode) t_push_fit_taken = false;
+	// (spec_format_ahead: a pair's birth, set by its caller in mode 4 with the switch on, for this call's lookups only: Get's
+	// table form reads it. Its answer cleared first, so no way out leaves an earlier birth's bits.)
+	struct FaBirthScope {
+		bool on = false;
+		FaBirthScope(bool birth, bool pixel): on(birth) {
+			if (!on) [[likely]] return;
+			ProgramCache::t_fa_birth_lookup  = true;
+			ProgramCache::t_fa_pixel_pending = pixel;
+			ProgramCache::t_fa_pixel_id      = 0;
+		}
+		~FaBirthScope() {
+			if (on) [[unlikely]] ProgramCache::t_fa_birth_lookup = false;
+		}
+	};
+	const bool fa_asked = t_fa_birth;
+	if (fa_asked) [[unlikely]] t_fa_birth = false, t_fa_pair_bits = 0;
+	const FaBirthScope fa_birth(fa_asked && table_mode && FormatAheadOn(), pixel_active);
 	// Reused per thread: every normal-path draw prepares both (their user data were new vectors).
 	thread_local ShaderParams vertex_params, pixel_params;
 	std::optional<ShaderHashNoFaultScope> no_fault; // (PrepareNoFault)

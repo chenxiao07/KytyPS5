@@ -348,6 +348,13 @@ public:
 	// KYTY_SPEC_PAIR_PUSH_FIT: this thread's last table-mode GetGraphicsPrograms returned the retry's pair (the pixel
 	// program's reduced form); its caller marks the pair (TablePair::push_fit, spec_pair_push_fit_draws_n).
 	static inline thread_local bool t_push_fit_taken = false;
+	// spec_format_ahead (local/format-ahead.h): set by the caller of a table-mode GetGraphicsPrograms for a pair's birth (its
+	// first programs: TableStore, a worker's new pair), in mode 4 with the switch on only; taken (cleared) by that call,
+	// which then clears t_fa_pair_bits and, its vertex lookup reaching Get's table form, sets it to the vertex program's
+	// buffers the pair's recorded mask made portable (runtime-format ones only). The caller ORs them into the pair's
+	// `portable`, as a learn does.
+	static thread_local bool     t_fa_birth;
+	static thread_local uint32_t t_fa_pair_bits;
 	// With t_find_only, a program whose permutation is not in memory but whose module the prefetch holds DONE is adopted
 	// here as the GPU thread's normal draw adopts it (under m_mutex: the permutation published), but NOT recorded: it is kept
 	// unrecorded (ProgramCache::unrecorded) and recorded by the first in-order lookup that finds it, or by the commit of an
@@ -408,6 +415,9 @@ public:
 	};
 	// Stops a warmup still running beside the game, and waits for it (the window's close; not under m_mutex).
 	void StopWarmup();
+	// spec_format_ahead (the GPU thread only, as mode 4 is applied, before its speculation threads are made): the recorded
+	// pairs' masks made, once a run. Waits for no other thread.
+	void ApplyFormatAhead();
 	[[nodiscard]] PrefetchProgress GetPrefetchProgress() const;
 	// KYTY_PREFETCH_WAIT=1 (default off): the game's first instruction waits until the shader prefetch has translated
 	// every program (a warmup beside the game first, which starts it), at most KYTY_PREFETCH_WAIT_S seconds (default 600,
@@ -594,6 +604,13 @@ private:
 	void              RunWarmup(WarmupSettings settings);
 	void              StartShaderPrefetch(std::vector<std::vector<uint32_t>> recorded_inputs);
 	std::thread       m_warmup_thread;
+	// (spec_format_ahead) The shipped hints and the recording folded at the warmup's load, where this boot asks for mode 4
+	// (the constructor's thread).
+	void              PrepareFormatAhead();
+	// (spec_format_ahead) The fold of a recording the warmup was done with as mode 4 was applied, or of hints not read at
+	// the load: started once, by the GPU thread (ApplyFormatAhead), joined once that is gone (FinishCompileWorkers).
+	void              FoldRecordingFile(bool read_hints);
+	std::thread       m_format_ahead_thread;
 	std::atomic<bool> m_warmup_stop {false};
 	// The game held until the shader prefetch is done (HoldForShaderPrefetch): from the start with KYTY_PREFETCH_WAIT=1,
 	// before any warmup thread reads it.
