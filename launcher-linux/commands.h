@@ -1,6 +1,8 @@
 #ifndef KYTY_LAUNCHER_LINUX_COMMANDS_H
 #define KYTY_LAUNCHER_LINUX_COMMANDS_H
 
+#include "mode4.h"
+
 #include "game.h"
 #include "platform.h"
 
@@ -29,6 +31,11 @@ public:
 
 	// DLSS chosen and able to run (an NVIDIA RTX graphics card, libkyty_dlss.so).
 	[[nodiscard]] bool Dlss() const;
+	// Mode 4's gate (mode4.h) on the variables as the game will see them: the extra options' pair, else the launcher's
+	// own environment, which the game inherits.
+	[[nodiscard]] Mode4::Verdict Mode4Verdict() const;
+	// The Experimental page's parallel translation (KYTY_SPECULATE=4): on, and offered on this PC.
+	[[nodiscard]] bool Mode4On() const;
 	// FSR upscaling: FSR 3 (built into the emulator: any graphics card), or FSR 4 (which falls back to it).
 	[[nodiscard]] bool FsrUpscaler() const;
 	// FSR 4 chosen and ready to run (an AMD graphics card, libffx_vk_linux.so and AMD's DLLs: KYTY_FSR4=1).

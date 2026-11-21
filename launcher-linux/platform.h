@@ -29,6 +29,9 @@ struct Terminal {
 class LauncherContext {
 public:
 	LauncherContext();
+	// (Tests, tests/LauncherMode4LinuxTests.cpp: nothing found; the caller fills in what it needs.)
+	struct Bare {};
+	explicit LauncherContext(Bare) {}
 
 	fs::path root;       // the folder of run_ds.sh (a package), or the repository's root (a build)
 	fs::path run_script; // run_ds.sh

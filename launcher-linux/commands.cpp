@@ -122,6 +122,23 @@ bool Commands::Dlss() const {
 	return context_.DlssAvailable() && S().Str("upscaler") == "dlss";
 }
 
+Mode4::Verdict Commands::Mode4Verdict() const {
+	const auto extra = ParseExtra(S().Str("extra_args"));
+	return Mode4::Check(context_.ram, [&](const char* name) {
+		// (KEY= in the extra options: "0" for a variable the launcher does not set itself, as Play does.)
+		std::optional<std::string> value;
+		for (const auto& [key, text]: extra.set)
+			if (key == name) value = text.empty() ? std::string("0") : text;
+		if (value) return *value;
+		const char* own = std::getenv(name);
+		return std::string(own != nullptr ? own : "");
+	});
+}
+
+bool Commands::Mode4On() const {
+	return Mode4::On(S().Bool("mode4"), Mode4Verdict());
+}
+
 bool Commands::FsrUpscaler() const {
 	const auto upscaler = S().Str("upscaler");
 	return upscaler == "fsr" || upscaler == "fsr4";
@@ -311,6 +328,8 @@ Launch Commands::Play(const GameInfo& game, bool direct) const {
 	if (S().Bool("antilag")) Put(set, "KYTY_ANTI_LAG", "1");
 	// The game's 3D view at most every 2nd vblank: a steady 30 fps at the same game speed.
 	if (S().Bool("fps30")) Put(set, "KYTY_FLIP_RATE", "1");
+	// The parallel translation (mode 4), where it is offered: nothing otherwise, so the emulator runs as without it.
+	if (Mode4On()) Put(set, "KYTY_SPECULATE", "4");
 	// The DLSS model (a preset letter; none: the DLSS version's own choice).
 	if (const auto preset = S().Str("dlss_preset");
 	    dlss && preset.size() == 1 && preset[0] >= 'A' && preset[0] <= 'O')

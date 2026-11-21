@@ -1,5 +1,6 @@
 #include "ui.h"
 
+#include "mode4.h"
 #include "strings.h"
 
 #include <SDL.h>
@@ -1557,6 +1558,22 @@ void LauncherWindow::ExperimentalPage() {
 	    },
 	    T(context_.amd ? "antilag.desc" : "antilag.notAmd"));
 	Row(nullptr, [&] { Feedback(80); });
+	// (Not offered where the emulator would stand it down: why, in its place. No feedback issue yet.)
+	Section("experimental.translation");
+	const auto mode4         = commands_.Mode4Verdict();
+	const bool mode4_offered = mode4.gate == Mode4::Gate::Available;
+	Row(
+	    "mode4",
+	    [&] {
+		    bool value = S().Bool("mode4") && mode4_offered;
+		    if (Switch("##mode4", &value, mode4_offered)) {
+			    S().Set("mode4", value);
+			    Changed();
+		    }
+	    },
+	    mode4_offered                       ? F("mode4.desc", {Mode4::ExtraMemoryGb})
+	    : mode4.gate == Mode4::Gate::LowRam ? F("mode4.lowRam", {std::to_string(mode4.ram_gib)})
+	                                        : F("mode4.fewCores", {std::to_string(mode4.cpus_needed), std::to_string(mode4.cpus)}));
 }
 
 // ------------------------------------------------------------ summary
@@ -1601,6 +1618,7 @@ std::string LauncherWindow::Summary(std::vector<std::pair<std::string, std::stri
 	if (S().Bool("present_direct")) options.emplace_back(T("summary.presentDirect"));
 	if (S().Bool("vrr_flips")) options.emplace_back(T("summary.vrrFlips"));
 	if (S().Bool("antilag")) options.emplace_back(T("summary.antilag"));
+	if (commands_.Mode4On()) options.emplace_back(T("summary.mode4"));
 	if (S().Bool("mangohud") && context_.HasMangoHud()) options.emplace_back(T("summary.mangohud"));
 	if (S().Bool("gamemode") && context_.HasGameMode()) options.emplace_back(T("summary.gamemode"));
 	if (!S().Str("extra_args").empty()) options.emplace_back(T("summary.extra"));
