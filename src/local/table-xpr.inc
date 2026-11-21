@@ -3974,9 +3974,10 @@ static void Replay(std::span<const LocalVulkanRecording::Segment> segments, cons
 // The call recorded as such a packet (true), with its reference noted in the speculation's state; false: record it plainly.
 // (A plain one over a game buffer, not a ring's copy (no guest address), is one more reference the commit cannot
 // relocate: noted as such, so the segment stops as before when a registration moved over its range.)
-// (No check that `used` is still the range's registered buffer: TableDraw found the registration epoch unmoved after its
-// lookups, and a registration after that moves it past the segment's base over the range, which the commit's Changed()
-// finds: the cell is then rewritten with the live buffer (RelocEligible / RelocPatch) or the segment stops.)
+// (No check that `used` is still the range's registered buffer: a registration over the range after the speculation began
+// moves it past the segment's base, which the commit's Changed() finds, whether it came after the draw's lookups or during
+// them (a worker's draw is kept over an epoch that moved during its lookups: TableDraw): the cell is then rewritten with
+// the live buffer (RelocEligible / RelocPatch) or the segment stops.)
 // The caller calls it only with relocation on (a speculation's state with reloc_on).
 static bool TableRelocRecord(vk::CommandBuffer vk_buffer, Spec::State& spec, uint8_t kind,
                              const std::pair<Buffer*, uint64_t>& used, uint64_t address, uint64_t size, uint32_t op,
@@ -4004,10 +4005,11 @@ static bool TableRelocRecord(vk::CommandBuffer vk_buffer, Spec::State& spec, uin
 	return false;
 }
 
-// (Mode 4) A worker's table draw whose blocks, argument and index lookups saw the registration epoch move (the GPU thread's
-// registrations, anywhere: a speculation's lookups register nothing) is kept when no registration since reached the tracker
-// regions of a buffer range its open segment used (a superset of this draw's: its notes merge into them), and refused as
-// before otherwise. The commit's Changed() asks the same of those ranges since the speculation began.
+// (Mode 4) A worker's table dispatch whose lookups saw the registration epoch move (the GPU thread's registrations,
+// anywhere: a speculation's lookups register nothing) is kept when no registration since reached the tracker regions of a
+// buffer range its open segment used (a superset of this dispatch's: its notes merge into them), and refused as before
+// otherwise. The commit's Changed() asks the same of those ranges since the speculation began. (A worker's table draw is
+// kept without this test, its commit deciding: TableDraw.)
 static bool TableWorkerKeepsMoved(const Spec::State& spec, const BufferCache& cache, uint64_t epoch) {
 	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return false;
 	for (size_t i = spec.Sealed().buffer_ranges; i < spec.buffer_ranges.size(); ++i) {
@@ -4324,8 +4326,19 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		});
 		if (indices.first == nullptr) return TableResult::Native;
 	}
+	// The registration epoch moved during the lookups (the GPU thread's registrations, anywhere: a speculation's lookups
+	// register nothing). The GPU thread's draw, and any draw outside mode 4: Native as before. A worker's draw (mode 4) is
+	// kept and its segment's commit decides, as it already does for every reference the draw records, since the
+	// speculation began (at or before this draw's epoch) and with the finer predicate (regions, then granules):
+	// - the index buffer and draw arguments are relocatable cells (reloc_refs, with their buffer ranges: RelocEligible /
+	//   RelocPatch re-point them to the live buffer; a plain bind over a game buffer is a reloc_unrel range, below);
+	// - the table V#s are spec_reloc_refs' entries with their `since` (looked up again when registered over since);
+	// - any other game buffer reference is a buffer range and a reloc_unrel range (Changed() stops; RelocEligible refuses a
+	//   moved one): a segment stopped there runs as a hole, as any other.
+	// Before, it was refused unless no registration since reached its open segment's buffer ranges (TableWorkerKeepsMoved,
+	// still the dispatch's test), and TableTry's caller ran it as a "native record" hole.
 	if (buffer_cache.RegistrationEpoch() != registration &&
-	    (spec_state == nullptr || !TableWorkerKeepsMoved(*spec_state, buffer_cache, registration)))
+	    (spec_state == nullptr || speculate_mode != 4))
 		return TableAdd<P>(LiveCounters::TableRegistered), TableResult::Native;
 	// (A speculation's lookups and preparation refuse without failing: nothing is recorded for a refused draw.)
 	if (spec_state != nullptr && spec_state->refused != nullptr) return TableResult::Native;
