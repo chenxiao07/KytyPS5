@@ -3804,8 +3804,24 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
 	auto* const spec = Spec::Current();
+	// copy_gpu_dirty_src (live, default 0; the flyby GPU drain): a speculation's copy over a page its own or an earlier
+	// uncommitted speculation's GPU work writes takes the GPU path here, as in order (where that write marked the whole
+	// 4 KiB page GPU-modified before the copy: the memory tracker's grain), instead of a journaled processor copy whose
+	// commit then reads the read-watched page (CopyGuestMemory's fault: a full GPU drain and download on this thread).
+	// (WrittenIntersects is byte-exact; IsRegionGpuModified's page test is the tracker's.) GPU-written bytes not yet
+	// downloaded (HasGpuDirtyBytes) count too.
+	static auto& copy_gpu_dirty = LiveSwitch::Find("copy_gpu_dirty_src", 0);
+	const auto   gpu_dirty      = [&](uint64_t vaddr) {
+		if (copy_gpu_dirty.load(std::memory_order_relaxed) == 0) return false;
+		if (HasGpuDirtyBytes(vaddr, size)) return true;
+		if (spec == nullptr) return false;
+		const auto begin = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+		const auto end   = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+		return spec->WrittenIntersects(begin, end - begin);
+	};
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
-	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size) &&
+	    !gpu_dirty(dst_vaddr) && !gpu_dirty(src_vaddr)) {
 		if (spec != nullptr) {
 			// A speculative translation's copy is made at its commit, in order with its other guest memory writes,
 			// between ranges no GPU work wrote (speculation-state.h: work that writes them stops the commit first).
