@@ -1,5 +1,35 @@
 ## New in this build
 
+Your precompiled shaders stay valid.
+
+- **Fewer hitches when the game frees memory** (#368): when the game gives back a block of memory the graphics card
+  had written, the emulator copied those bytes back at once and waited for the graphics card first. In a player's log
+  that took up to 11 ms in one go, about 0.1 s every 30 s, most of it at area loads. The copy now runs without the wait,
+  and the bytes go back into game memory a moment later, while the emulator's render thread has nothing else to do;
+  anything that touches that memory in between finds it as before. On 10 minutes of travel through every world, the
+  render thread's time at frees went from 0.79 s to 0.16 s. `-Set KYTY_FREED_READBACK_ASYNC=0` brings back the old way.
+- **No dark slabs in the distance after Continue** (PR #373, credit @CarpetHead): after quitting to the title and
+  Continue, the far field showed dark hard-edged slabs over water and ground. The game builds its occlusion culling
+  from a depth surface it fast-clears every frame; the emulator applied that clear only when the surface was next drawn
+  into, so a reload culled with the previous load's occluders. The clear is now applied before the surface is read, as
+  on the PS5. `-Set KYTY_SAMPLE_PENDING_HTILE_CLEAR=0` turns it off.
+- **Linux, Mesa 26.3: no crash right after the world loads** (PR #370, credit @Bios2000): RADV in Mesa 26.3 crashed at
+  the first depth-writing draw, in every mode. The emulator now turns on the driver feature RADV needs for it (on RADV
+  only; other drivers are unaffected).
+- **Keyboard prompts: the inventory's page-switch marks too** (PR #372, credit @shanedirksen, Windows launcher): with
+  Keyboard and mouse prompts on, the square and triangle marks at the bottom of the inventory and status panels show
+  your keys. The launcher writes them into the game's UI sheet in place and puts the original bytes back when you turn
+  the option off; a sheet it doesn't recognise is left alone.
+- **Parallel translation (`KYTY_SPECULATE=4`, experimental), round 3 by @CarpetHead** (PR #364): area crossings are
+  shorter (the 1-3 crossing frame ~63 -> 46-51 ms on the author's PC) with fewer long frames, through more of the table
+  work done by the workers and a new upload pipe, whose copy threads take only the cores the CPU has left (none on an
+  8-core CPU); a worker that met an image replaced during an area load no longer ends the game (1 of 17 boots on
+  Linux). The default mode is unchanged.
+- **Thanks** to @Ludicrance for the screenshots and logs, @CarpetHead, @Bios2000 and @shanedirksen for their PRs, and
+  @Bios2000 for the Linux tests of #364.
+
+## New in v20261120
+
 Your precompiled shaders stay valid. On AMD graphics cards under Windows, the decal shaders made with the pixel interlock
 are compiled once more without it the first time they appear (or with your next precompile).
 
@@ -33,47 +63,18 @@ are compiled once more without it the first time they appear (or with your next 
 - **Thanks** to @supercc4e for the face report and tests, @CarpetHead and @shanedirksen for their PRs, @Rufus7787 for
   tracking down the label hitch, and @Bios2000 for testing #349 on Linux.
 
-## New in v20261118
-
-Your precompiled shaders stay valid. On graphics cards with the pixel interlock, precompiling once more brings the
-decal fix below (only those shaders are compiled again).
-
-- **Overlapping decals: the flickering square holes are fixed** (#341, #315): the candle wax in the Nexus and the marks
-  at the foot of 1-3's walls showed holes of 2x2 pixels, different every frame. The game's decals read the surface data
-  under them and write it back, one decal after another. The PS5 keeps them in order for each pixel, but a PC graphics
-  card ran several at once, so a decal could overwrite the one before it. On cards with the pixel interlock (NVIDIA,
-  Intel, and AMD on Linux with RADV) these shaders now run in pixel order, as on the PS5. No measurable cost (RTX 5090
-  at the 120 Hz cap, without -> with: 1-1 66.8 -> 68.9 fps, Latria 73.9 -> 74.0, the 1-1 arena 113.1 -> 113.7; RX 9070 XT
-  on Linux 60.0 -> 59.6).
-  - **If you have already precompiled:** press Precompile on the launcher's Shaders page once more. Only the decal
-    pipelines are compiled again; until then the game runs exactly as before. A new install gets the fix with its
-    first precompile. `-Set KYTY_PIXEL_INTERLOCK=1` turns it on without a precompile; each decal shader then compiles
-    the first time it appears, with a short stutter.
-  - **AMD on Windows:** the driver has no pixel interlock. `-Set KYTY_DRAW_READ_AFTER_WRITE=1` is still the workaround
-    (each decal waits for the one before; it costs frame rate where there are hundreds of decals).
-  - `-Set KYTY_PIXEL_INTERLOCK=0` turns the fix off.
-- **HDR: highlights fitted to your display** (PR #350, credit @Mustard-Tiger): at the game's default brightness its HDR
-  highlights reach 2,500–3,000 nits, and a monitor clips everything above its own peak, so their detail was lost. With
-  HDR on, the brightest part is now compressed into the display's peak (the BT.2390 curve, colours kept); darker and
-  middle tones stay as they were. Windows supplies the display's peak (from the monitor, or from the Windows HDR
-  Calibration app once you have run it). `-HdrMaxNits` sets the peak by hand; `-HdrSourceNits 0` brings back the old
-  clipping. SDR is unchanged.
-- **Less memory:** the emulator no longer keeps data it never reads again: the shader prefetch's pipeline recipes, a
-  second copy of the warmup recording, an 8 MiB read window on every game thread that once read a large file from a
-  .zar, the system font files (now read in place), a second copy of the ~224,000 file paths the game looks up, and the
-  shader translator's work buffers once it is idle. At the start of 1-1 with the 16 GB PC settings (simulated, RTX
-  5090), the emulator's heap is about 0.4 GB smaller and its working set about 0.45 GB smaller than in v20261117. The
-  frame rate is the same.
-- **A rare ordering gap closed** (credit @CarpetHead, who found it while reviewing the code for #349): a copy the game
-  asks the GPU for (made on the CPU here) could change bytes that earlier work still had to upload, so that work used
-  the new bytes instead of the old. Such work now finishes before the copy. No visible case is known; no cost measured.
-- **Linux: GPU fault reports name the memory at the faulting address** (PR #353, credit @Bios2000): when the GPU faults
-  (the game closes with "device lost"), the log now lists what was bound last at the faulting address, from the
-  driver's own reports (RADV; `-Set KYTY_FAULT_BINDINGS=1` with other drivers). This is to track down #314.
-- **Thanks** to @Bios2000 for the RADV tests and the fault report, @Mustard-Tiger for the HDR work, @CarpetHead for
-  spotting the copy gap, and @zezoman and @robbely for the decal reports.
-
 ## 本版本的变化
+
+已预编译的着色器依然有效。
+
+- **游戏释放内存时的卡顿更少了**（#368）：游戏归还一块显卡写过的内存时，模拟器以前会立刻把这些数据拷回来，而且要先等显卡做完。一位玩家的日志里单次最长 11 毫秒，每 30 秒累计约 0.1 秒，大多发生在读图时。现在拷贝不再等待，数据稍后在模拟器的渲染线程空闲时写回游戏内存；在此之前访问这块内存，看到的数据和以前一样。在 6 个世界之间往返 10 分钟，渲染线程花在释放上的时间从 0.79 秒降到 0.16 秒。`-Set KYTY_FREED_READBACK_ASYNC=0` 恢复旧的做法。
+- **“继续游戏”后远景不再出现黑色块**（PR #373，感谢 @CarpetHead）：退回标题再“继续游戏”后，远处的水面和地面会出现边缘生硬的黑色块。游戏用一张每帧快速清除的深度图来做遮挡剔除，模拟器以前要等下次往这张图上画东西时才执行清除，于是重新读档后会拿上一次读档时的遮挡物来剔除。现在会在读取这张图之前先执行清除，和 PS5 一致。`-Set KYTY_SAMPLE_PENDING_HTILE_CLEAR=0` 可关闭。
+- **Linux 上 Mesa 26.3：进入世界后不再崩溃**（PR #370，感谢 @Bios2000）：Mesa 26.3 的 RADV 在第一次写深度的绘制时崩溃，所有模式都会。模拟器现在开启 RADV 这里需要的驱动功能（只在 RADV 上开启，其他驱动不受影响）。
+- **键盘提示：物品栏的翻页标记也换成按键了**（PR #372，感谢 @shanedirksen，Windows 启动器）：开启“键盘鼠标提示”后，物品栏和状态栏底部的方块、三角翻页标记也会显示你的按键。启动器直接改写游戏 UI 贴图里的这两处，关闭选项时还原原始数据；遇到认不出的贴图文件则不动它。
+- **并行翻译（`KYTY_SPECULATE=4`，实验功能），@CarpetHead 的第三轮改进**（PR #364）：区域切换时的长帧更短更少（作者电脑上 1-3 切换帧约 63 -> 46-51 毫秒），因为更多的表格工作交给了工作线程，并新增了上传管线，其拷贝线程只使用 CPU 剩余的核心（8 核 CPU 上为 0）；工作线程在读图时遇到被替换的图像不会再导致游戏退出（Linux 上 17 次启动中出现 1 次）。默认模式不变。
+- **感谢** @Ludicrance 的截图和日志，@CarpetHead、@Bios2000 和 @shanedirksen 的 PR，以及 @Bios2000 在 Linux 上测试 #364。
+
+## v20261120 的变化
 
 已预编译的着色器依然有效。Windows 上的 AMD 显卡：用像素互锁生成的贴花着色器会在第一次出现时去掉互锁重新编译一次（或在下次预编译时编译）。
 
@@ -83,36 +84,3 @@ decal fix below (only those shaders are compiled again).
 - **并行翻译（`KYTY_SPECULATE=4`，实验功能），@CarpetHead 的后续修复**（PR #349）：`KYTY_RENDER_CPUS=0,8-15` 这类 CPU 列表现在能正确读取范围（以前范围会被截断）；Linux 上状态遍历线程有了自己的核心；长时间游玩时不再随着标签集合增大出现 80–160 ms 的单帧卡顿（@Rufus7787 在 PR #356 中也发现了这个问题）；提交时会核对更多工作线程读过的数据。默认模式不变。
 - **画面冻结时日志会留下记录**（#357）：如果画面停住而游戏仍在运行（音乐还在播），5 秒后日志会写明把画面交给 Windows 的哪一步在等待，方便报告问题时定位。
 - **感谢** @supercc4e 的报告和测试，@CarpetHead 和 @shanedirksen 的 PR，@Rufus7787 找到标签卡顿，以及 @Bios2000 在 Linux 上测试 #349。
-
-## v20261118 的变化
-
-已有的预编译着色器继续有效。在支持像素互锁（pixel interlock）的显卡上，再预编译一次即可获得下面的贴花修复（只会重新编译
-这部分着色器）。
-
-- **重叠贴花的闪烁方块修复了**（#341、#315）：Nexus 的蜡烛蜡油、1-3 墙脚的痕迹上会出现 2x2 像素的小洞，每帧位置都不同。
-  游戏的贴花会读取下方的表面数据再写回去，一个接一个地画。PS5 对每个像素按顺序执行，而 PC 显卡会同时执行好几个，于是
-  后一个贴花可能覆盖前一个的结果。在支持像素互锁的显卡上（NVIDIA、Intel，以及 Linux 上使用 RADV 的 AMD），这些着色器
-  现在按像素顺序执行，和 PS5 一样。没有可测的性能开销（RTX 5090，120 Hz 上限，关闭 -> 开启：1-1 66.8 -> 68.9 fps，
-  Latria 73.9 -> 74.0，1-1 竞技场 113.1 -> 113.7；Linux 上 RX 9070 XT 60.0 -> 59.6）。
-  - **已经预编译过的：** 在启动器的"着色器"页再点一次"预编译"。只会重新编译贴花相关的管线；在此之前游戏和以前完全一样。
-    新安装的在第一次预编译时就会带上这个修复。`-Set KYTY_PIXEL_INTERLOCK=1` 不预编译也能开启，之后每个贴花着色器第一次
-    出现时会编译一次，有短暂卡顿。
-  - **Windows 上的 AMD 显卡：** 驱动没有像素互锁，仍可用 `-Set KYTY_DRAW_READ_AFTER_WRITE=1` 规避（每个贴花等前一个画完，
-    贴花很多的地方会掉帧）。
-  - `-Set KYTY_PIXEL_INTERLOCK=0` 关闭这个修复。
-- **HDR：高光按显示器亮度压缩**（PR #350，感谢 @Mustard-Tiger）：游戏默认亮度下 HDR 高光可达 2500–3000 尼特，而显示器会
-  把超过自身峰值的部分全部截掉，高光细节因此丢失。开启 HDR 时，现在会把最亮的部分压缩到显示器的峰值以内（BT.2390 曲线，
-  保持色彩），暗部和中间调不变。显示器的峰值由 Windows 提供（来自显示器本身，或运行过 Windows HDR 校准应用后的数值）。
-  `-HdrMaxNits` 可手动指定峰值，`-HdrSourceNits 0` 恢复旧的截断方式。SDR 不受影响。
-- **内存占用更少：** 模拟器不再保留之后用不到的数据：着色器预取的管线配方、预热录制的第二份拷贝、每个从 .zar 读过大文件
-  的游戏线程各自保留的 8 MiB 读取窗口、系统字体文件（现在直接映射读取）、游戏查找的约 22.4 万个文件路径的第二份拷贝，
-  以及着色器翻译器空闲后的工作缓冲。在 1-1 起点按 16 GB 电脑的设置测试（模拟，RTX 5090）：和 v20261117 相比，模拟器的
-  堆内存少约 0.4 GB，工作集少约 0.45 GB。帧率不变。
-- **修复一个罕见的顺序问题**（感谢 @CarpetHead 在 #349 中审阅代码时发现）：游戏交给 GPU 的复制（这里在 CPU 上完成）可能
-  改写之前的工作还没上传的数据，那份工作就会用到新数据而不是旧数据。现在这些工作会在复制之前完成。目前没有已知的可见
-  问题，也没有测到开销。
-- **Linux：GPU 故障报告会写出故障地址上的内存**（PR #353，感谢 @Bios2000）：GPU 出错（游戏以 "device lost" 结束）时，
-  日志现在会根据驱动自己的报告，列出故障地址上最后绑定的内存（RADV；其他驱动用 `-Set KYTY_FAULT_BINDINGS=1`）。用于排查
-  #314。
-- **感谢** @Bios2000 的 RADV 测试和故障报告功能，@Mustard-Tiger 的 HDR 改进，@CarpetHead 发现的复制问题，以及 @zezoman
-  和 @robbely 的贴花报告。
