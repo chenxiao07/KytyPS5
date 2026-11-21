@@ -2026,7 +2026,7 @@ uint64_t BufferCache::DropFreedRange(uint64_t vaddr, uint64_t size, bool read_ba
 bool BufferCache::BeginFreedReadback(uint64_t vaddr, uint64_t size) {
 	// (128 MiB where the emulator has more than 16 GiB of RAM, else 64: an area load's burst of frees filled 64, and the
 	// next freed block of the GPU heap took the read back at the free, 9.6 ms.)
-	static const uint64_t capacity = [] {
+	static const uint64_t capacity = []() -> uint64_t {
 		const char* value = std::getenv("KYTY_FREED_READBACK_MB");
 		if (value != nullptr && value[0] != '\0') return std::strtoull(value, nullptr, 10) * MiB;
 		return (LocalPlatform::EmulatorMemory() > (uint64_t {16} << 30u) ? 128 : 64) * MiB;
