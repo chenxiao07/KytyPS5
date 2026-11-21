@@ -47,6 +47,7 @@
 #include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
 #include "speculation-state.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_window_handoff_mode {1};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_image_granules_mode {2};
@@ -2951,6 +2952,140 @@ bool TextureCache::UploadImagePartial(Image& image, uint64_t window_begin, uint6
 	return true;
 }
 
+// KYTY_SAMPLE_PENDING_HTILE_CLEAR (default 1; 0 off, read once): a one-layer depth surface whose HTile says it is fast
+// cleared gets that clear before it is sampled. The clear was applied only where the image is bound as a depth target
+// (renderDraw.cpp: the draw's load op, htile_load_decision); a surface the game cleared and then only samples kept the
+// image's older contents, where the console's texture unit reads the cleared value through the HTile (Demon's Souls: the
+// 1024x512 occlusion depth at 0x2b3970000 is HTile-cleared by a compute fill every frame and sampled to build its min/max
+// pyramid, while occluders are drawn into it only in some stretches; it held the last stretch's occluders, a previous
+// load's after a reload, and far shadow casters were culled). Exactness:
+// - the extent: one-layer, one-level images only, the whole depth aspect. (A layered surface's clear bits are not exact
+//   per slice: a target bind's clear marks every slice and consumes only its base slice's bit.)
+// - the value: the fill's own, its Z range (htile_fill_depth_value) where the fill clears the depth (ZMask 0) or holds
+//   one uniform depth, as the texture unit decodes a cleared tile; a fill not known (a clear of no recorded value) is
+//   left pending, as before. (The target path takes a ZMask-0 fill's value from DB_DEPTH_CLEAR instead: the two differ
+//   only where the game's HTile word and its register disagree.)
+// - the stencil: a fill that also clears a compressed stencil plane (stencil_meta_clear) gets its depth cleared and
+//   keeps its bit, so the next target bind still clears the stencil (DB_STENCIL_CLEAR, the bind's), and its depth again:
+//   the same value over contents nothing changed in between but sampling (a write of the surface is a target bind,
+//   which is that bind); sample_depth_done keeps a second sample from clearing it again. Without, the bit is consumed as
+//   the target path consumes it, so a later target bind loads what the clear left;
+// - the order: decided before the binding's upload and applied after it (which it overrides), recorded in the current
+//   command buffer before the draw or dispatch that samples (ClearImage ends an open rendering, as PrepareDccClear's
+//   colour clears do). A pending bit means no write of the surface since the clear (a depth write is a target bind,
+//   which consumes it), so the clear never lands after a draw;
+// - the paths: FindTexture (the normal path's draws and dispatches); the native and table paths, which bind without it,
+//   leave a draw or dispatch sampling such a view to the normal path (SampleHtileClearPending: exactly where FindTexture
+//   would clear), as they do a pending DCC clear;
+// - a speculation (mode 4): asked as after its holes (HtileWouldClearLocked: Spec::KnownMeta first, as IsMetaCleared asks
+//   it before its filter): a hole of its own that clears the surface (a fill) makes the sample's FindTexture clear at
+//   the commit; else the record decides as on the GPU thread, a "not cleared" answer noted for the commit. Its table or
+//   native use of such a view is refused, a hole that consumes the clear (ConsumeMeta); its recorder thread's
+//   FindTexture clears nothing: refused (RecorderRefusal).
+// Not covered: a sampled stencil aspect (its pending stencil clear stays the target bind's); an image bound later at the
+// address without HTile keeps the record's bits (as the target path does).
+// One line at the first clear of a surface and at every 256th: "Depth: pending HTile clear applied before a sample ...".
+bool TextureCache::SampleHtileClearOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_SAMPLE_PENDING_HTILE_CLEAR");
+		const bool  set   = value == nullptr || value[0] != '0';
+		std::printf("Depth: a sampled depth surface's pending HTile clear applied first: %s (KYTY_SAMPLE_PENDING_HTILE_CLEAR=%s)\n",
+		            set ? "on" : "off", set ? "0 turns it off" : "0");
+		std::fflush(stdout);
+		return set;
+	}();
+	return on;
+}
+
+// The HTile address of a sampled view the clear may apply to (0: none), and whether its stencil is compressed. (The
+// image's and the binding's own fields only: no lock.)
+uint64_t TextureCache::HtileSampleMeta(const Image& image, const ImageDesc& desc, bool* stencil_compressed) {
+	if (desc.type != BindingType::Texture) return 0;
+	const auto& meta = desc.info.metadata.kind == ImageMetadataKind::Htile ? desc.info.metadata : image.info.metadata;
+	if (meta.kind != ImageMetadataKind::Htile || !image.info.IsDepth() || image.depth_id || image.info.resources.levels != 1 ||
+	    image.info.resources.layers != 1 || desc.view_info.base_layer != 0)
+		return 0;
+	*stencil_compressed = meta.stencil_compressed;
+	return meta.range.address;
+}
+
+// (m_lock held) The clear a fill record gives a sampled depth: whether there is one, its value, whether its bit stays.
+TextureCache::HtileSampleClear TextureCache::HtileFillClearLocked(const MetaDataInfo& record, uint64_t meta,
+                                                                  bool stencil_compressed) {
+	if (record.type != MetaDataInfo::Type::HTile || !record.fill_known) return {};
+	const auto decision = htile_load_decision(true, record.fill_value, true, stencil_compressed);
+	if (!htile_fill_clears_depth(record.fill_value) && !decision.depth_uniform) return {};
+	return {1u, meta, htile_fill_depth_value(record.fill_value, stencil_compressed), decision.stencil_meta_clear};
+}
+
+// (m_lock held) Whether FindTexture clears the sampled view of the HTile at `meta` (`clear`: that clear, as the record's
+// fill gives it). `spec` (a speculation's thread): as after its holes. Its own hole that clears the surface (a fill,
+// KnownMeta 1) makes the commit's FindTexture clear with that fill, which is not known here: yes. One that consumed it
+// (0): no. Else the record, as on the GPU thread; an answer of "not cleared" noted for the commit (NoteMetaRead), and a
+// clear another speculation's hole consumes first (ConsumedElsewhere) not this one's.
+bool TextureCache::HtileWouldClearLocked(uint64_t meta, bool stencil_compressed, Spec::State* spec, HtileSampleClear* clear) {
+	const auto  found  = m_surface_metas.find(meta);
+	const auto* record = found != m_surface_metas.end() && found->second.type == MetaDataInfo::Type::HTile ? &found->second
+	                                                                                                        : nullptr;
+	*clear = record != nullptr ? HtileFillClearLocked(*record, meta, stencil_compressed) : HtileSampleClear {};
+	const bool pending = record != nullptr && (record->clear_mask & 1u) != 0 && (record->sample_depth_done & 1u) == 0;
+	if (spec == nullptr) return clear->slices != 0 && pending;
+	if (const auto known = spec->KnownMeta(meta, 0, false); known >= 0) return known == 1;
+	if (record != nullptr && (record->clear_mask & 1u) != 0 && !spec->ConsumedElsewhere(meta, 0))
+		return clear->slices != 0 && pending; // (cleared: as the GPU thread's FindTexture decides it)
+	spec->NoteMetaRead(meta, 0);
+	return false;
+}
+
+TextureCache::HtileSampleClear TextureCache::HtileSampleClearLocked(const Image& image, const ImageDesc& desc) {
+	bool       stencil_compressed = false;
+	const auto meta               = HtileSampleMeta(image, desc, &stencil_compressed);
+	if (meta == 0) return {};
+	HtileSampleClear clear;
+	if (CommandScheduler::ThreadRecorder() != nullptr) {
+		// (A speculation's recorder thread clears nothing: where FindTexture would, the work is the GPU thread's.)
+		if (HtileWouldClearLocked(meta, stencil_compressed, Spec::Current(), &clear))
+			throw CommandScheduler::RecorderRefusal {"sampled depth's HTile clear"};
+		return {};
+	}
+	return HtileWouldClearLocked(meta, stencil_compressed, nullptr, &clear) ? clear : HtileSampleClear {};
+}
+
+bool TextureCache::SampleHtileClearPending(const Image& image, const ImageDesc& desc, uint64_t* meta, bool* consume) {
+	if (!SampleHtileClearOn()) return false;
+	bool       stencil_compressed = false;
+	const auto address            = HtileSampleMeta(image, desc, &stencil_compressed); // (before the lock)
+	if (address == 0) return false;
+	*meta     = address;
+	auto* spec = Spec::Current();
+	// (The GPU thread: a surface with no record has nothing pending. A speculation asks its holes first.)
+	if (spec == nullptr && !MetaFilterMayHold(address)) return false;
+	std::scoped_lock lock {m_lock};
+	HtileSampleClear clear;
+	const bool       would = HtileWouldClearLocked(address, stencil_compressed, spec, &clear);
+	*consume               = clear.slices == 0 || !clear.keep; // (a hole's fill not known here: as a plain one)
+	return would;
+}
+
+void TextureCache::ApplyHtileSampleClear(ImageId id, const HtileSampleClear& clear) {
+	const auto found = m_surface_metas.find(clear.meta);
+	if (found == m_surface_metas.end() || found->second.type != MetaDataInfo::Type::HTile) return;
+	auto&          record = found->second;
+	const auto&    image  = m_slot_images[id];
+	vk::ClearValue value {};
+	value.depthStencil = vk::ClearDepthStencilValue {clear.value, 0};
+	ClearImage(m_scheduler.Current(), id, {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}, value);
+	if (clear.keep) record.sample_depth_done |= 1u; // (the target bind still clears the stencil)
+	else record.clear_mask &= ~1u;
+	if (const auto clears = ++record.sample_clears; clears == 1 || clears % 256 == 0) {
+		std::printf("Depth: pending HTile clear applied before a sample at 0x%llx (%s %ux%u, value %g%s): %llu times\n",
+		            static_cast<unsigned long long>(image.info.data.address), vk::to_string(image.backing.format).c_str(),
+		            image.info.extent.width, image.info.extent.height, static_cast<double>(clear.value),
+		            clear.keep ? ", depth only: the stencil's left to the bind" : "", static_cast<unsigned long long>(clears));
+		std::fflush(stdout);
+	}
+}
+
 void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc) {
 		return;
@@ -3901,6 +4036,11 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
 		}
 	}
+	// (KYTY_SAMPLE_PENDING_HTILE_CLEAR: decided before the upload, a speculation's recorder refused before anything
+	// changed; applied after the upload, which it overrides.)
+	const auto htile = desc.type == BindingType::Texture && !image.info.data.Empty() && SampleHtileClearOn()
+	                       ? HtileSampleClearLocked(image, desc)
+	                       : HtileSampleClear {};
 	if (desc.type == BindingType::Storage) {
 		image.MarkGpuModified();
 	}
@@ -3909,6 +4049,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		if (desc.type != BindingType::Texture || !RefreshTextureLevels(id, desc.view_info)) {
 			RefreshImage(id);
 		}
+		if (htile.slices != 0) ApplyHtileSampleClear(id, htile);
 	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
@@ -5336,8 +5477,9 @@ bool TextureCache::ClearMeta(uint64_t address) {
 		// validated fill value, so an arbitrary compute write must not clear it.
 		return false;
 	}
-	found->second.clear_mask = UINT32_MAX;
-	found->second.fill_known = false;
+	found->second.clear_mask        = UINT32_MAX;
+	found->second.fill_known        = false;
+	found->second.sample_depth_done = 0;
 	MoveMeta(address); // (a clear pending: cached answers ask again)
 	return true;
 }
@@ -5350,9 +5492,10 @@ bool TextureCache::ClearMeta(uint64_t address, uint32_t fill_value) {
 	    found->second.type == MetaDataInfo::Type::Dcc) {
 		return false;
 	}
-	found->second.clear_mask = UINT32_MAX;
-	found->second.fill_value = fill_value;
-	found->second.fill_known = true;
+	found->second.clear_mask        = UINT32_MAX;
+	found->second.fill_value        = fill_value;
+	found->second.fill_known        = true;
+	found->second.sample_depth_done = 0;
 	MoveMeta(address);
 	return true;
 }
@@ -5435,6 +5578,7 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	    slice >= 32) {
 		return false;
 	}
+	found->second.sample_depth_done &= ~(1u << slice); // (KYTY_SAMPLE_PENDING_HTILE_CLEAR: a new clear, or consumed)
 	if (is_clear) {
 		found->second.clear_mask |= 1u << slice;
 		MoveMeta(address);

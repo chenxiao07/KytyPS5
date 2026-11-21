@@ -3511,6 +3511,20 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 			for (uint32_t layer = dep.range.base_layer; layer < dep.range.base_layer + dep.range.layer_count; ++layer)
 				if (layer >= 32 || textures.IsMetaCleared(dep.desc.info.metadata.range.address, layer)) return false;
 		}
+		// So is a depth image with an HTile clear pending (KYTY_SAMPLE_PENDING_HTILE_CLEAR).
+		if (image->info.IsDepth() && TextureCache::SampleHtileClearOn()) {
+			uint64_t meta    = 0;
+			bool     consume = false;
+			if (textures.SampleHtileClearPending(*image, dep.desc, &meta, &consume)) {
+				// (A speculation's: a hole that consumes the clear where the normal path does. Native draws are refused under
+				// a speculation before here: kept for the rule.)
+				if (auto* spec = Spec::Current()) {
+					if (consume) spec->ConsumeMeta(meta, 0);
+					return Spec::Refuse("native: depth texture with an HTile clear pending"), false;
+				}
+				return false;
+			}
+		}
 		image->Transit(dep.layout, vk::AccessFlagBits2::eShaderRead, dep.range, vk_buffer);
 	}
 	scheduler.BeginRendering(keep_clears ? draw_state.first_rendering : draw_state.rendering);
