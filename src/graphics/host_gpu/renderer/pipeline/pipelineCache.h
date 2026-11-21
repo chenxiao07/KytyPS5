@@ -705,6 +705,9 @@ bool LastPipelineFromStore();
 // The pipeline's handle for a binding now (the GPU thread): the flip noted, and the pipeline made again first when it was
 // evicted (PipelineCache::EvictIdlePipelines).
 vk::Pipeline BindPipelineHandle(const PipelineCache::Pipeline& pipeline);
+// Pipelines evicted while idle so far, their handles destroyed (EvictIdlePipelines): a weave worker's recorded bind of
+// a handle is spliced only while this hasn't moved since its parcel began.
+[[nodiscard]] uint64_t PipelineEvictionCount();
 // zstd on the calling thread's own contexts (shaders.cpp): ZSTD_compress and ZSTD_decompress make one for every call, the
 // compressor's ~0.5 MiB (the shader prefetch's threads allocated 2.9 GB of them a minute, memory the system zero-fills).
 // ZstdPack: `data` compressed into the thread's buffer, valid until the thread's next ZstdPack (it only grows, and is not

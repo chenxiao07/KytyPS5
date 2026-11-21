@@ -282,6 +282,10 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 bool ShaderLookupMappedData(uint64_t addr, ShaderMappedData* out);
 // Moves with every registration (ShaderMapUserData): what was compiled for an address may be stale.
 [[nodiscard]] uint64_t ShaderMapGeneration();
+// The weave's open: whether a shader was registered at any of `sorted_addresses` (ascending) after map generation
+// `generation`, by the log of the last 4,096 registrations. When the log doesn't reach back to `generation`, the
+// answer is true.
+[[nodiscard]] bool ShaderRegisteredAtSince(uint64_t generation, std::span<const uint64_t> sorted_addresses);
 // The hash the pipeline cache knows the shader registered at `addr` by (the code's), 0 when none is.
 [[nodiscard]] uint64_t ShaderHashAt(uint64_t addr);
 // ShaderHashAt for a thread that must never wait on a fault (a weave worker): the code read from its backing between

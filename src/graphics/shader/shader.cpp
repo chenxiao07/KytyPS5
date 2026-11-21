@@ -17,6 +17,7 @@
 #include "graphics/shader/shaderVertexMetadata.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
+#include "weave.h"
 
 #include <algorithm>
 #include <array>
@@ -69,6 +70,14 @@ static std::unique_ptr<std::unordered_map<uint64_t, ShaderMappedData>> g_shader_
 static std::mutex                                                      g_shader_map_mutex;
 // Bumped on every registration: invalidates the per-thread last lookup below.
 static std::atomic<uint64_t> g_shader_map_generation {0};
+// While the weave is on: each registration's address by the generation it made, the last ShaderLog of them (written
+// and read under g_shader_map_mutex; the generation goes up by one a registration). The weave's open asks it whether a
+// parcel's shaders were registered again since its workers proved them (ShaderRegisteredAtSince).
+static constexpr uint64_t ShaderLog = 4096;
+struct LoggedShader {
+	uint64_t generation = 0, addr = 0;
+};
+static std::array<LoggedShader, ShaderLog> g_shader_log {};
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -82,11 +91,28 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	(*g_shader_map)[addr] = data;
-	g_shader_map_generation.fetch_add(1, std::memory_order_release);
+	const auto generation = g_shader_map_generation.fetch_add(1, std::memory_order_release) + 1;
+	if (Weave::Enabled()) g_shader_log[generation % ShaderLog] = {generation, addr};
 }
 
 uint64_t ShaderMapGeneration() {
 	return g_shader_map_generation.load(std::memory_order_acquire);
+}
+
+bool ShaderRegisteredAtSince(uint64_t generation, std::span<const uint64_t> sorted_addresses) {
+	const auto now         = g_shader_map_generation.load(std::memory_order_acquire);
+	const auto logged_from = now > ShaderLog ? now - ShaderLog : 0; // (the oldest generation the log answers from)
+	if (generation >= now || sorted_addresses.empty()) return false;
+	if (generation < logged_from) return true;
+	std::scoped_lock lock(g_shader_map_mutex);
+	// (Under the lock every generation up to `now` is logged; one written over since by a newer generation, or not
+	// written while the weave was off, is not known: true.)
+	for (auto at = generation + 1; at <= now; ++at) {
+		const auto& entry = g_shader_log[at % ShaderLog];
+		if (entry.generation != at || std::binary_search(sorted_addresses.begin(), sorted_addresses.end(), entry.addr))
+			return true;
+	}
+	return false;
 }
 
 bool ShaderLookupMappedData(uint64_t addr, ShaderMappedData* out) {
