@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
 #include "resource-plan-serial.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -34,6 +35,7 @@
 #include "live-counters.h"
 #include "device-fault.h"
 #include "local-platform.h"
+#include "mode-toggle.h"
 #include "slow-log.h"
 #include "speculation-state.h"
 #include "startup-progress.h"
@@ -184,8 +186,30 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 		*value = 0;
 		return true;
 	}
-	return value != nullptr &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBackingToHost(address, value, sizeof(*value));
+	if (value != nullptr && Libs::LibKernel::Memory::TryReadGpuCleanBackingToHost(address, value, sizeof(*value))) return true;
+	// (TableWorkerEntry's adopt-only, record-making and reuse lookups on a worker: a specialization word it could not read
+	// clean, the GPU's or its own speculation's pending or written range, would make the materialization pick another
+	// specialization than the in-order one, quietly: a failed read, the lookup refused. Mode 0 tests the global first, on
+	// this failure path only.)
+	if (Spec::On() && PipelineCache::t_no_fault_reads &&
+	    (PipelineCache::t_adopt_only || PipelineCache::t_adopt_records || PipelineCache::t_strict_reads)) [[unlikely]] {
+		// (Mode 4: a buffer word GPU work wrote, not the translation's own write, fails the in-order read too
+		// (TryReadGpuCleanBackingToHost on the GPU thread: GPU-dirty bytes, no clean read), and the lookup goes on
+		// unspecialized there as here: false, as in order, noted for the commit to find it failing still
+		// (Speculation's SrtVerifyHolds; a clean read there stops the segment). The translation's own written and journaled
+		// ranges are tested first, then SrtVerifyEligible: no image over the word.)
+		if (auto* spec = Spec::Current(); spec != nullptr && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 &&
+		                                  !spec->WrittenIntersects(address, sizeof(uint32_t)) &&
+		                                  !spec->JournalIntersects(address, sizeof(uint32_t)) &&
+		                                  Libs::LibKernel::Memory::SrtVerifyEligible(address, sizeof(uint32_t))) {
+			auto& reads = spec->srt_verify;
+			if (reads.size() == spec->Sealed().srt_verify || reads.back().address != address || !reads.back().expect_fail)
+				reads.push_back({address, 0, true});
+			return false;
+		}
+		PipelineCache::t_no_fault_failed = true;
+	}
+	return false;
 }
 
 bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
@@ -202,6 +226,21 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 		// (A speculation's program lookup: never a fault, which would wait for the GPU thread under the cache's lock. Set
 		// only under a speculation: mode 0 tests the global, as the base reads no thread-local here.)
 		if (!Libs::LibKernel::Memory::TryReadGuestNoFault(address, value, sizeof(*value))) {
+			// (Mode 4: a buffer word GPU work wrote (SrtVerifyEligible: its GPU-dirty bytes, no image over it), not the
+			// translation's own write or journaled one: the word of the stale clean backing, noted with its value
+			// (Spec::State::srt_verify; the same word with the same value once in the open segment) and checked at the commit
+			// against the in-order read (Speculation's SrtVerifyHolds), instead of refusing the lookup.)
+			if (auto* spec = Spec::Current(); spec != nullptr && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 &&
+			                                  !spec->WrittenIntersects(address, sizeof(*value)) &&
+			                                  !spec->JournalIntersects(address, sizeof(*value)) &&
+			                                  Libs::LibKernel::Memory::SrtVerifyEligible(address, sizeof(*value)) &&
+			                                  Libs::LibKernel::Memory::TryReadBackingToHost(address, value, sizeof(*value))) {
+				auto& reads = spec->srt_verify;
+				if (reads.size() == spec->Sealed().srt_verify || reads.back().address != address || reads.back().value != *value ||
+				    reads.back().expect_fail)
+					reads.push_back({address, *value});
+				return true;
+			}
 			PipelineCache::t_no_fault_failed = true;
 			*value                           = 0;
 		}
@@ -287,6 +326,25 @@ void MaterializationReaders(ShaderRecompiler::IR::SrtRuntime& runtime) {
 	runtime.mapping_end                = ShaderMappingEnd;
 }
 
+uint32_t ReadSrtWordInOrder(uint64_t address) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	// (The in-order read: never a speculation's no-fault read, whatever this thread's lookup state.)
+	const bool no_fault = std::exchange(PipelineCache::t_no_fault_reads, false);
+	uint32_t   value    = 0;
+	(void)ReadShaderRawGuestMemory(nullptr, address, &value);
+	PipelineCache::t_no_fault_reads = no_fault;
+	return value;
+}
+
+bool ReadSpecializationWordInOrder(uint64_t address) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	const bool no_fault = std::exchange(PipelineCache::t_no_fault_reads, false); // (the in-order read, as above)
+	uint32_t   value    = 0;
+	const bool read     = ReadShaderGuestMemory(nullptr, address, &value);
+	PipelineCache::t_no_fault_reads = no_fault;
+	return read;
+}
+
 namespace {
 
 // Native XPR records evaluate their SRT again over memory the guest may have reused since: a stale
@@ -299,6 +357,17 @@ bool ReadMappedRawGuestMemory(void* userdata, uint64_t address, uint32_t* value)
 bool ReadMappedMemorySpan(void* userdata, uint64_t address, uint32_t* values, uint32_t count, bool clean) {
 	return Libs::LibKernel::Memory::IsFullyMapped(address, uint64_t {count} * 4u) &&
 	       ReadShaderMemorySpan(userdata, address, values, count, clean);
+}
+
+// KYTY_SPEC_PIPECACHE_SPLIT (live spec_pipecache_split; on under KYTY_SPECULATE=4, 0 otherwise: mode-toggle.h), read at
+// each GetGraphicsPrograms / GetComputeProgram (a lookup in progress keeps what it read): the GPU thread's lookup that must
+// translate a program builds it with the cache's m_mutex released and publishes it under it, the first publish winning
+// (ProgramCache::BuildUnlocked; set, in either mode); a speculation's thread's lookup reads a known program's plan back
+// and materializes with the lock released, the lock taken again to find or adopt (mode 4: speculation threads exist only
+// there); the "Shaders:" line from running counts. Off: the locked lookup, as before.
+[[nodiscard]] bool PipecacheSplitOn() {
+	static auto& on = LiveSwitch::Find("spec_pipecache_split", ModeToggle::Default("spec_pipecache_split"));
+	return on.load(std::memory_order_relaxed) != 0;
 }
 
 // An indirect dispatch takes a failed evaluation back (GetComputeProgram): with no thread groups in its
@@ -442,6 +511,30 @@ static bool PlanEvictionEnabled() {
 	return enabled;
 }
 
+// The plans' budget in memory (SweepPlans): RAM/128 in plans of ~77 KB (RAM the system does not report: 0).
+static size_t PlanBudget() {
+	static const size_t budget = [] {
+		const uint64_t ram = LocalPlatform::EmulatorMemory();
+		return static_cast<size_t>(ram / 128u / (77u * 1024u));
+	}();
+	return budget;
+}
+
+// KYTY_SPEC_PRELOAD_FIX (live spec_preload_fix; on under KYTY_SPECULATE=4, 0 otherwise: mode-toggle.h; set, it acts in
+// either mode): a preload never displaces a plan a lookup used. The sweep sends the preloaded plans no lookup used yet out
+// first, the oldest preload first (before any idle plan a lookup met, whatever their age), and one sent out so is not
+// preloaded again until a lookup has used it; a worker's read an erase made stale leaves its live entry listed out again
+// (PreloadPlans meets it again). Off: the sweep and the preload as before.
+static bool PreloadFixOn() {
+	static auto& on = LiveSwitch::Find("spec_preload_fix", ModeToggle::Default("spec_preload_fix"));
+	return on.load(std::memory_order_relaxed) != 0;
+}
+
+// (Mode 4) The plans of the programs the ahead pool prepares kept in memory until their first lookup (AheadJob).
+static bool AheadPlanPinOn() {
+	return ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+}
+
 // A plan's bytes written (any thread: the file's end reserved atomically).
 static bool SpillPlanBytes(const ShaderRecompiler::IR::ResourcePlan& plan, SpilledPlan& out) {
 	static std::once_flag        once;
@@ -483,6 +576,48 @@ static bool TableDeadUserDataOn() {
 	return on.load(std::memory_order_relaxed) != 0;
 }
 
+// KYTY_SPEC_PAIR_PUSH_FIT (live spec_pair_push_fit; mode-toggle row {1, 0}: on under KYTY_SPECULATE=4): a table pair whose vertex program is
+// refused because its shader data do not fit the push constants after its pixel program's (the pixel stage's push data
+// come first, GetGraphicsPrograms; Demon's Souls' VS 0xb2f062027869d4ee after PS 0x4d86d2e2bb1b49cd: cursor 32, needs 2,
+// ~4 'table: pair refused' holes a frame) takes its pixel program's REDUCED table form (CompileOptions::
+// table_reduce_user_data: TableLiveUserData's registers alone, KYTY_TABLE_DEAD_USER_DATA's layout, laid out whether the
+// plain one fits or not) and its vertex program at the cursor after that, when that cursor is earlier. The reduced form is
+// a permutation of its own (Permutation::table_reduced), found only by a lookup asking for it (GetGraphicsPrograms' retry),
+// never by a plain one (Get, the ahead paths, TableFormatOnlyBuffers); and a refusal for push constants is taken as the
+// refusal at its own cursor only (Permutation::table_overflow_cursor; a refused permutation otherwise matches any cursor),
+// in Get's find and the ahead paths (AheadJob, AheadPermutation). So a vertex program refused for push constants at one
+// cursor is compiled at every other cursor it is met at (with the switch off the first refusal stood for all cursors, the
+// result depending on which cursor came first): that VS's modules at those cursors are new too (counted:
+// spec_pair_push_fit_other_cursor). Every other program and pair is looked up and compiled as with the switch off (the
+// same SPIR-V, the same pipeline keys); the new modules are the pixel program's reduced form and those vertex programs'
+// at new cursors, for pairs refused today (their pipelines are new keys; nothing on disk records table programs).
+static bool PairPushFitOn() {
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return false;
+	static auto& on = LiveSwitch::Find("spec_pair_push_fit", ModeToggle::Default("spec_pair_push_fit"));
+	return on.load(std::memory_order_relaxed) != 0;
+}
+// (A refused permutation passed over by a lookup at `cursor` with the switch on: a refusal for push constants made at
+// another cursor.)
+template <typename P>
+static bool OverflowElsewhere(const P& p, uint32_t cursor, bool push_fit) {
+	return push_fit && !p.handle && p.table_overflow_cursor != UINT32_MAX && p.table_overflow_cursor != cursor;
+}
+
+// KYTY_SPEC_PAIR_DENSE_INDIRECT (live spec_pair_dense_indirect; mode-toggle row {1, 0}: KYTY_SPECULATE=4 only, the mode checked first):
+// a vertex or pixel table translation takes a dense indirect image (a T# table indexed by a bounded key: Demon's Souls'
+// material pixel programs, ~3 'table: pair refused' holes a frame) as an indirect root, as a compute program's address
+// probe is (CompileOptions::table_dense_indirect, IR::EnterTableMode; the renderer enumerates it per draw, TableEvaluate's
+// TableEnumerateDense, and binds its elements in that order, TableResolveSet). Read where a table translation is asked
+// for (the job's options, AheadJob's, the static precompile's), as table_dead_user_data: a module made keeps its form, a
+// program refused before it is on stays refused (on from start-up, by its environment variable). Off: EnterTableMode
+// refuses those programs as before, so no module, key or path changes. On: new table modules only for the programs
+// refused today for that root ("indirect image root (compute only)"), and new table pipeline keys for their pairs.
+static bool TableDenseIndirectOn() {
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return false;
+	static auto& on = LiveSwitch::Find("spec_pair_dense_indirect", ModeToggle::Default("spec_pair_dense_indirect"));
+	return on.load(std::memory_order_relaxed) != 0;
+}
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -499,6 +634,13 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
 		bool                                         table_mode = false; // an empty handle: refused
+		// (Mode 4, under the cache's m_mutex) A table permutation published ahead (AheadPermutation) that no lookup has
+		// found yet: no draw holds it (every pointer a draw holds comes from a lookup, which clears it). DropAheadUnmet.
+		bool ahead_unmet = false;
+		// KYTY_SPEC_PAIR_PUSH_FIT: a table permutation in the reduced form (found only by a lookup asking for it); and a table
+		// refusal because the shader data did not fit the push constants: the cursor it was refused at (UINT32_MAX: none).
+		bool     table_reduced         = false;
+		uint32_t table_overflow_cursor = UINT32_MAX;
 	};
 
 	// A permutation the prefetch translated, its SPIR-V in the prefetch's scratch file: zstd-compressed (spirv_bytes,
@@ -518,6 +660,7 @@ struct PipelineCache::ProgramCache {
 	struct TableJob {
 		ShaderRecompiler::IR::ResourceSpecialization   specialization;
 		uint32_t                                       push_data_cursor = 0;
+		bool                                           table_reduced    = false; // KYTY_SPEC_PAIR_PUSH_FIT's reduced form
 		std::vector<uint32_t>                          code, back_code, user_data;
 		ShaderVertexInputInfo                          vertex;
 		ShaderPixelInputInfo                           pixel;
@@ -528,7 +671,86 @@ struct PipelineCache::ProgramCache {
 		vk::ShaderModule                               module = nullptr; // the result's, made by the worker
 		std::string                                    refused;
 		std::atomic<bool>                              done {false};
+		// (Mode 4, PostTableAhead) Made ahead of its draw from a recorded seed. `claimed`: its translation taken by a worker
+		// (the ahead pool's, or the table workers' once a draw met it queued: `promoted`); `taken`: a draw or
+		// AheadPermutation took its result (its module then the permutation's, under the cache's m_mutex); `after`: run by
+		// the worker that translated it, before `done` (the paired vertex programs' jobs); `after_done`: just after `done`
+		// (the pair's table pipelines, PipelinesAhead).
+		bool                           ahead = false;
+		std::atomic<bool>              claimed {false}, promoted {false};
+		bool                           taken  = false;
+		vk::Device                     device = nullptr;
+		std::function<void(TableJob&)> after, after_done;
+		TableJob() = default;
+		KYTY_CLASS_NO_COPY(TableJob);
+		~TableJob() {
+			// (Made ahead and never taken: its module destroyed, as a dropped program's.)
+			if (!ahead || taken || module == nullptr || !device) return;
+			DestroyShaderModule(device, module);
+			LiveCounters::g_shader_modules.fetch_sub(1, std::memory_order_relaxed);
+		}
 	};
+	// A table job's translation, on the worker that takes it: the one call both the draw's job (Get) and one made ahead
+	// (PostTableAhead) run, over the job's own inputs.
+	// KYTY_SPEC_PAIR_DENSE_INDIRECT (spec_pair_dense_root_*): a vertex or pixel table translation refused with the option on,
+	// by the condition its text names: a root of another form (a loop bound, a key bound over 64, not dense), more roots
+	// than IndirectMaxRoots, a written or dynamic-mip image, no runtime search, other than 16 elements (TableIndirectForm
+	// left it: a group of more candidates, more images), a heap table mode cannot address, a candidate without its root,
+	// shader data not fitting the push constants with the LOD words in the block.
+	static void NoteDenseRefusal(const std::string& refused) {
+		using L         = LiveCounters::Id;
+		const auto root = refused.find(ShaderRecompiler::IR::TableDenseRootText);
+		if (root != std::string::npos) {
+			const auto what = std::string_view(refused).substr(root + std::strlen(ShaderRecompiler::IR::TableDenseRootText));
+			LiveCounters::Add(what.starts_with("another form") ? L::SpecPairDenseRootForm
+			                  : what.starts_with("roots")      ? L::SpecPairDenseRootRoots
+			                  : what.starts_with("image form") ? L::SpecPairDenseRootImage
+			                  : what.starts_with("search")     ? L::SpecPairDenseRootSearch
+			                  : what.starts_with("elements")   ? L::SpecPairDenseRootElements
+			                                                   : L::SpecPairDenseRootAddress);
+		} else if (refused.find("indirect image candidate without its root") != std::string::npos) {
+			LiveCounters::Add(L::SpecPairDenseRootCandidate);
+		} else if (refused.find(ShaderRecompiler::IR::TableDensePushText) != std::string::npos) {
+			LiveCounters::Add(L::SpecPairDenseRootPush);
+		}
+	}
+	static void RunTableJob(TableJob& job, vk::Device device) {
+		const auto begin = std::chrono::steady_clock::now(); // (KYTY_SPEC_PAIR_DENSE_INDIRECT's compile time)
+		try {
+			Common::RecoverableExitScope recoverable;
+			auto translated = ShaderRecompiler::TranslateProgram(job.code, job.options);
+			job.result      = ShaderRecompiler::CompileProgram(std::move(translated), job.options, job.specialization,
+			                                                   job.push_data_cursor);
+			job.module      = CreateModule(device, job.options, job.result->spirv);
+			job.info        = TakeOnWorker(*job.result);
+		} catch (const Common::RecoverableExit& refused) {
+			// (A line of its own in the log: most exit messages end without one.)
+			job.refused = refused.message;
+			if (job.refused.empty() || job.refused.back() != '\n') job.refused += '\n';
+		}
+		// KYTY_SPEC_PAIR_DENSE_INDIRECT: a vertex or pixel table module with a dense root (the only indirect root those
+		// stages take), counted with its time; the first ones printed with how it was asked for (a draw's job: its pair's
+		// draws took the normal path until it was done; ahead: before its first draw).
+		if (job.options.table_dense_indirect && job.result && job.options.stage != ShaderType::Compute &&
+		    !job.info.table_plan.indirect.empty()) [[unlikely]] {
+			const auto us = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count());
+			LiveCounters::Add(LiveCounters::SpecPairDenseCompiles);
+			LiveCounters::Add(LiveCounters::SpecPairDenseCompileUs, us);
+			static std::atomic<uint32_t> reports {0};
+			if (reports.fetch_add(1, std::memory_order_relaxed) < 32)
+				std::printf("Table: dense indirect module: %s 0x%016llx compiled in %.1f ms (%s)\n",
+				            job.options.stage == ShaderType::Pixel ? "PS" : "VS",
+				            static_cast<unsigned long long>(job.options.shader_hash), static_cast<double>(us) / 1000.0,
+				            job.ahead ? "ahead" : "draw");
+		}
+		// (Refused with the option on: each condition counted, by the texts EnterTableMode and AllocateBindings give.)
+		if (job.options.table_dense_indirect && !job.refused.empty() && job.options.stage != ShaderType::Compute)
+			[[unlikely]] NoteDenseRefusal(job.refused);
+		if (job.ahead && job.after) job.after(job);
+		job.done.store(true, std::memory_order_release);
+		if (job.ahead && job.after_done) job.after_done(job);
+	}
 
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
@@ -563,9 +785,34 @@ struct PipelineCache::ProgramCache {
 		std::multimap<uint32_t, SourceEntry*>::iterator             plan_node {};
 		bool                                                        plan_listed = false;
 		bool                                                        plan_preloaded = false; // back by a worker, not used since
+		// (Mode 4) Its plan kept in memory until its first lookup (AheadJob).
+		bool plan_pinned = false;
+		// KYTY_SPEC_PRELOAD_FIX: sent out as a preload no lookup used; not preloaded again until a lookup uses it.
+		bool preload_shunned = false;
+		// (Mode 4) The scene whose warmup listed it last (KeepScenePlans; SceneTags::None: none), and whether a lookup has
+		// met it since.
+		bool     keep_met   = false;
+		uint32_t keep_scene = SceneTags::None;
 	};
+	// (Mode 4) The pinned plans (AheadJob): released at their first lookup (EnsurePlan), when the entry leaves the programs,
+	// and at each scene change (SceneLoop, WarmScene).
+	size_t plan_pins = 0;
+	void   Unpin(SourceEntry& source) {
+		if (!source.plan_pinned) return;
+		source.plan_pinned = false;
+		--plan_pins;
+	}
+	// (Under the cache's m_mutex.)
+	void ReleasePlanPins() {
+		if (plan_pins == 0) return;
+		for (auto& [key, source]: programs) {
+			(void)key;
+			Unpin(source);
+		}
+	}
 	// Plans: sweeps so far (one a flip, SweepPlans), out of memory now, brought back (by the render thread; by workers).
 	uint32_t plan_clock = 0;
+	uint32_t last_sweep_clock = 0; // (KYTY_SPEC_PRELOAD_FIX: plan_clock at the last sweep that ran)
 	size_t   plans_out = 0;
 	uint64_t plan_reloads = 0, plan_preloads = 0, plan_preload_uses = 0;
 
@@ -579,6 +826,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan plan;
 		bool                               linear = false;
 		uint64_t                           erased = 0;
+		bool                               failed = false; // (a pin's read-back that failed: nothing to restore)
 	};
 	struct PlanLoads {
 		std::mutex                                   mutex;
@@ -586,6 +834,10 @@ struct PipelineCache::ProgramCache {
 	};
 	std::shared_ptr<PlanLoads> plan_loads = std::make_shared<PlanLoads>();
 	uint64_t                   programs_erased = 0;
+	// (KYTY_SPEC_PRELOAD_FIX, or a pin's read-back) The entries a worker's read was posted for, not erased since
+	// (ForgetPlanLoads takes one out), whose result is not taken yet: a result an erase made stale is a live entry's exactly
+	// when its entry is here (no scan of the programs). At most the reads in flight; empty with the switch off in mode 0.
+	std::unordered_set<const SourceEntry*> loads_tracked;
 	void UnlistPlan(SourceEntry& source) {
 		if (!source.plan_listed) return;
 		plans_out_by_use.erase(source.plan_node);
@@ -595,6 +847,7 @@ struct PipelineCache::ProgramCache {
 	void ForgetPlanLoads(SourceEntry& entry) {
 		UnlistPlan(entry);
 		programs_erased++;
+		if (!loads_tracked.empty()) loads_tracked.erase(&entry);
 	}
 
 	// The plan back in the entry (its linear SRT plan kept meanwhile).
@@ -619,8 +872,9 @@ struct PipelineCache::ProgramCache {
 			loaded = std::move(found->second);
 			plan_loads->plans.erase(found);
 		}
+		if (!loads_tracked.empty()) loads_tracked.erase(&source);
 		source.plan_loading = false;
-		if (loaded.erased != programs_erased || loaded.linear != (source.plan_linear != nullptr)) return false;
+		if (loaded.failed || loaded.erased != programs_erased || loaded.linear != (source.plan_linear != nullptr)) return false;
 		plan = std::move(loaded.plan);
 		return true;
 	}
@@ -633,13 +887,16 @@ struct PipelineCache::ProgramCache {
 		static constexpr size_t   MaxPlans = 256, PlansPerJob = 4;
 		if (!push_job || plans_out_by_use.empty()) return;
 		std::vector<std::pair<SourceEntry*, SpilledPlan>> batch;
+		const bool fix = PreloadFixOn(); // (KYTY_SPEC_PRELOAD_FIX)
 		for (auto it = plans_out_by_use.lower_bound(around > PreloadWindow ? around - PreloadWindow : 0);
 		     it != plans_out_by_use.end() && it->first <= around + PreloadWindow && batch.size() < MaxPlans;) {
 			auto* entry        = it->second;
 			it                 = plans_out_by_use.erase(it); // (listed again when out again)
 			entry->plan_listed = false;
 			if (!entry->plan_out || entry->plan_loading) continue;
+			if (fix && entry->preload_shunned) continue; // (KYTY_SPEC_PRELOAD_FIX: left until a lookup uses it)
 			entry->plan_loading = true;
+			if (fix) loads_tracked.insert(entry);
 			batch.emplace_back(entry, entry->plan_spilled);
 		}
 		for (size_t first = 0; first < batch.size(); first += PlansPerJob) {
@@ -654,7 +911,7 @@ struct PipelineCache::ProgramCache {
 					std::lock_guard lock(loads->mutex);
 					loads->plans[entry] = std::move(loaded);
 				}
-			});
+			}, true);
 		}
 	}
 
@@ -666,8 +923,26 @@ struct PipelineCache::ProgramCache {
 			if (plan_loads->plans.empty()) return;
 			plans.swap(plan_loads->plans);
 		}
+		// (A tracked entry whose read an erase made stale, or whose pin read-back failed: not loading any more, and listed out
+		// again, so it can be preloaded or pin-loaded again. Once a result: a read posted after it is stale only after another
+		// erase.)
+		const auto relist = [this](SourceEntry& entry) {
+			entry.plan_loading = false;
+			if (!entry.plan_out || entry.plan_listed) return;
+			entry.plan_node   = plans_out_by_use.emplace(entry.plan_use, &entry);
+			entry.plan_listed = true;
+		};
 		for (auto& [entry, loaded]: plans) {
-			if (loaded.erased != programs_erased) continue; // (the entry may be gone)
+			// (Tracked: posted under KYTY_SPEC_PRELOAD_FIX or as a pin's read-back and not erased since: a live entry.)
+			const bool tracked = !loads_tracked.empty() && loads_tracked.erase(entry) != 0;
+			if (loaded.erased != programs_erased) { // (the entry may be gone)
+				if (tracked) relist(*entry);
+				continue;
+			}
+			if (loaded.failed) {
+				relist(*entry);
+				continue;
+			}
 			entry->plan_loading = false;
 			if (!entry->plan_out || loaded.linear != (entry->plan_linear != nullptr)) continue;
 			RestorePlan(*entry, std::move(loaded.plan));
@@ -677,10 +952,63 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	// KYTY_SPEC_PIPECACHE_SPLIT (a speculation's lookup, `split` held, the entry's plan out of memory): EnsurePlan with the
+	// file read made with `split` released (UnlockedRead); its plan_use, preload and loaded-plan take as there, under the
+	// lock. Then the entry found again by its key: gone or another (retired meanwhile), false (the lookup refuses); brought
+	// back meanwhile by another lookup, this read dropped; else restored as EnsurePlan restores it.
+	template <typename Entry>
+	bool EnsurePlanUnlocked(Common::Mutex& split, Entry& entry) {
+		auto& source = entry->second;
+		Unpin(source);                  // ((Mode 4) its first lookup)
+		source.preload_shunned = false; // (KYTY_SPEC_PRELOAD_FIX: a lookup used it)
+		source.keep_met        = true;  // ((Mode 4) met since its scene's warmup)
+		const auto last_use    = source.plan_use;
+		source.plan_use        = plan_clock;
+		if (source.plan_preloaded) {
+			source.plan_preloaded = false;
+			plan_preload_uses++;
+		}
+		ShaderRecompiler::IR::ResourcePlan plan;
+		if (TakeLoadedPlan(source, plan)) {
+			RestorePlan(source, std::move(plan));
+			plan_reloads++;
+			return true;
+		}
+		PreloadPlans(last_use);
+		const auto         spilled = source.plan_spilled;
+		const auto         key     = lookup_key;
+		SourceEntry* const was     = &source;
+		bool               read    = false;
+		bool               linear  = false;
+		{
+			const UnlockedRead unlocked(*this, split);
+			read = LoadPlanBytes(spilled, plan, linear);
+		}
+		lookup_key = key;
+		entry      = programs.find(key);
+		if (entry == programs.end() || &entry->second != was) return false;
+		if (!was->plan_out) {
+			// (KYTY_SPEC_PRELOAD_FIX: restored meanwhile by DrainLoadedPlans, and used by this lookup: not an unused preload.)
+			if (was->plan_preloaded && PreloadFixOn()) {
+				was->plan_preloaded = false;
+				plan_preload_uses++;
+			}
+			return true;
+		}
+		if (!read || linear != (was->plan_linear != nullptr))
+			EXIT("a shader's resource plan could not be read back from the scratch file\n");
+		RestorePlan(*was, std::move(plan));
+		plan_reloads++;
+		return true;
+	}
+
 	// The source's plan in memory again (before each use of it), its last use noted.
 	void EnsurePlan(SourceEntry& source) {
-		const auto last_use = source.plan_use;
-		source.plan_use     = plan_clock;
+		Unpin(source);                  // ((Mode 4) its first lookup)
+		source.preload_shunned = false; // (KYTY_SPEC_PRELOAD_FIX: a lookup used it)
+		source.keep_met        = true;  // ((Mode 4) met since its scene's warmup)
+		const auto last_use    = source.plan_use;
+		source.plan_use        = plan_clock;
 		if (source.plan_preloaded) {
 			source.plan_preloaded = false;
 			plan_preload_uses++;
@@ -717,21 +1045,49 @@ struct PipelineCache::ProgramCache {
 		const uint32_t            PlanSweepFlips     = PlanIdleFlips / 30u;
 		DrainLoadedPlans();
 		if (!PlanEvictionEnabled() || ++plan_clock % PlanSweepFlips != 0) return;
+		if (unlocked_readers != 0) return; // (KYTY_SPEC_PIPECACHE_SPLIT: a plan read with the lock released; the next)
+		// KYTY_SPEC_PRELOAD_FIX: the previous sweep's clock: a preload restored before it has had a whole sweep period.
+		const uint32_t previous_sweep = std::exchange(last_sweep_clock, plan_clock);
 		// (RAM the system does not report: a budget of 0, every idle plan leaves.)
-		static const size_t budget = [] {
-			const uint64_t ram = LocalPlatform::EmulatorMemory();
-			return static_cast<size_t>(ram / 128u / (77u * 1024u));
-		}();
-		size_t                    in_memory = 0;
+		const size_t              budget       = PlanBudget();
+		const bool                pins         = plan_pins != 0 && AheadPlanPinOn(); // ((Mode 4) a pinned plan counts, stays)
+		const bool                unused_first = PreloadFixOn(); // (KYTY_SPEC_PRELOAD_FIX: unused preloads go first)
+		size_t                    in_memory    = 0;
 		std::vector<SourceEntry*> idle;
+		size_t                    unused = 0; // (KYTY_SPEC_PRELOAD_FIX: the unused preloads, at the front of `idle`)
 		for (auto& [key, source]: programs) {
 			(void)key;
 			if (source.plan_out) continue;
 			in_memory++;
-			if (plan_clock - source.plan_use >= PlanIdleFlips) idle.push_back(&source);
+			if (pins && source.plan_pinned) continue;
+			if (unused_first && source.plan_preloaded) {
+				// (A preload no lookup used, restored before the previous sweep (its plan_use the restore's, a lookup clearing
+				// plan_preloaded): out first. One restored since keeps its place until the next sweep.)
+				if (source.plan_use < previous_sweep) {
+					idle.push_back(&source);
+					std::swap(idle[unused++], idle.back());
+				}
+			} else if (plan_clock - source.plan_use >= PlanIdleFlips) {
+				idle.push_back(&source);
+			}
 		}
 		if (in_memory <= budget || idle.empty()) return;
-		std::ranges::sort(idle, {}, [](const SourceEntry* source) { return source->plan_use; });
+		// (The unused preloads, oldest preload first, then the idle plans, least recently used first.)
+		const auto by_use = [](const SourceEntry* source) { return source->plan_use; };
+		if (unused != 0) std::ranges::sort(idle.begin(), idle.begin() + static_cast<std::ptrdiff_t>(unused), {}, by_use);
+		// (Mode 4) Among the idle plans the current scene's last (KeepScenePlans): those a lookup met since its warmup, then
+		// those not met yet (what a first arrival needs); each least recently used first. The budget still wins.
+		const uint32_t keep_scene = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? SceneTags::Current()
+		                                                                                              : SceneTags::None;
+		if (keep_scene != SceneTags::None) {
+			const auto by_rank = [keep_scene](const SourceEntry* source) {
+				const uint32_t rank = source->keep_scene != keep_scene ? 0u : source->keep_met ? 1u : 2u;
+				return std::pair {rank, source->plan_use};
+			};
+			std::ranges::sort(idle.begin() + static_cast<std::ptrdiff_t>(unused), idle.end(), {}, by_rank);
+		} else {
+			std::ranges::sort(idle.begin() + static_cast<std::ptrdiff_t>(unused), idle.end(), {}, by_use);
+		}
 		idle.resize(std::min(idle.size(), in_memory - budget));
 		uint32_t writes = 0;
 		auto     freed  = std::make_shared<std::vector<ShaderRecompiler::IR::ResourcePlan>>();
@@ -745,6 +1101,7 @@ struct PipelineCache::ProgramCache {
 			freed->push_back(std::move(source.resource_plan));
 			source.resource_plan = {};
 			source.plan_out       = true;
+			if (unused_first && source.plan_preloaded && source.plan_use < previous_sweep) source.preload_shunned = true;
 			source.plan_preloaded = false;
 			plans_out++;
 			source.plan_node   = plans_out_by_use.emplace(source.plan_use, &source);
@@ -755,10 +1112,11 @@ struct PipelineCache::ProgramCache {
 			PipelineCacheLog("Shader plans: {} out of memory ({} now), {} brought back so far ({} beside the render thread, "
 			                 "{} of those used)",
 			                 plans_out, freed->size(), plan_reloads + plan_preloads, plan_preloads, plan_preload_uses);
-		if (push_job) push_job([freed] { freed->clear(); });
+		if (push_job) push_job([freed] { freed->clear(); }, true);
 	}
-	// Runs a job on the pipeline cache's compile workers (set by PipelineCache).
-	std::function<void(std::function<void()>)> push_job;
+	// Runs a job on the pipeline cache's compile workers (set by PipelineCache); `background`: a plan preload or housekeeping
+	// (mode 4: the table workers' background lane).
+	std::function<void(std::function<void()>, bool)> push_job;
 	// The last table mode Get found its permutation still translating (empty, not refused), and that translation's
 	// completion. Mode 0: the members, as the base (only the GPU thread looks programs up). Under a speculation, per
 	// thread (spec_worker_sets: a speculation's set build looks programs up beside the GPU thread; each reads the
@@ -772,6 +1130,64 @@ struct PipelineCache::ProgramCache {
 	static thread_local std::shared_ptr<const std::atomic<bool>> t_table_waiting;
 	bool&                                     Pending() noexcept { return Spec::On() ? t_table_pending : table_pending; }
 	std::shared_ptr<const std::atomic<bool>>& Waiting() noexcept { return Spec::On() ? t_table_waiting : table_waiting; }
+	// KYTY_SPEC_PIPECACHE_SPLIT: the cache's m_mutex, offered for the lookup's scope (SplitOffer): on the GPU thread, a
+	// translation may be built with it released (t_split_lock); on a speculation's thread, a known program's plan read and
+	// its materialization (t_worker_split). Null otherwise.
+	static inline thread_local Common::Mutex* t_split_lock   = nullptr;
+	static inline thread_local Common::Mutex* t_worker_split = nullptr;
+	struct SplitOffer {
+		Common::Mutex** slot = nullptr;
+		Common::Mutex*  old  = nullptr;
+		explicit SplitOffer(Common::Mutex& mutex) {
+			if (!PipecacheSplitOn()) return;
+			if (GuestGpu::IsGpuThread()) {
+				if (!PipelineCache::t_find_only) slot = &t_split_lock;
+			} else if (Spec::On() && Spec::Current() != nullptr) {
+				slot = &t_worker_split;
+			}
+			if (slot != nullptr) old = std::exchange(*slot, &mutex);
+		}
+		~SplitOffer() {
+			if (slot != nullptr) *slot = old;
+		}
+		SplitOffer(const SplitOffer&)            = delete;
+		SplitOffer& operator=(const SplitOffer&) = delete;
+	};
+	// (Under m_mutex) the lookups reading a plan with the lock released now. While any does, no entry is freed (a dropped
+	// one is retired: Get's warm-code compare; ReleaseRetired waits) and no plan leaves memory (SweepPlans skips).
+	size_t unlocked_readers = 0;
+	// m_mutex released for a read of a plan (`cache.unlocked_readers` counting it), taken again at the scope's end (also
+	// when the read throws); the last reader out releases what was retired meanwhile.
+	struct UnlockedRead {
+		ProgramCache&  cache;
+		Common::Mutex& mutex;
+		UnlockedRead(ProgramCache& owner, Common::Mutex& lock): cache(owner), mutex(lock) {
+			++cache.unlocked_readers;
+			mutex.Unlock();
+		}
+		~UnlockedRead() {
+			mutex.Lock();
+			if (--cache.unlocked_readers == 0 && !cache.retired.empty() && !cache.warming) cache.ReleaseRetired();
+		}
+		UnlockedRead(const UnlockedRead&)            = delete;
+		UnlockedRead& operator=(const UnlockedRead&) = delete;
+	};
+	// KYTY_SPEC_PIPECACHE_SPLIT: the permutations of the programs in `programs` by their key's stage (the "Shaders:" line),
+	// counted by one walk at the first line printed with the switch on, then kept while `permutations_counted`: one more at
+	// each permutation stored (every push into a SourceEntry's permutations), an entry's all fewer when it leaves
+	// `programs` (erased or retired). A line printed with the switch off walks, as before, and stops the count.
+	std::array<size_t, static_cast<size_t>(ShaderType::Mesh) + 1> permutation_counts {};
+	bool permutations_counted = false;
+	void CountPermutations(ShaderType stage, size_t added) {
+		if (permutations_counted) permutation_counts[static_cast<size_t>(stage)] += added;
+	}
+	void UncountPermutations(ShaderType stage, size_t removed) {
+		if (permutations_counted) permutation_counts[static_cast<size_t>(stage)] -= removed;
+	}
+	// KYTY_SPEC_PAIR_PUSH_FIT (switch on only): this thread's last table lookup (Get) returned the refusal made at its own
+	// cursor because the shader data did not fit the push constants. Cleared by GetGraphicsPrograms before the vertex
+	// lookup it reads it after.
+	static inline thread_local bool t_push_overflow = false;
 	void                                      ClearTable() noexcept {
 		if (Spec::On()) {
 			t_table_pending = false;
@@ -1859,11 +2275,14 @@ struct PipelineCache::ProgramCache {
 
 	// The prefetched translation of the program `lookup_key` names, met for the first time: taken over
 	// once done (waiting for it when a worker translates it now), else null and left to the caller.
-	Prefetch::Group* PrefetchedGroup(const ShaderParams& params) {
+	// (`adopt_only`: a worker's adopt-only lookup (TableWorkerEntry, mode 4), Get's own gate; false on every other lookup.)
+	Prefetch::Group* PrefetchedGroup(const ShaderParams& params, bool adopt_only = false) {
 		if (prefetch == nullptr || !prefetch->ready.load(std::memory_order_acquire)) return nullptr;
 		const auto found = prefetch->index.find(lookup_key);
 		if (found == prefetch->index.end()) return nullptr;
 		auto& group = *found->second;
+		// (A worker's adopt-only lookup: a group not done yet is left to the GPU thread's lookup, which claims or waits.)
+		if (adopt_only && group.state.load(std::memory_order_acquire) != Prefetch::Done) return nullptr;
 		prefetch->Follow(group.first_record);
 		auto state = group.state.load(std::memory_order_acquire);
 		if (state == Prefetch::Pending &&
@@ -1878,6 +2297,13 @@ struct PipelineCache::ProgramCache {
 		group.state.store(Prefetch::Taken, std::memory_order_relaxed);
 		prefetch->adopted++;
 		return &group;
+	}
+	// (An adopt-only lookup: a group PrefetchedGroup took whose plan then did not materialize for the worker's draw (a failed
+	// evaluation, a guest word it could not read) goes back to Done, under m_mutex as it was taken; nothing of it was moved
+	// (its plan only loaded), so the in-order lookup takes it over as it would have.)
+	void ReturnPrefetchedGroup(Prefetch::Group& group) {
+		group.state.store(Prefetch::Done, std::memory_order_release);
+		prefetch->adopted--;
 	}
 
 	// The prefetched translations of a program the warmup already holds (the recording's records it did not translate:
@@ -1929,6 +2355,7 @@ struct PipelineCache::ProgramCache {
 		if (const auto stored = CreateModuleInPlace(options, *module)) {
 			source.permutations.push_back(
 			    ModulePermutation(options, {}, std::move(module->program), std::move(specialization), stored));
+			CountPermutations(options.stage, 1);
 			source.prefetched.erase(module);
 			prefetch->adopted_modules++;
 			return &source.permutations.back();
@@ -1945,6 +2372,7 @@ struct PipelineCache::ProgramCache {
 		}
 		source.permutations.push_back(
 		    ModulePermutation(options, spirv, std::move(module->program), std::move(specialization)));
+		CountPermutations(options.stage, 1);
 		source.prefetched.erase(module);
 		prefetch->adopted_modules++;
 		return &source.permutations.back();
@@ -2089,11 +2517,199 @@ struct PipelineCache::ProgramCache {
 		};
 	}
 
+	// The warmup record of a permutation Get makes (or finds unrecorded): one builder, so both hold the same fields.
+	template <typename InputInfo>
+	void FillRecord(LocalShaderWarmup::Record& record, ShaderType stage, const ShaderParams& params, const InputInfo& input_info,
+	                uint32_t push_data_cursor, const ShaderRecompiler::IR::ResourceSpecialization& specialization) const {
+		record.stage           = stage;
+		record.hash            = params.hash;
+		record.user_data_count = static_cast<uint32_t>(params.user_data.size());
+		record.push_cursor     = push_data_cursor;
+		record.static_key      = lookup_key.static_state;
+		record.code.assign(params.code.begin(), params.code.end());
+		record.back_code.assign(params.back_code.begin(), params.back_code.end());
+		record.specialization = specialization;
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) record.vertex = input_info;
+		else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) record.pixel = input_info;
+		else record.compute = input_info;
+	}
+	// (Mode 4, TableWorkerEntry) A permutation a worker's adopt-only lookup adopted is not recorded there (its segment may
+	// never commit; its inputs are the worker's). Its shader id waits here, and it is recorded once, by the first of:
+	// - a lookup that is not find-only and finds it (RecordFound, at Get's two finds): the lookup that would have adopted it
+	//   and called warmup.Add in order; the record is made from that lookup's own inputs (its push cursor, input info, static
+	//   key, and the permutation's specialization, which the find matched) at its place in the stream;
+	// - the commit of a worker entry resting on it (RecordMet, from the entry's own lookup's record, t_met_records);
+	// - the warmup beside the game meeting it for a record of the file first (TranslateWarmup): the record's index, as when
+	//   the warmup makes the permutation before the game's lookup.
+	// One none meets stays unrecorded, as in order (no in-order lookup made it). Under m_mutex. Empty unless a worker adopted
+	// (mode 0: always empty, Get's finds test only that).
+	std::unordered_set<uint64_t> unrecorded;
+	// The records this thread's find-only or adopt-only lookups would make of the unrecorded permutations they meet, from
+	// their own inputs (the push cursor, input info, static key of this lookup and the permutation's specialization, which its
+	// find matched or its adoption made), in t_adopt_ids' order: what the in-order lookup of the same draw records
+	// (FillRecord, as there). Taken by PipelineCache::TakeAdoptedRecords.
+	static inline thread_local std::array<LocalShaderWarmup::Record, 2> t_met_records {};
+	static inline thread_local std::array<bool, 2>                      t_met_made {};
+	// (A find-only or adopt-only lookup met unrecorded permutation `id`: noted for its caller, with its record if asked.)
+	template <typename InputInfo>
+	void NoteMet(uint64_t id, ShaderType stage, const ShaderParams& params, const InputInfo& input_info, uint32_t push_data_cursor,
+	             const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+		const auto n = PipelineCache::t_adopt_ids_n;
+		if (n >= PipelineCache::t_adopt_ids.size()) return;
+		PipelineCache::t_adopt_ids[n] = id;
+		// (Not where the code was not copied before the lock (params.code_unread: `code` is the guest's span, which may fault
+		// here under m_mutex, or hold bytes not yet in order): no record, so no entry.)
+		t_met_made[n] = PipelineCache::t_adopt_records && warmup.Enabled() && !params.code_unread;
+		if (t_met_made[n]) {
+			t_met_records[n] = {};
+			FillRecord(t_met_records[n], stage, params, input_info, push_data_cursor, specialization);
+		}
+		PipelineCache::t_adopt_ids_n = n + 1;
+	}
+	// (At the commit of an entry resting on it: recorded with the entry's own record, unless something recorded it since.)
+	void RecordMet(uint64_t id, LocalShaderWarmup::Record& record) {
+		if (unrecorded.erase(id) == 0) return;
+		const auto index = warmup.Add(record);
+		if (index != LocalShaderWarmup::NoShader) recorded_programs[id] = index;
+	}
+	template <typename InputInfo>
+	void RecordFound(const Permutation& found, ShaderType stage, const ShaderParams& params, const InputInfo& input_info,
+	                 uint32_t push_data_cursor) {
+		const auto it = unrecorded.find(found.handle.id);
+		if (it == unrecorded.end()) return;
+		// (A find-only lookup, a worker's: not recorded there; its caller learns it met one.)
+		if (PipelineCache::g_find_only_users.load(std::memory_order_relaxed) != 0 && PipelineCache::t_find_only) {
+			NoteMet(found.handle.id, stage, params, input_info, push_data_cursor, found.specialization);
+			return;
+		}
+		unrecorded.erase(it);
+		LocalShaderWarmup::Record record;
+		FillRecord(record, stage, params, input_info, push_data_cursor, found.specialization);
+		const auto index = warmup.Add(record);
+		if (index != LocalShaderWarmup::NoShader) recorded_programs[found.handle.id] = index;
+	}
+
+	// KYTY_SPEC_PIPECACHE_SPLIT (Get's translation on the GPU thread, normal mode; `split` held by this thread, the
+	// specialization of a known program materialized under it): the program built with `split` released, as the locked
+	// build makes it: TranslateProgram; for a new program its plan (ExtractResourcePlan) and its materialization over this
+	// lookup's runtime; the portable choice (PortableFormats, a known program's plan read under the lock first);
+	// CompileProgram, the shader module (CreateModule) and the compiled info (TakeOnWorker), as a table job makes them on a
+	// worker. Then `split` taken again (also when the build throws), and the result published where the locked build puts
+	// it, unless another thread's publish came first:
+	// - a known program (still the same entry, found again by its address: nothing erases it while `split` is released.
+	//   The one erase or retire of a program entry is a lookup's warm-code compare, the GPU thread's or a worker's
+	//   (any lookup not find-only), and it takes only an entry holding warm code; `known` holds none, as this lookup's own
+	//   compare before cleared it (or erased the entry: then no `known`), and warm code is set only on an entry the warmup
+	//   makes new. The map's nodes do not move) holding a permutation of this specialization and cursor now: that one is
+	//   taken, as this lookup's find would take it after that publish (its record as there), and this module destroyed;
+	// - a new program another thread made meanwhile (the warmup beside the game): this build dropped and the lookup made
+	//   again, locked throughout;
+	// - else this permutation published (FinishPermutation: its program id the next, taken under the lock at the publish,
+	//   so a dropped build takes none; the portable module under the exact specialization, as the locked build). Get
+	//   records it, as after the locked build.
+	// Nothing of the cache is read or written while `split` is released: the key is copied (lookup_key is the cache's
+	// scratch), and the materialization's failure report and the shader hash global are made after the lock is taken
+	// again. Returns the result to return (a permutation taken, or a refusal), else nothing (published in `entry`).
+	template <typename InputInfo, typename Entry>
+	std::optional<ShaderProgram> BuildUnlocked(Common::Mutex& split, const ShaderParams& params, InputInfo& input_info,
+	                                           uint32_t& push_data_cursor, uint32_t table_portable, ShaderType stage,
+	                                           const char* label, Entry& entry,
+	                                           const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                                           ShaderRecompiler::IR::ResourceSnapshot& resources,
+	                                           ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                           ShaderRecompiler::IR::MaterializeReport& report,
+	                                           const ShaderRecompiler::CompileOptions& options, double& front_ms) {
+		const auto   key   = lookup_key;
+		SourceEntry* known = entry != programs.end() ? &entry->second : nullptr;
+		std::optional<ShaderRecompiler::IR::ResourceSpecialization> portable;
+		if (known != nullptr) {
+			auto value = specialization;
+			if (ShaderRecompiler::IR::PortableFormats(known->resource_plan.info, value)) portable = std::move(value);
+		}
+		std::optional<ShaderRecompiler::IR::ResourcePlan> new_plan;
+		std::optional<ShaderRecompiler::CompileResult>    compiled;
+		ShaderRecompiler::IR::CompiledShaderInfo          info;
+		vk::ShaderModule                                  module       = nullptr;
+		bool                                              materialized = true;
+		const auto                                        front_begin  = std::chrono::steady_clock::now();
+		{
+			split.Unlock();
+			struct Relock {
+				Common::Mutex& mutex;
+				~Relock() { mutex.Lock(); }
+			} relock {split};
+			auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+			front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
+			if (known == nullptr) {
+				new_plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
+				materialized =
+				    ShaderRecompiler::IR::MaterializeResources(*new_plan, runtime, resources, specialization, &report);
+				if (materialized) {
+					auto value = specialization;
+					if (ShaderRecompiler::IR::PortableFormats(new_plan->info, value)) portable = std::move(value);
+				}
+			}
+			if (materialized) {
+				compiled.emplace(ShaderRecompiler::CompileProgram(std::move(translated), options,
+				                                                  portable ? *portable : specialization, push_data_cursor));
+				module = CreateModule(device, options, compiled->spirv);
+				info   = TakeOnWorker(*compiled);
+			}
+		}
+		Libs::LibKernel::Memory::g_srt_shader_hash = params.hash;
+		if (!materialized) return ReportMaterialization(label, stage, params.hash, report, false), ShaderProgram {};
+		const auto drop = [&] {
+			DestroyShaderModule(device, module);
+			LiveCounters::g_shader_modules.fetch_sub(1, std::memory_order_relaxed);
+		};
+		auto again = programs.find(key);
+		if (known == nullptr ? again != programs.end() : again == programs.end() || &again->second != known) {
+			drop();
+			struct NoSplit {
+				Common::Mutex* old = std::exchange(t_split_lock, nullptr);
+				~NoSplit() { t_split_lock = old; }
+			} no_split;
+			return Get(params, input_info, push_data_cursor, false, table_portable);
+		}
+		if (known != nullptr) {
+			const auto found = std::ranges::find_if(known->permutations, [&](const Permutation& candidate) {
+				const auto& layout = candidate.program.bindings;
+				return !candidate.table_mode &&
+				       layout.push_data_start_dword ==
+				           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords()) &&
+				       candidate.specialization == specialization;
+			});
+			if (found != known->permutations.end()) {
+				drop();
+				if (!unrecorded.empty()) [[unlikely]] // (as Get's find)
+					RecordFound(*found, stage, params, input_info, push_data_cursor);
+				if (&resources != &input_info.stage.resources) input_info.stage.resources = std::move(resources);
+				input_info.stage.program = &found->program;
+				found->program.bindings.AdvancePushData(push_data_cursor);
+				return found->handle;
+			}
+			entry = again;
+		} else {
+			(void)ReportMaterialization(label, stage, params.hash, report, true);
+			entry                       = programs.try_emplace(key, std::move(*new_plan)).first;
+			entry->second.plan_use      = plan_clock;
+			entry->second.source_digest = SourceDigest(params.code, params.back_code);
+		}
+		const bool made_portable = portable.has_value();
+		entry->second.permutations.push_back(FinishPermutation(params, options, *compiled, std::move(info),
+		                                                       made_portable ? std::move(*portable) : specialization, module));
+		CountPermutations(stage, 1);
+		if (made_portable) entry->second.permutations.back().specialization = std::move(specialization);
+		return std::nullopt;
+	}
+
 	template <typename InputInfo>
 	// `table_mode`: the permutation compiled in table mode (ShaderRecompiler::IR::EnterTableMode), empty
-	// when the program does not allow it.
+	// when the program does not allow it. `table_reduced` (table mode, KYTY_SPEC_PAIR_PUSH_FIT's retry only): its reduced
+	// form (CompileOptions::table_reduce_user_data), a permutation of its own.
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                  uint32_t& push_data_cursor, bool table_mode = false, uint32_t table_portable = 0) {
+	                  uint32_t& push_data_cursor, bool table_mode = false, uint32_t table_portable = 0,
+	                  bool table_reduced = false) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.mesh.threads_num[0] != 0 ? ShaderType::Mesh : ShaderType::Vertex;
@@ -2119,14 +2735,34 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
-		if (entry != programs.end() && !entry->second.warm_code.empty()) {
+		// (A worker's find-only lookup, TableWorkerEntry's, mode 4: a program entry kept for its warm code (the boot warmup's,
+		// not compared with the game's code by an in-order lookup yet). The compare the in-order lookup makes below, made here
+		// on the worker's own copy of the code only: the bytes CopyShaderCode copied BEFORE this lock through the guarded read
+		// (code_address set, code_unread clear); never a guest read under m_mutex (a fault there waits for the GPU thread,
+		// which waits for this lock). Not copied, or another code: empty (the entry left as it is: its erase or retire stays
+		// the in-order lookup's). Equal: on to the find, the entry left as it is too (its warm code kept for the in-order
+		// lookup's own compare): read only. The permutations found are the warmup's, recorded at the boot: the find records
+		// nothing, as the in-order find records nothing.)
+		bool warm_checked = false;
+		if (entry != programs.end() && !entry->second.warm_code.empty() &&
+		    PipelineCache::g_find_only_users.load(std::memory_order_relaxed) != 0 && PipelineCache::t_find_only) {
+			if (params.code_unread || params.code_address == 0 || !std::ranges::equal(params.code, entry->second.warm_code) ||
+			    !std::ranges::equal(params.back_code, entry->second.warm_back_code))
+				return {};
+			warm_checked = true;
+		}
+		if (entry != programs.end() && !entry->second.warm_code.empty() && !warm_checked) {
 			if (params.code_unread) return UnreadCode();
 			if (!std::ranges::equal(params.code, entry->second.warm_code) ||
 			    !std::ranges::equal(params.back_code, entry->second.warm_back_code)) {
 				std::erase_if(by_program, [&](const auto& item) { return item.second.first == &entry->second; });
 				ForgetPlanLoads(entry->second);
-				// (A warmup beside the game may be making pipelines of its permutations: kept until it is done.)
-				if (warming) {
+				UncountPermutations(entry->first.stage, entry->second.permutations.size());
+				Unpin(entry->second);
+				// (A warmup beside the game may be making pipelines of its permutations: kept until it is done. So too while
+				// table pipelines made ahead (mode 4) are queued or building, and while a lookup reads a plan with the lock
+				// released (KYTY_SPEC_PIPECACHE_SPLIT): ReleaseRetired.)
+				if (warming || ahead_pipeline_builds != 0 || unlocked_readers != 0) {
 					retired.push_back(programs.extract(entry));
 				} else {
 					for (const auto& p : entry->second.permutations) {
@@ -2141,7 +2777,16 @@ struct PipelineCache::ProgramCache {
 				std::vector<uint32_t>().swap(entry->second.warm_back_code);
 			}
 		}
-		if (entry != programs.end()) EnsurePlan(entry->second);
+		// KYTY_SPEC_PIPECACHE_SPLIT: a speculation's lookup reads the plan and materializes with the lock released; the entry
+		// found again after each (gone: refused). (Mode 0: no speculation thread; the global read first.)
+		Common::Mutex* const worker_split = Spec::On() ? t_worker_split : nullptr;
+		if (entry != programs.end()) {
+			if (worker_split != nullptr && entry->second.plan_out) {
+				if (!EnsurePlanUnlocked(*worker_split, entry)) return {};
+			} else {
+				EnsurePlan(entry->second);
+			}
+		}
 		ShaderRecompiler::IR::ResourceSnapshot temporary_resources;
 		auto& resources = NativePreparationScratchEnabled() ? input_info.stage.resources
 		                                                    : temporary_resources;
@@ -2184,15 +2829,53 @@ struct PipelineCache::ProgramCache {
 			}
 			// An indirect image with the table program's elements (its candidates' count is the draw's or dispatch's:
 			// one program takes any), the snapshot it binds from padded alike (TableResolveSet).
-			(void)ShaderRecompiler::IR::TableIndirectForm(table_specialization, &resources.images);
+			(void)ShaderRecompiler::IR::TableIndirectForm(table_specialization, &resources.images,
+			                                              TableDenseIndirectOn() && (stage == ShaderType::Vertex || stage == ShaderType::Pixel));
 		};
 		if (entry != programs.end()) {
 			const ShaderRecompiler::IR::ResourceSpecialization* borrowed_specialization = nullptr;
-			if (!ReportMaterialization(label, stage, params.hash, report,
-			                           ShaderRecompiler::IR::MaterializeResources(
-			                               entry->second.resource_plan, runtime, resources, specialization,
-			                               &report, &entry->second.specialization_guard, &borrowed_specialization)))
-				return {};
+			bool                                                materialized            = false;
+			if (worker_split != nullptr) {
+				// KYTY_SPEC_PIPECACHE_SPLIT: over a private copy of the specialization guard, made under the lock (the shared
+				// one is written by a materialization), with the lock released (UnlockedRead: the plan is immutable, and no
+				// entry is freed nor plan swept while it is out); then the entry found again (gone: refused). The copy, with
+				// what this materialization taught it, is published back as the shared guard when the shared one is still the
+				// one copied (its publication unchanged: no locked lookup published another, and no RestorePlan reset it from a
+				// publication past 0) and the copy is this plan's (owner: the entry's plan, the same plan: only the GPU
+				// thread's sweep sends it out, and not while a reader is out); a specialization it lent then points into the
+				// shared guard, as a locked lookup's would, and the guard's selected-permutation shortcut applies. Else the
+				// shared guard is kept (another state of it, as right) and a lent specialization is taken by value for the
+				// find below. Which correct guard state is kept is all this decides.
+				ShaderRecompiler::IR::ResourceSpecializationGuard guard_copy = entry->second.specialization_guard;
+				const uint64_t                                    copied_publication = guard_copy.publication;
+				const auto                                        key                = lookup_key;
+				SourceEntry* const                                was                = &entry->second;
+				{
+					const UnlockedRead unlocked(*this, *worker_split);
+					materialized = ShaderRecompiler::IR::MaterializeResources(was->resource_plan, runtime, resources,
+					                                                          specialization, &report, &guard_copy,
+					                                                          &borrowed_specialization);
+				}
+				lookup_key = key;
+				entry      = programs.find(key);
+				if (entry == programs.end() || &entry->second != was) return {};
+				auto& shared = was->specialization_guard;
+				if (materialized && shared.publication == copied_publication &&
+				    (guard_copy.owner == nullptr || guard_copy.owner == &was->resource_plan)) {
+					const bool lent = borrowed_specialization != nullptr;
+					shared          = std::move(guard_copy);
+					if (lent) borrowed_specialization = &shared.specialization;
+				} else if (borrowed_specialization != nullptr) {
+					specialization          = *borrowed_specialization;
+					borrowed_specialization = nullptr;
+				}
+			} else {
+				materialized = ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime, resources,
+				                                                          specialization, &report,
+				                                                          &entry->second.specialization_guard,
+				                                                          &borrowed_specialization);
+			}
+			if (!ReportMaterialization(label, stage, params.hash, report, materialized)) return {};
 			if (table_mode) table_form(borrowed_specialization ? *borrowed_specialization : specialization);
 			const auto& active_specialization =
 			    table_mode ? table_specialization : borrowed_specialization ? *borrowed_specialization : specialization;
@@ -2201,10 +2884,18 @@ struct PipelineCache::ProgramCache {
 				return layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
 				    push_data_cursor, layout.ShaderDataDwords());
 			};
+			// (KYTY_SPEC_PAIR_PUSH_FIT: the reduced form found by a lookup asking for it alone; a refusal for push constants
+			// made at another cursor passed over, so this cursor's own lookup is made.)
+			const bool push_fit         = table_mode && PairPushFitOn();
 			const auto find_permutation = [&] { return std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
-				        return candidate.table_mode == table_mode && compatible_push_data(candidate) &&
-				               candidate.specialization == active_specialization;
+				        if (!(candidate.table_mode == table_mode && compatible_push_data(candidate) &&
+				              candidate.specialization == active_specialization && candidate.table_reduced == table_reduced))
+					        return false;
+				        if (push_fit && candidate.table_overflow_cursor != UINT32_MAX &&
+				            candidate.table_overflow_cursor != push_data_cursor) [[unlikely]]
+					        return LiveCounters::Add(LiveCounters::SpecPairPushFitOtherCursor), false;
+				        return true;
 			        }); };
 			// A borrowed specialization comes from the guard: the permutation it
 			// selected under the same publication is still the right one.
@@ -2213,25 +2904,43 @@ struct PipelineCache::ProgramCache {
 			    source.guarded_publication == source.specialization_guard.publication &&
 			    compatible_push_data(*source.guarded_permutation)) {
 				const auto* selected = source.guarded_permutation;
+				if (!unrecorded.empty()) [[unlikely]] // (one adopted off the in-order path, recorded here as its adoption would have)
+					RecordFound(*selected, stage, params, input_info, push_data_cursor);
 				publish_stage(selected->program);
 				selected->program.bindings.AdvancePushData(push_data_cursor);
 				return selected->handle;
 			}
 			if (const auto permutation = find_permutation();
 			    permutation != entry->second.permutations.end()) {
-				if (!permutation->handle) return {}; // table mode refused
+				if (!permutation->handle) { // table mode refused
+					if (push_fit && permutation->table_overflow_cursor == push_data_cursor) t_push_overflow = true;
+					return {};
+				}
+				// (Mode 4: a table permutation published ahead, found by its first lookup: a draw holds it from here on.)
+				if (permutation->ahead_unmet) [[unlikely]] permutation->ahead_unmet = false;
 				// Only a borrowed result certifies this exact guard publication.
 				// An ineligible reference transaction must not relabel an old guard.
 				if (borrowed_specialization && !table_mode) {
 					source.guarded_permutation = &*permutation;
 					source.guarded_publication = source.specialization_guard.publication;
 				}
+				if (!unrecorded.empty()) [[unlikely]] // (as above)
+					RecordFound(*permutation, stage, params, input_info, push_data_cursor);
 				publish_stage(permutation->program);
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
 			if (borrowed_specialization) specialization = *borrowed_specialization;
 		}
+		// (A worker's find-only lookup, t_find_only: no permutation in memory: none is adopted, translated or recorded.
+		// t_adopt_only: one the prefetch holds done is adopted below, as here on the GPU thread; one that would be translated
+		// is not.)
+		const bool find_only  = PipelineCache::g_find_only_users.load(std::memory_order_relaxed) != 0 && PipelineCache::t_find_only;
+		const bool adopt_only = find_only && PipelineCache::t_adopt_only;
+		if (find_only && !adopt_only) return {};
+		// (A guest word this lookup, or the pixel program's before it, could not read made the specialization of a zero:
+		// nothing is adopted for it; the caller refuses the draw as a read.)
+		if (adopt_only && PipelineCache::t_no_fault_failed) return {};
 
 		ShaderStageInputInfo stage_input {};
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
@@ -2268,19 +2977,23 @@ struct PipelineCache::ProgramCache {
 			if (entry == programs.end()) return {};
 			auto&      jobs  = entry->second.table_jobs;
 			const auto found = std::ranges::find_if(jobs, [&](const auto& job) {
-				return job->push_data_cursor == push_data_cursor && job->specialization == table_specialization;
+				return job->push_data_cursor == push_data_cursor && job->specialization == table_specialization &&
+				       job->table_reduced == table_reduced;
 			});
 			if (found == jobs.end()) {
 				if (params.code_unread) return UnreadCode();
 				auto job              = std::make_shared<TableJob>();
 				job->specialization   = table_specialization;
 				job->push_data_cursor = push_data_cursor;
+				job->table_reduced    = table_reduced;
 				job->code.assign(params.code.begin(), params.code.end());
 				job->back_code.assign(params.back_code.begin(), params.back_code.end());
 				job->user_data         = params.user_data;
 				job->options           = options;
 				job->options.table_mode = true;
 				job->options.table_dead_user_data = TableDeadUserDataOn();
+				job->options.table_reduce_user_data = table_reduced;
+				job->options.table_dense_indirect = TableDenseIndirectOn();
 				job->options.user_data = job->user_data;
 				job->options.back_code = job->back_code;
 				job->options.input_info = {};
@@ -2295,32 +3008,25 @@ struct PipelineCache::ProgramCache {
 					job->options.input_info.compute = &job->compute;
 				}
 				jobs.push_back(job);
-				push_job([job, device = device] {
-					try {
-						Common::RecoverableExitScope recoverable;
-						auto translated = ShaderRecompiler::TranslateProgram(job->code, job->options);
-						job->result     = ShaderRecompiler::CompileProgram(std::move(translated), job->options,
-						                                                   job->specialization, job->push_data_cursor);
-						job->module     = CreateModule(device, job->options, job->result->spirv);
-						job->info       = TakeOnWorker(*job->result);
-					} catch (const Common::RecoverableExit& refused) {
-						// (A line of its own in the log: most exit messages end without one.)
-						job->refused = refused.message;
-						if (job->refused.empty() || job->refused.back() != '\n') job->refused += '\n';
-					}
-					job->done.store(true, std::memory_order_release);
-				});
+				push_job([job, device = device] { RunTableJob(*job, device); }, false);
 				Pending() = true;
 				Waiting() = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 				return {};
 			}
 			const auto job = *found;
+			// (Mode 4: a job posted ahead (PostTableAhead) still queued on the ahead pool moves to the table workers now, as
+			// the draw's own would be, run by whichever takes it first.)
+			if (job->ahead && !job->done.load(std::memory_order_acquire) && !job->promoted.exchange(true, std::memory_order_relaxed))
+				[[unlikely]] push_job([job, device = device] {
+					if (!job->claimed.exchange(true, std::memory_order_acq_rel)) RunTableJob(*job, device);
+				}, false);
 			if (!job->done.load(std::memory_order_acquire)) {
 				Pending() = true;
 				Waiting() = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 				return {};
 			}
 			jobs.erase(found);
+			job->taken = true; // (its module, if any, the permutation's below)
 			Permutation permutation {.specialization = table_specialization, .table_mode = true};
 			if (job->result) {
 				const ShaderParams job_params {.code = job->code, .user_data = job->user_data, .hash = params.hash,
@@ -2334,9 +3040,18 @@ struct PipelineCache::ProgramCache {
 				if (reports.fetch_add(1, std::memory_order_relaxed) < 200)
 					std::printf("Table: %s 0x%016llx: %s", label, static_cast<unsigned long long>(params.hash),
 					            job->refused.c_str());
+				// (KYTY_SPEC_PAIR_PUSH_FIT: a refusal for push constants is this cursor's alone. Noted with the switch on, so
+				// a refusal made before it was turned on matches any cursor, as with it off.)
+				if (PairPushFitOn() && job->refused.find(ShaderRecompiler::IR::TablePushOverflowText) != std::string::npos)
+					permutation.table_overflow_cursor = job->push_data_cursor;
 			}
+			permutation.table_reduced = job->table_reduced;
 			const auto& stored = entry->second.permutations.emplace_back(std::move(permutation));
-			if (!stored.handle) return {};
+			CountPermutations(stage, 1);
+			if (!stored.handle) {
+				if (stored.table_overflow_cursor == push_data_cursor) t_push_overflow = true; // (set with the switch on only)
+				return {};
+			}
 			if (TableFormatIndexOn()) // (TableFormatOnlyBuffers' index: KYTY_TABLE_FORMAT_INDEX only, mode 0 as before)
 				by_program.try_emplace(&stored.program, std::pair {&entry->second, &stored});
 			publish_stage(stored.program);
@@ -2347,11 +3062,30 @@ struct PipelineCache::ProgramCache {
 		// A program met for the first time that the prefetch translated: its plan, materialized for
 		// this draw, and its modules are taken over.
 		if (entry == programs.end()) {
-			if (auto* group = PrefetchedGroup(params)) {
-				if (!ReportMaterialization(label, stage, params.hash, report,
-				                           ShaderRecompiler::IR::MaterializeResources(*group->plan, runtime, resources,
-				                                                                      specialization, &report)))
+			if (auto* group = PrefetchedGroup(params, adopt_only)) {
+				// KYTY_SPEC_PIPECACHE_SPLIT: the group (taken: this lookup's alone until it moves or goes back) materialized
+				// with the lock released; a program made meanwhile (the GPU thread's lookup, which found the group taken,
+				// translated it): the group goes back, the lookup refused.
+				bool group_materialized = false;
+				if (worker_split != nullptr) {
+					const auto key = lookup_key;
+					{
+						const UnlockedRead unlocked(*this, *worker_split);
+						group_materialized =
+						    ShaderRecompiler::IR::MaterializeResources(*group->plan, runtime, resources, specialization, &report);
+					}
+					lookup_key = key;
+					if (programs.find(key) != programs.end()) return ReturnPrefetchedGroup(*group), ShaderProgram {};
+				} else {
+					group_materialized =
+					    ShaderRecompiler::IR::MaterializeResources(*group->plan, runtime, resources, specialization, &report);
+				}
+				if (!ReportMaterialization(label, stage, params.hash, report, group_materialized)) {
+					if (adopt_only) ReturnPrefetchedGroup(*group); // (left as found for the in-order lookup)
 					return {};
+				}
+				// (A word the worker could not read: the specialization is not this draw's; the group goes back.)
+				if (adopt_only && PipelineCache::t_no_fault_failed) return ReturnPrefetchedGroup(*group), ShaderProgram {};
 				entry = programs.try_emplace(lookup_key, std::move(*group->plan)).first;
 				entry->second.source_digest = group->source;
 				entry->second.prefetched = std::move(group->modules);
@@ -2369,8 +3103,11 @@ struct PipelineCache::ProgramCache {
 		bool       translated_here = false;
 		double     translate_ms    = 0.0;
 		const auto adopt = [&] { return AdoptPrefetchedModule(entry->second, options, specialization, push_data_cursor); };
-		if (entry == programs.end() ||
-		    (adopt() == nullptr && (!TakePrefetchedModules(entry->second, params) || adopt() == nullptr))) {
+		const bool need_translation = entry == programs.end() ||
+		                              (adopt() == nullptr && (!TakePrefetchedModules(entry->second, params) || adopt() == nullptr));
+		if (need_translation && adopt_only) return {};
+		if (adopt_only) ++PipelineCache::t_adopt_adopted;
+		if (need_translation) {
 			translated_here = true;
 			// With the slow-call log: the translation's specialization-independent part (front) and
 			// whether the program had other permutations already.
@@ -2383,36 +3120,50 @@ struct PipelineCache::ProgramCache {
 				            known_program ? "specialization" : "program");
 			}, SlowLog::HitchThreshold());
 			LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
-			auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
-			front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
-			translate_ms = front_ms;
-			if (entry == programs.end()) {
-				auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-				if (!ReportMaterialization(label, stage, params.hash, report,
-				                           ShaderRecompiler::IR::MaterializeResources(
-				                               resource_plan, runtime, resources, specialization, &report)))
-					return {};
-				entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
-				entry->second.plan_use      = plan_clock;
-				entry->second.source_digest = SourceDigest(params.code, params.back_code);
-			}
-			// A specialization met for the first time whose formatted buffers can decode their formats at
-			// run time gets the portable module (IR::PortableFormats) under its own specialization: the
-			// static precompile (WarmSeeds) holds that module's pipelines, so no driver compilation holds
-			// up this draw. The warmup file records the exact specialization, and the next start compiles
-			// its specialized module.
-			auto portable = specialization;
-			if (ShaderRecompiler::IR::PortableFormats(entry->second.resource_plan.info, portable)) {
-				entry->second.permutations.push_back(CompilePermutation(
-				    params, options, std::move(translated), std::move(portable), push_data_cursor));
-				entry->second.permutations.back().specialization = std::move(specialization);
+			// KYTY_SPEC_PIPECACHE_SPLIT: built with the lock released, published under it (BuildUnlocked: it returns the
+			// lookup's result when the permutation found or made meanwhile is taken instead; else the permutation is
+			// published in `entry`).
+			if (auto* const split = t_split_lock; split != nullptr && !table_mode) {
+				if (auto taken = BuildUnlocked(*split, params, input_info, push_data_cursor, table_portable, stage, label,
+				                               entry, runtime, resources, specialization, report, options, front_ms))
+					return *taken;
+				translate_ms = front_ms;
+				render_translations++;
+				render_translate_ms +=
+				    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
 			} else {
-				entry->second.permutations.push_back(CompilePermutation(
-				    params, options, std::move(translated), std::move(specialization), push_data_cursor));
+				auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+				front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
+				translate_ms = front_ms;
+				if (entry == programs.end()) {
+					auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+					if (!ReportMaterialization(label, stage, params.hash, report,
+					                           ShaderRecompiler::IR::MaterializeResources(
+					                               resource_plan, runtime, resources, specialization, &report)))
+						return {};
+					entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
+					entry->second.plan_use      = plan_clock;
+					entry->second.source_digest = SourceDigest(params.code, params.back_code);
+				}
+				// A specialization met for the first time whose formatted buffers can decode their formats at
+				// run time gets the portable module (IR::PortableFormats) under its own specialization: the
+				// static precompile (WarmSeeds) holds that module's pipelines, so no driver compilation holds
+				// up this draw. The warmup file records the exact specialization, and the next start compiles
+				// its specialized module.
+				auto portable = specialization;
+				if (ShaderRecompiler::IR::PortableFormats(entry->second.resource_plan.info, portable)) {
+					entry->second.permutations.push_back(CompilePermutation(
+					    params, options, std::move(translated), std::move(portable), push_data_cursor));
+					entry->second.permutations.back().specialization = std::move(specialization);
+				} else {
+					entry->second.permutations.push_back(CompilePermutation(
+					    params, options, std::move(translated), std::move(specialization), push_data_cursor));
+				}
+				CountPermutations(stage, 1);
+				render_translations++;
+				render_translate_ms +=
+				    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
 			}
-			render_translations++;
-			render_translate_ms +=
-			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
 		}
 		const auto& permutation = entry->second.permutations.back();
 		if (PipelineSourceLog())
@@ -2420,27 +3171,38 @@ struct PipelineCache::ProgramCache {
 			            static_cast<unsigned long long>(params.hash), translated_here ? 1 : 0, translate_ms,
 			            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - source_begin).count());
 		if (warmup.Enabled()) {
-			LocalShaderWarmup::Record record;
-			record.stage = stage;
-			record.hash = params.hash;
-			record.user_data_count = static_cast<uint32_t>(params.user_data.size());
-			record.push_cursor = push_data_cursor;
-			record.static_key = lookup_key.static_state;
-			record.code.assign(params.code.begin(), params.code.end());
-			record.back_code.assign(params.back_code.begin(), params.back_code.end());
-			record.specialization = permutation.specialization;
-			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) record.vertex = input_info;
-			else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) record.pixel = input_info;
-			else record.compute = input_info;
-			const auto index = warmup.Add(record);
-			if (index != LocalShaderWarmup::NoShader) recorded_programs[permutation.handle.id] = index;
+			if (adopt_only) {
+				// (Not recorded on the worker; kept unrecorded, recorded in order: `unrecorded` above. Its shader id goes to the
+				// caller, which records it at its entry's commit, or makes no entry on it.)
+				NoteMet(permutation.handle.id, stage, params, input_info, push_data_cursor, permutation.specialization);
+				unrecorded.insert(permutation.handle.id);
+			} else {
+				LocalShaderWarmup::Record record;
+				FillRecord(record, stage, params, input_info, push_data_cursor, permutation.specialization);
+				const auto index = warmup.Add(record);
+				if (index != LocalShaderWarmup::NoShader) recorded_programs[permutation.handle.id] = index;
+			}
 		}
 		publish_stage(permutation.program);
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
+		// (KYTY_SPEC_PIPECACHE_SPLIT: the running counts, the same numbers, instead of a walk over every program under the
+		// lock at each new permutation; the walk made once when the count starts.)
 		std::array<size_t, static_cast<size_t>(ShaderType::Mesh) + 1> counts {};
-		for (const auto& [key, source]: programs) {
-			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+		if (PipecacheSplitOn()) {
+			if (!permutations_counted) {
+				for (const auto& [key, source]: programs) {
+					counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+				}
+				permutation_counts   = counts;
+				permutations_counted = true;
+			}
+			counts = permutation_counts;
+		} else {
+			permutations_counted = false;
+			for (const auto& [key, source]: programs) {
+				counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+			}
 		}
 		// Guest geometry shaders are compiled through the host mesh stage.
 		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu\n",
@@ -2713,7 +3475,376 @@ struct PipelineCache::ProgramCache {
 			       p.program.bindings.push_data_start_dword ==
 			           ShaderRecompiler::IR::PushData::StartFor(record.push_cursor, p.program.bindings.ShaderDataDwords());
 		});
-		return found != entry->second.permutations.end() ? &*found : nullptr;
+		if (found == entry->second.permutations.end()) return nullptr;
+		// (One a worker adopted that no in-order lookup has met is not there yet for the recording's warmup, as in order:
+		// its pipelines are made where the draw makes them, with their recipes.)
+		if (!unrecorded.empty() && unrecorded.contains(found->handle.id)) return nullptr;
+		return &*found;
+	}
+
+	// (Mode 4) The table programs of a scene's recorded pairs, translated on the ahead pool (push_ahead: background threads
+	// off the render CPUs) before a draw meets them, into the program entry's table jobs where the draw's own Get would post
+	// its job: a draw whose table specialization and push data cursor are a job's finds it there (made, or moved to the
+	// table workers if still queued) instead of posting one. Then each pair's table pipelines, one per recipe, once both of
+	// its table programs are made (PipelinesAhead).
+	std::function<void(std::function<void()>)> push_ahead;
+	// (Set under the cache's m_mutex before the pools are reset at shutdown (FinishCompileWorkers): no job is pushed to the
+	// ahead pool after it, so none makes a pool again; read under that lock too, by PushAhead and a job's `after`.)
+	bool ahead_stopping = false;
+	// (Under the cache's m_mutex) Table pipelines made ahead queued or building, which read their table permutations'
+	// programs and modules: while any is, a dropped entry is retired, not freed (ReleaseRetired).
+	uint32_t ahead_pipeline_builds = 0;
+	// (Mode 4, the warmup thread in WarmScene) The programs of the recording's recipes (those of `only` where given)
+	// marked as `scene`'s, not met since: the sweep sends them out last while the scene is current (SweepPlans). The
+	// records decoded without the cache's lock (the warmup thread's own views), the programs marked under `mutex` (the
+	// cache's); a program the cache lacks, or holds of other code, is left. A program two scenes list is the last warmed
+	// one's; a scene left behind: its marks are not read, its plans age as any.
+	void KeepScenePlans(uint32_t scene, const std::unordered_set<uint64_t>* only, Common::Mutex& mutex) {
+		std::vector<uint8_t> needed(warm_records.size(), 0);
+		for (const auto& words: warm_recipes) {
+			if (only != nullptr && !only->contains(LocalShaderWarmup::RecipeKey(words))) continue;
+			LocalShaderWarmup::PipelineRecord recipe;
+			LocalShaderWarmup::Reader         reader {words};
+			if (!LocalShaderWarmup::VisitPipeline(reader, recipe)) continue;
+			for (const auto index: {recipe.vertex, recipe.pixel, recipe.compute})
+				if (index < needed.size()) needed[index] = 1;
+		}
+		std::vector<std::pair<ProgramKey, uint64_t>> keys; // (the key, the code's digest)
+		for (size_t i = 0; i < needed.size(); ++i) {
+			if (needed[i] == 0) continue;
+			LocalShaderWarmup::Record record;
+			LocalShaderWarmup::Reader reader {warm_records[i]};
+			if (!LocalShaderWarmup::Visit(reader, record)) continue;
+			keys.emplace_back(ProgramKey {record.stage, record.hash, record.user_data_count,
+			                              static_cast<uint32_t>(record.code.size()), record.static_key},
+			                  SourceDigest(record.code, record.back_code));
+		}
+		Common::LockGuard lock(mutex);
+		for (const auto& [key, digest]: keys) {
+			const auto entry = programs.find(key);
+			if (entry == programs.end() || entry->second.source_digest != digest) continue;
+			entry->second.keep_scene = scene;
+			entry->second.keep_met   = false;
+		}
+	}
+	struct AheadSeed {
+		ProgramKey                key;
+		uint64_t                  digest = 0;
+		LocalShaderWarmup::Record record;
+	};
+	// The table form of a seed's specialization, as Get's table branch makes it (table_portable 0: no byte-base offsets,
+	// the indirect image's form; a dense root's for a vertex or pixel program only, as Get's).
+	static ShaderRecompiler::IR::ResourceSpecialization AheadSpecialization(const AheadSeed& seed) {
+		auto table_specialization = seed.record.specialization;
+		for (auto& buffer: table_specialization.buffers) buffer.byte_base_offset = false;
+		const auto stage = seed.record.stage;
+		(void)ShaderRecompiler::IR::TableIndirectForm(table_specialization, nullptr,
+		                                              TableDenseIndirectOn() &&
+		                                                  (stage == ShaderType::Vertex || stage == ShaderType::Pixel));
+		return table_specialization;
+	}
+	// The job of `seed`'s table program at `cursor`, put into its entry as Get's table branch makes one (under the cache's
+	// m_mutex): the same inputs, but for the user data's values, which the translation does not read (the count only:
+	// Translate's user_data_base / count, DetectEmbeddedVertexFetch's size; the values are the SRT walker's at the draw).
+	// Null where the entry is not there or holds other code, or the job or a table permutation of it is there already.
+	std::shared_ptr<TableJob> AheadJob(const AheadSeed& seed, uint32_t cursor) {
+		const auto& record = seed.record;
+		if (record.stage != ShaderType::Vertex && record.stage != ShaderType::Pixel) return nullptr;
+		const auto entry = programs.find(seed.key);
+		if (entry == programs.end() || entry->second.source_digest != seed.digest) return nullptr;
+		auto& source               = entry->second;
+		auto  table_specialization = AheadSpecialization(seed);
+		// (KYTY_SPEC_PAIR_PUSH_FIT's reduced forms are not the plain program's: passed over; so is a refusal for push
+		// constants made at another cursor, as Get's find passes it over.)
+		for (const auto& job: source.table_jobs)
+			if (job->push_data_cursor == cursor && job->specialization == table_specialization && !job->table_reduced)
+				return nullptr;
+		const bool push_fit = PairPushFitOn();
+		for (const auto& p: source.permutations)
+			if (p.table_mode && !p.table_reduced && !OverflowElsewhere(p, cursor, push_fit) &&
+			    p.specialization == table_specialization &&
+			    p.program.bindings.push_data_start_dword ==
+			        ShaderRecompiler::IR::PushData::StartFor(cursor, p.program.bindings.ShaderDataDwords()))
+				return nullptr;
+		auto job              = std::make_shared<TableJob>();
+		job->ahead            = true;
+		job->device           = device;
+		job->specialization   = std::move(table_specialization);
+		job->push_data_cursor = cursor;
+		job->code             = record.code;
+		job->back_code        = record.back_code;
+		job->user_data.assign(record.user_data_count, 0u);
+		// (Get's options, field by field; then its table job's.)
+		auto& options            = job->options;
+		options.stage            = record.stage;
+		options.enable_lod_stats = true;
+		options.shader_hash      = record.hash;
+		options.dump_ir          = Config::GetShaderLogDirection() != Config::ShaderLogDirection::Silent;
+		options.early_dump       = options.dump_ir;
+		options.dump_label       = record.stage == ShaderType::Vertex ? "ShaderRecompiler VS" : "ShaderRecompiler PS";
+		if (record.stage == ShaderType::Vertex) {
+			job->vertex               = record.vertex;
+			options.input_info.vertex = &job->vertex;
+			options.scratch_dwords    = job->vertex.scratch_size_dwords;
+			options.user_data_base    = 8;
+		} else {
+			job->pixel               = record.pixel;
+			options.input_info.pixel = &job->pixel;
+			options.scratch_dwords   = job->pixel.scratch_size_dwords;
+		}
+		options.table_mode           = true;
+		options.table_dead_user_data = TableDeadUserDataOn();
+		options.table_dense_indirect = TableDenseIndirectOn();
+		options.user_data            = job->user_data;
+		options.back_code            = job->back_code;
+		source.table_jobs.push_back(job);
+		// The program's plan kept in memory until its first lookup (EnsurePlan), while pinned plans are fewer than half the
+		// plans' budget (they count against it: SweepPlans takes other idle plans first); out of memory, read back on the
+		// ahead pool, restored as a preload is (DrainLoadedPlans at the next flip, or TakeLoadedPlan at the lookup). The
+		// ahead pool's programs were swept as any idle plan, and read back on the GPU thread or a worker at their first
+		// lookup (a full specialization check after each restore).
+		if (AheadPlanPinOn() && !source.plan_pinned && plan_pins < PlanBudget() / 2) {
+			source.plan_pinned = true;
+			++plan_pins;
+			if (source.plan_out && !source.plan_loading && push_ahead && !ahead_stopping) {
+				UnlistPlan(source);
+				source.plan_loading = true;
+				loads_tracked.insert(&source);
+				push_ahead([loads = plan_loads, entry = &source, spilled = source.plan_spilled, erased = programs_erased] {
+					LoadedPlan loaded;
+					loaded.erased = erased;
+					loaded.failed = !LoadPlanBytes(spilled, loaded.plan, loaded.linear); // (failed: the lookup reads it)
+					std::lock_guard lock(loads->mutex);
+					loads->plans[entry] = std::move(loaded);
+				});
+			}
+		}
+		return job;
+	}
+	void PushAhead(const std::shared_ptr<TableJob>& job) {
+		if (ahead_stopping) return; // (shutdown: left unrun, freed with its entry)
+		push_ahead([job, device = device] {
+			if (!job->claimed.exchange(true, std::memory_order_acq_rel)) RunTableJob(*job, device);
+		});
+	}
+	// A recorded pair's seeds and the fixed-function states of its recipes (each one pipeline of the pair the game made),
+	// whose table pipelines are made on the ahead pool once both table programs are (PipelinesAhead).
+	struct AheadPair {
+		std::shared_ptr<AheadSeed>                     vertex, pixel; // (pixel null: a pair without a pixel shader)
+		std::vector<LocalShaderWarmup::PipelineRecord> recipes;
+	};
+	// (The pipeline cache's, set in its constructor; called under its m_mutex.)
+	std::function<void(const std::vector<LocalShaderWarmup::PipelineRecord>&, const Permutation&, const ShaderVertexInputInfo&,
+	                   const Permutation*, const ShaderPixelInputInfo*)>
+	    table_pipelines_ahead;
+	// (Under the cache's m_mutex) `seed`'s table permutation at `cursor`. Its job made ahead and done is published first, as
+	// the draw's Get publishes it (its table branch: the job out of the entry's jobs, the permutation finished from its
+	// result and stored), which the draw then finds as one made. Null: not made yet (a job of a draw's own or still running),
+	// refused, or the entry gone.
+	Permutation* AheadPermutation(const AheadSeed& seed, uint32_t cursor) {
+		const auto entry = programs.find(seed.key);
+		if (entry == programs.end() || entry->second.source_digest != seed.digest) return nullptr;
+		auto&      source               = entry->second;
+		const auto table_specialization = AheadSpecialization(seed);
+		const auto found                = std::ranges::find_if(source.table_jobs, [&](const auto& job) {
+            return job->push_data_cursor == cursor && job->specialization == table_specialization && !job->table_reduced;
+        });
+		if (found != source.table_jobs.end()) {
+			const auto job = *found;
+			if (!job->ahead || !job->done.load(std::memory_order_acquire) || !job->result) return nullptr;
+			source.table_jobs.erase(found);
+			job->taken = true;
+			const ShaderParams job_params {.code = job->code, .user_data = job->user_data, .hash = seed.record.hash,
+			                               .back_code = job->back_code};
+			auto permutation = FinishPermutation(job_params, job->options, *job->result, std::move(job->info),
+			                                     ShaderRecompiler::IR::ResourceSpecialization {table_specialization}, job->module);
+			permutation.table_mode = true;
+			auto& stored           = source.permutations.emplace_back(std::move(permutation));
+			CountPermutations(entry->first.stage, 1);
+			if (!stored.handle) return nullptr;
+			stored.ahead_unmet = true; // (until a lookup finds it: DropAheadUnmet)
+			if (TableFormatIndexOn()) by_program.try_emplace(&stored.program, std::pair {&source, &stored});
+			return &stored;
+		}
+		const bool push_fit = PairPushFitOn(); // (a refusal for push constants made at another cursor: passed over)
+		for (auto& p: source.permutations)
+			if (p.table_mode && !p.table_reduced && !OverflowElsewhere(p, cursor, push_fit) &&
+			    p.specialization == table_specialization &&
+			    p.program.bindings.push_data_start_dword ==
+			        ShaderRecompiler::IR::PushData::StartFor(cursor, p.program.bindings.ShaderDataDwords()))
+				return p.handle ? &p : nullptr;
+		return nullptr;
+	}
+	// (Under the cache's m_mutex, at a scene's warmup before it posts its own: PipelineCache::DropTableAheadUnmet, after
+	// the table pipelines) The bound on what the ahead pool holds: what the earlier scenes' batches made ahead that no draw
+	// took goes.
+	// - A job made ahead that no draw met (`promoted`: set by the Get that finds it unmade; one a Get finds made is taken at
+	//   once, out of the jobs), not running: out of its entry's jobs (one still queued claimed first, so the pool skips it);
+	//   freed with its last reference, its module with it (~TableJob).
+	// - A table permutation published ahead that no lookup has found (`ahead_unmet`) and no table pipeline building now
+	//   reads (`building`): its module destroyed and its slot made one no lookup matches: program cleared, no handle, no
+	//   specialization, push data start PushData::DwordCount + 1, a value PushData::StartFor never returns (the cursor, at
+	//   most DwordCount, or NoStart), so no scan comparing it with StartFor's matches it (Get's find, AheadJob's,
+	//   AheadPermutation's, PostTableAhead's); table_mode kept, so no normal lookup matches it either. Out of by_program. The
+	//   slot stays: draws hold pointers to the deque's other permutations, which an erase would move.
+	// A later draw's lookup then finds none and makes it as with nothing made ahead: Get's table branch posts its own job,
+	// the same translation over the draw's inputs (RunTableJob), the same SPIR-V; a new shader id, as any program made the
+	// first time (ids are the session's, never recorded).
+	void DropAheadUnmet(const std::unordered_set<const ShaderRecompiler::IR::CompiledShaderInfo*>& building) {
+		for (auto& [key, source]: programs) {
+			(void)key;
+			for (auto it = source.table_jobs.begin(); it != source.table_jobs.end();) {
+				const auto& job  = *it;
+				const bool  drop = job->ahead && !job->promoted.load(std::memory_order_relaxed) &&
+				                  (!job->claimed.exchange(true, std::memory_order_acq_rel) || job->done.load(std::memory_order_acquire));
+				it = drop ? source.table_jobs.erase(it) : it + 1;
+			}
+			for (auto& permutation: source.permutations) {
+				if (!permutation.ahead_unmet || building.contains(&permutation.program)) continue;
+				by_program.erase(&permutation.program);
+				DestroyShaderModule(device, permutation.handle.module);
+				if (permutation.handle.module) LiveCounters::g_shader_modules.fetch_sub(1, std::memory_order_relaxed);
+				permutation.handle                                 = {};
+				permutation.program                                = {};
+				permutation.program.bindings.push_data_start_dword = ShaderRecompiler::IR::PushData::DwordCount + 1u;
+				permutation.specialization                         = {};
+				permutation.ahead_unmet                            = false;
+			}
+		}
+	}
+	// (Under the cache's m_mutex) `pair`'s table pipelines, its vertex program's table permutation at `cursor` and its pixel
+	// program's at 0 both made (else nothing: the later of the two jobs' after_done comes here again), queued on the ahead
+	// pool by the pipeline cache (table_pipelines_ahead) where none is there for the key.
+	void PipelinesAhead(const AheadPair& pair, uint32_t cursor) {
+		if (!table_pipelines_ahead || ahead_stopping || pair.recipes.empty()) return;
+		Permutation* vertex = AheadPermutation(*pair.vertex, cursor);
+		if (vertex == nullptr) return;
+		Permutation* pixel = pair.pixel != nullptr ? AheadPermutation(*pair.pixel, 0) : nullptr;
+		if (pair.pixel != nullptr && pixel == nullptr) return;
+		table_pipelines_ahead(pair.recipes, *vertex, pair.vertex->record.vertex, pixel,
+		                      pixel != nullptr ? &pair.pixel->record.pixel : nullptr);
+	}
+	// The scene's recorded pairs (`recipes`, `only`: its recipe keys; null: all) whose vertex shader is a table one (no vertex
+	// buffers): each pixel seed's table program at cursor 0, then, once it is made, its paired vertex seeds' at the cursor
+	// after its push data (GetGraphicsPrograms looks the pixel program up first); a pair without a pixel shader's vertex
+	// seed at 0. Each pair's table pipelines too, one per recipe of it, once both of its table programs are made (the
+	// after_done of each job: whichever comes second finds both; PipelinesAhead). The seeds decoded here, off the lock; the
+	// jobs put in under `mutex` (the cache's). Returns the jobs posted.
+	size_t PostTableAhead(std::span<const std::span<const uint32_t>> records, const std::vector<std::vector<uint32_t>>& recipes,
+	                      const std::unordered_set<uint64_t>* only, Common::Mutex& mutex) {
+		if (!push_ahead) return 0;
+		using Pairs = std::vector<std::shared_ptr<AheadPair>>;
+		std::unordered_map<uint32_t, std::shared_ptr<AheadSeed>> seeds;
+		std::unordered_map<uint32_t, std::shared_ptr<Pairs>>     by_pixel;
+		Pairs                                                    vertex_alone;
+		const auto seed_of = [&](uint32_t index) -> std::shared_ptr<AheadSeed> {
+			if (index >= records.size()) return nullptr;
+			if (const auto found = seeds.find(index); found != seeds.end()) return found->second;
+			auto                      seed = std::make_shared<AheadSeed>();
+			LocalShaderWarmup::Reader reader {records[index]};
+			if (!LocalShaderWarmup::Visit(reader, seed->record)) seed = nullptr;
+			if (seed != nullptr) {
+				const auto& r = seed->record;
+				seed->key     = {r.stage, r.hash, r.user_data_count, static_cast<uint32_t>(r.code.size()), r.static_key};
+				seed->digest  = SourceDigest(r.code, r.back_code);
+			}
+			return seeds[index] = seed;
+		};
+		// (A pair once per vertex seed, its recipes gathered.)
+		const auto pair_in = [&](Pairs& pairs, const std::shared_ptr<AheadSeed>& vertex, const std::shared_ptr<AheadSeed>& pixel,
+		                         const LocalShaderWarmup::PipelineRecord& recipe) {
+			auto found = std::ranges::find_if(pairs, [&](const auto& pair) { return pair->vertex == vertex; });
+			if (found == pairs.end()) {
+				auto pair    = std::make_shared<AheadPair>();
+				pair->vertex = vertex;
+				pair->pixel  = pixel;
+				found        = pairs.insert(pairs.end(), std::move(pair));
+			}
+			(*found)->recipes.push_back(recipe);
+		};
+		for (const auto& words: recipes) {
+			if (only != nullptr && !only->contains(LocalShaderWarmup::RecipeKey(words))) continue;
+			LocalShaderWarmup::PipelineRecord recipe;
+			LocalShaderWarmup::Reader         reader {words};
+			if (!LocalShaderWarmup::VisitPipeline(reader, recipe) || recipe.compute != LocalShaderWarmup::NoShader) continue;
+			if (recipe.vertex_input.binding_count != 0) continue; // (a table pair's vertex shader fetches no vertex buffer)
+			const auto vertex = seed_of(recipe.vertex);
+			if (vertex == nullptr || vertex->record.stage != ShaderType::Vertex) continue;
+			if (recipe.pixel == LocalShaderWarmup::NoShader) {
+				pair_in(vertex_alone, vertex, nullptr, recipe);
+				continue;
+			}
+			const auto pixel = seed_of(recipe.pixel);
+			if (pixel == nullptr || pixel->record.stage != ShaderType::Pixel) continue;
+			auto& list = by_pixel[recipe.pixel];
+			if (list == nullptr) list = std::make_shared<Pairs>();
+			pair_in(*list, vertex, pixel, recipe);
+		}
+		size_t               posted  = 0;
+		auto* const          self    = this;
+		Common::Mutex* const lock_of = &mutex;
+		// (A pair's vertex seed at `cursor`, under the lock; its pipelines from the job's after_done, or at once where no job
+		// is posted (its table program there already, or another's job).)
+		const auto post_vertex = [self, lock_of](const std::shared_ptr<AheadPair>& pair, uint32_t cursor) -> size_t {
+			const auto job = self->AheadJob(*pair->vertex, cursor);
+			if (job == nullptr) {
+				self->PipelinesAhead(*pair, cursor);
+				return 0;
+			}
+			job->after_done = [self, lock_of, pair, cursor](TableJob&) {
+				Common::LockGuard relock(*lock_of);
+				self->PipelinesAhead(*pair, cursor);
+			};
+			self->PushAhead(job);
+			return 1;
+		};
+		// (The cache's lock a pair at a time: the GPU thread's lookups wait for one pair's jobs at most.)
+		for (const auto& [index, pairs]: by_pixel) {
+			const auto&       pixel = *seeds[index];
+			Common::LockGuard lock(mutex);
+			if (const auto job = AheadJob(pixel, 0)) {
+				job->after = [self, lock_of, pairs, post_vertex](TableJob& made) {
+					if (!made.result) return; // (refused in table mode: its pair is refused, nothing to pair)
+					uint32_t cursor = 0;
+					made.info.bindings.AdvancePushData(cursor);
+					Common::LockGuard relock(*lock_of);
+					if (self->ahead_stopping) return; // (shutdown: no more jobs)
+					for (const auto& pair: *pairs) (void)post_vertex(pair, cursor);
+				};
+				// (The pairs whose vertex job ran first, or was not posted: their pipelines now.)
+				job->after_done = [self, lock_of, pairs, held = seeds[index]](TableJob& made) {
+					if (!made.result) return;
+					Common::LockGuard relock(*lock_of);
+					const auto*       published = self->AheadPermutation(*held, 0);
+					if (published == nullptr) return;
+					uint32_t cursor = 0;
+					published->program.bindings.AdvancePushData(cursor);
+					for (const auto& pair: *pairs) self->PipelinesAhead(*pair, cursor);
+				};
+				PushAhead(job);
+				++posted;
+				continue;
+			}
+			// (The pixel program's table permutation made already, at cursor 0: its vertex seeds at once.)
+			const auto entry = programs.find(pixel.key);
+			if (entry == programs.end() || entry->second.source_digest != pixel.digest) continue;
+			const auto table_specialization = AheadSpecialization(pixel);
+			for (const auto& p: entry->second.permutations) {
+				if (!p.table_mode || p.table_reduced || !p.handle || p.specialization != table_specialization ||
+				    p.program.bindings.push_data_start_dword !=
+				        ShaderRecompiler::IR::PushData::StartFor(0, p.program.bindings.ShaderDataDwords()))
+					continue;
+				uint32_t cursor = 0;
+				p.program.bindings.AdvancePushData(cursor);
+				for (const auto& pair: *pairs) posted += post_vertex(pair, cursor);
+				break;
+			}
+		}
+		for (const auto& pair: vertex_alone) {
+			Common::LockGuard lock(mutex);
+			posted += post_vertex(pair, 0);
+		}
+		return posted;
 	}
 
 	void TranslateWarmup(Common::Mutex& mutex, bool background, const std::atomic<bool>& stop) {
@@ -2774,6 +3905,9 @@ struct PipelineCache::ProgramCache {
 				});
 				if (found != entry->second.permutations.end()) {
 					warm_permutations[index] = &*found;
+					// (One a worker adopted unrecorded is this record's, as when the warmup makes it before the game's
+					// lookup; the game's find then records nothing.)
+					if (!unrecorded.empty() && unrecorded.erase(found->handle.id) != 0) recorded_programs[found->handle.id] = uint32_t(index);
 					DropWarmJob(device, *job);
 					continue;
 				}
@@ -2789,6 +3923,7 @@ struct PipelineCache::ProgramCache {
 			ShaderParams params {record.code, std::move(user_data), record.hash, record.back_code};
 			entry->second.permutations.push_back(FinishPermutation(params, options, job->result, std::move(job->info),
 			                                                       std::move(record.specialization), job->module));
+			CountPermutations(entry->first.stage, 1);
 			job->module       = nullptr;
 			auto& permutation = entry->second.permutations.back();
 			recorded_programs[permutation.handle.id] = uint32_t(index);
@@ -2830,7 +3965,7 @@ struct PipelineCache::ProgramCache {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
-		ReleaseRetired();
+		ReleaseRetired(true);
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
@@ -2845,7 +3980,10 @@ struct PipelineCache::ProgramCache {
 	// has (Get) wait here, their modules alive, until it is done (it may be making their pipelines).
 	bool                                       warming = false;
 	std::vector<decltype(programs)::node_type> retired;
-	void ReleaseRetired() {
+	// (`all`: the cache's end. Else none while table pipelines made ahead are queued or building (mode 4): the last done
+	// releases them, RunAheadTablePipeline.)
+	void ReleaseRetired(bool all = false) {
+		if (!all && (ahead_pipeline_builds != 0 || unlocked_readers != 0)) return;
 		for (auto& node: retired)
 			for (const auto& permutation: node.mapped().permutations) {
 				DestroyShaderModule(device, permutation.handle.module);
@@ -2886,6 +4024,10 @@ struct PipelineCache::PendingGraphicsPipeline {
 	ShaderProgram             pixel_program;
 	bool                      native_bindings = false;
 	std::atomic<bool>         done {false};
+	// (Mode 4) Made ahead of its draw from a recorded recipe (the pipeline cache's table_pipelines_ahead). `claimed`: its
+	// build taken by a worker (the ahead pool's, or the table workers' once a draw met it unbuilt: `promoted`).
+	bool              ahead = false;
+	std::atomic<bool> claimed {false}, promoted {false};
 };
 
 // Threads that create pipelines off the render thread (vkCreate* calls are thread-safe, and the
@@ -2909,10 +4051,16 @@ public:
 		for (auto& thread: m_threads) thread.join();
 	}
 	KYTY_CLASS_NO_COPY(CompileWorkers);
-	void Push(std::function<void()> job) {
+	// (Mode 4, the table workers) Three lanes, each in push order: a worker takes the park lane's front first (a compile a
+	// worker entry is parked on: ParkCompiling), then the asked-for lane's (a job something waits for: every job outside
+	// mode 4), and the background lane's (plan preloads, housekeeping) only when both are empty, so a preload never starts
+	// while an asked-for job is queued. Exact: a job's result does not depend on when a background thread runs it. A
+	// lookup never waits on a preload (it reads a plan still loading itself: TakeLoadedPlan).
+	enum class Lane : uint8_t { Asked, Background, Park };
+	void Push(std::function<void()> job, Lane lane = Lane::Asked) {
 		{
 			std::lock_guard lock(m_mutex);
-			m_jobs.push_back(std::move(job));
+			(lane == Lane::Park ? m_park : lane == Lane::Background ? m_low : m_jobs).push_back(std::move(job));
 		}
 		m_wake.notify_one();
 	}
@@ -2929,7 +4077,7 @@ private:
 			std::function<void()> job;
 			{
 				std::unique_lock lock(m_mutex);
-				const auto       ready = [this] { return m_stop || !m_jobs.empty(); };
+				const auto       ready = [this] { return m_stop || !m_jobs.empty() || !m_park.empty() || !m_low.empty(); };
 				if (worked && !m_wake.wait_for(lock, IdleRelease, ready)) {
 					lock.unlock();
 					ShaderRecompiler::ReleaseThreadScratch();
@@ -2938,9 +4086,10 @@ private:
 				}
 				m_wake.wait(lock, ready);
 				// Queued jobs still run at shutdown: their pipelines are destroyed with the rest.
-				if (m_jobs.empty() || (m_stop && m_background)) return;
-				job = std::move(m_jobs.front());
-				m_jobs.pop_front();
+				if ((m_jobs.empty() && m_park.empty() && m_low.empty()) || (m_stop && m_background)) return;
+				auto& lane = !m_park.empty() ? m_park : !m_jobs.empty() ? m_jobs : m_low;
+				job        = std::move(lane.front());
+				lane.pop_front();
 			}
 			job();
 			worked = true;
@@ -2950,6 +4099,8 @@ private:
 	std::mutex                        m_mutex;
 	std::condition_variable           m_wake;
 	std::deque<std::function<void()>> m_jobs;
+	std::deque<std::function<void()>> m_park; // (mode 4: the compiles parked worker entries wait on)
+	std::deque<std::function<void()>> m_low;  // (mode 4: plan preloads, housekeeping)
 	bool                              m_stop = false;
 	const bool                        m_background;
 	std::vector<std::thread>          m_threads;
@@ -2970,6 +4121,14 @@ PipelineCache::CompileWorkers& PipelineCache::TableWorkers() {
 		m_table_workers = std::make_unique<CompileWorkers>(std::max(2u, std::thread::hardware_concurrency() / 2u), true);
 	}
 	return *m_table_workers;
+}
+
+PipelineCache::CompileWorkers& PipelineCache::AheadWorkers() {
+	if (m_ahead_workers == nullptr) {
+		// (A quarter of the table workers': background threads, behind nothing a draw waits for.)
+		m_ahead_workers = std::make_unique<CompileWorkers>(std::max(1u, std::thread::hardware_concurrency() / 8u), true);
+	}
+	return *m_ahead_workers;
 }
 
 PipelineCache::CompileWorkers& PipelineCache::OptimizeWorkers() {
@@ -3371,6 +4530,13 @@ void PipelineCache::FinishCompileWorkers() {
 	m_program_cache->prefetch_live.store(nullptr, std::memory_order_release);
 	m_program_cache->prefetch.reset();
 	m_stopping.store(true, std::memory_order_relaxed);
+	{
+		// (No job pushed to the ahead pool from here on, from the warmup thread or a job's `after` on a pool thread: none
+		// builds the pool again while it and the table workers are reset.)
+		Common::LockGuard lock(m_mutex);
+		m_program_cache->ahead_stopping = true;
+	}
+	m_ahead_workers.reset(); // (before the table workers its jobs may move to)
 	m_optimize_workers.reset();
 	m_table_workers.reset();
 	m_compile_workers.reset();
@@ -3422,7 +4588,51 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	LiveCounters::g_objects_report = [](uint64_t id) {
 		if (g_live_pipeline_cache != nullptr) g_live_pipeline_cache->ReportObjects(id);
 	};
-	m_program_cache->push_job = [this](std::function<void()> job) { TableWorkers().Push(std::move(job)); };
+	// (Mode 4: a background job (a plan preload, housekeeping) on the table workers' background lane.)
+	m_program_cache->push_job = [this](std::function<void()> job, bool background) {
+		const bool low = background && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+		TableWorkers().Push(std::move(job), low ? CompileWorkers::Lane::Background : CompileWorkers::Lane::Asked);
+	};
+	m_program_cache->push_ahead = [this](std::function<void()> job) { AheadWorkers().Push(std::move(job)); };
+	// (Mode 4, under m_mutex, from ProgramCache::PipelinesAhead) A recorded pair's table pipelines, one per recipe, put where
+	// the draw's TryCreateGraphicsPipeline puts its own compile (m_pending_graphics_pipelines, by the key it builds: the
+	// recipe's rendering, vertex input and static parameters, the pair's table programs, native bindings) and built on the
+	// ahead pool with the inputs that compile takes; none where the key is made or pending already.
+	m_program_cache->table_pipelines_ahead = [this](const std::vector<LocalShaderWarmup::PipelineRecord>& recipes,
+	                                                const ProgramCache::Permutation& vertex, const ShaderVertexInputInfo& vertex_info,
+	                                                const ProgramCache::Permutation* pixel, const ShaderPixelInputInfo* pixel_info) {
+		for (const auto& recipe: recipes) {
+			GraphicsPipelineKey key {};
+			key.rendering       = recipe.rendering;
+			key.vs_shader_id    = vertex.handle.id;
+			key.ps_shader_id    = pixel != nullptr ? pixel->handle.id : 0;
+			key.vertex_input    = recipe.vertex_input;
+			key.static_params   = recipe.state;
+			key.native_bindings = true;
+			if (m_graphics_pipelines.contains(key) || m_pending_graphics_pipelines.contains(key)) continue;
+			auto job                         = std::make_shared<PendingGraphicsPipeline>();
+			job->rendering                   = key.rendering;
+			job->vertex_input                = key.vertex_input;
+			job->static_params               = key.static_params;
+			job->vs_input_info               = vertex_info;
+			job->vs_input_info.stage.program = &vertex.program;
+			job->ps_active                   = pixel != nullptr;
+			if (pixel != nullptr) {
+				job->ps_input_info               = *pixel_info;
+				job->ps_input_info.stage.program = &pixel->program;
+			}
+			job->vertex_program  = vertex.handle;
+			job->pixel_program   = pixel != nullptr ? pixel->handle : ShaderProgram {};
+			job->native_bindings = true;
+			job->ahead           = true;
+			m_pending_graphics_pipelines.emplace(key, job);
+			m_table_pipeline_jobs.fetch_add(1, std::memory_order_relaxed);
+			++m_program_cache->ahead_pipeline_builds;
+			AheadWorkers().Push([this, job] {
+				if (!job->claimed.exchange(true, std::memory_order_acq_rel)) RunAheadTablePipeline(*job);
+			});
+		}
+	};
 	// (The static store first: whether it is there sets how much of the driver caches is loaded.)
 	StartupProgress::Report("Loading the pipeline cache", 0, 0);
 	InitializeStaticCache(false);
@@ -3644,6 +4854,8 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 void PipelineCache::WarmScene(uint32_t scene, uint64_t compute_video, bool in_memory) {
 	auto& programs = *m_program_cache;
 	m_scenes_warmed.insert(scene);
+	// (Mode 4) What the earlier batches made ahead that no draw took dropped, before this scene posts its own.
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) DropTableAheadUnmet();
 	bool known = scene != SceneTags::None && SceneTags::Knows(scene);
 	std::unordered_set<uint64_t> only;
 	if (known) only = SceneTags::Recipes(scene);
@@ -3699,6 +4911,21 @@ void PipelineCache::WarmScene(uint32_t scene, uint64_t compute_video, bool in_me
 		if (!in_memory)
 			for (const auto& words: programs.warm_recipes) only.insert(LocalShaderWarmup::RecipeKey(words));
 	}
+	// (Mode 4) The scene's recorded table pairs' table programs queued on the ahead pool now, before its draws meet them,
+	// ahead of its pipelines, and their table pipelines once both programs of a pair are made (ProgramCache::PostTableAhead).
+	// The plans an earlier scene's jobs pinned that no lookup released let go first (ProgramCache::AheadJob).
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+		{
+			Common::LockGuard lock(m_mutex);
+			programs.ReleasePlanPins();
+		}
+		// The programs of the scene's recipes (the set WarmPipelines makes pipelines of) marked as the scene's.
+		programs.KeepScenePlans(scene, known || !in_memory ? &only : nullptr, m_mutex);
+		const auto posted = programs.PostTableAhead(programs.warm_records, programs.warm_recipes,
+		                                            known || !in_memory ? &only : nullptr, m_mutex);
+		PipelineCacheLog("Table ahead: {}: {} table programs queued (their vertex programs follow their pixel programs)",
+		                 scene != SceneTags::None ? SceneTags::Name(scene) : std::string("no scene"), posted);
+	}
 	WarmPipelines(compute_video, true, known || !in_memory ? &only : nullptr);
 	if (!in_memory) {
 		Common::LockGuard lock(m_mutex);
@@ -3724,7 +4951,13 @@ void PipelineCache::SceneLoop(uint64_t compute_video) {
 			saved = now;
 		}
 		if (const auto generation = SceneTags::Generation(); generation != seen) {
-			seen             = generation;
+			seen = generation;
+			if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+				// (Mode 4) At every scene change the plans pinned for the ahead pool's programs that no lookup released (WarmScene
+				// runs only for a scene not warmed yet: the last warmed scene's, or a scene's on a return to it, would stay).
+				Common::LockGuard lock(m_mutex);
+				m_program_cache->ReleasePlanPins();
+			}
 			const auto scene = SceneTags::Current();
 			if (!m_scene_warmed_all && !m_scenes_warmed.contains(scene)) WarmScene(scene, compute_video, false);
 		}
@@ -4636,6 +5869,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     std::array<uint32_t, 2> table_portable) {
 	LiveCensus::Scope census(LiveCensus::GraphicsPrograms, 0);
 	m_program_cache->ClearTable();
+	// (spec_pair_push_fit_draws_n's mark: cleared first, so no way out (PrepareUnread, an adopt-only miss) leaves the last
+	// lookup's.)
+	if (table_mode) t_push_fit_taken = false;
 	// Reused per thread: every normal-path draw prepares both (their user data were new vectors).
 	thread_local ShaderParams vertex_params, pixel_params;
 	std::optional<ShaderHashNoFaultScope> no_fault; // (PrepareNoFault)
@@ -4687,14 +5923,49 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		if (pixel_active) CopyShaderCode(pixel_params, pixel_code, pixel_back_code);
 	}
 	Common::LockGuard lock(m_mutex);
+	const ProgramCache::SplitOffer split(m_mutex); // (KYTY_SPEC_PIPECACHE_SPLIT)
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
 	if (pixel_active) {
 		pixel_info.lod_stats_subgroup = m_graphics.fragment_subgroup_reduction;
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor, table_mode, table_portable[1]);
+		// (A worker's adopt-only lookup: a pixel program not found or adopted left the cursor where it was: the vertex program
+		// is not looked up at a cursor the draw does not have (it would be adopted for it). The caller refuses the draw.)
+		if (!result.pixel && g_find_only_users.load(std::memory_order_relaxed) != 0 && t_find_only && t_adopt_only) return result;
 	}
+	// KYTY_SPEC_PAIR_PUSH_FIT (PairPushFitOn): a table vertex program refused at this cursor because its shader data do not
+	// fit after the pixel program's: the pixel program's reduced form looked up (made by a table job as any table program;
+	// pending: the caller waits as for any), and, its data ending earlier, the vertex program at the cursor after it. Both
+	// found: the pair's programs; else the plain result, as with the switch off (the pixel stage's program put back). The
+	// same inputs give the same programs on every call (TableStore's, a worker's, a set's), as each lookup does.
+	const bool push_fit = table_mode && pixel_active && result.pixel && PairPushFitOn();
+	if (push_fit) ProgramCache::t_push_overflow = false;
 	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor, table_mode, table_portable[0]);
+	if (push_fit && !result.vertex && ProgramCache::t_push_overflow) [[unlikely]] {
+		ProgramCache::t_push_overflow = false;
+		const auto* const plain_pixel = pixel_info.stage.program;
+		const uint32_t    refused_at  = push_data_cursor; // (where the plain pixel program's data end)
+		uint32_t          cursor      = mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
+		const auto reduced = m_program_cache->Get(pixel_params, pixel_info, cursor, true, table_portable[1], true);
+		if (!reduced) {
+			pixel_info.stage.program = plain_pixel;
+			LiveCounters::Add(m_program_cache->Pending() ? LiveCounters::SpecPairPushFitPending
+			                                             : LiveCounters::SpecPairPushFitPsRefused);
+		} else if (cursor >= refused_at) {
+			pixel_info.stage.program = plain_pixel;
+			LiveCounters::Add(LiveCounters::SpecPairPushFitNoGain);
+		} else if (auto vertex = m_program_cache->Get(vertex_params, vertex_info, cursor, true, table_portable[0]); vertex) {
+			result.pixel  = reduced;
+			result.vertex = vertex;
+			LiveCounters::Add(LiveCounters::SpecPairPushFitTaken);
+			t_push_fit_taken = true;
+		} else {
+			pixel_info.stage.program = plain_pixel;
+			LiveCounters::Add(m_program_cache->Pending() ? LiveCounters::SpecPairPushFitPending
+			                                             : LiveCounters::SpecPairPushFitVsRefused);
+		}
+	}
 	return result;
 }
 
@@ -4736,6 +6007,7 @@ uint32_t PipelineCache::TableFormatOnlyBuffers(const void* want, const void* got
 			}
 	}
 	if (mw == nullptr || mg == nullptr || kw != kg || !mw->table_mode || !mg->table_mode ||
+	    mw->table_reduced != mg->table_reduced || // (KYTY_SPEC_PAIR_PUSH_FIT: a reduced form and a plain one: other layouts)
 	    mw->program.bindings.push_data_start_dword != mg->program.bindings.push_data_start_dword)
 		return UINT32_MAX;
 	const auto& a = mw->specialization;
@@ -4772,6 +6044,9 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 		CopyShaderCode(params, code, back_code);
 	}
 	Common::LockGuard lock(m_mutex);
+	// (KYTY_SPEC_PIPECACHE_SPLIT, as a draw's: the report a failed materialization makes, g_unevaluated and
+	// g_materialization_failed, is this thread's, made after the lock is taken again.)
+	const ProgramCache::SplitOffer split(m_mutex);
 	m_program_cache->ClearTable();
 	uint32_t          push_data_cursor = 0;
 	g_unevaluated     = unevaluated;
@@ -4814,12 +6089,305 @@ PipelineCache::Pipeline* PipelineCache::TryCreateGraphicsPipeline(
 	                                  native_bindings, true);
 }
 
+PipelineCache::Pipeline* PipelineCache::FindGraphicsPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+                                                             const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+                                                             const ShaderPixelInputInfo* ps_input_info,
+                                                             vk::PrimitiveTopology topology, bool primitive_restart_enable,
+                                                             const ShaderProgram& vertex_program,
+                                                             const ShaderProgram& pixel_program) {
+	Common::LockGuard   lock(m_mutex);
+	GraphicsPipelineKey key {};
+	if (!NormalGraphicsKey(colors, depth, vs_input_info, command, ps_input_info, topology, primitive_restart_enable, vertex_program,
+	                       pixel_program, key))
+		return nullptr;
+	const auto found = m_graphics_pipelines.find(key);
+	return found != m_graphics_pipelines.end() ? found->second.get() : nullptr;
+}
+
+bool PipelineCache::NormalGraphicsKey(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+                                      const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+                                      const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+                                      bool primitive_restart_enable, const ShaderProgram& vertex_program,
+                                      const ShaderProgram& pixel_program, GraphicsPipelineKey& key) const {
+	if (colors.size() > RENDER_COLOR_ATTACHMENTS_MAX || !vertex_program || vs_input_info.stage.program == nullptr) return false;
+	const bool ps_active = ps_input_info != nullptr;
+	if (ps_active && !pixel_program) return false;
+	const auto color_count = static_cast<uint32_t>(colors.size());
+
+	auto&                  ctx = command.GetRegisters();
+	const HW::ModeControl& mc  = ctx.GetModeControl();
+
+	// (`key`: value-initialized by the caller, `{}` as the create's: the static parameters compare and hash as bytes.)
+	key.vs_shader_id            = vertex_program.id;
+	key.ps_shader_id            = ps_active ? pixel_program.id : 0;
+	key.native_bindings         = false;
+	auto& static_params         = key.static_params;
+	auto& rendering             = key.rendering;
+	rendering.color_count       = color_count;
+	uint32_t attachment_samples = 0;
+	for (uint32_t i = 0; i < color_count; i++) {
+		if (!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined) return false;
+		static_params.color_mask[i] = colors[i].export_mapping.ApplyMask(
+		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
+		rendering.color_formats[i] = colors[i].desc.view_info.format;
+		if (attachment_samples == 0) {
+			attachment_samples = colors[i].desc.info.samples;
+		} else if (attachment_samples != colors[i].desc.info.samples) {
+			return false;
+		}
+	}
+	const bool with_depth =
+	    depth.desc.view_info.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id);
+	if (with_depth) {
+		const auto aspects       = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
+		rendering.depth_format   = aspects & vk::ImageAspectFlagBits::eDepth
+		                               ? depth.desc.view_info.format
+		                               : vk::Format::eUndefined;
+		rendering.stencil_format = aspects & vk::ImageAspectFlagBits::eStencil
+		                               ? depth.desc.view_info.format
+		                               : vk::Format::eUndefined;
+		if (attachment_samples == 0) {
+			attachment_samples = depth.desc.info.samples;
+		} else if (attachment_samples != depth.desc.info.samples) {
+			return false;
+		}
+	}
+	if (color_count == 0 && !with_depth) {
+		attachment_samples = render_sample_count(ctx.GetAaConfig().msaa_num_samples);
+		if (!static_cast<bool>(
+		        m_graphics.GetPhysicalDeviceProperties().limits.framebufferNoAttachmentsSampleCounts &
+		        vulkan_sample_count(attachment_samples)))
+			return false;
+	}
+	if (attachment_samples == 0 || vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {}) return false;
+
+	const auto& clip_control               = ctx.GetClipControl();
+	static_params.negative_one_to_one      = !clip_control.dx_clip_space;
+	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
+	static_params.topology                 = topology;
+	static_params.primitive_restart_enable = primitive_restart_enable;
+	static_params.samples                  = attachment_samples;
+	static_params.sample_shading_enable =
+	    ps_active && attachment_samples > 1 && ps_input_info->ps_sample_shading;
+	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) return false;
+	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
+	static_params.depth_min_bounds         = depth.depth_min_bounds;
+	static_params.depth_max_bounds         = depth.depth_max_bounds;
+	static_params.stencil_test_enable      = depth.stencil_test_enable;
+	static_params.stencil_front            = depth.stencil_static_front;
+	static_params.stencil_back             = depth.stencil_static_back;
+	const bool rect_list     = topology == vk::PrimitiveTopology::ePatchList;
+	static_params.cull_back  = !rect_list && mc.cull_back;
+	static_params.cull_front = !rect_list && mc.cull_front;
+	static_params.face       = mc.face;
+	static_params.provoking_vtx_last = mc.provoking_vtx_last;
+	static_params.polygon_mode =
+	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
+
+	for (uint32_t i = 0; i < color_count; i++) {
+		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
+		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
+		static_params.color_srcblend[i]       = bc.color_srcblend;
+		static_params.color_comb_fcn[i]       = bc.color_comb_fcn;
+		static_params.color_destblend[i]      = bc.color_destblend;
+		static_params.alpha_srcblend[i]       = bc.alpha_srcblend;
+		static_params.alpha_comb_fcn[i]       = bc.alpha_comb_fcn;
+		static_params.alpha_destblend[i]      = bc.alpha_destblend;
+		static_params.separate_alpha_blend[i] = bc.separate_alpha_blend;
+		static_params.blend_enable[i]         = bc.enable;
+		static_params.blend_bypass[i]         = rt.info.blend_bypass;
+	}
+	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
+		if (vs_input_info.buffers_num < 0 || vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||
+		    vs_input_info.resources_num < 0 || vs_input_info.resources_num > ShaderVertexInputInfo::RES_MAX)
+			return false;
+		key.vertex_input.binding_count   = static_cast<uint8_t>(vs_input_info.buffers_num);
+		key.vertex_input.attribute_count = static_cast<uint8_t>(vs_input_info.resources_num);
+		uint32_t attributes_num          = 0;
+		for (int binding = 0; binding < vs_input_info.buffers_num; binding++) {
+			const auto& buffer = vs_input_info.buffers[binding];
+			if (buffer.attr_num < 0 || buffer.attr_num > ShaderVertexInputBuffer::ATTR_MAX) return false;
+			attributes_num += static_cast<uint32_t>(buffer.attr_num);
+			if (attributes_num > static_cast<uint32_t>(vs_input_info.resources_num)) return false;
+			key.vertex_input.bindings[binding] = {.stride   = buffer.stride,
+			                                      .instance = buffer.fetch_index != 0};
+			for (int attribute = 0; attribute < buffer.attr_num; attribute++) {
+				const auto index = buffer.attr_indices[attribute];
+				if (index < 0 || index >= vs_input_info.resources_num) return false;
+				key.vertex_input.attributes[index] = {
+				    .offset  = buffer.attr_offsets[attribute],
+				    .binding = static_cast<uint8_t>(binding),
+				};
+			}
+		}
+		if (attributes_num != static_cast<uint32_t>(vs_input_info.resources_num)) return false;
+	}
+	return true;
+}
+
+PipelineCache::Pipeline* PipelineCache::TryCreateGraphicsPipelineWorker(
+    std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+    const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+    const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+    bool primitive_restart_enable, const ShaderProgram& vertex_program,
+    const ShaderProgram& pixel_program, bool native_bindings, std::shared_ptr<const std::atomic<bool>>& waiting) {
+	return CreateGraphicsPipelineImpl(colors, depth, vs_input_info, command, ps_input_info, topology,
+	                                  primitive_restart_enable, vertex_program, pixel_program,
+	                                  native_bindings, true, &waiting);
+}
+
+// A compile TryCreateGraphicsPipeline posted, on the worker that takes it (and a table pipeline made ahead's, mode 4: the
+// one body both run, over the job's own inputs).
+void PipelineCache::RunPendingGraphicsPipeline(PendingGraphicsPipeline& pending, bool table) {
+	auto* const job = &pending;
+	// (KYTY_HITCH_LOG_MS: a pipeline no cache held, compiled while its draws took another path.)
+	SlowLog::Scope slow([&](double ms) {
+		const auto* pixel = job->ps_active ? job->ps_input_info.stage.program : nullptr;
+		std::printf("SLOW AsyncGraphicsPipeline %.1f ms %s VS=0x%016llx PS=0x%016llx\n", ms, table ? "table" : "native",
+		            static_cast<unsigned long long>(job->vs_input_info.stage.program->shader_hash),
+		            static_cast<unsigned long long>(pixel != nullptr ? pixel->shader_hash : 0));
+	}, SlowLog::HitchThreshold());
+	CreatePipelineInternal(m_graphics, *job->pipeline, job->rendering, job->vertex_input,
+	                       job->vs_input_info, job->vertex_program,
+	                       job->ps_active ? &job->ps_input_info : nullptr, job->pixel_program,
+	                       job->static_params, table ? TablePipelineCache() : m_driver_cache,
+	                       job->native_bindings);
+	if (KeepsRemake(m_graphics, *job->pipeline, LastPipelineFromStore())) {
+		GraphicsMakeInputs inputs;
+		inputs.rendering       = job->rendering;
+		inputs.vertex_input    = job->vertex_input;
+		inputs.static_params   = job->static_params;
+		inputs.SetVertexInput(job->vs_input_info);
+		inputs.ps_input_info   = job->ps_input_info;
+		inputs.ps_active       = job->ps_active;
+		inputs.vertex_program  = job->vertex_program;
+		inputs.pixel_program   = job->pixel_program;
+		inputs.native_bindings = job->native_bindings;
+		inputs.table           = table;
+		job->pipeline->remake  = GraphicsRemake(std::move(inputs));
+	}
+	if (table) TablePipelineDone();
+	else MainPipelineDone();
+	job->done.store(true, std::memory_order_release);
+}
+
+// (Mode 4) A table pipeline made ahead, built as the draw's own compile would be (RunPendingGraphicsPipeline); the last
+// build done releases the program entries retired meanwhile.
+void PipelineCache::RunAheadTablePipeline(PendingGraphicsPipeline& job) {
+	RunPendingGraphicsPipeline(job, true);
+	Common::LockGuard lock(m_mutex);
+	if (--m_program_cache->ahead_pipeline_builds == 0 && !m_program_cache->warming) m_program_cache->ReleaseRetired();
+}
+
+// (Mode 4, at each scene's warmup before it posts its own batch: WarmScene) The bound on what the ahead pool holds: what
+// the earlier batches made ahead that no draw took goes. Each table pipeline made ahead that no draw met (`promoted`: set by
+// the draw that finds it unbuilt; one a draw finds built leaves the map at once): queued (not started), claimed so the pool
+// skips it and its build's counts taken back (m_table_pipeline_jobs, ahead_pipeline_builds); built, its VkPipeline
+// destroyed; building now, left, and its two programs with it; out of m_pending_graphics_pipelines. Then the programs
+// (ProgramCache::DropAheadUnmet). What a draw met lives as anything a draw made: a program until its code changes (Get's
+// warm-code compare), a pipeline for the session or until the pipeline eviction takes it where it keeps a remake
+// (EvictIdlePipelines). A later meet of a dropped pipeline's key is TryCreateGraphicsPipeline's own compile, the same
+// inputs and body. Nothing here records: the recording, the recipes and the warmup file are untouched.
+void PipelineCache::DropTableAheadUnmet() {
+	Common::LockGuard                                                   lock(m_mutex);
+	std::unordered_set<const ShaderRecompiler::IR::CompiledShaderInfo*> building;
+	for (auto it = m_pending_graphics_pipelines.begin(); it != m_pending_graphics_pipelines.end();) {
+		const auto job = it->second;
+		if (!job->ahead || job->promoted.load(std::memory_order_relaxed)) {
+			++it;
+			continue;
+		}
+		if (!job->claimed.exchange(true, std::memory_order_acq_rel)) {
+			// (Queued, never to run: its build's counts taken back.)
+			m_table_pipeline_jobs.fetch_sub(1, std::memory_order_release);
+			if (--m_program_cache->ahead_pipeline_builds == 0 && !m_program_cache->warming) m_program_cache->ReleaseRetired();
+		} else if (!job->done.load(std::memory_order_acquire)) {
+			building.insert(job->vs_input_info.stage.program);
+			if (job->ps_active) building.insert(job->ps_input_info.stage.program);
+			++it;
+			continue;
+		} else if (job->pipeline->pipeline != nullptr) {
+			DeviceFault::ForgetPipeline(static_cast<VkPipeline>(job->pipeline->pipeline));
+			m_graphics.device.destroyPipeline(job->pipeline->pipeline, nullptr);
+			job->pipeline->pipeline = nullptr;
+		}
+		it = m_pending_graphics_pipelines.erase(it);
+	}
+	m_program_cache->DropAheadUnmet(building);
+}
+
+// (Mode 4, ParkCompiling) The job and its key (the job held: its `done` and inputs stay readable whatever the map does).
+struct PipelineCache::ParkedPipeline {
+	GraphicsPipelineKey                      key;
+	std::shared_ptr<PendingGraphicsPipeline> job;
+};
+
+std::shared_ptr<PipelineCache::ParkedPipeline> PipelineCache::ParkCompiling(const std::shared_ptr<const std::atomic<bool>>& waiting,
+                                                                            Pipeline&                                       layouts) {
+	if (waiting == nullptr) return nullptr;
+	std::shared_ptr<ParkedPipeline> parked;
+	{
+		Common::LockGuard lock(m_mutex);
+		for (const auto& [key, job]: m_pending_graphics_pipelines)
+			if (&job->done == waiting.get()) {
+				parked = std::make_shared<ParkedPipeline>(ParkedPipeline {key, job});
+				break;
+			}
+	}
+	if (parked == nullptr) return nullptr;
+	// (The parked compile pushed again on the table workers' park lane, taken before the asked-for lane, so the commit's
+	// check finds it done more often; it runs once (`claimed`: the first of its two pushes to start builds it). Only the order
+	// of background compiles changes. Not for a job made ahead: a draw's meet promotes those already.)
+	const auto* parked_vs = parked->job->vs_input_info.stage.program; // (a table pipeline's job: the table workers')
+	if (!parked->job->ahead && parked_vs != nullptr && parked_vs->table_mode && !parked->job->done.load(std::memory_order_acquire) &&
+	    !parked->job->promoted.exchange(true, std::memory_order_relaxed))
+		TableWorkers().Push(
+		    [this, job = parked->job] {
+			    if (!job->claimed.exchange(true, std::memory_order_acq_rel)) RunPendingGraphicsPipeline(*job, true);
+		    },
+		    CompileWorkers::Lane::Park);
+	// (The job's inputs are written before it is put in the map, under m_mutex, and never after: read here as its compile
+	// reads them.)
+	const auto& job = *parked->job;
+	SharedGraphicsLayouts(m_graphics, layouts, job.vs_input_info, job.ps_active ? &job.ps_input_info : nullptr, job.native_bindings);
+	return parked;
+}
+
+bool PipelineCache::ParkedDone(const ParkedPipeline& parked) {
+	return parked.job->done.load(std::memory_order_acquire);
+}
+
+PipelineCache::Pipeline* PipelineCache::ResolveParked(const ParkedPipeline& parked) {
+	if (!ParkedDone(parked)) return nullptr;
+	Common::LockGuard lock(m_mutex);
+	// (CreateGraphicsPipelineImpl's lookup of the key, as the GPU thread's TryCreateGraphicsPipeline makes it: the pipeline in
+	// memory, else the finished job's moved in. PromoteOptimized, which that call makes first, swaps builds in place: the
+	// same Pipeline either way.)
+	const bool indexed = kyty_local_pipeline_index_mode.load(std::memory_order_relaxed) != 0;
+	if (indexed)
+		if (auto found = m_native_graphics_pipelines.find(parked.key); found != m_native_graphics_pipelines.end()) return found->second;
+	if (auto iter = m_graphics_pipelines.find(parked.key); iter != m_graphics_pipelines.end()) {
+		if (indexed) m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
+		return iter->second.get();
+	}
+	const auto pending = m_pending_graphics_pipelines.find(parked.key);
+	if (pending == m_pending_graphics_pipelines.end() || pending->second != parked.job) return nullptr;
+	auto finished = std::move(pending->second->pipeline);
+	m_pending_graphics_pipelines.erase(pending);
+	EXIT_NOT_IMPLEMENTED(finished->pipeline == nullptr || finished->pipeline_layout == nullptr);
+	auto [iter, inserted] = m_graphics_pipelines.emplace(parked.key, std::move(finished));
+	EXIT_IF(!inserted);
+	if (indexed) m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
+	return iter->second.get();
+}
+
 PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const ShaderProgram& vertex_program,
-    const ShaderProgram& pixel_program, bool native_bindings, bool async) {
+    const ShaderProgram& pixel_program, bool native_bindings, bool async,
+    std::shared_ptr<const std::atomic<bool>>* worker_waiting) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
 	EXIT_IF(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
@@ -4829,7 +6397,8 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	const auto color_count = static_cast<uint32_t>(colors.size());
 
 	Common::LockGuard lock(m_mutex);
-	PromoteOptimized();
+	// (A worker's call, TryCreateGraphicsPipelineWorker: left to the GPU thread, which swaps pipelines in place.)
+	if (worker_waiting == nullptr) PromoteOptimized();
 	auto&             ctx = command.GetRegisters();
 
 	const HW::ModeControl& mc = ctx.GetModeControl();
@@ -4972,8 +6541,16 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	if (async) {
 		if (auto pending = m_pending_graphics_pipelines.find(key);
 		    pending != m_pending_graphics_pipelines.end()) {
+			// (Mode 4: one made ahead still queued on the ahead pool moves to the table workers now, as the draw's own
+			// compile would be, built by whichever takes it first.)
+			if (const auto& ahead = pending->second; ahead->ahead && !ahead->done.load(std::memory_order_acquire) &&
+			                                         !ahead->promoted.exchange(true, std::memory_order_relaxed)) [[unlikely]]
+				TableWorkers().Push([this, job = ahead] {
+					if (!job->claimed.exchange(true, std::memory_order_acq_rel)) RunAheadTablePipeline(*job);
+				});
 			if (!pending->second->done.load(std::memory_order_acquire)) {
-				m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(pending->second, &pending->second->done);
+				(worker_waiting != nullptr ? *worker_waiting : m_pipeline_waiting) =
+				    std::shared_ptr<const std::atomic<bool>>(pending->second, &pending->second->done);
 				return nullptr;
 			}
 			auto finished = std::move(pending->second->pipeline);
@@ -5001,39 +6578,13 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 		m_pending_graphics_pipelines.emplace(key, job);
 		const bool table = vs_input_info.stage.program != nullptr && vs_input_info.stage.program->table_mode;
 		if (table) m_table_pipeline_jobs.fetch_add(1, std::memory_order_relaxed);
+		// (A table job a parked worker entry pushes again on the park lane (ParkCompiling): whichever push starts first
+		// builds it.)
 		(table ? TableWorkers() : Workers()).Push([this, job, table] {
-			// (KYTY_HITCH_LOG_MS: a pipeline no cache held, compiled while its draws took another path.)
-			SlowLog::Scope slow([&](double ms) {
-				const auto* pixel = job->ps_active ? job->ps_input_info.stage.program : nullptr;
-				std::printf("SLOW AsyncGraphicsPipeline %.1f ms %s VS=0x%016llx PS=0x%016llx\n", ms, table ? "table" : "native",
-				            static_cast<unsigned long long>(job->vs_input_info.stage.program->shader_hash),
-				            static_cast<unsigned long long>(pixel != nullptr ? pixel->shader_hash : 0));
-			}, SlowLog::HitchThreshold());
-			CreatePipelineInternal(m_graphics, *job->pipeline, job->rendering, job->vertex_input,
-			                       job->vs_input_info, job->vertex_program,
-			                       job->ps_active ? &job->ps_input_info : nullptr, job->pixel_program,
-			                       job->static_params, table ? TablePipelineCache() : m_driver_cache,
-			                       job->native_bindings);
-			if (KeepsRemake(m_graphics, *job->pipeline, LastPipelineFromStore())) {
-				GraphicsMakeInputs inputs;
-				inputs.rendering       = job->rendering;
-				inputs.vertex_input    = job->vertex_input;
-				inputs.static_params   = job->static_params;
-				inputs.SetVertexInput(job->vs_input_info);
-				inputs.ps_input_info   = job->ps_input_info;
-				inputs.ps_active       = job->ps_active;
-				inputs.vertex_program  = job->vertex_program;
-				inputs.pixel_program   = job->pixel_program;
-				inputs.native_bindings = job->native_bindings;
-				inputs.table           = table;
-				job->pipeline->remake  = GraphicsRemake(std::move(inputs));
-			}
-			if (table) TablePipelineDone();
-			else MainPipelineDone();
-			job->done.store(true, std::memory_order_release);
+			if (!table || !job->claimed.exchange(true, std::memory_order_acq_rel)) RunPendingGraphicsPipeline(*job, table);
 		});
 		LiveCounters::Add(LiveCounters::AsyncPipelines);
-		m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
+		(worker_waiting != nullptr ? *worker_waiting : m_pipeline_waiting) = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 		return nullptr;
 	}
 
@@ -5120,6 +6671,162 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	}
 
 	return iter->second.get();
+}
+
+// (TableWorkerEntry, mode 4) See the header. The private pipeline is owned here until the commit moves it into
+// m_graphics_pipelines; dropped (never committed, or the cache made the key meanwhile), it is destroyed: it was never bound
+// (the entry draws with its table pipeline), and its build wrote nothing that outlives it (PipelineBuild::Fast: the stores
+// and the driver cache only looked up, an unoptimized build in no cache).
+struct PipelineCache::AdoptedCommit {
+	vk::Device                               device = nullptr;
+	std::array<uint64_t, 2>                  ids {};
+	std::array<LocalShaderWarmup::Record, 2> records {};
+	uint32_t                                 count = 0;
+	GraphicsPipelineKey                      key {};
+	std::unique_ptr<Pipeline>                pipeline; // (null: the normal pipeline was in memory, or none made)
+	GraphicsMakeInputs                       inputs;
+	bool                                     from_store = false;
+	uint64_t                                 create_us  = 0;
+	~AdoptedCommit() {
+		if (pipeline == nullptr || pipeline->pipeline == nullptr) return;
+		DeviceFault::ForgetPipeline(static_cast<VkPipeline>(pipeline->pipeline));
+		device.destroyPipeline(pipeline->pipeline, nullptr);
+	}
+};
+
+std::shared_ptr<PipelineCache::AdoptedCommit> PipelineCache::TakeAdoptedRecords() {
+	const auto count = t_adopt_ids_n;
+	if (count == 0 || count > t_adopt_ids.size()) return nullptr;
+	for (uint32_t i = 0; i < count; ++i)
+		if (!ProgramCache::t_met_made[i]) return nullptr;
+	auto commit    = std::make_shared<AdoptedCommit>();
+	commit->device = m_graphics.device;
+	commit->count  = count;
+	for (uint32_t i = 0; i < count; ++i) {
+		commit->ids[i]              = t_adopt_ids[i];
+		commit->records[i]          = std::move(ProgramCache::t_met_records[i]);
+		ProgramCache::t_met_made[i] = false;
+	}
+	return commit;
+}
+
+bool PipelineCache::CreatePrivateGraphicsPipeline(AdoptedCommit& commit, std::span<const RenderColorInfo> colors,
+                                                  const RenderDepthInfo& depth, const ShaderVertexInputInfo& vs_input_info,
+                                                  CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
+                                                  vk::PrimitiveTopology topology, bool primitive_restart_enable,
+                                                  const ShaderProgram& vertex_program, const ShaderProgram& pixel_program) {
+	if (commit.pipeline != nullptr || FirstBuild(m_graphics) != PipelineBuild::Fast) return false;
+	// (The create's key, CreateGraphicsPipelineImpl's: NormalGraphicsKey, `commit.key` value-initialized as the create's.)
+	if (!NormalGraphicsKey(colors, depth, vs_input_info, command, ps_input_info, topology, primitive_restart_enable, vertex_program,
+	                       pixel_program, commit.key))
+		return false;
+	{
+		Common::LockGuard lock(m_mutex);
+		if (m_graphics_pipelines.contains(commit.key) || m_pending_graphics_pipelines.contains(commit.key)) return false;
+	}
+	const bool ps_active = ps_input_info != nullptr;
+	auto&      in        = commit.inputs;
+	in.rendering         = commit.key.rendering;
+	in.vertex_input      = commit.key.vertex_input;
+	in.static_params     = commit.key.static_params;
+	in.SetVertexInput(vs_input_info);
+	in.ps_active         = ps_active;
+	if (ps_active) in.ps_input_info = *ps_input_info;
+	in.vertex_program  = vertex_program;
+	in.pixel_program   = pixel_program;
+	in.native_bindings = false;
+	in.table           = false;
+	// (As the create's synchronous build, CreateGraphicsPipelineImpl: the same inputs, the driver cache, FirstBuild; off the
+	// lock, as a compile worker's build: the driver cache takes concurrent creates.)
+	auto       made  = std::make_unique<Pipeline>();
+	const auto begin = std::chrono::steady_clock::now();
+	CreatePipelineInternal(m_graphics, *made, commit.key.rendering, commit.key.vertex_input, vs_input_info, vertex_program,
+	                       ps_input_info, pixel_program, commit.key.static_params, m_driver_cache, false, PipelineBuild::Fast);
+	commit.from_store = LastPipelineFromStore();
+	commit.create_us  = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count());
+	if (made->pipeline == nullptr || made->pipeline_layout == nullptr) {
+		if (made->pipeline != nullptr) {
+			DeviceFault::ForgetPipeline(static_cast<VkPipeline>(made->pipeline));
+			m_graphics.device.destroyPipeline(made->pipeline, nullptr);
+		}
+		return false;
+	}
+	commit.pipeline = std::move(made);
+	return true;
+}
+
+bool PipelineCache::PrivateBuildsAllowed() const {
+	return FirstBuild(m_graphics) == PipelineBuild::Fast;
+}
+
+void PipelineCache::CommitAdopted(AdoptedCommit& commit) {
+	Common::LockGuard lock(m_mutex);
+	// The permutations' records first, as the in-order lookup makes them before its draw's pipeline.
+	for (uint32_t i = 0; i < commit.count; ++i) m_program_cache->RecordMet(commit.ids[i], commit.records[i]);
+	if (commit.pipeline == nullptr) return;
+	// (Made meanwhile, by an in-order draw before this one or an earlier commit: that one stays, recipe and all, as the
+	// in-order create would have found it; this one is destroyed with `commit`.)
+	if (m_graphics_pipelines.contains(commit.key) || m_pending_graphics_pipelines.contains(commit.key)) return;
+	// What CreateGraphicsPipelineImpl's synchronous create does after its build, in its order.
+	if (!commit.from_store) {
+		m_play_compiles.fetch_add(1, std::memory_order_relaxed);
+		m_play_compile_us.fetch_add(commit.create_us, std::memory_order_relaxed);
+	}
+	m_render_pipelines++;
+	m_render_pipeline_ms += static_cast<double>(commit.create_us) / 1000.0;
+	MainPipelineDone();
+	auto [iter, inserted] = m_graphics_pipelines.emplace(commit.key, std::move(commit.pipeline));
+	EXIT_IF(!inserted);
+	if (kyty_local_pipeline_index_mode.load(std::memory_order_relaxed) != 0)
+		m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
+	const auto& in   = commit.inputs;
+	const auto  make = [this, in](PipelineBuild build) {
+		return [=, this](Pipeline& target) {
+			// (The vertex input info as GraphicsRemake reads it back from its record.)
+			const auto                vs_input_info = std::make_unique<ShaderVertexInputInfo>();
+			LocalShaderWarmup::Reader reader {in.vs_input_words};
+			EXIT_IF(!LocalShaderWarmup::VisitVertexInput(reader, *vs_input_info) || reader.cursor != in.vs_input_words.size());
+			vs_input_info->stage.program = in.vs_program;
+			CreatePipelineInternal(m_graphics, target, in.rendering, in.vertex_input, *vs_input_info, in.vertex_program,
+			                       in.ps_active ? &in.ps_input_info : nullptr, in.pixel_program, in.static_params, m_driver_cache,
+			                       false, build);
+		};
+	};
+	if (KeepsRemake(m_graphics, *iter->second, commit.from_store)) iter->second->remake = GraphicsRemake(in);
+	BuildOptimized(*iter->second, make(PipelineBuild::Optimize));
+	LocalShaderWarmup::PipelineRecord recipe;
+	recipe.vertex       = m_program_cache->RecordedIndex(in.vertex_program);
+	recipe.pixel        = in.ps_active ? m_program_cache->RecordedIndex(in.pixel_program) : LocalShaderWarmup::NoShader;
+	recipe.rendering    = iter->first.rendering;
+	recipe.vertex_input = iter->first.vertex_input;
+	recipe.state        = iter->first.static_params;
+	if (recipe.vertex != LocalShaderWarmup::NoShader && (!in.ps_active || recipe.pixel != LocalShaderWarmup::NoShader)) {
+		m_program_cache->warmup.AddPipeline(recipe);
+		iter->second->recipe = LocalShaderWarmup::RecipeKey(recipe);
+	}
+}
+
+bool PipelineCache::AdoptedCovers(const AdoptedCommit* commit, std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+                                  const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+                                  const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+                                  bool primitive_restart_enable, const ShaderProgram& vertex_program,
+                                  const ShaderProgram& pixel_program) {
+	const auto met = t_adopt_ids_n;
+	if (met > t_adopt_ids.size()) return false;
+	for (uint32_t i = 0; i < met; ++i) {
+		if (commit == nullptr) return false;
+		const auto end = commit->ids.begin() + commit->count;
+		if (std::find(commit->ids.begin(), end, t_adopt_ids[i]) == end) return false;
+	}
+	// (The key as FindGraphicsPipeline builds it, under the cache's lock as there.)
+	Common::LockGuard   lock(m_mutex);
+	GraphicsPipelineKey key {};
+	if (!NormalGraphicsKey(colors, depth, vs_input_info, command, ps_input_info, topology, primitive_restart_enable, vertex_program,
+	                       pixel_program, key))
+		return false;
+	if (m_graphics_pipelines.contains(key)) return true;
+	return commit != nullptr && commit->pipeline != nullptr && key == commit->key;
 }
 
 PipelineCache::Pipeline&

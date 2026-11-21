@@ -68,7 +68,7 @@ namespace LocalPlatform {
 // empty or invalid list. A range with an end below 0 is skipped; "8-" or "8-x" takes the 8 and stops there. A list with
 // no '-' reads as it did before ranges. (Ranges were read as two CPUs before, "0,8-15" as {0, 8}: a Linux tester's
 // KYTY_RENDER_CPUS, 16 Nov.)
-static uint64_t CpuListMask(const char* list) {
+uint64_t CpuListMask(const char* list) {
 	uint64_t mask = 0;
 	if (list == nullptr) return 0;
 	for (const char* p = list; *p != '\0';) {
@@ -324,6 +324,88 @@ uint32_t PerformanceLogicalCpus() {
 			offset += info->Size;
 		}
 	return count;
+}
+
+uint64_t CurrentThreadAffinity() {
+	// (No GetThreadAffinityMask: SetThreadAffinityMask returns the mask it replaced; the process's mask, a superset,
+	// then the thread's own back.)
+	DWORD_PTR process = 0, system = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) == 0 || process == 0) return 0;
+	const DWORD_PTR old = SetThreadAffinityMask(GetCurrentThread(), process);
+	if (old != 0 && old != process) (void)SetThreadAffinityMask(GetCurrentThread(), old);
+	return static_cast<uint64_t>(old);
+}
+
+bool SetCurrentThreadAffinity(uint64_t mask) {
+	return mask != 0 && SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(mask)) != 0;
+}
+
+uint32_t PerformanceCoresIn(uint64_t mask) {
+	DWORD_PTR process = 0, system = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) == 0) process = ~DWORD_PTR(0);
+	ULONG length = 0;
+	(void)GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+	std::vector<uint8_t> buffer(length);
+	if (length == 0 || !GetSystemCpuSetInformation(reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data()), length,
+	                                               &length, GetCurrentProcess(), 0))
+		return 0;
+	uint32_t           fastest = 0;
+	std::set<uint32_t> cores;
+	for (int pass = 0; pass < 2; ++pass)
+		for (ULONG offset = 0; offset < length;) {
+			const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+			if (info->Type == CpuSetInformation && info->CpuSet.Group == 0 && info->CpuSet.LogicalProcessorIndex < 64 &&
+			    ((process >> info->CpuSet.LogicalProcessorIndex) & 1u) != 0) {
+				if (pass == 0) fastest = std::max<uint32_t>(fastest, info->CpuSet.EfficiencyClass);
+				else if (info->CpuSet.EfficiencyClass == fastest && ((mask >> info->CpuSet.LogicalProcessorIndex) & 1u) != 0)
+					cores.insert(info->CpuSet.CoreIndex);
+			}
+			offset += info->Size;
+		}
+	return static_cast<uint32_t>(cores.size());
+}
+
+uint32_t CoresIn(uint64_t mask) {
+	DWORD_PTR process = 0, system = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) == 0) process = ~DWORD_PTR(0);
+	ULONG length = 0;
+	(void)GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+	std::vector<uint8_t> buffer(length);
+	if (length == 0 || !GetSystemCpuSetInformation(reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data()), length,
+	                                               &length, GetCurrentProcess(), 0))
+		return 0;
+	const uint64_t     allowed = static_cast<uint64_t>(process) & mask;
+	std::set<uint32_t> cores;
+	for (ULONG offset = 0; offset < length;) {
+		const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+		if (info->Type == CpuSetInformation && info->CpuSet.Group == 0 && info->CpuSet.LogicalProcessorIndex < 64 &&
+		    ((allowed >> info->CpuSet.LogicalProcessorIndex) & 1u) != 0)
+			cores.insert(info->CpuSet.CoreIndex);
+		offset += info->Size;
+	}
+	return static_cast<uint32_t>(cores.size());
+}
+
+uint64_t CoresOf(uint64_t mask) {
+	ULONG length = 0;
+	(void)GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+	std::vector<uint8_t> buffer(length);
+	if (length == 0 || !GetSystemCpuSetInformation(reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data()), length,
+	                                               &length, GetCurrentProcess(), 0))
+		return mask;
+	std::set<uint32_t> cores;
+	uint64_t           result = mask;
+	for (int pass = 0; pass < 2; ++pass)
+		for (ULONG offset = 0; offset < length;) {
+			const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+			if (info->Type == CpuSetInformation && info->CpuSet.Group == 0 && info->CpuSet.LogicalProcessorIndex < 64) {
+				const uint32_t cpu = info->CpuSet.LogicalProcessorIndex;
+				if (pass == 0 && ((mask >> cpu) & 1u) != 0) cores.insert(info->CpuSet.CoreIndex);
+				else if (pass == 1 && cores.count(info->CpuSet.CoreIndex) != 0) result |= uint64_t(1) << cpu;
+			}
+			offset += info->Size;
+		}
+	return result;
 }
 
 uint64_t CurrentThreadHandle() {
@@ -2474,6 +2556,18 @@ static uint64_t CoreSiblings(int cpu) {
 	}
 	return core;
 }
+// The CPUs the process may run on, read while the process loads (taskset, a cgroup cpuset: sched_getaffinity), before
+// any thread is pinned to fewer (CoresIn).
+static uint64_t AffinityAtLoad() {
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (sched_getaffinity(0, sizeof(set), &set) != 0) return ~uint64_t {0};
+	uint64_t mask = 0;
+	for (int cpu = 0; cpu < 64; ++cpu)
+		if (CPU_ISSET(cpu, &set)) mask |= uint64_t {1} << cpu;
+	return mask;
+}
+static const uint64_t g_affinity_at_load = AffinityAtLoad();
 #endif
 
 std::string SpareCpu(const char* avoid) {
@@ -2494,6 +2588,76 @@ std::string SpareCpu(const char* avoid) {
 #else
 	(void)avoid;
 	return {};
+#endif
+}
+
+uint64_t CurrentThreadAffinity() {
+#if defined(__linux__)
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (sched_getaffinity(0, sizeof(set), &set) != 0) return 0;
+	uint64_t mask = 0;
+	for (int cpu = 0; cpu < 64; ++cpu)
+		if (CPU_ISSET(cpu, &set)) mask |= uint64_t(1) << cpu;
+	return mask;
+#else
+	return 0;
+#endif
+}
+
+bool SetCurrentThreadAffinity(uint64_t mask) {
+#if defined(__linux__)
+	cpu_set_t set;
+	return MaskToSet(mask, &set) && sched_setaffinity(0, sizeof(set), &set) == 0;
+#else
+	(void)mask;
+	return false;
+#endif
+}
+
+uint32_t PerformanceCoresIn(uint64_t mask) {
+#if defined(__linux__)
+	uint64_t counted = 0;
+	uint32_t cores   = 0;
+	for (int cpu = 0; cpu < 64; ++cpu) {
+		if (((mask >> cpu) & 1u) == 0 || ((counted >> cpu) & 1u) != 0) continue;
+		counted |= CoreSiblings(cpu);
+		++cores;
+	}
+	return cores;
+#else
+	(void)mask;
+	return 0;
+#endif
+}
+
+uint32_t CoresIn(uint64_t mask) {
+#if defined(__linux__)
+	uint64_t online = 0;
+	if (FILE* file = std::fopen("/sys/devices/system/cpu/online", "r"); file != nullptr) {
+		char list[256] = {};
+		if (std::fgets(list, sizeof(list), file) != nullptr) {
+			list[std::strcspn(list, "\n")] = '\0';
+			online = CpuListMask(list);
+		}
+		std::fclose(file);
+	}
+	const uint64_t allowed = (online != 0 ? online : ~uint64_t {0}) & g_affinity_at_load & mask;
+	return allowed == 0 ? 0 : PerformanceCoresIn(allowed);
+#else
+	(void)mask;
+	return 0;
+#endif
+}
+
+uint64_t CoresOf(uint64_t mask) {
+#if defined(__linux__)
+	uint64_t result = mask;
+	for (int cpu = 0; cpu < 64; ++cpu)
+		if (((mask >> cpu) & 1u) != 0) result |= CoreSiblings(cpu);
+	return result;
+#else
+	return mask;
 #endif
 }
 

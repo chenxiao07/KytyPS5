@@ -2,6 +2,7 @@
 #include "live-census.h"
 #include "write-guard.h"
 #include "live-counters.h"
+#include "mode-toggle.h"
 #include "async-upload.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 
@@ -11,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
+#include <unordered_set>
 #include <utility>
 #include <x86intrin.h>
 
@@ -570,11 +572,18 @@ bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges
 		// Prepared when it is committed (and its guest memory writes made after its work).
 		if (std::ranges::any_of(ranges, [&](const auto& range) { return spec->open_journal_set.Intersects(range.address, range.size); }))
 			Spec::Refuse("memory the processor writes");
-		spec->bda.insert(spec->bda.end(), ranges.begin(), ranges.end());
+		for (const auto& range: ranges) spec->NoteBda(range); // (KYTY_SPECULATE=4: a repeat in its segment not again)
 		return true;
 	}
 	// (Before the lock: making buffers asks for it.)
-	m_buffer_cache.EnsureBdaReadable(ranges);
+	// KYTY_SPECULATE=4: a range whose head pages this thread found all held by registered buffers at the registration
+	// epoch that still stands is not walked again (EnsureBdaReadableMemo): EnsureBdaReadable acts only on pages no buffer
+	// holds, and a page's owner changes only in BufferCache::ChangeRegister, which moves the epoch (the page table's one
+	// writer). The dirty-region syncs below run as before.
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) [[unlikely]]
+		EnsureBdaReadableMemo(ranges);
+	else
+		m_buffer_cache.EnsureBdaReadable(ranges);
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	RefreshBdaRanges();
 	LiveCounters::Add(LiveCounters::BdaRangeCalls);
@@ -598,10 +607,49 @@ bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges
 	return true;
 }
 
+// KYTY_SPECULATE=4: EnsureBdaReadable for the ranges not known all held at the current registration epoch; those found
+// all held after it, at an epoch read before and after the look, remembered (this thread's, cleared when the epoch
+// moves).
+void GpuResourceManager::EnsureBdaReadableMemo(std::span<const GuestRange> ranges) {
+	struct Key {
+		uint64_t address = 0, size = 0;
+		bool     operator==(const Key&) const = default;
+	};
+	struct Hash {
+		size_t operator()(const Key& key) const noexcept {
+			const uint64_t h = key.address * 0x9E3779B97F4A7C15ull ^ (key.size + 0x632BE59BD9B4E019ull);
+			return static_cast<size_t>(h ^ (h >> 29u));
+		}
+	};
+	thread_local uint64_t                      memo_epoch = 0;
+	thread_local std::unordered_set<Key, Hash> held;
+	thread_local std::vector<GuestRange>       todo;
+	if (const auto epoch = m_buffer_cache.RegistrationEpoch(); epoch != memo_epoch) {
+		held.clear();
+		memo_epoch = epoch;
+	}
+	todo.clear();
+	for (const auto& range: ranges)
+		if (!held.contains({range.address, range.size})) todo.push_back(range);
+	if (todo.empty()) return;
+	m_buffer_cache.EnsureBdaReadable(todo);
+	const auto before = m_buffer_cache.RegistrationEpoch();
+	if (before != memo_epoch) {
+		held.clear();
+		memo_epoch = before;
+	}
+	for (const auto& range: todo)
+		if (m_buffer_cache.BdaHeadHeld(range) && m_buffer_cache.RegistrationEpoch() == before) held.insert({range.address, range.size});
+}
+
 void GpuResourceManager::SynchronizeDirtyBdaRegions(GuestRange range) {
 	const auto first = range.address / TRACKER_REGION_SIZE;
 	if (first >= BdaDirtyRegions::Regions) return;
 	const auto last = std::min((range.End() - 1) / TRACKER_REGION_SIZE, BdaDirtyRegions::Regions - 1);
+	// KYTY_SPEC_BDA_CLEAN_SKIP (live spec_bda_clean_skip; on under KYTY_SPECULATE=4, 0 otherwise: mode-toggle.h; set, it
+	// acts in either mode): in a region synced, a request with no page CPU-dirty is not visited (below).
+	static auto& clean_skip_switch = LiveSwitch::Find("spec_bda_clean_skip", ModeToggle::Default("spec_bda_clean_skip"));
+	const bool   clean_skip        = clean_skip_switch.load(std::memory_order_relaxed) != 0;
 	for (auto word = first / 64; word <= last / 64; ++word) {
 		auto mask = ~uint64_t {0};
 		if (word == first / 64) mask &= ~uint64_t {0} << (first % 64);
@@ -616,6 +664,21 @@ void GpuResourceManager::SynchronizeDirtyBdaRegions(GuestRange range) {
 			    [](const auto& request, uint64_t begin) { return request.address + request.size <= begin; });
 			bool unproven = false;
 			for (; it != m_bda_region_requests.end() && it->address < region_begin + TRACKER_REGION_SIZE; ++it) {
+				// KYTY_SPEC_BDA_CLEAN_SKIP: a request proven before (not new, not unproven: cpu_epoch set), its region's
+				// registrations unchanged since, whose visit would sync (its region's CPU epoch moved), and no page of which
+				// is CPU-dirty under the region's lock: its visit would copy nothing (SynchronizeBuffer's read-only sync
+				// uploads only what IsRegionCpuModified finds; DrainGuestReadback returns at once for it; a sync stamp left
+				// older only makes a later visit look again; the sync index is rebuilt lazily by the next call that needs
+				// it). Skipped, it is proven at the epoch read under that lock, as the visit would have proven it; a
+				// dirtying after it moves the epoch. A forced request (a registration since, or cpu_epoch 0) is visited.
+				if (clean_skip && it->cpu_epoch != 0 &&
+				    it->registration_epoch == m_buffer_cache.RegionRegistrationEpoch(it->address)) {
+					if (const auto now = m_buffer_cache.CpuModificationEpoch(it->address, it->size); now != 0 && now != it->cpu_epoch)
+						if (const auto clean = m_buffer_cache.CleanRangeEpoch(it->address, it->size); clean != 0) {
+							it->cpu_epoch = clean;
+							continue;
+						}
+				}
 				m_buffer_cache.SynchronizeRegionRequest(*it);
 				unproven |= it->cpu_epoch == 0;
 			}

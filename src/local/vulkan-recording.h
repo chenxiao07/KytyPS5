@@ -34,6 +34,11 @@ bool PacketsEnabled();
 // until replay finishes; callers never lend stack or mutable-cache pointers.
 bool EnqueuePacket(ReplayPacket replay, std::span<const Segment> segments,
                    std::shared_ptr<const void> owner = {});
+// One segment, no owner, and (when true is returned) `copy`: where its copy lives in the stream's chunk. A passive
+// producer's chunk stays where it is, read by nobody, until the render thread splices its segment (then its replay reads
+// it) or discards it; the splicing thread may rewrite the copy's bytes before the splice (a speculation's relocatable
+// buffer references, Spec::RelocCell), never after.
+bool EnqueuePacketCopy(ReplayPacket replay, const Segment& segment, void** copy);
 // Preserve order when a packet cannot fit. Does not retain any argument.
 void ReplayInline(ReplayPacket replay, std::span<const Segment> segments);
 // A packet's replay that records commands the recording does not see (a library's own: DLSS through Streamline)

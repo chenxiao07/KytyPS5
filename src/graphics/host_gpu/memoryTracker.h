@@ -36,6 +36,16 @@ public:
 		const auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
 		return manager == nullptr ? 0 : manager->CpuModificationEpoch();
 	}
+	// KYTY_SPEC_BDA_CLEAN_SKIP: RegionManager::CleanRangeEpoch for a range within one region, under its lock; no region
+	// manager made (never tracked, all its pages CPU-dirty) or a range over several regions: 0.
+	[[nodiscard]] uint64_t CleanRangeEpoch(uint64_t vaddr, uint64_t size) const {
+		if (!GuestRange {vaddr, size}.Valid() || vaddr / TRACKER_REGION_SIZE != (vaddr + size - 1) / TRACKER_REGION_SIZE)
+			return 0;
+		auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+		if (manager == nullptr) return 0;
+		std::scoped_lock lock(manager->lock);
+		return manager->CleanRangeEpoch(vaddr, size);
+	}
 	// A write protection of the region's pages is queued (KYTY_ASYNC_REPROTECT): their copies are taken
 	// after it lands, so a write before it is uploaded and one after it faults.
 	[[nodiscard]] bool DeferredProtectionPending(uint64_t vaddr) const {
@@ -43,13 +53,16 @@ public:
 		return manager != nullptr && manager->DeferredProtectionPending();
 	}
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
+	// The same answer with no region manager made (IsRegionCpuModified makes the missing ones, whose pages start
+	// CPU-dirty): a region with none was never tracked and answers CPU-dirty.
+	[[nodiscard]] bool IsRegionCpuModifiedNoCreate(uint64_t vaddr, uint64_t size) const;
 	// Every page CPU-dirty (untracked memory is): none is write-protected for the tracker.
 	[[nodiscard]] bool IsRegionFullyCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionFullyGpuModified(uint64_t vaddr, uint64_t size);
 	// `handoff` (a held caller lock) is released once the region lock is held, so the
 	// protection change does not extend the caller's critical section.
 	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size,
-	                                               std::unique_lock<TrackingSpinLock>* handoff = nullptr) noexcept;
+	                                               std::unique_lock<TextureCacheLock>* handoff = nullptr) noexcept;
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	// CPU-dirty, the write protection kept (RegionManager::MarkCpuDirtyKeepProtection): for a write through the
@@ -143,7 +156,10 @@ public:
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		// KYTY_ASYNC_REPROTECT: the pages this upload marks clean get their write protection
 		// from the upload worker, queued ahead of their copies (see TakeDeferredProtects).
-		const bool defer = !is_written && kyty_local_async_reprotect_mode.load(std::memory_order_relaxed) != 0;
+		// KYTY_SPEC_PROTECT_ASYNC (mode 4): a written buffer's too (`written`: its job leaves a no access the GPU thread
+		// still holds pending to that flush, PageManager::ReapplyWrittenProtection).
+		const bool defer = kyty_local_async_reprotect_mode.load(std::memory_order_relaxed) != 0 &&
+		                   (!is_written || PageManager::WrittenArmAsync());
 		// Reused per thread (no nested upload, see CheckNotInUploadCallback above).
 		thread_local std::vector<PageManager::DeferredRange> ranges;
 		ranges.clear();
@@ -157,7 +173,7 @@ public:
 				PageManager::SetDeferredWriteProtectSink(nullptr);
 				for (const auto& range: ranges) {
 					manager->BeginDeferredProtection();
-					s_deferred.push_back({manager, range.address, range.size});
+					s_deferred.push_back({manager, range.address, range.size, is_written});
 				}
 				ranges.clear();
 			}
@@ -184,6 +200,8 @@ public:
 	struct DeferredProtect {
 		RegionManager* manager = nullptr;
 		uint64_t       address = 0, size = 0;
+		bool           written = false; // (KYTY_SPEC_PROTECT_ASYNC: a written buffer's upload; queued, its job is
+		                                // ApplyDeferredWrittenProtection)
 	};
 	// The upload callback takes the protections to queue ahead of its copies.
 	[[nodiscard]] static std::vector<DeferredProtect> TakeDeferredProtects() { return std::exchange(s_deferred, {}); }

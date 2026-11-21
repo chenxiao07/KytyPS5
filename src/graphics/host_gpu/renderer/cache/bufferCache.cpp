@@ -11,6 +11,7 @@
 #include "live-trace-gpu.h"
 #include "native-resource-state.h"
 #include "async-upload.h"
+#include "write-guard.h"
 #include "parallel-pages.h"
 #include "readback-queue.h"
 #include "local-platform.h"
@@ -2451,7 +2452,12 @@ BufferId BufferCache::FindBufferSpec(uint64_t vaddr, uint64_t size) {
 		const auto* buffer = m_slot_buffers.try_get(owner);
 		if (buffer == nullptr) return Spec::Refuse("buffer registration (unregistered meanwhile)"), NULL_BUFFER_ID;
 		if (buffer->IsInBounds(vaddr, size)) {
-			if (!Spec::t_no_range) Spec::Current()->NoteBufferRange(vaddr, size); // (spec_reloc_refs: the caller records it)
+			if (!Spec::t_no_range) {
+				auto* spec = Spec::Current();
+				spec->NoteBufferRange(vaddr, size); // (spec_reloc_refs: the caller records it)
+				// (Its callers record the buffer's handle (dispatch-indirect arguments): never relocated.)
+				spec->NoteUnrel(vaddr, size);
+			}
 			return owner;
 		}
 	}
@@ -2700,6 +2706,33 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	}
 	Register(id);
 	return id;
+}
+
+BufferCache::RelocUpload BufferCache::UploadRelocated(BufferId id, uint64_t vaddr, uint64_t size) {
+	auto* buffer = GetBufferIfLive(id);
+	EXIT_IF(buffer == nullptr || !buffer->IsInBounds(vaddr, size));
+	// (The commit's thread, the GPU thread, outside any speculative translation: else refused, nothing done.)
+	if (!GuestGpu::IsGpuThread() || Spec::Current() != nullptr) return RelocUpload::Refused;
+	// GPU-written bytes over the range (written by work recorded before this point and the pages GPU-owned, or exact
+	// ranges): the in-order read takes the device's bytes there, which the live buffer may not hold. Refused.
+	if (m_memory_tracker.IsRegionGpuModified(vaddr, size) || m_gpu_modified_ranges.Intersects(vaddr, size))
+		return RelocUpload::Refused;
+	// A guest readback pending over it (its pages GPU-owned until it lands): refused, never drained here.
+	if (m_active_guest_readbacks != 0)
+		for (const auto& request: m_guest_readbacks) {
+			if (!request || vaddr >= request->begin + request->size || (vaddr < request->begin && size <= request->begin - vaddr))
+				continue;
+			if (std::ranges::any_of(request->pages, [&](const GuestRange& page) {
+				    return vaddr < page.End() && (vaddr >= page.address || size > page.address - vaddr);
+			    }))
+				return RelocUpload::Refused;
+		}
+	// Texture bytes the offload must bring back or wait for (a flush of the open buffer, a restore): refused.
+	if (TextureOffload::MustWaitBeforeRead(vaddr, size) || TextureOffload::Overlaps(vaddr, size)) return RelocUpload::Refused;
+	// (ObtainBuffer's for a read, not texel: DrainGuestReadback returns for a read-only binding, then its buffer path.)
+	TouchBuffer(*buffer);
+	(void)SynchronizeBuffer(*buffer, vaddr, size, false, false);
+	return m_memory_tracker.IsRegionCpuModified(vaddr, size) ? RelocUpload::StillDirty : RelocUpload::Uploaded;
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
@@ -2971,12 +3004,31 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		for (const auto& copy: copies)
 			queued = queued && LibKernel::Memory::TryGetBackingPointer(buffer.CpuAddress() + copy.dstOffset, copy.size);
 		for (const auto& item: deferred) {
-			if (queued) {
+			if (queued && item.written) {
+				// KYTY_SPEC_PROTECT_ASYNC: a written buffer's arm, ahead of its copies as the others; its job leaves a no
+				// access still pending on the GPU thread to that flush (RegionManager::ApplyDeferredWrittenProtection).
+				LiveCounters::Add(LiveCounters::Wa1Queued);
+				PageManager::NoteWrittenArmQueued(); // (the GPU thread keeps the pages' marks until the job ran)
+				AsyncUpload::Get().PushProtection(
+				    [](void* manager, uint64_t address, uint64_t size) {
+					    static_cast<RegionManager*>(manager)->ApplyDeferredWrittenProtection(address, size);
+				    },
+				    item.manager, item.address, item.size, item.address, item.size,
+				    // (KYTY_SPEC_UPLOAD_PIPE: `count` of them over adjacent ranges as one; never with a read-only buffer's.)
+				    [](void* manager, uint64_t address, uint64_t size, uint64_t count) {
+					    static_cast<RegionManager*>(manager)->ApplyDeferredWrittenProtections(address, size,
+					                                                                          static_cast<uint32_t>(count));
+				    });
+			} else if (queued) {
 				AsyncUpload::Get().PushProtection(
 				    [](void* manager, uint64_t address, uint64_t size) {
 					    static_cast<RegionManager*>(manager)->ApplyDeferredProtection(address, size);
 				    },
-				    item.manager, item.address, item.size, item.address, item.size);
+				    item.manager, item.address, item.size, item.address, item.size,
+				    // (KYTY_SPEC_UPLOAD_PIPE: `count` of them over adjacent ranges as one.)
+				    [](void* manager, uint64_t address, uint64_t size, uint64_t count) {
+					    static_cast<RegionManager*>(manager)->ApplyDeferredProtections(address, size, static_cast<uint32_t>(count));
+				    });
 			} else {
 				item.manager->ApplyDeferredProtection(item.address, item.size);
 			}
@@ -3047,6 +3099,17 @@ void BufferCache::EnsureBdaReadable(std::span<const GuestRange> ranges) {
 			page = end;
 		}
 	}
+}
+
+bool BufferCache::BdaHeadHeld(const GuestRange& range) const {
+	constexpr uint64_t HeadBytes = uint64_t {64} << 10u; // (EnsureBdaReadable's)
+	if (range.size == 0) return true;
+	const auto last = (range.address + std::min(range.size, HeadBytes) - 1) >> PageTable::kPageBits;
+	for (auto page = range.address >> PageTable::kPageBits; page <= last; ++page) {
+		const BufferId owner = LoadOwner(m_page_table.Find(page)); // (one read: LoadOwner)
+		if (!owner) return false;
+	}
+	return true;
 }
 
 void BufferCache::EnsureBufferContents(uint64_t vaddr, uint64_t size) {
@@ -3169,7 +3232,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSpec(Spec::State& spec, ui
 	else if (m_memory_tracker.IsRegionCpuModified(vaddr, size) || spec.JournalIntersects(vaddr, size))
 		spec.NoteCurrent(vaddr, size);
 	if (spec.touched_buffers.empty() || spec.touched_buffers.back() != *owner) spec.touched_buffers.push_back(*owner);
-	if (!Spec::t_no_range) spec.NoteBufferRange(vaddr, size); // (spec_reloc_refs: the caller records it)
+	if (!Spec::t_no_range) {
+		spec.NoteBufferRange(vaddr, size); // (spec_reloc_refs: the caller records it)
+		// (A buffer reference the commit cannot relocate: not a V# (patched by its entry), not the table path's index
+		// buffer or draw arguments (recorded as relocatable packets).)
+		if (Spec::t_reloc_scope == 0) spec.NoteUnrel(vaddr, size);
+	}
 	return {buffer, buffer->Offset(vaddr)};
 }
 
@@ -3339,7 +3407,11 @@ void BufferCache::QueueImageProtects(std::span<const StagingPiece> copied, bool 
 		    [](void* manager, uint64_t address, uint64_t bytes) {
 			    static_cast<PageManager*>(manager)->SyncProtection(address, bytes);
 		    },
-		    m_image_protect_manager, range.address, range.size, range.address, range.size);
+		    m_image_protect_manager, range.address, range.size, range.address, range.size,
+		    // (KYTY_SPEC_UPLOAD_PIPE: adjacent ones as one; it reads each page's watchers when it runs.)
+		    [](void* manager, uint64_t address, uint64_t bytes, uint64_t) {
+			    static_cast<PageManager*>(manager)->SyncProtection(address, bytes);
+		    });
 	}
 	m_image_protects.clear();
 }
@@ -3363,7 +3435,7 @@ bool BufferCache::PushImageStagingCopies(uint8_t* staging, uint64_t vaddr, uint6
 	// Partly unmapped (a texture pool with released layers): the worker reads the mapped
 	// parts; the render thread copied hundreds of MiB here synchronously before.
 	AsyncUpload::Get().PushCall(ReadMappedOrZeroCall, reinterpret_cast<void*>(vaddr),
-	                            reinterpret_cast<uint64_t>(staging), size, vaddr, size);
+	                            reinterpret_cast<uint64_t>(staging), size, vaddr, size, AsyncUpload::Worker::JobKind::Read);
 	return false;
 }
 
@@ -3448,7 +3520,8 @@ std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<Sta
 		// when memory is mapped there (TextureCache::MapMemory).
 		if (async) {
 			AsyncUpload::Get().PushCall(ReadMappedOrZeroCall, reinterpret_cast<void*>(piece.vaddr),
-			                            reinterpret_cast<uint64_t>(target), piece.size, piece.vaddr, piece.size);
+			                            reinterpret_cast<uint64_t>(target), piece.size, piece.vaddr, piece.size,
+			                            AsyncUpload::Worker::JobKind::Read);
 			queued = true;
 			continue;
 		}
@@ -3584,6 +3657,44 @@ static void DrainCopyDestination(uint64_t vaddr, uint64_t size) {
 	if (drain.load(std::memory_order_relaxed) != 0) AsyncUpload::DrainRange(vaddr, size);
 }
 
+// KYTY_SPEC_LABEL_KNOWN_WRITER: CopyGuestMemory's keep-protection write for the GPU thread's other writes into watched
+// pages (a commit's labels, WRITE_DATA and end-of-pipe labels, a linear copy's CPU-dirty runs), which faulted: the write
+// window released the memory tracker's watch, and the next upload of the covering buffer armed it again (~36 pairs a
+// frame on the GPU thread in play). Exact, as the fault would have it: the images over the range invalidated first
+// (TextureCache::InvalidateMemory: pending downloads released, CPU aliases invalidated), the pages CPU-dirty
+// (MarkRegionAsCpuDirtyKeepProtection: the epoch, the dirty clock and the BDA mark move as ChangeState moves them; only
+// the written pages, where the window took up to 16), the bytes in the backing view (the guest's view shows them: the
+// same memory; fresh granules marked written there, TryWrite*Backing; an offload's range given back first). The watch
+// stays: the guest CPU's next write to the pages faults and drops it as for any dirty page, and the next upload finds
+// them protected already. Not taken, the caller's write as before: no watcher on the range (it does not fault); a write
+// guard on a page (its protection is not the page manager's); a read watcher (GPU-written bytes to read back first, an
+// offload's hold, a read guard); a view a partial unmap is mapping again; GPU-modified pages (only this thread marks
+// them, so a range found unmodified stays so until the write); no single backing mapping for the range.
+bool BufferCache::WriteGuestKnownWriter(uint64_t vaddr, const void* data, uint64_t size, bool source_in_guest) {
+	static auto& on = LiveSwitch::Find("spec_label_known_writer", ModeToggle::Default("spec_label_known_writer"));
+	if (on.load(std::memory_order_relaxed) == 0 || !GuestGpu::IsGpuThread() || m_resources == nullptr || data == nullptr ||
+	    size == 0 || !GuestRange {vaddr, size}.Valid())
+		return false;
+	uint64_t first = 0, end = 0;
+	if (!m_resources->WatchedSpan(vaddr, size, &first, &end) || WriteGuard::GuardedBacking(vaddr, size) != nullptr ||
+	    Libs::LibKernel::Memory::ReadFaults(vaddr, size) || Libs::LibKernel::Memory::InRemapWindow(vaddr) ||
+	    Libs::LibKernel::Memory::InRemapWindow(vaddr + size - 1) || m_memory_tracker.IsRegionGpuModified(vaddr, size))
+		return false;
+	// (A source in guest memory read here, its faults served outside the backing write: GuardedWrite's order.)
+	if (source_in_guest) {
+		thread_local std::vector<uint8_t> bytes;
+		bytes.resize(size);
+		std::memcpy(bytes.data(), data, size);
+		data = bytes.data();
+	}
+	// (As the write fault would: the images over the pages first.)
+	m_texture_cache.InvalidateMemory(vaddr, size);
+	if (!m_memory_tracker.MarkRegionAsCpuDirtyKeepProtection(vaddr, size)) return false;
+	// (Not GPU-modified: no data writer writes these pages, so the CPU-owned writer first, as WriteGuardedBacking.)
+	return Libs::LibKernel::Memory::TryWriteCpuBacking(vaddr, data, size) ||
+	       Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size);
+}
+
 void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size) {
 	// The game's linear copies mostly rewrite what the destination already holds (95% of the bytes in the fixed
 	// scene): only the destination pages whose bytes differ are written, so the others stay clean (no upload of their
@@ -3612,6 +3723,12 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 			}
 			// (Memory the backing view does not hold: written through the guest's view, unprotected first.)
 			InvalidateMemory(address, bytes);
+		} else if (WriteGuestKnownWriter(address, from, bytes)) {
+			// (KYTY_SPEC_LABEL_KNOWN_WRITER: CPU-dirty pages still watched, written the way above since their upload, are
+			// written the same way again, their epoch moved by the mark: no write fault releasing the watch.)
+			parts.Note();
+			if (Scout::Running()) Scout::NoteHostWrite(address, bytes);
+			return;
 		}
 		// (Pages CPU-dirty already change no state: their epoch moves, a copy of their bytes taken meanwhile is
 		// stale. A linear copy is a dispatch, no point the observation epoch moves at.)
@@ -3663,6 +3780,12 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 		at += bytes;
 	}
 	write();
+}
+
+// (The guarded write's own fault path, TouchForWrite, marked the pages it found clean CPU-dirty, which moved their
+// epochs; pages CPU-dirty already change no state: their epochs move here, as CopyGuestMemory's NoteHostWrite.)
+void BufferCache::NoteGuardedCopyWrite(uint64_t vaddr, uint64_t size) {
+	m_memory_tracker.NoteHostWrite(vaddr, size);
 }
 
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {

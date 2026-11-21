@@ -16,6 +16,10 @@ uint64_t GuardedCopy(void* destination, const void* source, uint64_t size) noexc
 // The vectored exception handler's check (`context`: the fault's CONTEXT): true when the access violation is
 // GuardedCopy's, with the context moved past its copy.
 bool ResumeGuardedCopy(void* context) noexcept;
+// The exception filter's check of a guard-page violation (`address`: the page it hit): true when GuardedCopy raised it,
+// with the context moved past its copy (a short read, as at a page without access) and the page's guard, which the
+// touch consumed, set again over its current protection (private memory only).
+bool ResumeGuardedCopyAtGuard(void* context, uint64_t address) noexcept;
 #endif
 
 } // namespace Common

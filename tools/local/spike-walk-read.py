@@ -19,7 +19,7 @@ Then, beside those (printed after them in both tables; "-" when the walk is too 
                    "-" for a boot run with -Tail 0
 Boots flagged STORM are listed but left out of the means (their window rows measure the storm, not the crossing).
 Each walk's end position (its last LIVE_WHERE before the flipsx reply) is checked against the bridge's (z 390.3, SPIKE-WALK.md):
-a walk that ends elsewhere gets a WARNING line (a save without the Tower Knight beaten, a stuck run); no reply, or ok=0,
+a walk that ends elsewhere gets a WARNING line (a stuck run, a wrong start); no reply, or ok=0,
 "where failed".
 Labels are spike-walk.ps1's -Label; each walk of a boot is LABEL-wN. Means and standard errors over the labels given.
 """
@@ -83,7 +83,7 @@ def walk_rows(d, label, walk):
         print(f'WARNING {label} {walk}: where failed at the run\'s end (no end position read)')
     elif abs(float(z.group(1)) - END_Z) > END_Z_TOLERANCE:
         print(f'WARNING {label} {walk}: the run ended at z={float(z.group(1)):.1f}, not on the bridge (z {END_Z}); '
-              f'the save may lack the Tower Knight beaten (SPIKE-WALK.md)')
+              f'check the run (stuck, or a wrong start: SPIKE-WALK.md)')
     last = int(re.search(r'last=(\d+)', live[end]).group(1))
     pad_line = max(i for i in range(start) if live[i].startswith('LIVE_PAD'))
     pad_flip = int(re.search(r'flip=(\d+)', live[pad_line]).group(1))

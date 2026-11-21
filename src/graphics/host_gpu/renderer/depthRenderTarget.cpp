@@ -327,7 +327,8 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	}
 	auto& cache = m_context.GetTextureCache();
 	r.image_id = cache.FindImage(r.desc);
-	BindRenderTarget(r.image_id);
+	// (Mode 4, a worker's capture: its read-only resolution binds nothing: the draw's binding state is the GPU thread's.)
+	if (!TextureCache::ReadOnly()) BindRenderTarget(r.image_id);
 }
 
 bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {

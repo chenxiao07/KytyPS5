@@ -51,6 +51,25 @@ std::string SpareCpu(const char* avoid);
 // The logical CPUs of the performance cores (the highest efficiency class; all of them where every core is alike) the
 // process may run on; 0 where that is not known (Linux). KYTY_SIMULATE_PCORES=<n> stands in for it (a test).
 uint32_t PerformanceLogicalCpus();
+// "1,2,3" or "0,8-15" -> bit mask of CPUs 0..63; 0 for an empty or invalid list (local-platform.cpp).
+uint64_t CpuListMask(const char* list);
+// The calling thread's CPU mask (bit n: CPU n; Windows: the process's group, read by setting the process's mask and the
+// thread's back; Linux: sched_getaffinity); 0 when unknown. SetCurrentThreadAffinity: the calling thread on those CPUs.
+uint64_t CurrentThreadAffinity();
+bool     SetCurrentThreadAffinity(uint64_t mask);
+// The physical performance cores among the CPUs of `mask` the process may run on: SMT siblings count as one core, cores
+// of a lower efficiency class (E-cores) not at all (Windows: CPU set CoreIndex and EfficiencyClass; every core where all
+// are alike). Linux: the distinct cores (CoreSiblings' thread_siblings_list) among the CPUs of `mask`, every class alike.
+// 0 when unknown.
+uint32_t PerformanceCoresIn(uint64_t mask);
+// The physical cores of every efficiency class among the CPUs of `mask` the process may run on: SMT siblings one core,
+// an E-core one core (Windows: CPU set CoreIndex in the process's affinity mask, CPU-set limits not seen, as
+// PerformanceCoresIn; Linux: the online CPUs the process could run on as it loaded, sched_getaffinity, which a taskset
+// or cgroup cpuset narrows, thread_siblings_list). 0 when unknown. 16 for ~0 on an 8 P-core (16 CPUs) + 8 E-core part.
+uint32_t CoresIn(uint64_t mask);
+// Every logical CPU (0..63) of a physical core that holds a CPU of `mask`: the mask with its SMT siblings (Windows: CPU
+// set CoreIndex; Linux: thread_siblings_list). `mask` itself where the topology is not known.
+uint64_t CoresOf(uint64_t mask);
 
 // Opaque handle of the calling thread for ThreadCpuSeconds (valid while the thread runs).
 uint64_t CurrentThreadHandle();

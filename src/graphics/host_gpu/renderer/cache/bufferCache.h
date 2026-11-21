@@ -83,6 +83,8 @@ public:
 	void                   EnsureTexelContents(uint64_t vaddr, uint64_t size);
 	// The start of each range shaders read through pointers held by a buffer with the guest's bytes (see the definition).
 	void                   EnsureBdaReadable(std::span<const GuestRange> ranges);
+	// Every page EnsureBdaReadable looks at for `range` (its head) held by a buffer now.
+	[[nodiscard]] bool     BdaHeadHeld(const GuestRange& range) const;
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
@@ -149,6 +151,18 @@ public:
 	                bool src_gds);
 	// CopyBuffer's copy on the CPU: only the destination pages whose bytes differ are written.
 	void CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size);
+	// A commit's copy bytes written by a guarded write (speculation.cpp, GuardedCopy): the regions' epochs move, as
+	// CopyGuestMemory's writes move them.
+	void NoteGuardedCopyWrite(uint64_t vaddr, uint64_t size);
+	// KYTY_SPEC_LABEL_KNOWN_WRITER (live spec_label_known_writer; on under KYTY_SPECULATE=4, 0 otherwise: mode-toggle.h;
+	// set, it acts in either mode; the GPU thread only): the GPU thread's own write of guest bytes into watched memory
+	// made through the backing view, its pages marked CPU-dirty with their write protection kept (CopyGuestMemory's
+	// form), in place of the write fault that released the watch (and the upload that armed it again). True: written,
+	// the caller writes nothing. False: not written, the caller writes as before (images over the range may have been
+	// invalidated and its pages marked CPU-dirty: both exact before a write). `source_in_guest`: `data` may be guest
+	// memory (a packet's bytes): read into a local copy first, so a fault reading it is served before the backing write's
+	// locks are taken (GuardedWrite's order).
+	[[nodiscard]] bool WriteGuestKnownWriter(uint64_t vaddr, const void* data, uint64_t size, bool source_in_guest = false);
 	// Called after an identified small GPU copy; it never submits or publishes guest data.
 	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
 	// KYTY_EAGER_FEEDBACK (live eager_feedback, default off: fps flat in PR #300): GPU thread, the copy-feedback
@@ -176,6 +190,18 @@ public:
 	[[nodiscard]] bool IsRegionCpuDirty(uint64_t vaddr, uint64_t size) {
 		return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 	}
+	// The same, read only: no region manager made (an untracked region answers CPU-dirty, as a made one would).
+	[[nodiscard]] bool IsRegionCpuDirtyNoCreate(uint64_t vaddr, uint64_t size) const {
+		return m_memory_tracker.IsRegionCpuModifiedNoCreate(vaddr, size);
+	}
+	// The commit (on the GPU thread): a relocated reference's CPU-dirty range uploaded into its live buffer `id` as the
+	// in-order draw's lookup of it (ObtainBuffer, read, not texel) does: SynchronizeBuffer, into the open command buffer
+	// or its upload prologue, barriers its own. Refused with nothing done when the range holds GPU-written bytes (tracker
+	// or exact ranges), a guest readback is pending over it, the texture offload must restore or wait for its bytes, or
+	// the caller is not the GPU thread outside a speculative translation; StillDirty: the sync ran and pages stay
+	// CPU-dirty (unmapped ones).
+	enum class RelocUpload : uint8_t { Uploaded, Refused, StillDirty };
+	[[nodiscard]] RelocUpload UploadRelocated(BufferId id, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
@@ -228,6 +254,10 @@ public:
 	// an unchanged sum proves that no region saw a new CPU-dirty mark.
 	[[nodiscard]] bool DeferredProtectionPending(uint64_t vaddr) const {
 		return m_memory_tracker.DeferredProtectionPending(vaddr);
+	}
+	// KYTY_SPEC_BDA_CLEAN_SKIP: MemoryTracker::CleanRangeEpoch (GpuResourceManager::SynchronizeDirtyBdaRegions).
+	[[nodiscard]] uint64_t CleanRangeEpoch(uint64_t vaddr, uint64_t size) const {
+		return m_memory_tracker.CleanRangeEpoch(vaddr, size);
 	}
 	[[nodiscard]] uint64_t CpuModificationEpoch(uint64_t vaddr, uint64_t size) const {
 		if (!GuestRange {vaddr, size}.Valid()) return 0;

@@ -64,8 +64,10 @@ public:
 	void Stop();
 
 	// Blocked: committed up to a wait hole not satisfied yet (the submission waits; Resume goes on from there). Chunk:
-	// committed up to the end of its chunk (mode 4: the execution is where the next begins).
-	enum class Outcome { Whole, Partly, None, Blocked, Chunk };
+	// committed up to the end of its chunk (mode 4: the execution is where the next begins). Yield (mode 4): nothing
+	// committed, the chunk still being translated and another queue's front ready: the submission is requeued at this
+	// chunk (as at a wait), that front runs first.
+	enum class Outcome { Whole, Partly, None, Blocked, Chunk, Yield };
 	// The command buffer translated speculatively from `cp`'s state, from where `execution` is (its start, or a wait the
 	// normal translation stopped at), and committed: whole (`cp` then has its state after it), partly or not at all
 	// (the rest is translated the normal way from `execution`, where `cp` has the state; nothing committed: as it was).
@@ -102,6 +104,9 @@ public:
 	[[nodiscard]] Outcome CommitReady(CommandProcessor& cp, const Job& job, uint32_t chunk, Pm4Execution& execution,
 	                                  std::optional<Pm4Execution>& end);
 	void                  Done(uint64_t serial, const CommandProcessor& cp);
+	// Mode 4: a translated chunk of the submission with that serial is waiting to be committed (the speculation's own
+	// lock, taken and released here; the caller holds no other instance's).
+	[[nodiscard]] bool    FrontReady(uint64_t serial, uint32_t chunk);
 	static constexpr uint32_t ChunkWork = 128;
 	// KYTY_SPEC_CHUNK_IN_ORDER (live spec_chunk_in_order, default off): a chunk the state pass has not cut when the GPU
 	// thread comes for it ("not passed yet") is translated in order up to where the pass will end it (ChunkWork draws
@@ -114,6 +119,9 @@ public:
 	// commits).
 	[[nodiscard]] Spec::EffectsLog& Log() noexcept { return m_log; }
 	[[nodiscard]] static uint64_t NowNs() noexcept;
+	// The GPU thread (KYTY_SPEC_GPU_AFFINITY, live spec_gpu_affinity; on under KYTY_SPECULATE=4): its CPUs without the
+	// speculation workers' cores, taken at a guest flip in mode 4 and given back out of it (speculation.cpp).
+	static void GpuThreadAffinityAtFlip();
 
 private:
 	// A packet left to the commit (Spec::State::closed: it follows the segment of its index), why, and the
@@ -128,8 +136,9 @@ private:
 	};
 	enum class Progress { Complete, Stopped, Blocked };
 	enum class HoleRun { Done, Changed, Blocked };
-	// SegmentAsHole: not taken (nothing run), or run by the GPU thread up to its hole's packet, or past it without reaching it.
-	enum class AsHole { NotTaken, Reached, NotReached };
+	// SegmentAsHole: not taken (nothing run), or run by the GPU thread up to its hole's packet, or past it without reaching it,
+	// or (mode 4) stopped at a wait inside it not satisfied yet (result.resume_at there).
+	enum class AsHole { NotTaken, Reached, NotReached, Blocked };
 	// What the speculation's work assumed of the caches: no buffer or image registered or released, no mapping changed
 	// since (and the surface metadata it found not cleared still not: Spec::State::meta_facts).
 	struct Epochs {
@@ -165,7 +174,20 @@ private:
 		size_t       submitted = 0, next = 0; // recorded command buffers submitted, segments committed
 		uint64_t     last_tick = 0;           // the last of them's tick (0: none; batched / spliced: not yet submitted)
 		size_t       blocked   = SIZE_MAX;    // the wait hole the commit waits at
-		uint64_t     retired   = 0;           // when Finish kept it for reuse (m_clock; 0: in use)
+		bool         blocked_as_hole = false; // (... after its segment ran as a hole: `cp` holds the hole's state)
+		// (Mode 4) the segment run as a hole the commit waits in, at a wait inside it (resume_at; `cp` holds the run's
+		// state there).
+		size_t       blocked_segment = SIZE_MAX;
+		// (The report's classes) its segments run as holes (redone in order: SegmentAsHole); a stop that left the in-order
+		// path no more than a hole's run would (SegmentAsHole NotTaken: its last segment, or a wait inside it that does not
+		// hold, where in order the GPU thread blocks too and the rest goes in order after a block anyway).
+		size_t       redone    = 0;
+		bool         stop_free = false;
+		// (The report's) a stop after its segment ran as a hole or after a hole ran: the in-order path goes on past it, so
+		// the segments from `next` on are abandoned (else `next` is the refused segment, which runs in order as its hole
+		// would).
+		bool         stop_past = false;
+		uint64_t     retired   = 0;          // when Finish kept it for reuse (m_clock; 0: in use)
 		// When its translation started and ended, when each segment's ended.
 		uint64_t              start_ns = 0, end_ns = 0;
 		std::vector<uint64_t> segment_ends;
@@ -191,6 +213,9 @@ private:
 		Result*                                    current     = nullptr;
 		// The GPU thread's request that the translation going on stop (Spec::State::cancel); when it began (under m_mutex).
 		std::atomic<bool>                          cancel {false};
+		// (Mode 4: set when its translation saw `cancel`, Spec::State::cancel_seen; CommitReady's spin goes on through the
+		// tail then.)
+		std::atomic<bool>                          cancel_seen {false};
 		uint64_t                                   began_ns = 0;
 		uint64_t                                   since       = 0;
 	};
@@ -224,11 +249,25 @@ private:
 	[[nodiscard]] Epochs  CurrentEpochs() const;
 	// Why the work of the segment no longer holds (a buffer or image it used registered over, a mapping changed), or
 	// null.
-	[[nodiscard]] const char* Changed(const Result& result, size_t index) const;
+	// (skip_registered: the registrations over its buffer ranges not looked at: RelocEligible did.)
+	// (`since`: the epochs to check from instead of the result's: Changed's stamps, mode 4, the call after Before.)
+	[[nodiscard]] const char* Changed(const Result& result, size_t index, bool skip_registered = false,
+	                                  const Epochs* since = nullptr) const;
+	// KYTY_SPECULATE=4 (Spec::State::reloc_on): whether a segment Changed() stopped with `why` passes with its
+	// relocatable buffer references patched: each range a registration moved over is covered whole by them, each resolves
+	// to one live registered buffer now, and no other buffer reference of the segment has a range a registration moved
+	// over. RelocPatch writes them (after its Before, before its splice); false: stop as before. RelocPatch's non-null
+	// answer is the stop's reason (a reference unresolved, or one over CPU-dirty memory its upload refused), with no cell
+	// written.
+	[[nodiscard]] bool        RelocEligible(const Result& result, size_t index, const char* why) const;
+	[[nodiscard]] const char* RelocPatch(Result& result, size_t index);
 	// redo_level_precise: a used image's unmap left the levels its segment sampled mapped (speculation.cpp).
 	[[nodiscard]] bool SampledLevelsMapped(const Spec::ImageUse& use, uint64_t mapping) const;
 	// The segments committed, the holes after them run: all, or up to what the work after it no longer holds
 	// (Result::next: the segments committed).
+	// Under KYTY_SPECULATE=4 (Spec::State::read_values_on): whether a clean read of segment `index` that a processor
+	// write was logged over since the speculation began still gives the translation's bytes.
+	[[nodiscard]] bool     ReadValuesHold(const Result& result, size_t index, const Spec::Range& read) const;
 	[[nodiscard]] Progress CommitSegments(Result& result, CommandProcessor& cp);
 	// The segment before its work and after it.
 	void Before(Result& result, size_t index);
@@ -238,8 +277,9 @@ private:
 	[[nodiscard]] HoleRun RunHole(Result& result, CommandProcessor& cp, size_t index, bool copy_state = true);
 	// Under KYTY_SPECULATE=4: segment `index`, which Changed stopped, run by `cp` the normal way
 	// as a hole (its recorded work dropped), so the commit can go on; NotTaken: the stop stands, nothing run. Reached or
-	// NotReached: result.resume_at is where `cp` stopped.
-	[[nodiscard]] AsHole SegmentAsHole(Result& result, CommandProcessor& cp, size_t index);
+	// NotReached: result.resume_at is where `cp` stopped. Blocked: stopped at a wait inside it not satisfied yet
+	// (result.resume_at there); `resume` goes on from there.
+	[[nodiscard]] AsHole SegmentAsHole(Result& result, CommandProcessor& cp, size_t index, bool resume = false);
 	// At segment `index`'s commit (KYTY_SPECULATE=4): why a word it read from the journal that an earlier segment's
 	// write gave no longer holds (null: all hold).
 	[[nodiscard]] const char* JournalReadsMoved(const Result& result, size_t index) const;
@@ -278,6 +318,8 @@ private:
 	std::vector<std::unique_ptr<Translator>> m_translators;
 	bool                                     m_pass_thread = false; // (KYTY_SPEC_PASS_THREAD: the last of m_translators)
 	std::deque<std::unique_ptr<Result>>      m_ahead;     // translated ahead (under m_mutex in mode 4)
+	// (Mode 4) moved by every worker's push into m_ahead (written under m_mutex: no locked add): CommitReady's spin.
+	std::atomic<uint64_t>                    m_ahead_gen {0};
 	std::unique_ptr<Result>                  m_blocked;   // a commit waiting at a wait hole
 	std::unique_ptr<CommandProcessor>        m_chain;     // mode 3: the state the next one ahead starts from
 	static constexpr size_t                  MaxAhead = 8;
@@ -309,11 +351,27 @@ private:
 	bool                              m_state_busy = false, m_broken = false;
 	uint64_t                          m_taken = 0, m_done_serial = 0; // (taken: with m_taken_chunk)
 	uint32_t                          m_taken_chunk = 0;
+	// Mode 4, the graphics instance: the chunk last checked for a ready front elsewhere (one check, so one yield, a
+	// chunk; under m_mutex).
+	uint64_t                          m_ready_checked_serial = 0;
+	uint32_t                          m_ready_checked_chunk  = UINT32_MAX;
 	std::unique_ptr<CommandProcessor> m_done_state;
 	Spec::State*                      m_pass_record = nullptr; // the record the state pass fills
 	std::vector<std::pair<uint64_t, std::unique_ptr<Spec::State>>> m_retired_records; // (when: m_clock)
 	uint64_t                          m_waits_for_ahead = 0, m_ahead_misses = 0; // (the report's)
 	uint64_t                          m_blind = 0, m_stopped = 0, m_blind_stopped = 0; // (the report's)
+	// (The report's classes of the results: committed, full (to its chunk's or submission's end) or cut short (its
+	// translation stopped early, the GPU thread coming for it most often: the rest in order), and of those the ones with
+	// segments run in order as holes (and how many segments); stopped with nothing abandoned (Result::stop_free); stopped
+	// abandoning work: the segments a hole would have committed, of all the segments of the results committed or stopped
+	// (translations dropped before a commit not counted), and their translation time.)
+	uint64_t m_class_full = 0, m_class_cut = 0, m_class_redone = 0, m_redone_segments = 0, m_class_stop_free = 0,
+	         m_class_stop_lost = 0, m_abandoned = 0, m_abandoned_ns = 0, m_translated_segments = 0;
+	// (The report's: the late target stops whose segment has no pending target that clears: no DCC clear its acquisition
+	// consumes, no layered-depth draw, whose acquisition may clear.)
+	uint64_t                          m_target_noclear = 0;
+	// (Why SegmentAsHole last said NotTaken, as a stop reason's suffix; null: not under KYTY_SPECULATE=4.)
+	const char*                       m_not_taken = nullptr;
 	// (The report's: the GPU thread's time waiting for a translation; from a push to its translation's start; the
 	// translations by duration: < 0.5, 1, 2, 4, 8 ms and longer, and the longest.)
 	uint64_t                          m_wait_ns = 0, m_start_delay_ns = 0, m_started = 0, m_longest_ns = 0;

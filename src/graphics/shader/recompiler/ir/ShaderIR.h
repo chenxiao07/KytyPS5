@@ -458,6 +458,10 @@ struct BindingLayout {
 	uint32_t                       table_block_dwords = 0; // table mode: the block's device address (TablePlan)
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
+	// KYTY_SPEC_PAIR_DENSE_INDIRECT: the LOD statistics words (lod_stats_count of them) are in the table block
+	// (TablePlan::LodStatsBlockDword), not in the shader data. In memory only (not serialized). (Last: the fields before
+	// it keep their offsets without the switch's form.)
+	bool                           lod_stats_in_block = false;
 
 	[[nodiscard]] uint32_t BufferWordDword() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
@@ -466,7 +470,7 @@ struct BindingLayout {
 		return BufferWordDword() + buffer_word_count;
 	}
 	[[nodiscard]] uint32_t TableBlockDword() const {
-		return LodStatsDword() + lod_stats_count;
+		return LodStatsDword() + (lod_stats_in_block ? 0u : lod_stats_count);
 	}
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
 		return TableBlockDword() + table_block_dwords;
@@ -605,6 +609,10 @@ struct TablePlan {
 	// Reads at offsets no slot fixes (a light's record by the index of its bit in a mask): loads by device address,
 	// through the page table, whose ranges the read plan readies (global_memory).
 	bool dynamic_reads = false;
+	// KYTY_SPEC_PAIR_DENSE_INDIRECT: a pixel program's LOD statistics words in the block after the mappings (this many,
+	// one an image: BindingLayout::lod_stats_in_block), not in its push data; 0: none there. In memory only. (Here, in the
+	// padding after the flags: no field after it moves.)
+	uint32_t lod_stats_words = 0;
 	// An image an address probe chooses (DescriptorSource::IndirectImage: records whose keys name T#s in a table, the
 	// key the shader's of one record): the renderer enumerates its candidates at every use as resource
 	// materialization does (EnumerateAddressProbe), binds them at the root's and its candidates' elements in an order
@@ -622,6 +630,8 @@ struct TablePlan {
 	static constexpr uint32_t IndirectCapacity      = 16;
 	static constexpr uint32_t IndirectMaxKeys       = 64;
 	static constexpr uint32_t IndirectMappingDwords = 1 + 2 * IndirectMaxKeys;
+	// KYTY_SPEC_PAIR_DENSE_INDIRECT: dense roots a vertex or pixel program may have (a compute program: one probe).
+	static constexpr uint32_t IndirectMaxRoots = 4;
 	std::vector<IndirectImage> indirect;
 
 	// A buffer's dwords in the block: its device address (2), size in dwords, buffer word (IR::BufferWord, as
@@ -630,8 +640,11 @@ struct TablePlan {
 	[[nodiscard]] uint32_t BufferDword(size_t buffer) const {
 		return static_cast<uint32_t>(slots.size() + BufferDwords * buffer);
 	}
-	[[nodiscard]] uint32_t BlockDwords() const {
+	[[nodiscard]] uint32_t LodStatsBlockDword() const {
 		return BufferDword(buffers.size()) + static_cast<uint32_t>(indirect.size()) * IndirectMappingDwords;
+	}
+	[[nodiscard]] uint32_t BlockDwords() const {
+		return LodStatsBlockDword() + lod_stats_words;
 	}
 	bool                   operator==(const TablePlan&) const = default;
 };

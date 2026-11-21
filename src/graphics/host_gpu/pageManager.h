@@ -41,6 +41,15 @@ public:
 		uint64_t address = 0, size = 0;
 	};
 	static void SetDeferredWriteProtectSink(std::vector<DeferredRange>* sink) noexcept;
+	// KYTY_SPEC_PROTECT_ASYNC (live spec_protect_async; KYTY_SPECULATE=4 only): the calling thread (the GPU thread,
+	// deferring its read protections and keeping their per-page marks) may hand an upload of a buffer GPU work writes its
+	// write protection as KYTY_ASYNC_REPROTECT hands a read-only one's (MemoryTracker::ForEachUploadRange); the job is
+	// ReapplyWrittenProtection: ReapplyProtection, except that a page whose no access the GPU thread still holds pending
+	// gets its write watchers' protection (read-only), the no access left to that flush.
+	// `jobs`: the queued jobs this call does (NoteWrittenArmQueued counts each as it is pushed; merged ones together).
+	[[nodiscard]] static bool WrittenArmAsync() noexcept;
+	static void               NoteWrittenArmQueued() noexcept;
+	void                      ReapplyWrittenProtection(uint64_t vaddr, uint64_t size, uint32_t jobs);
 
 	// Sets every page of the range to its watchers' current protection (writable when none).
 	void SyncProtection(uint64_t vaddr, uint64_t size);
@@ -69,6 +78,14 @@ public:
 	// after a submission, a label or a guest command of the GPU thread: it flushes before each of them.
 	static void DeferReadProtection(bool on) noexcept;
 	static void FlushDeferredProtection() noexcept;
+	// KYTY_SPEC_PROTECT_ASYNC (live spec_protect_async; KYTY_SPECULATE=4 only): as FlushDeferredProtection, at a
+	// submission (CommandScheduler::SubmitBuffers, before it takes its upload sequence): the pending no-access ranges
+	// handed to the upload worker, each a job `push` queues there, instead of applied here. Each is applied once, by the
+	// job or by the GPU thread's next other flush (FlushDeferredProtection, DeferReadProtection(false)), whichever comes
+	// first; the job ends only once it is applied. True: some were handed (the caller wakes the worker). Off, or no worker
+	// (`push` null): FlushDeferredProtection's work.
+	using HandPush = void (*)(void (*call)(void*, uint64_t, uint64_t), void* context, uint64_t vaddr, uint64_t size);
+	static bool FlushDeferredProtectionAtSubmit(HandPush push) noexcept;
 	// The calling thread's deferred read protections over [vaddr, vaddr + size) applied now (the
 	// texture offload's hold in force at once); the others stay pending.
 	static void FlushDeferredProtection(uint64_t vaddr, uint64_t size) noexcept;

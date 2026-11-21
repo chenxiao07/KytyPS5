@@ -190,6 +190,32 @@ private:
 };
 #endif
 
+// KYTY_SPEC_BACKING_RANGE_LOCK (live spec_backing_range_lock; on under KYTY_SPECULATE=4, 0 otherwise: mode-toggle.h): a
+// locked backing read (TryTransferBacking's reader: TryReadBacking, TryReadBackingToHost's reads over 64 KiB) that one
+// mapping covers holds a host read slot narrowed to its backing pages (BackingReadTransaction, as the small lock-free
+// reads do) instead of both writers' mutexes for its copy: a writer of other pages no longer waits for the whole copy (a
+// 320 MiB upload source read held them 27 ms at boot, the GPU thread's 8-byte label behind it). The sparse reader
+// (TryReadSparseBacking: a partly unmapped span, the upload worker's image staging of a streamed texture pool) the same
+// way, a mapping's piece at a time, in address order, the map lock held throughout; a piece whose slot is not had takes
+// both mutexes for that piece alone.
+// Exact: the reader's hold protects its bytes from a write while it copies them, and nothing else. The shared map lock
+// (taken first, as before) keeps the mapping and so its backing bytes fixed; every writer of backing bytes publishes its
+// pages and waits for any slot over them before it writes (DataWriteFence: the data writers, TryTransferBacking; the
+// CPU-owned writers, TryWriteCpuBacking; zeroing and mapping changes hold the map lock exclusively and wait for every
+// slot, BackingWriteFence), and the reader publishes its pages before it checks the writers' (Narrow: a write under way
+// over them, it falls back to the mutexes), both sides sequentially consistent, so one sees the other. A data write over
+// several mappings is fenced a piece at a time, so through an alias the reader's bytes may span two of its pieces: such a
+// write publishes its pieces' hull for its whole length, and a range reader whose pages the hull covers takes the mutexes,
+// which that writer holds throughout (ClearOfSpanWrite): it sees the write all or none. The sparse reader has each piece
+// all or none; a write may be seen in some of its pieces and not in others, as by the multi-piece image copies and the
+// small lock-free reads. A writer over a range reader's pages waits for its copy in the fence, spinning ~50 us and then
+// asleep until a reader releases its slot (DataWriteFence; with the switch on every reader's release wakes it). Off,
+// or not taken (no free slot, a write under way, several mappings): both mutexes, as before.
+static bool BackingRangeLockOn() {
+	static auto& on = LiveSwitch::Find("spec_backing_range_lock", ModeToggle::Default("spec_backing_range_lock"));
+	return on.load(std::memory_order_relaxed) != 0;
+}
+
 // The view a partial unmap maps again, from its unmap to the end of UnmapBacking (InRemapWindow).
 static std::atomic<uint64_t> g_remap_window_begin {0};
 static std::atomic<uint64_t> g_remap_window_end {0};
@@ -603,6 +629,8 @@ public:
 		}
 
 		auto            lock      = MapReadLock();
+		// KYTY_SPEC_BACKING_RANGE_LOCK: a mapping's piece at a time under a host read slot, not the mutexes below.
+		if (BackingRangeLockOn() && RangeReadsArmed()) return ReadSparseRangeUnlocked(vaddr, data, size);
 		auto            data_lock = DataLock();
 		std::lock_guard cpu_lock(m_cpu_write_mutex);
 		const auto      end   = vaddr + size;
@@ -1158,8 +1186,12 @@ private:
 	// mapping mutations hold m_mutex exclusively, which excludes both.
 	// A writer announces itself before inspecting the reader slots. Sequential
 	// consistency makes it impossible for both entrants to miss the other: either
-	// the reader falls back, or the writer waits for its bounded host copy to end.
-	// No GPU work, guest faults, or other locks occur inside that copy transaction.
+	// the reader falls back, or the writer waits for its host copy to end.
+	// The lock-free readers' copies (TryReadBackingToHost's up to 64 KiB, BackingPointer's lookup) are short, take no
+	// other lock and do no GPU work. KYTY_SPEC_BACKING_RANGE_LOCK's range readers are not: they hold a slot across their
+	// whole copy (up to hundreds of MiB, first-touch page-ins inside it), under the shared map lock. This fence's writers
+	// hold the map lock exclusively, so they never meet one; a DataWriteFence over a range reader's pages waits for its
+	// copy, spinning a while and then asleep (SleepWhileOver).
 	class BackingWriteFence {
 	public:
 		KYTY_CLASS_NO_COPY(BackingWriteFence);
@@ -1205,16 +1237,29 @@ private:
 		    : m_published(published) {
 			const auto pages = PackPages(begin, end);
 			m_published.store(pages, std::memory_order_seq_cst);
-			unsigned spins = 0;
+			unsigned                              spins = 0;
+			std::chrono::steady_clock::time_point since {}; // (KYTY_SPEC_BACKING_RANGE_LOCK: the wait's first look at the clock)
 			for (const auto& slot: store.m_host_read_slots) {
 				while (PagesOverlap(slot.pages.load(std::memory_order_seq_cst), pages)) {
 					_mm_pause();
-					if (++spins == 256) { std::this_thread::yield(); spins = 0; }
+					if (++spins == 256) {
+						std::this_thread::yield();
+						spins = 0;
+						// KYTY_SPEC_BACKING_RANGE_LOCK: a range reader's copy can last tens of ms; past SpinTime, asleep
+						// instead of spinning a core. Off: spins as before.
+						if (BackingRangeLockOn()) {
+							const auto now = std::chrono::steady_clock::now();
+							if (since == std::chrono::steady_clock::time_point {}) since = now;
+							else if (now - since >= SpinTime) store.SleepWhileOver(slot.pages, pages);
+						}
+					}
 				}
 			}
 		}
 		~DataWriteFence() { m_published.store(0, std::memory_order_release); }
 	private:
+		// (A wait for a reader over the pages spins this long, from the fence's first look at the clock, before it sleeps.)
+		static constexpr auto  SpinTime = std::chrono::microseconds(50);
 		std::atomic<uint64_t>& m_published;
 	};
 
@@ -1249,16 +1294,153 @@ private:
 			}
 			return true;
 		}
+		// KYTY_SPEC_BACKING_RANGE_LOCK's readers, after Narrow over the same bytes: false (and released) while a data write
+		// over several mappings has its hull over these pages (TryTransferBacking<true>, which publishes it once range
+		// reads are armed: RangeReadsArmed, which these readers pass first). Its pieces are fenced one by one, so through
+		// an alias whose bytes span two of them a reader admitted between the pieces would copy one new and one old; under
+		// the data mutex, which that writer holds for the whole write, it sees all or none. Exact: the writer publishes the
+		// hull (seq_cst) before its first piece's fence and clears it (release) after its last; this read published its
+		// slot (Narrow, seq_cst) before it reads the hull (seq_cst). Read before the hull's store: every piece's fence comes
+		// after both and finds the slot (or its later release, after the copy), so a piece over these pages waits for the
+		// copy (all old). Read as the hull: the mutexes. Read as cleared, or as a later write's hull: the write's bytes
+		// happen before the copy (all new).
+		bool ClearOfSpanWrite(uint64_t begin, uint64_t end) {
+			if (!PagesOverlap(m_store.m_span_write_pages.load(std::memory_order_seq_cst), PackPages(begin, end))) return true;
+			ReleaseWaking();
+			return false;
+		}
+		// A range reader's release: the slot cleared (seq_cst), then the fence writers asleep on a slot woken
+		// (SleepWhileOver).
+		void ReleaseWaking() {
+			if (m_slot == nullptr) return;
+			m_slot->store(0, std::memory_order_seq_cst);
+			m_slot = nullptr;
+			if (m_store.m_fence_sleepers.load(std::memory_order_seq_cst) != 0) m_store.WakeFenceSleepers();
+		}
 	private:
+		// The small lock-free readers' release (and Narrow's refusal, and the constructor's): with the switch on, as a range
+		// reader's (a fence writer may sleep on any slot, SleepWhileOver); off (no writer sleeps), a release store as before.
 		void Release() {
-			if (m_slot != nullptr) {
-				m_slot->store(0, std::memory_order_release);
-				m_slot = nullptr;
-			}
+			if (m_slot == nullptr) return;
+			if (BackingRangeLockOn()) return ReleaseWaking();
+			m_slot->store(0, std::memory_order_release);
+			m_slot = nullptr;
 		}
 		GuestBackingStore&     m_store;
 		std::atomic<uint64_t>* m_slot = nullptr;
 	};
+
+	// KYTY_SPEC_BACKING_RANGE_LOCK: true once range reads may run. The first range reader arms them: it marks the store
+	// (m_range_reads 1), takes and drops the data mutex (a data write under way, which did not publish a hull, ends first)
+	// and marks it armed (2, release); every data write over several mappings that takes the mutex after reads the mark
+	// and publishes its hull (TryTransferBacking). A reader that finds them being armed takes the mutexes this once. Until
+	// a range reader runs, a data write over several mappings pays one relaxed load for it.
+	bool RangeReadsArmed() {
+		if (m_range_reads.load(std::memory_order_acquire) == 2) return true;
+		uint32_t none = 0;
+		if (!m_range_reads.compare_exchange_strong(none, 1, std::memory_order_seq_cst)) return false;
+		{
+			auto data_lock = DataLock();
+			m_range_reads.store(2, std::memory_order_release);
+		}
+		return true;
+	}
+
+	// KYTY_SPEC_BACKING_RANGE_LOCK: TryTransferBacking's reader, the map lock held shared. When one mapping covers the
+	// range, its bytes copied under a host read slot over their pages; false (nothing copied, no slot held) when not
+	// taken: several mappings or out of the store, range reads not armed, no free slot, a write under way over its pages.
+	template <typename Transfer>
+	bool TryRangeReadUnlocked(uint64_t vaddr, uint64_t size, Transfer& transfer) {
+		MapEntry entry {};
+		if (!FindContainingUnlocked(vaddr, size, &entry)) return false;
+		const auto begin = entry.backing_offset + vaddr - entry.vaddr;
+		if (!RangeOk(begin, size) || !RangeReadsArmed()) return false;
+		BackingReadTransaction read(*this);
+		if (!read.Acquired() || !read.Narrow(begin, begin + size) || !read.ClearOfSpanWrite(begin, begin + size)) return false;
+		transfer(m_backing_base + begin, 0, static_cast<size_t>(size));
+		read.ReleaseWaking();
+		return true;
+	}
+
+	// KYTY_SPEC_BACKING_RANGE_LOCK: TryReadSparseBacking's copy, range reads armed, the map lock held shared: each
+	// mapping's piece under a host read slot over its pages, in address order; a piece whose slot is not had (no free
+	// slot, a write under way over its pages, a write over several mappings with its hull over them) under both mutexes,
+	// for that piece alone. (The checks and the zeroing as TryReadSparseBacking's.)
+	bool ReadSparseRangeUnlocked(uint64_t vaddr, void* data, uint64_t size) {
+		const auto end   = vaddr + size;
+		auto       first = m_maps.lower_bound(vaddr);
+		if (first != m_maps.begin()) {
+			auto previous = std::prev(first);
+			if (previous->second.vaddr + previous->second.size > vaddr) {
+				first = previous;
+			}
+		}
+		for (auto mapping = first; mapping != m_maps.end() && mapping->second.vaddr < end; ++mapping) {
+			const auto& entry = mapping->second;
+			const auto  start = std::max(vaddr, entry.vaddr);
+			const auto  bytes = std::min(end, entry.vaddr + entry.size) - start;
+			if (!RangeOk(entry.backing_offset + start - entry.vaddr, bytes)) {
+				return false;
+			}
+		}
+
+		auto* destination = static_cast<uint8_t*>(data);
+		std::memset(destination, 0, size);
+		for (auto mapping = first; mapping != m_maps.end() && mapping->second.vaddr < end; ++mapping) {
+			const auto& entry  = mapping->second;
+			const auto  start  = std::max(vaddr, entry.vaddr);
+			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - start;
+			const auto  offset = entry.backing_offset + start - entry.vaddr;
+			{
+				BackingReadTransaction read(*this);
+				if (read.Acquired() && read.Narrow(offset, offset + bytes) && read.ClearOfSpanWrite(offset, offset + bytes)) {
+					std::memcpy(destination + start - vaddr, m_backing_base + offset, bytes);
+					read.ReleaseWaking();
+					continue;
+				}
+			} // (the slot released before the mutexes: never a slot and a mutex together)
+			auto            data_lock = DataLock();
+			std::lock_guard cpu_lock(m_cpu_write_mutex);
+			std::memcpy(destination + start - vaddr, m_backing_base + offset, bytes);
+		}
+		return true;
+	}
+
+	// KYTY_SPEC_BACKING_RANGE_LOCK: a data write's pieces over [vaddr, end) (validated, the map lock held shared), their
+	// backing pages' hull published (seq_cst) for ClearOfSpanWrite.
+	void PublishSpanHull(uint64_t vaddr, uint64_t end) {
+		uint64_t first = UINT64_MAX, last = 0;
+		for (auto current = vaddr; current < end;) {
+			MapEntry piece {};
+			EXIT_IF(!FindContainingUnlocked(current, 1, &piece));
+			const auto next  = std::min(end, piece.vaddr + piece.size);
+			const auto begin = piece.backing_offset + current - piece.vaddr;
+			first            = std::min(first, begin);
+			last             = std::max(last, begin + (next - current));
+			current          = next;
+		}
+		m_span_write_pages.store(PackPages(first, last), std::memory_order_seq_cst);
+	}
+
+	// DataWriteFence's sleep (KYTY_SPEC_BACKING_RANGE_LOCK): while `slot` holds pages over `pages`, asleep until a reader
+	// releases a slot (ReleaseWaking: a range reader's, and with the switch on every reader's Release), 1 ms at most a
+	// sleep (a release with the switch moved off meanwhile wakes no one). The sleeper count is raised and the slot read
+	// under the mutex the waker takes before it notifies; a reader clears its slot before it reads the count, both
+	// seq_cst: either this read sees the slot changed, or the reader sees the count, and its notify, made after the mutex,
+	// finds this thread waiting.
+	void SleepWhileOver(const std::atomic<uint64_t>& slot, uint64_t pages) {
+		std::unique_lock lock(m_fence_sleep_mutex);
+		m_fence_sleepers.fetch_add(1, std::memory_order_seq_cst);
+		while (PagesOverlap(slot.load(std::memory_order_seq_cst), pages))
+			m_fence_wake.wait_for(lock, std::chrono::milliseconds(1));
+		m_fence_sleepers.fetch_sub(1, std::memory_order_relaxed);
+	}
+	void WakeFenceSleepers() {
+		{
+			std::lock_guard lock(m_fence_sleep_mutex);
+		}
+		m_fence_wake.notify_all();
+	}
 
 	template <bool Write, typename Transfer>
 	bool TryTransferBacking(uint64_t vaddr, uint64_t size, Transfer transfer) {
@@ -1267,6 +1449,10 @@ private:
 		}
 
 		auto lock      = MapReadLock();
+		// KYTY_SPEC_BACKING_RANGE_LOCK: one mapping's bytes under a host read slot over their pages, not the mutexes below.
+		if constexpr (!Write) {
+			if (BackingRangeLockOn() && TryRangeReadUnlocked(vaddr, size, transfer)) return true;
+		}
 		auto data_lock = DataLock(Write);
 		// (A reader excludes the CPU-owned writers too; a data writer's bytes are never theirs.)
 		std::unique_lock cpu_lock(m_cpu_write_mutex, std::defer_lock);
@@ -1283,7 +1469,9 @@ private:
 			// A range over several mappings (validated whole first: all or nothing) is written a mapping's piece at a
 			// time, each under the fence of its own pages. The fence that excludes every reader made each lock-free
 			// read of other bytes (the render thread's table copies) fall back to the data mutex and wait there for the
-			// whole copy (~160 us). A reader that spans mappings takes that mutex anyway, so it still sees all or none.
+			// whole copy (~160 us). A reader that spans mappings takes that mutex anyway, so it still sees all or none; a
+			// range reader under a slot (KYTY_SPEC_BACKING_RANGE_LOCK) whose bytes span two of these pieces through an
+			// alias sees the hull below and takes that mutex too (ClearOfSpanWrite).
 			LiveCounters::Add(LiveCounters::BackingSpanWrites);
 			const auto end = vaddr + size;
 			for (auto current = vaddr; current < end;) {
@@ -1293,6 +1481,11 @@ private:
 					return false;
 				current = std::min(end, piece.vaddr + piece.size);
 			}
+			// (KYTY_SPEC_BACKING_RANGE_LOCK, once range reads are armed: the pieces' hull published for the whole write,
+			// cleared after the last piece's fence, release: its bytes happen before a reader that reads it cleared. Read
+			// under the data mutex: RangeReadsArmed.)
+			const bool hull = m_range_reads.load(std::memory_order_relaxed) != 0;
+			if (hull) PublishSpanHull(vaddr, end);
 			for (auto current = vaddr; current < end;) {
 				MapEntry piece {};
 				EXIT_IF(!FindContainingUnlocked(current, 1, &piece));
@@ -1302,6 +1495,7 @@ private:
 				transfer(m_backing_base + begin, current - vaddr, static_cast<size_t>(bytes));
 				current += bytes;
 			}
+			if (hull) m_span_write_pages.store(0, std::memory_order_release);
 			return true;
 		} else {
 			return TransferBackingUnlocked(vaddr, size, transfer);
@@ -1671,6 +1865,15 @@ private:
 	alignas(64) std::atomic<uint64_t> m_data_write_pages {0};
 	// ... of the CPU-owned write in progress (TryWriteCpuBacking).
 	alignas(64) std::atomic<uint64_t> m_cpu_write_pages {0};
+	// The hull of the pages of the data write over several mappings in progress, for its whole length (its pieces each
+	// publish m_data_write_pages in turn), 0 when none; published once range reads are armed (ClearOfSpanWrite).
+	alignas(64) std::atomic<uint64_t> m_span_write_pages {0};
+	// KYTY_SPEC_BACKING_RANGE_LOCK's range reads: 0 none yet, 1 being armed, 2 armed (RangeReadsArmed). The data and
+	// CPU-owned writers asleep on a read slot (SleepWhileOver), and their wake.
+	alignas(64) std::atomic<uint32_t> m_range_reads {0};
+	alignas(64) std::atomic<uint32_t> m_fence_sleepers {0};
+	std::mutex                        m_fence_sleep_mutex;
+	std::condition_variable           m_fence_wake;
 	// The pages each active host read copies (all until it knows), 0 when none: a reader per slot. With one slot,
 	// a read that met another (an upload worker's BackingPointer, hundreds a frame) took the data mutex instead and
 	// waited there behind the copies of the writers (the render thread's per-draw reads: ~2.6 waits, ~0.23 ms a frame).
@@ -1916,7 +2119,7 @@ public:
 			LiveCounters::Add(LiveCounters::AddressSpaceWaitKt, waited);
 			if (LiveCensus::g_render) LiveCounters::Add(LiveCounters::AddressSpaceWaitKtRender, waited);
 		}
-		WaitNotBusy(lock, vaddr, size);
+		WaitNotBusy(lock, vaddr, size, /*count_stale=*/true); // (as_serial_broad_stale: SerialBroad's staleness fallback)
 		return ProtectMappedUnlocked(vaddr, size, mode, true);
 	}
 
@@ -2452,19 +2655,24 @@ private:
 		return on;
 #endif
 	}
-	[[nodiscard]] bool SerialBroad() const {
+	// `count_stale` (a protection's first test, ProtectTransient): the staleness watchdog's broad wait counted
+	// (as_serial_broad_stale), only where it decides.
+	[[nodiscard]] bool SerialBroad(bool count_stale = false) const {
 		if (const int forced = ProtectSerialEnv(); forced >= 0) return forced == 1;
 		if (!SerialPressureGateOn() || ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return true;
 		if (m_serial_pressure.load(std::memory_order_acquire)) return true;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		// (Staleness watchdog: a sample older than 300 ms, e.g. Kyty.MemPressure starved among busy threads, counts as short:
 		// the broad wait until the sampler runs again. GetTickCount64 reads shared user data, no system call.)
-		if (GetTickCount64() - m_serial_stamp.load(std::memory_order_acquire) > 300) return true;
+		if (GetTickCount64() - m_serial_stamp.load(std::memory_order_acquire) > 300) {
+			if (count_stale) LiveCounters::Add(LiveCounters::AsSerialBroadStale);
+			return true;
+		}
 #endif
 		return false;
 	}
-	[[nodiscard]] bool BusyUnlocked(uint64_t vaddr, uint64_t size) const {
-		const bool serial = SerialBroad();
+	[[nodiscard]] bool BusyUnlocked(uint64_t vaddr, uint64_t size, bool count_stale = false) const {
+		const bool serial = SerialBroad(count_stale);
 		if (serial && !m_busy.empty()) return true;
 		constexpr uint64_t PageTablePage = uint64_t {2} << 20u;
 		for (const auto& [begin, end]: m_busy) {
@@ -2526,8 +2734,9 @@ private:
 #endif
 
 	// (With m_mutex held shared.) Returns once no map or unmap is changing [vaddr, vaddr + size).
-	void WaitNotBusy(std::shared_lock<std::shared_mutex>& lock, uint64_t vaddr, uint64_t size) {
-		if (t_batch_section || !BusyUnlocked(vaddr, size)) return; // (batch_busy_once: its own section)
+	// `count_stale`: SerialBroad's, for the first test only (the waits' re-tests are not protections).
+	void WaitNotBusy(std::shared_lock<std::shared_mutex>& lock, uint64_t vaddr, uint64_t size, bool count_stale = false) {
+		if (t_batch_section || !BusyUnlocked(vaddr, size, count_stale)) return; // (batch_busy_once: its own section)
 		LiveCounters::Add(LiveCounters::AddressSpaceBusyWaits);
 		const auto start = __rdtsc();
 		m_busy_waiters.fetch_add(1, std::memory_order_acq_rel); // (trim_idle: a thread waits on a busy range)

@@ -626,6 +626,18 @@ bool EnqueuePacket(ReplayPacket replay, std::span<const Segment> segments,
         writer.Command([owner, copied, count, replay] { replay({copied.data(), count}, original); });
     });
 }
+bool EnqueuePacketCopy(ReplayPacket replay, const Segment& segment, void** copy) {
+    if (!PacketsEnabled() || !replay || (segment.size && !segment.data)) return false;
+    ++g_packets;
+    auto* stream = RecordingStream();
+    return stream->Enqueue([&](Writer& writer) {
+        // (Each attempt's: a retry after an overflow copies again into the next chunk, and the last attempt's stands.
+        // The chunk's own bytes: mutable memory.)
+        const Segment copied {writer.Copy(segment.data, segment.size), segment.size};
+        *copy = const_cast<void*>(copied.data);
+        writer.Command([copied, replay] { replay({&copied, 1}, original); });
+    });
+}
 bool DeferredSubmitEnabled() {
     // (Never on a passive producer: a worker does not submit.)
     return producer && !t_passive && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0 &&

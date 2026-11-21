@@ -13,7 +13,11 @@ namespace {
 void EmitLodStats(EmitterState& state, uint32_t resource, uint32_t sampled,
                   uint32_t coordinate, uint32_t bias) {
 	if (state.lod_stats_variable == 0) return;
-	const auto metadata = EmitShaderDataDwordLoad(state, state.program.bindings.LodStatsDword() + resource);
+	// (KYTY_SPEC_PAIR_DENSE_INDIRECT: a table program's words in its block, BindingLayout::lod_stats_in_block.)
+	const auto metadata =
+	    state.program.bindings.lod_stats_in_block
+	        ? EmitTableBlockLoad(state, ConstantU32(state, state.program.table_plan.LodStatsBlockDword() + resource))
+	        : EmitShaderDataDwordLoad(state, state.program.bindings.LodStatsDword() + resource);
 	const auto enabled = state.builder.AllocateId();
 	state.builder.AddFunction({OpINotEqual, TypeBool(state), enabled,
 	    EmitBinaryU32(state, OpBitwiseAnd, metadata, ConstantU32(state, 0x80000000u)), ConstantU32(state, 0)});

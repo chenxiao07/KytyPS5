@@ -387,6 +387,7 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info, bool find_only) {
 		     static_cast<vk::ImageUsageFlags::MaskType>(view_info.usage));
 	}
 	views.push_back({normalized, view});
+	g_target_lookup_epoch.fetch_add(1, std::memory_order_release); // (mode 4: a worker's refused capture tried again)
 	return view;
 }
 

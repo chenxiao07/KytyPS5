@@ -929,6 +929,7 @@ if(LINUX)
 		"${KYTY_SOURCE_DIR}/graphics/guest_gpu/graphicsRun.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/guest_gpu/speculation.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandScheduler.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/renderDraw.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/textureCache.cpp"
