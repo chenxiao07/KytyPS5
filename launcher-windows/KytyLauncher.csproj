@@ -68,6 +68,7 @@
     <Compile Include="KeyboardPrompts.cs" />
     <Compile Include="KeyboardLayout.cs" />
     <Compile Include="PromptTexture.cs" />
+    <Compile Include="PageMarks.cs" />
     <Compile Include="KeyboardControlsWindow.cs" />
     <!-- The prompt textures are kept gzipped here and embedded unpacked (KeyboardPromptsUnpack below). Embedded
          compressed data that the program unpacks and writes to disk is what Malwarebytes' machine-learning check flagged
