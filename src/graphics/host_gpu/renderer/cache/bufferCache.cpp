@@ -189,6 +189,7 @@ struct BufferCache::FreedReadback {
 	uint64_t                         ring_offset = 0, packed = 0, ring_end = 0;
 	uint64_t                         tick        = 0;
 	RangeSet                         stale;
+	RangeSet                         older_written; // (KYTY_FREED_READBACK_BYTE_GATE's counts: an older one's bytes written back)
 };
 
 // A value kept between calls on this thread for its storage (a vector's capacity): a call takes it out of `home` and
@@ -2202,21 +2203,106 @@ bool BufferCache::ServiceFreedReadback(FreeBlocksQuery free_blocks, FreeBlockSpl
 		if (from >= to) return;
 		LibKernel::Memory::WriteBacking(from, ring + part.offset + (from - part.address), to - from, "freed");
 		if (Scout::Running()) Scout::NoteHostWrite(from, to - from, true);
+		m_freed_counts.written_bytes += to - from;
 		if (!written.empty() && written.back().address + written.back().size == from)
 			written.back().size += to - from;
 		else
 			written.push_back({from, to - from});
 	};
-	// [from, to) of a part, less the bytes GPU work wrote since.
-	const auto write_fresh = [&](const GuestReadback::Part& part, uint64_t from, uint64_t to) {
+	// KYTY_FREED_READBACK_BYTE_GATE (default 1, every mode; 0: the page gate alone, as before; read once): the bytes of a
+	// page the GPU owns go back only where they are still GPU-written themselves (m_gpu_modified_ranges). A page's GPU bit
+	// does not say which of its bytes the GPU owns: a page given to the CPU since the free (a fault's readback, a memmove's
+	// DiscardGpuWrites) and then written by the CPU and again in part by GPU work is GPU-owned again as a whole page, and
+	// `stale` holds only the GPU's new bytes, so the page gate put the copies' old bytes over the CPU's new ones on the
+	// rest of it (a reused block: a header the game writes, a tail a dispatch writes). Every path that gives GPU-written
+	// bytes to the CPU takes them out of m_gpu_modified_ranges, and the one that adds them (ObtainBuffer) notes them in
+	// `stale` too: a byte still in it and not in `stale` holds what the GPU wrote before the free. One range-set lookup per
+	// part (its runs clipped to the pages the page gate passes), while the GPU thread has nothing else to do.
+	static const bool byte_gate = [] {
+		const char* value = std::getenv("KYTY_FREED_READBACK_BYTE_GATE");
+		const bool  on    = value == nullptr || value[0] != '0';
+		std::printf("Engine frees: a freed range's bytes written back only where the GPU still owns them byte by byte: %s "
+		            "(KYTY_FREED_READBACK_BYTE_GATE=%s)\n",
+		            on ? "on" : "off", on ? "0 turns it off" : "0");
+		std::fflush(stdout);
+		return on;
+	}();
+	// [from, to) less the bytes GPU work wrote since, run by run.
+	const auto for_each_fresh = [&](uint64_t from, uint64_t to, auto&& func) {
 		entry->stale.ForEachIntersection(from, to - from, [&](RangeSet::Range range) {
-			write(part, from, range.address);
-			skipped += range.size;
+			if (from < range.address) func(from, range.address);
 			from = range.address + range.size;
 		});
-		write(part, from, to);
+		if (from < to) func(from, to);
+	};
+	thread_local std::vector<RangeSet::Range> owned_home;
+	ScratchValue                              owned_scratch(owned_home);
+	auto&                                     owned = *owned_scratch;
+	// Bytes the page gate wrote that the byte gate leaves: CPU-owned since the free (the first 16 runs logged), or written
+	// back already by an older pending entry over the same bytes (`older_written`: the same bytes, as GPU work wrote none
+	// between the two frees, else the older one's `stale` held them; counted apart, not logged).
+	static uint32_t refused_logged = 0; // (GPU thread)
+	const auto      refuse_cpu     = [&](uint64_t from, uint64_t to) {
+		m_freed_counts.refused_bytes += to - from;
+		if (refused_logged >= 16) return;
+		++refused_logged;
+		std::printf("Engine frees: freed bytes not written back at 0x%llx (%llu bytes, page 0x%llx, freed at tick %llu): "
+		            "CPU-owned since the free, the page GPU-written again (KYTY_FREED_READBACK_BYTE_GATE; %u of the first 16)\n",
+		            static_cast<unsigned long long>(from), static_cast<unsigned long long>(to - from),
+		            static_cast<unsigned long long>(from & ~(TRACKER_PAGE_SIZE - 1)),
+		            static_cast<unsigned long long>(entry->tick), refused_logged);
+		std::fflush(stdout);
+	};
+	const auto refuse = [&](uint64_t from, uint64_t to) {
+		entry->older_written.ForEachIntersection(from, to - from, [&](RangeSet::Range range) {
+			if (from < range.address) refuse_cpu(from, range.address);
+			m_freed_counts.older_bytes += range.size;
+			from = range.address + range.size;
+		});
+		if (from < to) refuse_cpu(from, to);
+	};
+	// The part's runs still GPU-written (`owned`, looked up once a part), from `owned_next` on: the ones before ended
+	// before the pages already passed (the pages come in address order).
+	size_t owned_next = 0;
+	// [from, to) of a part on pages the GPU owns, less the bytes GPU work wrote since (and with the byte gate, those no
+	// longer GPU-written).
+	const auto write_fresh = [&](const GuestReadback::Part& part, uint64_t from, uint64_t to) {
+		if (!byte_gate) {
+			entry->stale.ForEachIntersection(from, to - from, [&](RangeSet::Range range) {
+				write(part, from, range.address);
+				skipped += range.size;
+				from = range.address + range.size;
+			});
+			write(part, from, to);
+			return;
+		}
+		uint64_t   fresh       = 0; // (written or refused: the bytes the page gate wrote)
+		const auto write_owned = [&](uint64_t a, uint64_t b) {
+			write(part, a, b);
+			fresh += b - a;
+		};
+		const auto refuse_fresh = [&](uint64_t a, uint64_t b) {
+			refuse(a, b);
+			fresh += b - a;
+		};
+		while (owned_next < owned.size() && owned[owned_next].address + owned[owned_next].size <= from) ++owned_next;
+		uint64_t at = from;
+		for (size_t i = owned_next; i < owned.size() && owned[i].address < to; ++i) {
+			const auto begin = std::max(owned[i].address, from), end = std::min(owned[i].address + owned[i].size, to);
+			if (at < begin) for_each_fresh(at, begin, refuse_fresh);
+			for_each_fresh(begin, end, write_owned);
+			at = end;
+		}
+		if (at < to) for_each_fresh(at, to, refuse_fresh);
+		skipped += (to - from) - fresh; // (`stale`'s, as the page gate counts them)
 	};
 	for (const auto& part: entry->parts) {
+		if (byte_gate) {
+			owned.clear();
+			owned_next = 0;
+			const std::shared_lock lock(m_gpu_modified_mutex);
+			m_gpu_modified_ranges.ForEachIntersection(part.address, part.size, [&](RangeSet::Range range) { owned.push_back(range); });
+		}
 		// Only on pages the GPU still owns: a fault's readback gave the others to the CPU, which may have written them since.
 		if (m_memory_tracker.IsRegionFullyGpuModified(part.address, part.size)) {
 			write_fresh(part, part.address, part.address + part.size);
@@ -2232,6 +2318,18 @@ bool BufferCache::ServiceFreedReadback(FreeBlocksQuery free_blocks, FreeBlockSpl
 		}
 	}
 	m_freed_counts.stale_bytes += skipped;
+	// (The byte gate's counts: the bytes written back here, on the pending entries over them, which refuse them then as
+	// written back already, not as CPU-owned.)
+	if (byte_gate && !written.empty()) {
+		const auto low = written.front().address, high = written.back().address + written.back().size;
+		for (auto& later: m_freed_readbacks) {
+			if (high <= later->first || later->last <= low) continue;
+			for (const auto& range: written) {
+				const auto from = std::max(range.address, later->first), to = std::min(range.address + range.size, later->last);
+				if (from < to) later->older_written.Add(from, to - from);
+			}
+		}
+	}
 	if (!written.empty()) {
 		{
 			const std::unique_lock lock(m_gpu_modified_mutex);
