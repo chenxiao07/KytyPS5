@@ -36,7 +36,7 @@ public partial class App : Application {
 			Refocus(e.Args[refocus + 1], e.Args[refocus + 2], e.Args[refocus + 3], context);
 			return;
 		}
-		if (lang != null) Strings.Language = lang == "zh" ? UiLanguage.Chinese : UiLanguage.English;
+		if (lang != null) Strings.Language = lang == "zh" ? UiLanguage.Chinese : lang == "ru" ? UiLanguage.Russian : UiLanguage.English;
 		if (dryRun != null) {
 			var text = new StringBuilder();
 			var commands = new Commands(context);
