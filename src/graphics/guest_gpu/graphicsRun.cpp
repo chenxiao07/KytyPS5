@@ -91,11 +91,23 @@ static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
 // KYTY_SPECULATE=4: the WAIT_REG_MEM the GPU thread's last unsatisfied wait suspended at (size 0: none); taken when its
 // submission is requeued (GuestGpu::ThreadRun).
+// (front_unblock_retest: `seq` is g_suspend_seq at its suspension, so the requeue tells it was the take's last.)
 struct FailedWaitWords {
 	uint64_t serial = 0, address = 0, reference = 0, mask = 0;
-	uint32_t function = 0, size = 0;
+	uint32_t function = 0, size = 0, seq = 0;
 };
 static thread_local FailedWaitWords g_failed_wait;
+// (front_unblock_retest) this thread's suspensions, counted (CommandProcessor::SuspendPm4: every wait that suspends an
+// execution, WAIT_REG_MEM's, WaitCe's, WaitDeDiff's, WaitForRewind's).
+static thread_local uint32_t g_suspend_seq = 0;
+// KYTY_FRONT_UNBLOCK_RETEST (live front_unblock_retest; mode-toggle.h: 1 under KYTY_SPECULATE=4, 0 otherwise; any mode
+// when set): a front blocked at a WAIT_REG_MEM is not unblocked untested at a completion or the selector's idle timeout,
+// its wait re-read instead (GuestGpu::UnblockFrontsRetested; the form and its liveness at RetestBlockedFronts).
+// 1: the compute queues' fronts; 2: queue 0's too.
+static std::atomic<int64_t>& FrontUnblockRetest() {
+	static auto& value = LiveSwitch::Find("front_unblock_retest", ModeToggle::Default("front_unblock_retest"));
+	return value;
+}
 static thread_local BufferCache*      g_gpu_buffers       = nullptr; // (the GPU thread's: spec_label_cpu_backing)
 
 struct DrawIndirectArgs {
@@ -1174,10 +1186,12 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		LiveTrace::Event(LiveTrace::FrontSuspend, reinterpret_cast<uint64_t>(addr),
 		                 (static_cast<uint64_t>(value) << 32u) | static_cast<uint32_t>(ref));
 		SuspendPm4();
-		// (KYTY_SPECULATE=4: kept for the queue selection's re-test, GuestGpu::RetestBlockedFronts.)
-		if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) [[unlikely]]
+		// (KYTY_SPECULATE=4, or front_unblock_retest on in any mode: kept for the queue selection's re-test,
+		// GuestGpu::RetestBlockedFronts; `seq` this suspension's.)
+		if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ||
+		    FrontUnblockRetest().load(std::memory_order_relaxed) != 0) [[unlikely]]
 			g_failed_wait = {0, reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(ref), static_cast<uint64_t>(mask), func,
-			                 static_cast<uint32_t>(sizeof(T))};
+			                 static_cast<uint32_t>(sizeof(T)), g_suspend_seq};
 	} else if (Spec::Current() == nullptr) { // (a speculation's commit publishes them)
 		BdaDirtyRegions::Publish();
 		// KYTY_SCOUT=2: a wait the scout passes, on a word another writer changed (Scout::CheckWait).
@@ -1359,27 +1373,84 @@ void GuestGpu::WaitForIdle() {
 // the GPU thread's WAIT_REG_MEM reads it (no speculation): through the backing view on a page a pending guarded write
 // guards, else the guest's word. Where that read would fault into the fault handler (a read-watched page: its read-back,
 // the handler's locks and waits), or the page has no access (GuardedCopy stops at a fault before the guest-memory
-// handler), it is not read: kept blocked, as before. Only a hint: the packet itself runs the wait again when the queue
-// runs, so a pass stale by then blocks again (one more slice); a fail or an unread word keeps today's behaviour.
-static bool RetestWait(uint64_t address, uint64_t reference, uint64_t mask, uint32_t function, uint32_t size) {
+// handler), it is not read (Unread): kept blocked at the selector, as before. Only a hint there: the packet itself runs
+// the wait again when the queue runs, so a pass stale by then blocks again (one more slice).
+enum class RetestRead { Unread, Fail, Pass };
+static RetestRead RetestWait(uint64_t address, uint64_t reference, uint64_t mask, uint32_t function, uint32_t size) {
 	uint64_t value = 0;
 	if (const auto* backing = WriteGuard::GuardedBacking(address, size)) {
 		std::memcpy(&value, backing, size);
 	} else if (Libs::LibKernel::Memory::ReadFaults(address, size) ||
 	           Common::GuardedCopy(&value, reinterpret_cast<const void*>(address), size) != 0) {
-		return false;
+		return RetestRead::Unread;
 	}
-	return TestWaitRegMemValue(value, reference, mask, function);
+	return TestWaitRegMemValue(value, reference, mask, function) ? RetestRead::Pass : RetestRead::Fail;
 }
 
-uint32_t GuestGpu::RetestBlockedFronts() {
+// front_unblock_retest (FrontUnblockRetest above). Without it every queue's front is unblocked untested when any
+// submission completes, and when the selector's 100 us idle wait times out; the round-robin then takes each blocked front
+// again, and its take runs the WAIT_REG_MEM again (BreakComputeChain, the label read, the suspension; a speculated
+// queue's blocked commit flushes too): at the crossing ~80 % of the compute rings' takes end blocked so. With the switch,
+// at those two points a front holding a stored wait (below) has that word re-read here instead (RetestWait: the read the
+// take's own WAIT_REG_MEM makes); it is unblocked if the wait passes, or if the word cannot be read (as before), and
+// kept blocked only when the word was read and the wait fails. Every other front is unblocked as before.
+// In mode 4, after 63 of those opportunities kept the same record blocked, the 64th unblocks it untested.
+// The next take reads the current packet and can recover from changed operands or a placeholder read as zero.
+// WHICH FRONTS HOLD A STORED WAIT (ThreadRun's requeue): a take that ended blocked (not complete, not yielded) whose LAST
+// suspension was a failed WAIT_REG_MEM made in that take (g_failed_wait.seq == g_suspend_seq, newer than the take's
+// start: no WaitCe / WaitDeDiff / WaitForRewind or other wait suspended after it). At value 1 the compute queues'
+// fronts; at 2 also queue 0's graphics fronts whose constant (CE) stream is complete or empty (the DE stream alone left,
+// so the wait is the only thing it is held at). Such a front's next take would begin with that same packet on that same
+// word: a non-speculated execution resumes at the packet it suspended at; a speculation blocked at a wait hole resumes
+// from that wait with `cp` untouched (Speculation::Resume / SegmentAsHole). If the operands and read stay the same,
+// the take would just read the word, fail and requeue.
+// LIVENESS: a front is kept blocked only by a read that failed; every place a label word can change is followed by
+// another read before the front could have run, or the front is unblocked as before:
+//  (a) the GPU thread's own packets, in any queue's take, complete or not: WRITE_DATA (WriteData), RELEASE_MEM /
+//      EVENT_WRITE_EOP (WriteAtEndOfPipe writes the label at the packet, the GDS words too), COPY_DATA's reference clock
+//      (WriteReferenceClock), DMA_DATA (BufferCache::FillBuffer / CopyBuffer), a speculation's commit (its journal's
+//      writes made at the commit on this thread), a pending guarded write (KYTY_WRITE_GUARD: in the backing view, which
+//      RetestWait reads first, as ReadGuestMemory does). Each take returns to ThreadRun's loop top, where
+//      RetestBlockedFronts(Selector) re-reads every stored wait before any front is picked (m_failed_waits_n != 0, in
+//      every mode), and a completion re-reads them here first.
+//  (b) the guest's CPU threads (a label the game writes; the kernel's): no signal is owed. Re-read at every loop top;
+//      with nothing runnable the selector waits at most 100 us (WaitFor: never the untimed idle wait, a blocked front
+//      counts in m_submission_count), and re-reads at that timeout and at the loop top after it: the latency of the
+//      timeout unblock and its re-take without the switch.
+//  (c) GPU-side writes (a shader's store, a copy; read back by the fault handler of a read-watched page): RetestWait
+//      does not read such a word (Unread), and here its front is unblocked as before, at every completion and every
+//      idle timeout; its own take reads it through the fault handler, as without the switch.
+// What a skipped take would also have done is not needed for (a)-(c): labels are written at their packets, not at the
+// host GPU's completion, so no flush is owed to a label; work recorded and deferred goes before the GPU thread idles
+// (FlushPending / FlushDeferred, the selector) or with the GPU's backlog rule (DeferrableFlush). When in doubt (no stored
+// wait, a later suspension, a CE stream not complete, an unread word, the switch off) the front is unblocked as before.
+void GuestGpu::UnblockFrontsRetested(RetestAt at, bool bound_retest) {
+	// (Caller holds m_queue_mutex.)
+	constexpr uint32_t RetestFallbackLimit = 64;
+	for (uint32_t id = 0; id < QueueCount; ++id) {
+		auto& queue = m_queues[id];
+		if (queue.empty() || !queue.front().blocked) continue;
+		auto& wait = m_failed_waits[id];
+		if (wait.size != 0 && wait.serial == queue.front().serial) {
+			// A retest that unblocks the front clears the record, including the count.
+			if (!bound_retest || ++wait.suppressed_unblocks < RetestFallbackLimit) continue;
+			wait = {};
+			--m_failed_waits_n;
+			LiveCounters::Add(LiveCounters::FrontRetestFallbacks);
+		}
+		queue.front().blocked = false;
+	}
+	if (m_failed_waits_n != 0) (void)RetestBlockedFronts(at);
+}
+
+uint32_t GuestGpu::RetestBlockedFronts(RetestAt at) {
 	// (Caller holds m_queue_mutex. The fronts copied under it; the words read without it, as the wait's handler reads
 	// them, so no lock of the read's is taken under it. Only this thread pops or requeues a front, so the fronts are the
 	// same ones when it is taken again.)
 	struct Front {
 		uint32_t   id = 0;
 		FailedWait wait;
-		bool       pass = false;
+		RetestRead read = RetestRead::Unread;
 	};
 	std::array<Front, QueueCount> fronts;
 	uint32_t                      count = 0;
@@ -1393,19 +1464,22 @@ uint32_t GuestGpu::RetestBlockedFronts() {
 			--m_failed_waits_n;
 			continue;
 		}
-		fronts[count++] = {id, wait, false};
+		fronts[count++] = {id, wait, RetestRead::Unread};
 	}
 	if (count == 0) return 0;
 	m_queue_mutex.Unlock();
 	for (uint32_t i = 0; i < count; ++i)
-		fronts[i].pass = RetestWait(fronts[i].wait.address, fronts[i].wait.reference, fronts[i].wait.mask,
+		fronts[i].read = RetestWait(fronts[i].wait.address, fronts[i].wait.reference, fronts[i].wait.mask,
 		                            fronts[i].wait.function, fronts[i].wait.size);
 	m_queue_mutex.Lock();
-	uint32_t unblocked = 0;
+	// (Selector: a pass unblocks. Completion / IdleTimeout, front_unblock_retest in place of the blanket unblock: an
+	// unread word unblocks too, as the blanket did; a failed read keeps the front blocked.)
+	const bool unread_unblocks = at != RetestAt::Selector;
+	uint32_t   unblocked       = 0;
 	for (uint32_t i = 0; i < count; ++i) {
-		if (!fronts[i].pass) continue;
 		auto& queue = m_queues[fronts[i].id];
 		if (queue.empty() || queue.front().serial != fronts[i].wait.serial || !queue.front().blocked) continue;
+		if (fronts[i].read == RetestRead::Fail || (fronts[i].read == RetestRead::Unread && !unread_unblocks)) continue;
 		queue.front().blocked = false;
 		if (m_failed_waits[fronts[i].id].size != 0) {
 			m_failed_waits[fronts[i].id] = {};
@@ -1546,8 +1620,10 @@ void GuestGpu::ThreadRun(void* data) {
 	// switches whose Find keeps main's default, the four levers, take mode 4's here.)
 	// (KYTY_SPEC_TEXCACHE_SHARED: the texture cache lock's shared mode, after the switches above, before the speculation
 	// threads that take it shared exist.)
-	gpu->m_renderer.GetTextureCache().ApplySharedMode(kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4);
-	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+	// The GPU thread owns live mode changes after initialization.
+	auto mode = kyty_local_speculate_mode.load(std::memory_order_relaxed);
+	gpu->m_renderer.GetTextureCache().ApplySharedMode(mode == 4);
+	if (mode == 4) {
 		ModeToggle::ApplyTable(4);
 		start_speculation();
 	}
@@ -1570,7 +1646,7 @@ void GuestGpu::ThreadRun(void* data) {
 			};
 			if (started(0) || (gpu->m_speculation_async && started(gpu->m_async_queue))) return;
 			ModeToggle::g_request.store(-1, std::memory_order_release);
-			if (static_cast<int>(kyty_local_speculate_mode.load(std::memory_order_relaxed)) == want) return;
+			if (static_cast<int>(mode) == want) return;
 			ModeToggle::ApplyTable(want);
 			if (want == 0) {
 				gpu->m_ahead.store(nullptr, std::memory_order_release);
@@ -1578,7 +1654,8 @@ void GuestGpu::ThreadRun(void* data) {
 				old       = std::move(gpu->m_speculation);
 				old_async = std::move(gpu->m_speculation_async);
 			} else {
-				kyty_local_speculate_mode.store(4, std::memory_order_relaxed);
+				mode = 4;
+				kyty_local_speculate_mode.store(mode, std::memory_order_relaxed);
 #if defined(__linux__)
 				check_write_guard_uffd(); // (the guard turns on with mode 4: #289's check, as at boot)
 #endif
@@ -1609,7 +1686,8 @@ void GuestGpu::ThreadRun(void* data) {
 		// the GPU thread between submissions.)
 		if (want == 0) {
 			RenderExecutor::SettleDrain(true); // (the commits' catalog parts still waiting, under mode 4's catalog writes)
-			kyty_local_speculate_mode.store(0, std::memory_order_relaxed);
+			mode = 0;
+			kyty_local_speculate_mode.store(mode, std::memory_order_relaxed);
 			Speculation::GpuThreadAffinityAtFlip(); // (KYTY_SPEC_GPU_AFFINITY: the GPU thread's mask given back, if changed)
 		}
 		std::printf("Mode: KYTY_SPECULATE=%d (live)\n", want);
@@ -1629,7 +1707,7 @@ void GuestGpu::ThreadRun(void* data) {
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		// KYTY_WEAVE: paused once a live change has set KYTY_SPECULATE to 4, before another packet or guest command
 		// runs (weave-order.inc).
-		if (Weave::Active() && kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) [[unlikely]]
+		if (Weave::Active() && mode != 0) [[unlikely]]
 			gpu->m_gfx_cp->WeaveModeChanged();
 #endif
 		PageManager::FlushDeferredProtection(); // (before a guest command, an idle wait, another queue's turn)
@@ -1713,6 +1791,11 @@ void GuestGpu::ThreadRun(void* data) {
 					GpuIdle::g_idle.store(false, std::memory_order_release);
 					LiveControl::g_render_idle_ns += (std::chrono::steady_clock::now() - idle).count();
 					LiveTrace::Event(LiveTrace::RenderIdle, 0, 1);
+					// (front_unblock_retest: a stored wait's front re-read, at the loop top again after this.)
+					if (FrontUnblockRetest().load(std::memory_order_relaxed) != 0) [[unlikely]] {
+						gpu->UnblockFrontsRetested(RetestAt::IdleTimeout, mode == 4);
+						continue;
+					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -1769,7 +1852,8 @@ void GuestGpu::ThreadRun(void* data) {
 		LiveTrace::Event(LiveTrace::RenderSlice,
 		                 submission.queue_id | static_cast<uint32_t>(submission.type) << 8u | 1u << 17u,
 		                 submission.frame_epoch | uint64_t {submission.commands.size()} << 32u);
-		const bool complete = gpu->Process(submission);
+		const uint32_t take_seq = g_suspend_seq; // (front_unblock_retest: the suspensions before this take)
+		const bool     complete = gpu->Process(submission);
 		LiveTrace::Event(LiveTrace::RenderSlice,
 		                 submission.queue_id | static_cast<uint32_t>(submission.type) << 8u |
 		                     static_cast<uint32_t>(complete) << 16u,
@@ -1790,7 +1874,17 @@ void GuestGpu::ThreadRun(void* data) {
 			const auto wait   = std::exchange(g_failed_wait, {});
 			auto&      stored = gpu->m_failed_waits[submission.queue_id];
 			if (stored.size != 0) stored = {}, --gpu->m_failed_waits_n;
-			if (!complete && !submission.yielded && submission.type == SubmissionType::Compute) {
+			// (front_unblock_retest on: only the fronts it covers, and only when that wait was the take's last suspension,
+			// made in this take; RetestBlockedFronts' comment. Off: as before, mode 4's compute fronts.)
+			const int64_t retest  = FrontUnblockRetest().load(std::memory_order_relaxed);
+			const bool    covered = retest == 0
+			                            ? submission.type == SubmissionType::Compute
+			                            : (submission.type == SubmissionType::Compute ||
+			                               (retest >= 2 && submission.queue_id == 0 &&
+			                                submission.type == SubmissionType::Graphics &&
+			                                (submission.constant_commands.empty() || submission.constant_complete))) &&
+			                                  wait.seq == g_suspend_seq && wait.seq != take_seq;
+			if (!complete && !submission.yielded && covered) {
 				stored = {submission.serial, wait.address, wait.reference, wait.mask, wait.function, wait.size};
 				++gpu->m_failed_waits_n;
 			}
@@ -1804,6 +1898,8 @@ void GuestGpu::ThreadRun(void* data) {
 				submission.blocked = true;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
+		} else if (FrontUnblockRetest().load(std::memory_order_relaxed) != 0) [[unlikely]] {
+			gpu->UnblockFrontsRetested(RetestAt::Completion, mode == 4); // (front_unblock_retest: a stored wait's front re-read)
 		} else {
 			for (auto& queue: gpu->m_queues) {
 				if (!queue.empty()) {
@@ -2175,6 +2271,7 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands)
 
 void CommandProcessor::SuspendPm4() {
 	EXIT_IF(g_current_execution == nullptr);
+	++g_suspend_seq; // (front_unblock_retest: GuestGpu::ThreadRun's requeue)
 	LiveCounters::Add(LiveCounters::Pm4Suspends);
 	g_current_execution->m_suspended = true;
 }

@@ -125,8 +125,15 @@ public:
 
 private:
 	// KYTY_SPECULATE=4, on the GPU thread holding m_queue_mutex (released for the reads, taken again): the blocked fronts
-	// whose stored WAIT_REG_MEM (m_failed_waits) passes now unblocked; how many.
-	uint32_t          RetestBlockedFronts();
+	// whose stored WAIT_REG_MEM (m_failed_waits) passes now unblocked; how many. `at` (front_unblock_retest,
+	// graphicsRun.cpp): Selector, as always (a word not read: kept blocked); at a completion or the selector's idle
+	// timeout, in place of the blanket unblock, a word not read unblocks its front as the blanket did, and a front whose
+	// word was read and fails is kept blocked.
+	enum class RetestAt { Selector, Completion, IdleTimeout };
+	uint32_t          RetestBlockedFronts(RetestAt at = RetestAt::Selector);
+	// (front_unblock_retest, holding m_queue_mutex: at a completion / the idle timeout) every blocked front unblocked as
+	// before except those holding a stored wait, which RetestBlockedFronts(at) re-reads until the mode-4 bound.
+	void              UnblockFrontsRetested(RetestAt at, bool bound_retest);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
@@ -157,9 +164,11 @@ private:
 	bool                                           m_scout_reset       = false;
 	// Under m_queue_mutex, KYTY_SPECULATE=4 only (0 / empty otherwise): the queued submissions a yield marked; and for a
 	// compute front requeued blocked at a WAIT_REG_MEM, that wait with the front's serial (size 0: none), and how many.
+	// (front_unblock_retest on, any mode: the fronts it covers, graphicsRun.cpp.)
 	struct FailedWait {
 		uint64_t serial = 0, address = 0, reference = 0, mask = 0;
 		uint32_t function = 0, size = 0;
+		uint32_t suppressed_unblocks = 0;
 	};
 	uint32_t                                       m_yields            = 0;
 	std::array<FailedWait, QueueCount>             m_failed_waits {};

@@ -41,6 +41,7 @@ inline constexpr Row Table[] = {
     {"spec_protect_async", 1, 0},       {"spec_completed_snapshot", 1, 0}, {"spec_texcache_shared", 1, 0},
     {"spec_texcache_upload_unlocked", 0, 0}, {"spec_pool_layers", 1, 0},
     {"spec_pair_push_fit", 1, 0},       {"spec_pair_dense_indirect", 1, 0},
+    {"front_unblock_retest", 1, 0}, // (graphicsRun.cpp: a blocked front's stored wait re-read, not unblocked untested)
 };
 // KYTY_TABLE_TARGET_READ (not a live switch: read where image sets are made): on under mode 4.
 inline constexpr uint32_t TableTargetRead4 = 1, TableTargetRead0 = 0;
