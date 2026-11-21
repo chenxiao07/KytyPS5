@@ -85,6 +85,7 @@
     <Compile Include="Platform.cs" />
     <Compile Include="Game.cs" />
     <Compile Include="Commands.cs" />
+    <Compile Include="Mode4.cs" />
     <Compile Include="Strings.cs" />
     <Compile Include="FolderPicker.cs" />
     <Compile Include="AssemblyInfo.cs" />

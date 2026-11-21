@@ -62,4 +62,27 @@ if(BUILD_TESTING)
 		COMPILE_DEFINITIONS "KYTY_PROMPT_ASSETS_DIR=\"${KYTY_PROMPT_ASSETS_DIR}\""
 		OBJECT_DEPENDS "${KYTY_PROMPT_ASSET_FILES}")
 	add_test(NAME launcher_keyboard_prompts COMMAND $<TARGET_FILE:kyty_launcher_prompts_tests>)
+
+	# The Experimental page's parallel translation (tests/LauncherMode4LinuxTests.cpp): its default, its gate, its text and
+	# Play's variables (Commands::Play with a bare LauncherContext): no game files, SDL or ImGui needed.
+	#   cmake --build <build> --target kyty_launcher_mode4_tests && ctest -R launcher_mode4
+	add_executable(kyty_launcher_mode4_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/LauncherMode4LinuxTests.cpp"
+		commands.cpp
+		game.cpp
+		platform.cpp
+		settings.cpp
+		strings.cpp
+		bytes.cpp
+		keyboard_layout.cpp
+		keyboard_layout_settings.cpp
+		keyboard_prompts.cpp
+		prompt_assets.cpp
+		prompt_texture.cpp
+	)
+	target_include_directories(kyty_launcher_mode4_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${KYTY_THIRD_PARTY_DIR}/stb")
+	target_compile_options(kyty_launcher_mode4_tests PRIVATE -fexceptions)
+	target_link_libraries(kyty_launcher_mode4_tests PRIVATE nlohmann_json::nlohmann_json Vulkan::Headers Threads::Threads
+		${CMAKE_DL_LIBS})
+	add_test(NAME launcher_mode4 COMMAND $<TARGET_FILE:kyty_launcher_mode4_tests>)
 endif()
