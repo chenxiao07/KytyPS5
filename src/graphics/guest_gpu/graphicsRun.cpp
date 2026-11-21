@@ -1480,13 +1480,25 @@ void GuestGpu::ThreadRun(void* data) {
 					gpu->m_queue_mutex.Lock();
 					continue;
 				}
+				// A freed range whose copies completed: written back and let go now, while nothing else waits, one at a time,
+				// as a command (GpuResourceManager::ServiceFreedReadback). With one whose copies run still, the wait looks
+				// again in 2 ms.
+				auto& resources = gpu->m_renderer.GetGpuResources();
+				if (resources.FreedReadbackReady()) {
+					gpu->m_commands.push_back(Common::UniqueFunction<void>([&resources] { resources.ServiceFreedReadback(); }));
+					gpu->m_pending_commands.fetch_add(1, std::memory_order_seq_cst);
+					continue;
+				}
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				LiveTrace::Event(LiveTrace::RenderIdle, 1, 0);
 				const auto idle = std::chrono::steady_clock::now();
 				LiveControl::NoteRenderIdle(idle.time_since_epoch().count());
 				GpuIdle::g_idle.store(true, std::memory_order_release); // (gpu-idle.h)
-				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				if (resources.FreedReadbackSubmitted())
+					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 2000); // (us)
+				else
+					gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 				GpuIdle::g_idle.store(false, std::memory_order_release);
 				LiveControl::g_render_idle_ns += (std::chrono::steady_clock::now() - idle).count();
 				LiveTrace::Event(LiveTrace::RenderIdle, 0, 0);

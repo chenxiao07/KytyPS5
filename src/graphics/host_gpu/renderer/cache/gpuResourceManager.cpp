@@ -351,6 +351,25 @@ void GpuResourceManager::PostLevelUploadAhead(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+// What the engine-free hook did, reported every 30 s it happened (the GPU thread's own counts: all of its time at the frees,
+// a freed block's read back there included when nothing went; and its time on the freed ranges left pending, while it had
+// nothing else to do).
+namespace {
+struct FreedReport {
+	BufferCache::FreeBlockSplits          splits;
+	uint64_t                              blocks = 0, bytes = 0, let_go = 0, ns = 0, max_ns = 0, idle_ns = 0, idle_max_ns = 0;
+	std::chrono::steady_clock::time_point next {};
+};
+FreedReport& Freed() {
+	static FreedReport report;
+	return report;
+}
+uint64_t NsSince(std::chrono::steady_clock::time_point start) {
+	return static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+} // namespace
+
 void GpuResourceManager::FreedByGame(uint64_t vaddr, uint64_t size) {
 	static const uint32_t mode = [] {
 		const char* value = std::getenv("KYTY_ENGINE_FREE_BUFFERS");
@@ -360,36 +379,55 @@ void GpuResourceManager::FreedByGame(uint64_t vaddr, uint64_t size) {
 	(void)m_gpu->TrySendCommand([this, vaddr, size] {
 		// (Unmapped meanwhile: UnmapMemory dealt with its buffers.)
 		if (!IsMapped(vaddr, size)) return;
-		const auto start = std::chrono::steady_clock::now();
-		// What went, reported every 30 s it happened (the GPU thread's own counts: all of its time here, a freed block's read
-		// back included when nothing went).
-		static BufferCache::FreeBlockSplits splits;
-		static uint64_t                     blocks = 0, bytes = 0, let_go = 0, ns = 0, max_ns = 0;
-		static auto                         next   = start + std::chrono::seconds(30);
-		const auto lists = splits.lists;
-		const auto freed = m_buffer_cache.DropFreedRange(vaddr, size, mode != 2, &Loader::DemonsSoulsPageFree::FreeBlocksIn, &splits);
-		const auto took  = static_cast<uint64_t>(
-		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
-		ns += took;
-		max_ns = std::max(max_ns, took);
-		if (freed != 0) {
-			blocks++;
-			bytes += size;
-			let_go += freed;
+		const auto start  = std::chrono::steady_clock::now();
+		auto&      report = Freed();
+		if (report.next == std::chrono::steady_clock::time_point {}) report.next = start + std::chrono::seconds(30);
+		const auto lists   = report.splits.lists;
+		const auto pending = m_buffer_cache.FreedReadbackPendingCount();
+		const auto freed = m_buffer_cache.DropFreedRange(vaddr, size, mode != 2, &Loader::DemonsSoulsPageFree::FreeBlocksIn,
+		                                                 &report.splits);
+		const auto took = NsSince(start);
+		report.ns += took;
+		report.max_ns = std::max(report.max_ns, took);
+		if (freed != 0 || m_buffer_cache.FreedReadbackPendingCount() > pending) {
+			report.blocks++;
+			report.bytes += size;
+			report.let_go += freed;
 		}
-		if ((freed == 0 && splits.lists == lists) || start < next) return;
+		if ((freed == 0 && report.splits.lists == lists && m_buffer_cache.FreedReadbackPendingCount() <= pending) ||
+		    start < report.next)
+			return;
+		const auto counts = m_buffer_cache.TakeFreedReadbackCounts();
 		std::printf("Engine frees: %llu freed blocks (%.0f MiB) had buffers over them: %.0f MiB of buffers let go (%.0f MiB cut off "
 		            "buffers over other free blocks too, the allocator's lists read %llu times), %.1f ms on the GPU thread (at most "
-		            "%.2f ms a block); BDA reads of unbuffered pages so far %llu (KYTY_ENGINE_FREE_BUFFERS)\n",
-		            static_cast<unsigned long long>(blocks), static_cast<double>(bytes) / 1048576.0,
-		            static_cast<double>(let_go) / 1048576.0, static_cast<double>(splits.cut) / 1048576.0,
-		            static_cast<unsigned long long>(splits.lists), static_cast<double>(ns) / 1e6, static_cast<double>(max_ns) / 1e6,
-		            static_cast<unsigned long long>(LiveCounters::Value(LiveCounters::BdaFaultPages)));
+		            "%.2f ms a block); BDA reads of unbuffered pages so far %llu (KYTY_ENGINE_FREE_BUFFERS); read back later %llu "
+		            "(%.1f MiB; %llu at the free), %llu done in %.1f ms of the idle GPU thread (at most %.2f ms), %llu kept "
+		            "(written again), %.2f MiB not written back (written since)\n",
+		            static_cast<unsigned long long>(report.blocks), static_cast<double>(report.bytes) / 1048576.0,
+		            static_cast<double>(report.let_go) / 1048576.0, static_cast<double>(report.splits.cut) / 1048576.0,
+		            static_cast<unsigned long long>(report.splits.lists), static_cast<double>(report.ns) / 1e6,
+		            static_cast<double>(report.max_ns) / 1e6,
+		            static_cast<unsigned long long>(LiveCounters::Value(LiveCounters::BdaFaultPages)),
+		            static_cast<unsigned long long>(counts.pending), static_cast<double>(counts.pending_bytes) / 1048576.0,
+		            static_cast<unsigned long long>(counts.at_free), static_cast<unsigned long long>(counts.serviced),
+		            static_cast<double>(report.idle_ns) / 1e6, static_cast<double>(report.idle_max_ns) / 1e6,
+		            static_cast<unsigned long long>(counts.kept), static_cast<double>(counts.stale_bytes) / 1048576.0);
 		std::fflush(stdout);
-		blocks = bytes = let_go = ns = max_ns = 0;
-		splits = {};
-		next   = start + std::chrono::seconds(30);
+		const auto next = start + std::chrono::seconds(30);
+		report          = {};
+		report.next     = next;
 	});
+}
+
+void GpuResourceManager::ServiceFreedReadback() {
+	const auto start  = std::chrono::steady_clock::now();
+	auto&      report = Freed();
+	uint64_t   let_go = 0;
+	if (!m_buffer_cache.ServiceFreedReadback(&Loader::DemonsSoulsPageFree::FreeBlocksIn, &report.splits, &let_go)) return;
+	const auto took = NsSince(start);
+	report.idle_ns += took;
+	report.idle_max_ns = std::max(report.idle_max_ns, took);
+	report.let_go += let_go;
 }
 
 thread_local bool t_unmap_list_site = false; // (spec_unmap_list: set while the commit's Changed runs)

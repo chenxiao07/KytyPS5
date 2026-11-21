@@ -13,6 +13,7 @@
 #include "async-upload.h"
 #include "parallel-pages.h"
 #include "readback-queue.h"
+#include "local-platform.h"
 #include "fresh-memory.h"
 #include "texture-offload.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -176,6 +177,17 @@ struct BufferCache::GuestReadback {
 	// GPU-owned, so the reader faults again and reads the newer GPU state.
 	enum State : uint32_t { Pending, Copying, Detached };
 	std::atomic<uint32_t> state {Pending};
+};
+
+// A freed range whose GPU-written bytes are on their way to guest memory (BeginFreedReadback): its pages, the bytes copied
+// (at their offsets in m_freed_ring), the graphics tick of the copies, and the bytes GPU work wrote since (`stale`).
+struct BufferCache::FreedReadback {
+	uint64_t                         begin = 0, size = 0;
+	uint64_t                         first = 0, last = 0;
+	std::vector<GuestReadback::Part> parts;
+	uint64_t                         ring_offset = 0, packed = 0, ring_end = 0;
+	uint64_t                         tick        = 0;
+	RangeSet                         stale;
 };
 
 // A value kept between calls on this thread for its storage (a vector's capacity): a call takes it out of `home` and
@@ -587,6 +599,8 @@ static void LogGpuWriteWatch(uint64_t vaddr, uint64_t size) {
 // current tick, so its tick is only set at the next point between commands. Every GPU write
 // into a guest buffer is noted: shader writes, uploads, image copies and buffer joins.
 void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
+	// (Bytes of a pending freed range written again: never written back from its copies.)
+	if (vaddr < m_freed_hi && m_freed_lo < vaddr + size) [[unlikely]] NoteFreedWrite(vaddr, size);
 	LogGpuWriteWatch(vaddr, size);
 	TraceGpuWrite(vaddr, size, m_scheduler.CurrentTick());
 	if (kyty_local_readback_queue_mode.load(std::memory_order_relaxed) == 0 || m_graphics.readback_queue == nullptr) {
@@ -1851,7 +1865,8 @@ uint64_t BufferCache::DeleteUnmappedBuffers(uint64_t vaddr, uint64_t size) {
 // bytes copied on the GPU (as a join copies them; the BDA page table points at them), so the bytes copied are at most
 // the bytes freed. Its unmapped bytes are nobody's: their GPU-owned ones were read back when unmapped (InvalidateMemory),
 // and a buffer with some there left is kept as it is.
-uint64_t BufferCache::SplitUnmappedBuffers(uint64_t vaddr, uint64_t size, FreeBlocksQuery free_blocks, FreeBlockSplits* splits) {
+uint64_t BufferCache::SplitUnmappedBuffers(uint64_t vaddr, uint64_t size, FreeBlocksQuery free_blocks, FreeBlockSplits* splits,
+                                           bool read_back_over) {
 	if (m_resources == nullptr || size == 0 || UINT64_MAX - vaddr < size) return 0;
 	const auto            end = vaddr + size;
 	std::vector<BufferId> candidates;
@@ -1924,6 +1939,10 @@ uint64_t BufferCache::SplitUnmappedBuffers(uint64_t vaddr, uint64_t size, FreeBl
 			for (const auto& [address, bytes]: over) mapped.Subtract(address, bytes);
 			cut_pieces();
 			if (kept * 2 > stop - begin) continue;
+			if (!read_back_over && std::ranges::any_of(over, [&](const auto& block) {
+				    return m_memory_tracker.IsRegionGpuModified(block.first, block.second);
+			    }))
+				continue;
 			for (const auto& [address, bytes]: over) InvalidateMemory(address, bytes);
 			if (m_slot_buffers[id].is_deleted) continue;
 			over_free_blocks = true;
@@ -1974,17 +1993,277 @@ uint64_t BufferCache::SplitUnmappedBuffers(uint64_t vaddr, uint64_t size, FreeBl
 // (`free_blocks`, the allocator's lists) is cut to the rest or goes: with this block alone two of 300-360 MiB stayed over
 // the GPU heap's old blocks, joins growing them on (BDA-read buffers of 16 MiB or more 0.55 -> 1.0 GiB in 42 loads; with
 // the lists 0.54-0.86, no trend). 11-08, 16 GiB of RAM: buffers 1.5-1.9 GiB, Boletaria 60 fps; ~2 s of the GPU thread
-// an hour, the most for one block 27 ms (one of the GPU heap's, at a load).
+// an hour, the most for one block 27 ms (one of the GPU heap's, at a load). A range with GPU-written bytes is left pending
+// instead (BeginFreedReadback): no wait for them here.
 uint64_t BufferCache::DropFreedRange(uint64_t vaddr, uint64_t size, bool read_back, FreeBlocksQuery free_blocks,
                                      FreeBlockSplits* splits) {
 	if (size == 0 || UINT64_MAX - vaddr < size || !IsRegionRegistered(vaddr, size)) return 0;
 	if (read_back) {
+		static auto& async = LiveSwitch::Find("freed_readback_async", 1);
+		if (async.load(std::memory_order_relaxed) != 0 && BeginFreedReadback(vaddr, size)) return 0;
 		InvalidateMemory(vaddr, size);
 	} else {
 		DiscardGpuWrites(vaddr, size);
 	}
 	const auto deleted = DeleteUnmappedBuffers(vaddr, size);
 	return deleted + SplitUnmappedBuffers(vaddr, size, free_blocks, splits);
+}
+
+// KYTY_ENGINE_FREE_BUFFERS=1 (live freed_readback_async, default 1; 0: read back at the free, as before): a freed range's
+// GPU-written bytes taken without a wait. The read back at the free took a buffer made over the whole range (a lookup
+// over it joins every buffer in it) and a drain of the graphics queue for the download: 4-24 ms of the GPU thread for one
+// of the GPU heap's blocks at a world load, ~100 ms in 30 s of a player's walk (issue #368). Here the copies of the
+// GPU-written bytes of its pages go into the open command buffer from the buffers that hold them (the page table's owners)
+// into a ring in host memory (KYTY_FREED_READBACK_MB, default 128, 64 with 16 GiB of RAM or less; 0: off), and nothing
+// else changes: its pages stay GPU-owned and its buffers registered, so whatever uses the range before the copies completed finds it as with no free
+// (a fault reads it back, GPU work reads the buffers). Once they completed, while the GPU thread has nothing else to do
+// (ServiceFreedReadback), the copied bytes go back on the pages the GPU still owns, except those GPU work wrote since
+// (`stale`, from NoteGpuWrite: shader writes, uploads, joins, image copies, a speculation's committed writes), and the
+// range's buffers go as DropFreedRange's do. An image the GPU wrote over those bytes is not downloaded meanwhile
+// (TextureCache::SafeToDownload refuses over GPU-dirty buffer bytes), so its bytes reach guest memory after them, as with
+// the read back at the free. False (nothing done): read it back now.
+bool BufferCache::BeginFreedReadback(uint64_t vaddr, uint64_t size) {
+	// (128 MiB where the emulator has more than 16 GiB of RAM, else 64: an area load's burst of frees filled 64, and the
+	// next freed block of the GPU heap took the read back at the free, 9.6 ms.)
+	static const uint64_t capacity = [] {
+		const char* value = std::getenv("KYTY_FREED_READBACK_MB");
+		if (value != nullptr && value[0] != '\0') return std::strtoull(value, nullptr, 10) * MiB;
+		return (LocalPlatform::EmulatorMemory() > (uint64_t {16} << 30u) ? 128 : 64) * MiB;
+	}();
+	const auto first = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	const auto last  = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	if (capacity == 0 || m_resources == nullptr || !m_memory_tracker.IsRegionGpuModified(first, last - first)) return false;
+	// (A guest readback of these pages under way writes back onto pages still GPU-owned: finished first.)
+	DrainGuestReadback(first, last - first);
+	const auto owner_at = [&](uint64_t at) -> Buffer* {
+		const BufferId owner = LoadOwner(m_page_table.Find(at >> PageTable::kPageBits)); // (one read: LoadOwner)
+		if (!owner) return nullptr;
+		auto& buffer = m_slot_buffers[owner];
+		return !buffer.is_deleted && buffer.IsInBounds(at, 1) ? &buffer : nullptr;
+	};
+	thread_local std::vector<DownloadCopy> copies_home;
+	ScratchValue                           copies_scratch(copies_home);
+	auto&                                  copies = *copies_scratch;
+	copies.clear();
+	bool unowned = false;
+	m_memory_tracker.ForEachDownloadRange<false>(first, last - first, [&](uint64_t address, uint64_t bytes) noexcept {
+		m_gpu_modified_ranges.ForEachIntersection(address, bytes, [&](RangeSet::Range range) {
+			for (uint64_t at = range.address, end = range.address + range.size; at < end && !unowned;) {
+				auto* owner = owner_at(at);
+				if (owner == nullptr) {
+					unowned = true;
+					break;
+				}
+				const auto next = std::min(end, owner->CpuAddress() + owner->Size());
+				copies.push_back({owner, owner->Offset(at), at, next - at});
+				at = next;
+			}
+		});
+	});
+	if (unowned || copies.empty()) return false;
+	// The copies' envelopes packed, one for envelopes of a buffer less than 64 KiB apart (BeginGuestReadback's).
+	struct Envelope {
+		Buffer*  buffer;
+		uint64_t source, size, cursor;
+	};
+	constexpr uint64_t                 Gap = 64 * 1024;
+	thread_local std::vector<Envelope> envelopes_home;
+	ScratchValue                       envelopes_scratch(envelopes_home);
+	auto&                              envelopes = *envelopes_scratch;
+	envelopes.clear();
+	std::vector<GuestReadback::Part> parts;
+	parts.reserve(copies.size());
+	uint64_t packed = 0;
+	for (const auto& copy: copies) {
+		const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+		if (!envelopes.empty() && copy.buffer == envelopes.back().buffer && source_begin >= envelopes.back().source &&
+		    source_begin <= envelopes.back().source + envelopes.back().size + Gap) {
+			auto&      envelope = envelopes.back();
+			const auto end      = std::max(envelope.source + envelope.size, source_begin + envelope_size);
+			packed += AlignDownload(end - envelope.source) - AlignDownload(envelope.size);
+			envelope.size = end - envelope.source;
+		} else {
+			envelopes.push_back({copy.buffer, source_begin, envelope_size, packed});
+			packed += AlignDownload(envelope_size);
+		}
+		parts.push_back({copy.address, copy.size, envelopes.back().cursor + copy.source_offset - envelopes.back().source});
+	}
+	// Room in the ring, in order (a range that does not fit before its end starts the next lap).
+	if (m_freed_readbacks.empty()) m_freed_ring_head = m_freed_ring_tail = 0;
+	uint64_t start = m_freed_ring_head;
+	if (start % capacity + packed > capacity) start += capacity - start % capacity;
+	if (packed > capacity || start + packed - m_freed_ring_tail > capacity) {
+		m_freed_counts.at_free++;
+		return false;
+	}
+	if (!m_freed_ring) {
+		m_freed_ring = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                        vk::BufferUsageFlagBits::eTransferDst, capacity);
+		SetVulkanObjectNameF(m_graphics.device, m_freed_ring->Handle(), "Kyty.FreedReadbacks");
+	}
+	m_freed_ring_head    = start + packed;
+	const uint64_t base  = start % capacity;
+	auto&          command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+	// (As FlushFeedbackBatch's barriers: what wrote the sources before the copies, the copies before the host's reads and
+	// what writes the sources next.)
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostRead;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion, 1, &before, 0, nullptr, 0,
+	                       nullptr);
+	thread_local std::vector<vk::BufferCopy> regions;
+	for (size_t i = 0; i < envelopes.size();) {
+		regions.clear();
+		size_t next = i;
+		for (; next < envelopes.size() && envelopes[next].buffer == envelopes[i].buffer; ++next)
+			regions.push_back({envelopes[next].source, base + envelopes[next].cursor, envelopes[next].size});
+		native.copyBuffer(envelopes[i].buffer->Handle(), m_freed_ring->Handle(), static_cast<uint32_t>(regions.size()),
+		                  regions.data());
+		i = next;
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	                       vk::DependencyFlagBits::eByRegion, 1, &after, 0, nullptr, 0, nullptr);
+	auto entry = std::make_unique<FreedReadback>();
+	entry->begin       = vaddr;
+	entry->size        = size;
+	entry->first       = first;
+	entry->last        = last;
+	entry->ring_offset = base;
+	entry->packed      = packed;
+	entry->ring_end    = m_freed_ring_head;
+	entry->tick        = m_scheduler.CurrentTick();
+	for (auto& part: parts) part.offset += base;
+	entry->parts = std::move(parts);
+	m_freed_readbacks.push_back(std::move(entry));
+	m_freed_lo = std::min(m_freed_lo, first);
+	m_freed_hi = std::max(m_freed_hi, last);
+	m_freed_counts.pending++;
+	m_freed_counts.pending_bytes += packed;
+	// The range's regions with no GPU-written page CPU-owned now, as the read back at the free made them (the next owner's
+	// writes take no fault there); the others once the bytes went back.
+	m_memory_tracker.InvalidateRegion(vaddr, size, [] {});
+	return true;
+}
+
+void BufferCache::NoteFreedWrite(uint64_t vaddr, uint64_t size) {
+	const auto end = vaddr + size;
+	for (auto& entry: m_freed_readbacks) {
+		if (vaddr >= entry->last || end <= entry->first) continue;
+		const auto from = std::max(vaddr, entry->first), to = std::min(end, entry->last);
+		entry->stale.Add(from, to - from);
+	}
+}
+
+void BufferCache::UpdateFreedBounds() {
+	m_freed_lo = UINT64_MAX;
+	m_freed_hi = 0;
+	for (const auto& entry: m_freed_readbacks) {
+		m_freed_lo = std::min(m_freed_lo, entry->first);
+		m_freed_hi = std::max(m_freed_hi, entry->last);
+	}
+}
+
+bool BufferCache::FreedReadbackReady() {
+	return !m_freed_readbacks.empty() && m_scheduler.IsFree(m_freed_readbacks.front()->tick);
+}
+
+bool BufferCache::FreedReadbackSubmitted() const {
+	return !m_freed_readbacks.empty() && m_freed_readbacks.front()->tick < m_scheduler.CurrentTick();
+}
+
+bool BufferCache::ServiceFreedReadback(FreeBlocksQuery free_blocks, FreeBlockSplits* splits, uint64_t* let_go) {
+	if (!FreedReadbackReady()) return false;
+	const std::unique_ptr<FreedReadback> entry = std::move(m_freed_readbacks.front());
+	m_freed_readbacks.pop_front();
+	m_freed_ring_tail = entry->ring_end;
+	UpdateFreedBounds();
+	m_freed_counts.serviced++;
+	// (A texture's download recorded before the copies writes back first, as for a guest readback. One of an image over
+	// these bytes waits for them: TextureCache::SafeToDownload refuses while they are GPU-dirty, so an image the GPU wrote
+	// there reaches guest memory after them, as with the read back at the free.)
+	m_scheduler.WaitPriorityOperations(entry->tick);
+	m_freed_ring->Invalidate(entry->ring_offset, entry->packed);
+	const uint8_t* ring = m_freed_ring->Mapped().data();
+	// The bytes written back, merged in address order (the parts are).
+	thread_local std::vector<RangeSet::Range> written_home;
+	ScratchValue                              written_scratch(written_home);
+	auto&                                     written = *written_scratch;
+	written.clear();
+	uint64_t   skipped = 0;
+	const auto write   = [&](const GuestReadback::Part& part, uint64_t from, uint64_t to) {
+		if (from >= to) return;
+		LibKernel::Memory::WriteBacking(from, ring + part.offset + (from - part.address), to - from, "freed");
+		if (Scout::Running()) Scout::NoteHostWrite(from, to - from, true);
+		if (!written.empty() && written.back().address + written.back().size == from)
+			written.back().size += to - from;
+		else
+			written.push_back({from, to - from});
+	};
+	// [from, to) of a part, less the bytes GPU work wrote since.
+	const auto write_fresh = [&](const GuestReadback::Part& part, uint64_t from, uint64_t to) {
+		entry->stale.ForEachIntersection(from, to - from, [&](RangeSet::Range range) {
+			write(part, from, range.address);
+			skipped += range.size;
+			from = range.address + range.size;
+		});
+		write(part, from, to);
+	};
+	for (const auto& part: entry->parts) {
+		// Only on pages the GPU still owns: a fault's readback gave the others to the CPU, which may have written them since.
+		if (m_memory_tracker.IsRegionFullyGpuModified(part.address, part.size)) {
+			write_fresh(part, part.address, part.address + part.size);
+			continue;
+		}
+		for (uint64_t at = part.address, end = part.address + part.size; at < end;) {
+			const auto next = std::min((at & ~(TRACKER_PAGE_SIZE - 1)) + TRACKER_PAGE_SIZE, end);
+			if (m_memory_tracker.IsRegionFullyGpuModified(at, next - at))
+				write_fresh(part, at, next);
+			else
+				skipped += next - at;
+			at = next;
+		}
+	}
+	m_freed_counts.stale_bytes += skipped;
+	if (!written.empty()) {
+		{
+			const std::unique_lock lock(m_gpu_modified_mutex);
+			m_gpu_modified_ranges.SubtractSorted(written);
+			++m_gpu_coverage_epoch;
+		}
+		// The pages with no GPU-written byte left are the CPU's again.
+		for (const auto& range: written) {
+			const auto page_begin = range.address & ~(TRACKER_PAGE_SIZE - 1);
+			const auto page_end   = (range.address + range.size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+			if (!m_gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
+				continue;
+			}
+			for (uint64_t page = page_begin; page < page_end; page += TRACKER_PAGE_SIZE)
+				if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE))
+					m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+		}
+	}
+	// (Unmapped since: UnmapMemory let its buffers go.)
+	if (m_resources == nullptr || !m_resources->IsMapped(entry->begin, entry->size)) return true;
+	// GPU-written bytes left inside it (not only on a page it shares with its neighbours): GPU work wrote it again, it is in
+	// use again.
+	const auto inner_first = (entry->begin + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	const auto inner_last  = (entry->begin + entry->size) & ~(TRACKER_PAGE_SIZE - 1);
+	if (inner_first < inner_last && m_memory_tracker.IsRegionGpuModified(inner_first, inner_last - inner_first)) {
+		m_freed_counts.kept++;
+		return true;
+	}
+	m_memory_tracker.InvalidateRegion(entry->begin, entry->size, [] {}); // (CPU-owned where no GPU-written page is left)
+	const auto deleted = DeleteUnmappedBuffers(entry->begin, entry->size);
+	*let_go += deleted + SplitUnmappedBuffers(entry->begin, entry->size, free_blocks, splits, false);
+	return true;
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {

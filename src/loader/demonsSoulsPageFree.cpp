@@ -8,6 +8,7 @@
 #include "loader/guestCode.h"
 #include "loader/runtimeLinker.h"
 #include "local/local-platform.h"
+#include "local/live-switch.h"
 #include "local/slow-log.h"
 
 #include <algorithm>
@@ -567,22 +568,38 @@ bool FreeBlocksIn(uint64_t begin, uint64_t end, std::vector<std::pair<uint64_t, 
 	static std::atomic<bool>     wrong {false};
 	if (cave == 0 || blocks == nullptr || begin >= end || wrong.load(std::memory_order_relaxed) || Load(g_stats_global) == 0)
 		return false;
+	// The lists read in the last 250 ms serve again (live free_list_reuse_ms, KYTY_FREE_LIST_REUSE_MS; 0: read at each
+	// call). A burst of frees at an area load asked for them once a freed block with a large buffer over it, 2-8 ms each
+	// (the lock, up to 2 ms, and ~1,500 free blocks), tens a burst, most for a block of 512 KiB-2 MiB whose buffer then
+	// stayed as it was. A list that old misses a block freed since (its buffer is cut by a later call, if it ever is) and
+	// may count one taken since as free (its buffer cut there: the new owner's bytes are its guest memory, and bytes the
+	// GPU wrote are never cut off, BufferCache::SplitUnmappedBuffers).
+	static auto&                      reuse_ms  = LiveSwitch::Find("free_list_reuse_ms", 250);
 	thread_local std::vector<FreeRun> runs;
-	runs.clear();
-	WalkTotals totals;
-	const bool checked = lists.load(std::memory_order_relaxed) < 3;
-	if (!LockAllocator(2)) return false;
-	const bool walked = WalkFreeLocked(runs, totals, checked);
-	UnlockAllocator();
-	lists.fetch_add(1, std::memory_order_relaxed);
-	if (!walked || (checked && (totals.blocks != totals.counted_blocks || totals.pages != totals.counted_pages))) {
-		if (!wrong.exchange(true, std::memory_order_relaxed)) {
-			std::printf("Engine frees: the allocator's free lists are not as read from its code: buffers over several free "
-			            "blocks stay (KYTY_ENGINE_FREE_BUFFERS)\n");
-			std::fflush(stdout);
+	thread_local int64_t              walked_at = 0;
+	thread_local bool                 walked_ok = false;
+	const int64_t                     now       = NowNs();
+	if (walked_at == 0 || now - walked_at > reuse_ms.load(std::memory_order_relaxed) * 1'000'000) {
+		runs.clear();
+		walked_ok = false;
+		walked_at = now;
+		WalkTotals totals;
+		const bool checked = lists.load(std::memory_order_relaxed) < 3;
+		if (!LockAllocator(2)) return false;
+		const bool walked = WalkFreeLocked(runs, totals, checked);
+		UnlockAllocator();
+		lists.fetch_add(1, std::memory_order_relaxed);
+		if (!walked || (checked && (totals.blocks != totals.counted_blocks || totals.pages != totals.counted_pages))) {
+			if (!wrong.exchange(true, std::memory_order_relaxed)) {
+				std::printf("Engine frees: the allocator's free lists are not as read from its code: buffers over several free "
+				            "blocks stay (KYTY_ENGINE_FREE_BUFFERS)\n");
+				std::fflush(stdout);
+			}
+			return false;
 		}
-		return false;
+		walked_ok = true;
 	}
+	if (!walked_ok) return false;
 	for (const auto& run: runs)
 		if (run.address < end && run.address + run.size > begin) blocks->emplace_back(run.address, run.size);
 	return true;
