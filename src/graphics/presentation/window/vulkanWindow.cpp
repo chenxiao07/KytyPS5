@@ -111,6 +111,20 @@ static bool HasExtension(const std::vector<const char*>& extensions, const char*
 	                   [name](const char* ext) { return strcmp(ext, name) == 0; });
 }
 
+// VK_EXT_extended_dynamic_state on RADV only (PR #370; VulkanCreateDevice enables its feature with it): RADV needs it for
+// its PS epilogs' cache. Elsewhere it does nothing for the renderer, which uses the Vulkan 1.3 core dynamic states, and a
+// driver's global pipeline key may take the extensions enabled: the static pipeline stores players made with the other
+// drivers stay valid.
+static void RadvEpilogCacheExtension(vk::PhysicalDevice physical_device, const std::vector<vk::ExtensionProperties>& available,
+                                     std::vector<const char*>& extensions) {
+	if (!HasExtension(available, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME)) return;
+	vk::PhysicalDeviceDriverProperties driver {};
+	vk::PhysicalDeviceProperties2      properties {};
+	properties.pNext = &driver;
+	physical_device.getProperties2(&properties);
+	if (driver.driverID == vk::DriverId::eMesaRadv) extensions.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+}
+
 #if defined(_WIN32)
 // KYTY_FULLSCREEN_EXCLUSIVE=0|1 (GraphicContext::full_screen_exclusive): -1 when unset.
 static int FullscreenExclusiveRequest() {
@@ -1385,6 +1399,18 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		binding_report.pNext                = const_cast<void*>(create_info.pNext);
 		create_info.pNext                   = &binding_report;
 	}
+	// RADV (Mesa 26.3 and later) gives a pixel shader that writes depth a PS epilog when the depth
+	// test is dynamic, but makes the epilogs' cache only with this EXT feature on. With the Vulkan
+	// 1.3 core dynamic states alone (all the renderer uses), the first such draw crashed in the
+	// driver, in every mode (a null hash function in radv_shader_part_cache_get). Upstream KytyPS5
+	// enables it for the same reason (#1906). Both device creations add the extension, on RADV only
+	// (RadvEpilogCacheExtension).
+	vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state {};
+	if (HasExtension(device_extensions, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME)) {
+		extended_dynamic_state.extendedDynamicState = VK_TRUE;
+		extended_dynamic_state.pNext                = const_cast<void*>(create_info.pNext);
+		create_info.pNext                           = &extended_dynamic_state;
+	}
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
@@ -1862,6 +1888,8 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(extension);
 			}
 		}
+		// (RADV's PS epilogs: VulkanCreateDevice.)
+		RadvEpilogCacheExtension(graphic_ctx.physical_device, available_extensions, device_extensions);
 		(void)AmdExplicitVertexBarycentrics(graphic_ctx.physical_device, available_extensions, device_extensions, graphic_ctx);
 		(void)PixelInterlockExtension(graphic_ctx.physical_device, available_extensions, device_extensions, graphic_ctx, true);
 		(void)AddressBindingReport(graphic_ctx.physical_device, available_extensions, device_extensions, graphic_ctx);
@@ -2106,6 +2134,8 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 		                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) device_extensions.push_back(extension);
 		}
+		// (RADV's PS epilogs: VulkanCreateDevice.)
+		RadvEpilogCacheExtension(graphic_ctx.physical_device, available_extensions, device_extensions);
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions,
 		                 VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
