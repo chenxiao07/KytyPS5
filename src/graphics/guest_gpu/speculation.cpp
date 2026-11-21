@@ -503,10 +503,10 @@ void Speculation::AheadRun(Translator& translator) {
 	Spec::t_packet_slot = translator.index;
 	std::unique_lock lock(m_mutex);
 	for (;;) {
-		Entry*   pass       = nullptr;
-		Entry*   work       = nullptr;
-		uint32_t work_chunk = 0;
-		m_ahead_wake.wait(lock, [&] {
+		Entry*     pass       = nullptr;
+		Entry*     work       = nullptr;
+		uint32_t   work_chunk = 0;
+		const auto ready      = [&] {
 			if (m_quit) return true;
 			ResyncStatePass();
 			// (KYTY_SPEC_PASS_THREAD: only its thread takes the pass, and it takes nothing else.)
@@ -525,7 +525,18 @@ void Speculation::AheadRun(Translator& translator) {
 					if (work != nullptr) break;
 				}
 			return pass != nullptr || work != nullptr;
-		});
+		};
+		if (!ready()) {
+			// (KYTY_SPEC_LEAF_POOL: with nothing to take, a stamp leaf made ready for the thread that commits first, outside
+			// the lock, one a turn: the work that comes meanwhile is taken at the next turn.)
+			if (m_log.stamps.PoolShort() || m_log.host_stamps.PoolShort()) {
+				lock.unlock();
+				if (!m_log.stamps.Refill()) (void)m_log.host_stamps.Refill();
+				lock.lock();
+				continue;
+			}
+			m_ahead_wake.wait(lock, ready);
+		}
 		if (m_quit) return;
 		if (const auto mask = live_cpus.load(std::memory_order_relaxed); !translator.pass_only && mask != applied_cpus) {
 			applied_cpus = mask;

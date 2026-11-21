@@ -1771,14 +1771,87 @@ struct WriteStamps {
 	};
 	std::vector<Granule> granules = std::vector<Granule>(AddressLimit >> GranuleBits);
 	std::vector<uint32_t> leafed; // the granules with a leaf (KYTY_SPEC_STAMP_TRIM)
+	// KYTY_SPEC_LEAF_POOL (a capacity: leaves kept ready, default 32 for each of the log's two stamp sets; 0: none): a
+	// granule's first stamp made its leaf on the thread that commits, a new 128 KiB (8.5 KiB for host stamps) zero-filled
+	// there, and the fill faulted in its fresh pages (33): ~3 ms of the GPU thread in an area crossing's long frame, one
+	// leaf for each 4 MiB granule its new resources were written to. A speculation's thread now makes them ahead (Refill:
+	// Speculation::AheadRun, before it waits for work), allocated and zero-filled there, and TakeLeaf takes a ready one.
+	// None ready, or the pool's lock held at that moment: the leaf is made in place as before. The thread that commits
+	// never waits for the pool. A leaf KYTY_SPEC_STAMP_TRIM frees goes back to the pool while it has room (zeroed by the
+	// next Refill), else to the heap as before.
+	[[nodiscard]] static uint32_t PoolCapacity() {
+		static const uint32_t capacity = [] {
+			const char* value = std::getenv("KYTY_SPEC_LEAF_POOL");
+			return value != nullptr && *value != '\0' ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 32u;
+		}();
+		return capacity;
+	}
+	std::mutex                         pool_mutex;
+	std::vector<std::unique_ptr<Leaf>> pool_ready, pool_used; // (used: freed by a trim, to be zeroed)
+	std::atomic<uint32_t>              pool_held {0};         // ready, used and being made (read without the lock)
+	std::atomic<uint32_t>              pool_used_n {0};
+	// (The thread that commits.) A leaf for a granule's first stamp: a ready one, else made here.
+	[[nodiscard]] std::unique_ptr<Leaf> TakeLeaf() {
+		std::unique_ptr<Leaf> leaf;
+		if (pool_held.load(std::memory_order_relaxed) != 0) {
+			std::unique_lock lock(pool_mutex, std::try_to_lock);
+			if (lock.owns_lock() && !pool_ready.empty()) {
+				leaf = std::move(pool_ready.back());
+				pool_ready.pop_back();
+				pool_held.fetch_sub(1, std::memory_order_relaxed);
+			}
+		}
+		if (!leaf) leaf = std::make_unique<Leaf>();
+		return leaf;
+	}
+	// Whether Refill has something to do (no lock).
+	[[nodiscard]] bool PoolShort() const {
+		return pool_used_n.load(std::memory_order_relaxed) != 0 || pool_held.load(std::memory_order_relaxed) < PoolCapacity();
+	}
+	// (A speculation's thread, outside m_mutex.) One leaf made ready: a trimmed one zeroed, else a new one made (its
+	// pages faulted in here). False: the pool is full.
+	bool Refill() {
+		std::unique_ptr<Leaf> leaf;
+		{
+			std::lock_guard lock(pool_mutex);
+			if (!pool_used.empty()) {
+				leaf = std::move(pool_used.back());
+				pool_used.pop_back();
+				pool_used_n.fetch_sub(1, std::memory_order_relaxed);
+			} else if (pool_held.load(std::memory_order_relaxed) >= PoolCapacity()) {
+				return false;
+			} else {
+				pool_held.fetch_add(1, std::memory_order_relaxed); // (its place, while it is made)
+			}
+		}
+		if (leaf) {
+			leaf->units.fill(0);
+			leaf->blocks.fill(0);
+		} else {
+			leaf = std::make_unique<Leaf>();
+		}
+		std::lock_guard lock(pool_mutex);
+		pool_ready.push_back(std::move(leaf));
+		return true;
+	}
 	// KYTY_SPEC_STAMP_TRIM: the leaves of granules not written since `from` freed (a granule whose latest stamp is
 	// `from` or older is passed whole by every question asked from `from` on; a write made later makes its leaf
-	// again).
+	// again). Back to the pool while it has room and its lock is free, else to the heap.
 	void FreeLeavesBefore(uint64_t from) {
+		const auto       capacity = PoolCapacity();
+		std::unique_lock lock(pool_mutex, std::defer_lock);
+		if (capacity != 0) (void)lock.try_lock();
 		std::erase_if(leafed, [&](uint32_t g) {
 			auto& granule = granules[g];
 			if (granule.latest > from) return false;
-			granule.leaf.reset();
+			if (lock.owns_lock() && pool_held.load(std::memory_order_relaxed) < capacity) {
+				pool_used.push_back(std::move(granule.leaf));
+				pool_held.fetch_add(1, std::memory_order_relaxed);
+				pool_used_n.fetch_add(1, std::memory_order_relaxed);
+				if (pool_held.load(std::memory_order_relaxed) >= capacity) lock.unlock(); // (full: the rest to the heap)
+			} else {
+				granule.leaf.reset();
+			}
 			return true;
 		});
 	}
@@ -1797,7 +1870,7 @@ struct WriteStamps {
 		for (auto at = address >> bits, last = (end - 1) >> bits; at <= last; ++at) {
 			auto& granule = granules[(at << bits) >> GranuleBits];
 			if (!granule.leaf) {
-				granule.leaf = std::make_unique<Leaf>();
+				granule.leaf = TakeLeaf(); // (KYTY_SPEC_LEAF_POOL)
 				leafed.push_back(static_cast<uint32_t>((at << bits) >> GranuleBits));
 			}
 			if (by_block) granule.leaf->blocks[at & ((uint64_t {1} << (GranuleBits - BlockBits)) - 1)] = stamp;
