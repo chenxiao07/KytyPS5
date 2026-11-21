@@ -5058,15 +5058,22 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 			indirect_offset = owner.Offset(indirect_args);
 		}
 		if (cache.RegistrationEpoch() == registration) break;
-		if (attempt == 0 && retry_spec != nullptr && retry_spec->refused == nullptr &&
-		    LocalVulkanRecording::RecordedWrites() == retry_work) {
-			// (The blocks and arguments again, from the epoch now: what the commit checks is noted again by them.)
-			retry_spec->RollbackTo(*retry_mark, retry_bda);
-			blocks          = {};
-			storage_writes  = false;
-			indirect_buffer = nullptr;
-			indirect_offset = 0;
-			continue;
+		if (retry_spec != nullptr && retry_spec->refused == nullptr) {
+			if (attempt == 0 && LocalVulkanRecording::RecordedWrites() == retry_work) {
+				// (The blocks and arguments again, from the epoch now: what the commit checks is noted again by them.)
+				retry_spec->RollbackTo(*retry_mark, retry_bda);
+				blocks          = {};
+				storage_writes  = false;
+				indirect_buffer = nullptr;
+				indirect_offset = 0;
+				continue;
+			}
+			// Keep the dispatch if registrations since its epoch missed the open segment's buffers.
+			if (TableWorkerKeepsMoved(*retry_spec, cache, registration)) {
+				LiveCounters::Add(LiveCounters::SpecTablePatchRegisteredKept);
+				break;
+			}
+			LiveCounters::Add(LiveCounters::SpecTablePatchRegisteredRefused);
 		}
 		return LiveCounters::Add(LiveCounters::TableRegistered), m_dispatch_declined = "table: buffers registered meanwhile", false;
 	}
