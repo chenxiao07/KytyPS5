@@ -33,6 +33,7 @@ extern volatile std::atomic_uint32_t kyty_local_weave_calls;   // KYTY_WEAVE_CAL
 namespace Weave {
 
 struct Registers;
+struct RegisterLog;
 struct Parcel;
 
 inline constexpr uint32_t MaxWorkers     = 8;
@@ -201,5 +202,16 @@ void AbandonParcel(Parcel& parcel) noexcept;
 // The GPU thread, done with a parcel (opened and closed, or gone past): dropped; a Cut one no worker took becomes
 // Skipped; a Skipped or Done one is released now (Bodies::release, then Free), a Taken one by its worker as it stops.
 void PassParcel(Parcel& parcel) noexcept;
+
+// --- The table path's two instantiations (render.h, table-xpr.inc) ---
+
+// The GPU thread's, today's code; and a worker's, whose writes to shared state are skipped, kept private, or noted for
+// the GPU thread's turn.
+struct Ordered {
+	static constexpr bool worker = false;
+};
+struct Worker {
+	static constexpr bool worker = true;
+};
 
 } // namespace Weave

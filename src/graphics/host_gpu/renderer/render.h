@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include "live-switch.h"
+#include "weave.h"
 
 #include <array>
 #include <functional>
@@ -194,6 +195,19 @@ public:
 
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
+	// A weave worker's view of `real` (context.cpp): its graphics generation and handle, with the worker's own
+	// registers. Only the table path's worker instantiation is given it; it records through the apart marker (Aim), and
+	// its calls go into the worker's apart buffer.
+	CommandBuffer(const CommandBuffer& real, HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
+	void Aim(VkCommandBuffer_T* marker) noexcept { m_buffer = vk::CommandBuffer(marker); }
+	// A worker's view at a render pass change inside its strand (context.cpp): the pass ended and `next` begun in its
+	// buffer, as EndRendering and BeginRendering make them.
+	void PassChange(const RenderState& next);
+	// The weave's turn: the pass the spliced part of a worker's strand left open is `state`'s (nothing recorded).
+	void AdoptRendering(const RenderState& state) {
+		m_render_state = state;
+		m_rendering    = true;
+	}
 	void Bind(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders) noexcept {
 		m_registers   = &registers;
 		m_user_config = &user_config;
@@ -240,11 +254,17 @@ private:
 	HW::Shader*         m_shaders     = nullptr;
 
 	friend class CommandScheduler;
+	// The weave's: a worker's view and its pass changes; the turn reads m_rendering and m_render_state.
+	friend class RenderExecutor;
 };
 
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	// (The weave's executor state, when WeaveStart made it for this executor, goes with it: weave-turn.inc.)
+	~RenderExecutor();
+#endif
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
@@ -563,6 +583,35 @@ private:
 	[[gnu::noinline]] TableImageSet* TableDrawStateSet(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
 	                                                   const NativeXprDrawState& draw_state, TableImageSet* set,
 	                                                   Spec::State* spec_state);
+	// The table path's functions a weave worker runs, under a policy (weave.h): Weave::Ordered is the GPU thread's,
+	// today's code, which the forms without one call; Weave::Worker a weave worker's (table-xpr.inc, weave-draw.inc).
+	template <typename P>
+	TableResult TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
+	                     uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct);
+	template <typename P>
+	bool TableContinue(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
+	                   uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct);
+	template <typename P>
+	TableResult TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
+	                      const NativeXprDrawState& draw_state, std::span<const uint64_t> commands,
+	                      uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
+	                      const NativeXprDirectDraw* direct);
+	template <typename P>
+	[[nodiscard]] bool TableEvaluate(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
+	template <typename P>
+	void TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
+	template <typename P>
+	[[nodiscard]] TableImageSet* TableSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
+	                                      const NativeXprDrawState* draw_state);
+	template <typename P>
+	[[nodiscard]] bool TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
+	                               std::array<vk::DeviceAddress, 2>& blocks, bool* writes);
+	// A copy in the table upload ring of a small range the guest wrote, as TableBlocks makes one (0: none;
+	// table-xpr.inc).
+	template <typename P>
+	[[nodiscard]] vk::DeviceAddress TableRingCopy(uint64_t address, uint64_t size, bool shareable,
+	                                              uint64_t& observation, uint64_t& cpu, bool& copied);
+	[[nodiscard]] vk::DeviceAddress TableRingCopy(uint64_t address, uint64_t size);
 	// spec_worker_images: a worker's set's pending slots completed by the GPU thread at its commit (Speculation::Before).
 	[[nodiscard]] bool TableCompletePendingImages(TableImageSet& set);
 	// (Mode 4; table-xpr.inc) A speculation makes the table entry a draw lacks (a new pair, a new draw state from a
@@ -597,6 +646,9 @@ private:
 	[[nodiscard]] TableImageSet* TableResolveSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
 	                                             const NativeXprDrawState* draw_state, std::span<const uint32_t> words);
 	[[nodiscard]] bool           TableValidateSet(TableImageSet& set);
+	// TableValidateSet's answer read only, when it would write nothing but the set's stamps: proven this frame under
+	// these registrations, or every image held as it was proven and its full check not due (a weave worker's proof).
+	[[nodiscard]] bool           TableSetProven(const TableImageSet& set) const;
 	void                         TableRuns(TablePair& pair);
 	void                         TableReset(TablePair& pair);
 	[[nodiscard]] bool           TableEvaluate(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
@@ -608,17 +660,116 @@ private:
 	void                         TablePrepareBda(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
 	[[nodiscard]] bool           TableTransit(const TableImageSet& set, vk::CommandBuffer vk_buffer,
 	                                          const NativeXprDrawState* draw_state);
+	// TableTransit would record nothing: the set's images are those the draw state's targets allow, none awaits an
+	// upload or a clear, none is written by the shaders, and each is in its layout and access (read only; a weave
+	// worker's).
+	[[nodiscard]] bool TableTransitPlaced(const TableImageSet& set, const NativeXprDrawState* draw_state) const;
 	void TableStore(CommandBuffer& buffer, const DrawRenderState& state, vk::PrimitiveTopology topology,
 	                bool primitive_restart_enable, const RenderState& rendering, bool storable);
 	void NativeXprCaptureState(CommandBuffer& buffer, const DrawRenderState& state, const RenderState& rendering,
 	                           uint64_t state_key, vk::PrimitiveTopology topology, bool primitive_restart_enable);
 	[[nodiscard]] bool NativeXprTargetsCurrent(const NativeXprDrawState& draw_state);
+	// NativeXprTargetsCurrent's proof, read only: the targets current at the resolution epoch of now, and what it then
+	// writes to the draw state. `shortcut`: the registration log may be read (the GPU thread's; never a weave
+	// worker's).
+	struct NativeXprTargetsProof {
+		uint64_t epoch = 0, erased = 0, checked = 0, span_begin = 0, span_end = 0;
+	};
+	[[nodiscard]] bool NativeXprTargetsProve(const NativeXprDrawState& draw_state, NativeXprTargetsProof& proof,
+	                                         bool shortcut);
 	// (`command`: the draw's command buffer, its registers for spec_depth_layers2; none: no target is left to the commit.)
 	[[nodiscard]] bool NativeXprEmitTargets(const NativeXprDrawState& draw_state, vk::CommandBuffer vk_buffer,
 	                                        const TableImageSet* reading = nullptr, const CommandBuffer* command = nullptr);
+	// NativeXprEmitTargets would refuse nothing and record nothing: every target live, GPU-owned, with no fast clear
+	// pending since its last emission, its whole image in the target's layout (read only; a weave worker's).
+	[[nodiscard]] bool NativeXprTargetsPlaced(const NativeXprDrawState& draw_state) const;
 	// The shader access a table image set adds to target `id` (KYTY_TABLE_TARGET_READ; none: empty).
 	[[nodiscard]] static vk::AccessFlags2 TableTargetRead(const TableImageSet& set, ImageId id);
-
+	// A weave worker's own state for the table path's worker instantiation (weave-draw.inc): its own lookups, entries,
+	// ring copies, emission, last draw and proofs. One a thread, made at its first use.
+	struct WeaveScratch;
+	[[nodiscard]] static WeaveScratch& WeaveHere();
+	// The table a policy keeps its lookups, entries and last draw in: the executor's own, or the worker's scratch's;
+	// what its last emission left bound (NativeXprCache::Emit); and its NativeXprTargetsCurrent.
+	template <typename P>
+	[[nodiscard]] TableXpr& TableOf();
+	template <typename P>
+	[[nodiscard]] auto& TableEmit();
+	template <typename P>
+	[[nodiscard]] bool TableTargetsCurrent(const NativeXprDrawState& draw_state);
+	// The weave (weave.h). A worker's table draw (weave-draw.inc), from the command processor's walk of a parcel on
+	// `view`, the worker's view of the GPU thread's command buffer: the table path's worker instantiation,
+	// TableContinue<Weave::Worker> when `clean`, else TableTry<Weave::Worker>.
+	TableResult WeaveTableDraw(CommandBuffer& view, std::span<const uint64_t> commands, uint64_t index_base,
+	                           uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct,
+	                           bool clean);
+	// Weave: the worker and the turn
+	// A worker's side (weave-worker.inc), from the command processor's walk of a parcel on worker `worker`'s thread, in
+	// this order. WeaveParcelBegin, once the processor holds the parcel's start registers: the worker's view bound to
+	// them, the parcel's result cleared (the apart buffers its slot's last parcel left freed here, on the worker), the
+	// clocks taken before any read, a slab of the worker's ring, its recording apart begun; false: nothing of it can be
+	// made, and it is never opened. WeaveStretch at its first draw packet and at each cut: its needs are grouped from
+	// there, and the strand breaks. WeaveDraw at each draw packet, with the arguments the native entries decode: the
+	// table draw under a DrawScope, made (a Made record, its calls in the strand's apart buffer) or a hole. WeaveHole:
+	// a draw packet the walk declines itself. WeaveStrandStart after a made draw: the start image of the strand it
+	// began, for the walk to fill as the registers were before the draw packet (null: it went on in the strand before).
+	// WeaveSpoil: a packet the walk could not take. WeaveParcelEnd, always: the last strand closed, the slab kept, the
+	// pages merged, the objects, the strands' lists and the register log's block_next made.
+	[[nodiscard]] bool              WeaveParcelBegin(uint32_t worker, Weave::Parcel& parcel, HW::Context& registers,
+	                                                 HW::UserConfig& user_config, HW::Shader& shaders);
+	void                            WeaveStretch(const uint32_t* packet);
+	[[nodiscard]] bool              WeaveDraw(const uint32_t* packet, const uint32_t* packet_end, bool clean,
+	                                          std::span<const uint64_t> commands, uint64_t index_base, uint64_t index_bytes,
+	                                          vk::IndexType index_type, const NativeXprDirectDraw* direct);
+	void                            WeaveHole(Weave::Miss miss);
+	[[nodiscard]] Weave::Registers* WeaveStrandStart() noexcept;
+	void                            WeaveSpoil() noexcept;
+	[[nodiscard]] uint32_t          WeaveMadeCount() const noexcept; // (the register log takes one entry each)
+	void                            WeaveParcelEnd();
+	// What the table path's worker instantiation asks of its worker (weave-worker.inc). The parcel being made: its
+	// result takes the draw's notes, and result->made.back() is the draw's own record (WeaveDraw made it). Why the draw
+	// is declined. Bytes of the parcel's slab for a block or a copy ({null, 0}: no room). The parcel's serial, its ring
+	// copies' sharing terms. A count that moves whenever nothing the worker's buffer bound may be assumed bound (the
+	// worker's emission and last draw are then forgotten). WeavePass, first in the worker's TableDraw: the draw's pass
+	// noted, and at a change a new stretch there, the pass ended and the next begun in the strand's buffer.
+	[[nodiscard]] static Weave::Parcel&                         WeaveParcel() noexcept;
+	static void                                                 WeaveMiss(Weave::Miss miss) noexcept;
+	[[nodiscard]] static std::pair<uint8_t*, vk::DeviceAddress> WeaveSlabTake(uint64_t size,
+	                                                                          uint64_t alignment) noexcept;
+	[[nodiscard]] static uint64_t                               WeaveParcelSerial() noexcept;
+	[[nodiscard]] static uint64_t                               WeaveForgetCount() noexcept;
+	void WeavePass(CommandBuffer& view, const RenderState& rendering);
+	// The GPU thread's side (weave-turn.inc). WeaveStart, before the threads start: each worker's view of the command
+	// buffer aimed at the apart marker, and its ring (direct calls); `same` compares the processor's registers with the
+	// worker's before a strand's draw (its start image, and the register log past its first draw). WeaveOpen at a
+	// parcel's first draw packet, its worker done and its start registers the GPU thread's: nothing it read moved since
+	// (each refusal counted); true: open. WeaveTurnAt at each draw packet of the open parcel: true when a part of a
+	// strand was spliced there (`until` the packet after it); false: the GPU thread makes the draw. WeaveSkip after a
+	// splice: the part's made draws, when its packets may be skipped by the parcel's register log. WeaveClose: the open
+	// parcel closed. WeaveRelease: a parcel's slab released once (`used`: by the GPU thread, with the tick of now).
+	// WeaveReclaim: the slabs whose tick is done freed.
+	[[nodiscard]] bool WeaveStart(uint32_t workers, const void* processor,
+	                              bool (*same)(const void* processor, const Weave::Registers& start,
+	                                           const Weave::RegisterLog& log, uint32_t first, uint32_t index));
+	[[nodiscard]] bool WeaveOpen(Weave::Parcel& parcel);
+	[[nodiscard]] bool WeaveTurnAt(const uint32_t* packet, const uint32_t*& until);
+	[[nodiscard]] bool WeaveSkip(uint32_t& begin, uint32_t& end) noexcept;
+	void               WeaveClose() noexcept;
+	void               WeaveRelease(Weave::Parcel& parcel, bool used);
+	void               WeaveReclaim();
+	// Their parts: a worker's strand break and stretch; the turn's needs, strand test, depth clear plan, recopies,
+	// stamps and image-start test.
+	struct WeaveClear;
+	static void        WeaveBreak();
+	static void        WeaveNewStretch(const uint32_t* packet);
+	void               WeaveNeedsAt(const uint32_t* packet);
+	void               WeaveTest(uint32_t strand);
+	[[nodiscard]] bool WeaveClearPlan(const NativeXprDrawState& state, WeaveClear& clear);
+	[[nodiscard]] bool WeaveRecopyable(uint32_t made, uint32_t use);
+	[[nodiscard]] bool WeaveRecopy(uint32_t made, uint32_t use);
+	void               WeaveStamps(uint32_t strand, uint32_t begin, uint32_t end);
+	[[nodiscard]] bool WeaveStartsHit(const Weave::Parcel& parcel);
+	// Weave: end of the worker and the turn
 
 private:
 	RenderContext&                        m_context;

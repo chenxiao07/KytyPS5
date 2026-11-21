@@ -5,7 +5,9 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "weave.h"
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -13,6 +15,10 @@
 namespace Libs::Graphics {
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
+// The first entry of an indirect register table (`pairs` register-value pairs; `bank`: 0 context, 1 SH, 2 uconfig) that
+// names no register of its bank (not the sentinel, a context table's fake registers or the bank's NOP), or `pairs` when
+// every entry does. Read only: what GuardTable checks off the GPU thread before it applies a table (pm4Handlers.cpp).
+[[nodiscard]] uint32_t RegisterTableFirstPastBank(const uint32_t* words, uint32_t pairs, uint32_t bank);
 
 // Off the GPU thread (ProcessPm4Spec: a speculation's or a state pass's thread), a SET_*_REG_INDIRECT packet's register
 // table read once, in a guarded copy before the packet is entered: the observer (DrawStateObserver::ObservePacket) reads
@@ -221,6 +227,14 @@ public:
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
+	// The weave (weave.h): GuestGpu::Enqueue's feed of a queue-0 graphics submission to the reader (the queue mutex
+	// held, as the scout is fed), and the GPU thread's at such a submission's first slice, on queue 0's processor
+	// (whose draw packets are then woven). WeaveModeChanged: the GPU thread between submissions, on queue 0's
+	// processor, once a live change has set KYTY_SPECULATE to 4: the weave paused there (a no-op unless it runs).
+	static void WeaveFeed(uint64_t sequence, std::span<const uint32_t> commands, bool constant, bool reset);
+	void        WeaveSubmission(uint64_t sequence);
+	void        WeaveModeChanged();
+
 private:
 	uint32_t            m_draw_run_skip = 0;
 	bool                m_state_only    = false;
@@ -234,6 +248,71 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution, size_t stop_depth);
 	void ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth);
+	// ProcessPm4's loop, one body: <false> as it is, <true> with the weave's hooks at queue 0's draw packets (taken
+	// only while the weave runs on this processor; a build without KYTY_LOCAL_VULKAN_RECORDING instantiates only
+	// <false>).
+	template <bool kWeave>
+	void ProcessPm4Loop(Pm4Execution& execution, size_t stop_depth);
+	// The weave's register image of this processor (Weave::Registers): taken, applied, compared whole.
+	void               WeaveSnapshot(Weave::Registers& out) const;
+	void               WeaveRestore(const Weave::Registers& in);
+	[[nodiscard]] bool WeaveSame(const Weave::Registers& in) const;
+	// A table draw's arguments as the native entries decode them from their packets and the index and indirect
+	// registers, read only: TryNativeXprDraws (a run of DRAW_INDEX_INDIRECT that differ only in the argument offset),
+	// TryNativeMultiDraw (a DRAW_INDEX_INDIRECT_MULTI of a count the packet holds) and TryNativeDirectDraw
+	// (DRAW_INDEX_2, DRAW_INDEX_OFFSET_2) decode through them, and so does a weave worker's walk. False: the entry
+	// leaves the packet to its handler. What reads the GPU thread's own state (a frame capture, the interface's scaled
+	// draws) stays in the entries.
+	struct NativeDrawArgs {
+		static constexpr uint32_t           MaxDraws = 64;
+		std::array<uint64_t, MaxDraws>      commands; // the indirect forms' argument addresses (the first `count`)
+		uint32_t                            count      = 0;
+		uint64_t                            index_base = 0, index_bytes = 0;
+		vk::IndexType                       index_type = vk::IndexType::eUint16;
+		bool                                is_direct  = false; // `direct` holds the draw (no `commands`)
+		RenderExecutor::NativeXprDirectDraw direct {};
+		uint32_t                            dwords = 0; // the packets' dwords the draw takes
+	};
+	[[nodiscard]] bool NativeXprDrawsArgs(std::span<const uint32_t> packets, NativeDrawArgs& args) const;
+	[[nodiscard]] bool NativeMultiDrawArgs(std::span<const uint32_t> packet, NativeDrawArgs& args) const;
+	[[nodiscard]] bool NativeDirectDrawArgs(std::span<const uint32_t> packet, NativeDrawArgs& args) const;
+	// Weave: the reader and the GPU thread's order
+	// The reader (weave-reader.inc): its loop (Weave::Bodies::read) and its read of a submission's copy from dword
+	// `from` (true: to its end, in step with the stream there; false: stopped at `stopped_at`). A worker's walk of a
+	// parcel (Weave::Bodies::make, on worker `worker`'s processor) and its draw entry (the dwords the draw took; 0, a
+	// hole: `skip` the dwords the GPU thread's entry takes); a parcel's release (Weave::Bodies::release). The register
+	// log's image: taken whole, its blocks changed since `at_last` appended to the parcel's log, the log's blocks
+	// [begin, end) applied.
+	static void            WeaveRead();
+	[[nodiscard]] bool     WeaveReadFrom(uint64_t sequence, const uint32_t* guest,
+	                                     const std::shared_ptr<const std::vector<uint32_t>>& copy, uint32_t from,
+	                                     uint32_t& stopped_at);
+	static void            WeaveMake(uint32_t worker, Weave::Parcel& parcel);
+	void                   WeaveWalk(uint32_t worker, Weave::Parcel& parcel);
+	[[nodiscard]] uint32_t WeaveDrawAt(std::span<const uint32_t> packets, const uint32_t* identity, uint32_t& skip);
+	static void            WeaveRelease(Weave::Parcel& parcel);
+	void                   WeaveLogTake(uint8_t* image) const;
+	void                   WeaveLogDelta(uint8_t* at_last, Weave::Parcel& parcel) const;
+	void                   WeaveLogApply(const Weave::Parcel& parcel, uint32_t begin, uint32_t end);
+	// The GPU thread's order (weave-order.inc): the weave started (once; false: stood down); at a top-level draw packet
+	// (true: passed, a part of a parcel spliced there); the parcel starting at the cursor's packet (its serial, -1
+	// none); a draw packet of the open parcel; a spliced part's made draws [begin, end) skipped to `until` from the
+	// register log, or one draw packet passed; the open parcel closed (`distrust`: the reader goes out of step); the
+	// weave paused; a handler's draw in the open parcel watched; the narrow walk test for the executor's turn.
+	[[nodiscard]] bool    WeaveStart();
+	[[nodiscard]] bool    WeaveAt(Pm4Execution& execution);
+	[[nodiscard]] int64_t WeaveFind(const Pm4Execution::BufferCursor& cursor);
+	[[nodiscard]] bool    WeaveInside(Pm4Execution& execution, const uint32_t* packet);
+	void                  WeaveSkip(Pm4Execution& execution, const Weave::Parcel& parcel, uint32_t begin, uint32_t end,
+	                                const uint32_t* until);
+	void                  WeavePassDraw(Pm4Execution& execution);
+	void                  WeaveClose(bool distrust);
+	void                  WeavePause();
+	void                  WeaveYieldBegin(const Pm4Execution& execution);
+	void                  WeaveYieldEnd();
+	static bool WeaveSameOf(const void* processor, const Weave::Registers& start, const Weave::RegisterLog& log,
+	                        uint32_t first, uint32_t index);
+	// Weave: end of the reader and the GPU thread's order
 	void SuspendPm4();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
