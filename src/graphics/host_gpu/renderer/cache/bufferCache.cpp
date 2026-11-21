@@ -17,6 +17,7 @@
 #include "local-platform.h"
 #include "fresh-memory.h"
 #include "texture-offload.h"
+#include "weave.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -137,6 +138,26 @@ uint64_t StagingRingSize(const GraphicContext& graphics) {
 	return (graphics.GetPhysicalDeviceProperties().deviceType == vk::PhysicalDeviceType::eIntegratedGpu ? 128 : 512) * MiB;
 }
 
+// The weave's views of the buffer cache, kept here rather than in it (there is one, GpuResourceManager's), written by
+// the GPU thread only while the weave is enabled (from the start-up gates on).
+// The pending readbacks as a weave thread reads them, written at each change of the slots (PublishGuestReadbacks)
+// under a sequence word, odd while it writes: each request's pages, or its bounds when it has more than PublishedPages
+// of them (begin, end pairs); PublishedReadbackOver reads them.
+constexpr size_t PublishedPages = 4, PublishedSlots = 32; // (BufferCache::GuestReadbackSlots, asserted at the write)
+struct PublishedReadbacks {
+	std::atomic<uint64_t>                                                             sequence {0};
+	std::atomic<uint32_t>                                                             active {0};
+	std::array<std::array<std::atomic<uint64_t>, PublishedPages * 2>, PublishedSlots> ranges {};
+};
+PublishedReadbacks g_published_readbacks;
+// Each registration change's span by its epoch, the last RegistrationLog of them (RegisteredOverSince; written by
+// ChangeRegister before the epoch's release).
+constexpr uint64_t RegistrationLog = 1024;
+struct LoggedRegistration {
+	uint64_t epoch = 0, address = 0, size = 0;
+};
+std::array<LoggedRegistration, RegistrationLog> g_registration_log {};
+
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -178,6 +199,14 @@ struct BufferCache::GuestReadback {
 	// GPU-owned, so the reader faults again and reads the newer GPU state.
 	enum State : uint32_t { Pending, Copying, Detached };
 	std::atomic<uint32_t> state {Pending};
+	// Some of the request's pages hold bytes of [address, address + bytes): its bounds, then its pages. What a range
+	// asks of a pending request before it is finished (DrainGuestReadback) or answered (GuestReadbackOver).
+	[[nodiscard]] bool Holds(uint64_t address, uint64_t bytes) const {
+		if (address >= begin + size || (address < begin && bytes <= begin - address)) return false;
+		return std::ranges::any_of(pages, [&](const GuestRange& page) {
+			return address < page.End() && (address >= page.address || bytes > page.address - address);
+		});
+	}
 };
 
 // A freed range whose GPU-written bytes are on their way to guest memory (BeginFreedReadback): its pages, the bytes copied
@@ -508,6 +537,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 			LiveTrace::Event(LiveTrace::ReadbackTicks, address, size | request->tick << 32u);
 		m_guest_readbacks[slot] = request;
 		m_active_guest_readbacks |= 1u << slot;
+		if (Weave::Enabled()) PublishGuestReadbacks();
 		LiveCounters::Add(LiveCounters::AsyncReadbacks);
 		return request;
 	}
@@ -526,6 +556,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	// Subsequent accesses to this window must retire this request before proceeding.
 	m_guest_readbacks[slot] = request;
 	m_active_guest_readbacks |= 1u << slot;
+	if (Weave::Enabled()) PublishGuestReadbacks();
 	LiveCounters::Add(LiveCounters::AsyncReadbacks);
 	return request;
 }
@@ -754,11 +785,7 @@ void BufferCache::DrainGuestReadback(uint64_t address, uint64_t size, bool gpu_r
 	for (size_t slot = 0; slot < GuestReadbackSlots; ++slot) {
 		const auto& request = m_guest_readbacks[slot];
 		if (!request) continue;
-		if (address != 0 && (address >= request->begin + request->size ||
-		                    (address < request->begin && size <= request->begin - address))) continue;
-		if (address != 0 && std::ranges::none_of(request->pages, [&](const GuestRange& page) {
-			return address < page.End() && (address >= page.address || size > page.address - address);
-		})) continue;
+		if (address != 0 && !request->Holds(address, size)) continue;
 		FinishGuestReadback(slot, gpu_write && kyty_local_readback_detach_mode.load(std::memory_order_relaxed) != 0);
 	}
 }
@@ -774,6 +801,7 @@ void BufferCache::FinishGuestReadback(size_t slot, bool detach) {
 		LiveCounters::Add(LiveCounters::ReadbackDetaches);
 		m_guest_readbacks[slot].reset();
 		m_active_guest_readbacks &= ~(1u << slot);
+		if (Weave::Enabled()) PublishGuestReadbacks();
 		return;
 	}
 	if (!request->copied.load(std::memory_order_acquire)) {
@@ -797,6 +825,70 @@ void BufferCache::FinishGuestReadback(size_t slot, bool detach) {
 		m_memory_tracker.UnmarkRegionAsGpuModified(page.address, page.size);
 	m_guest_readbacks[slot].reset();
 	m_active_guest_readbacks &= ~(1u << slot);
+	if (Weave::Enabled()) PublishGuestReadbacks();
+}
+
+bool BufferCache::GuestReadbackOver(uint64_t vaddr, uint64_t size) const {
+	// (A weave thread: the slots are the GPU thread's and change under it; it reads their published copy.)
+	if (Weave::OffGpuThread()) return PublishedReadbackOver(vaddr, size);
+	if (!m_active_guest_readbacks) return false;
+	return std::ranges::any_of(m_guest_readbacks,
+	                           [&](const auto& request) { return request && request->Holds(vaddr, size); });
+}
+
+// The GPU thread, after each change of the readback slots while the weave is enabled (from start-up on, so the copy
+// is current whenever a worker runs, after a resume too): the pending requests as a seqlock, the sequence word odd
+// while the ranges are written. A request is published by its pages, or by its bounds past PublishedPages of them.
+void BufferCache::PublishGuestReadbacks() {
+	static_assert(PublishedSlots == GuestReadbackSlots);
+	auto&      published = g_published_readbacks;
+	const auto sequence  = published.sequence.load(std::memory_order_relaxed);
+	published.sequence.store(sequence + 1, std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_release);
+	published.active.store(m_active_guest_readbacks, std::memory_order_relaxed);
+	for (size_t slot = 0; slot < GuestReadbackSlots; ++slot) {
+		const auto& request = m_guest_readbacks[slot];
+		if (((m_active_guest_readbacks >> slot) & 1u) == 0 || !request) continue;
+		auto&      ranges   = published.ranges[slot];
+		const bool by_pages = request->pages.size() <= PublishedPages;
+		for (size_t i = 0; i < PublishedPages; ++i) {
+			uint64_t begin = 0, end = 0;
+			if (by_pages && i < request->pages.size()) {
+				begin = request->pages[i].address;
+				end   = request->pages[i].End();
+			} else if (!by_pages && i == 0) {
+				begin = request->begin;
+				end   = request->begin + request->size;
+			}
+			ranges[i * 2].store(begin, std::memory_order_relaxed);
+			ranges[i * 2 + 1].store(end, std::memory_order_relaxed);
+		}
+	}
+	published.sequence.store(sequence + 2, std::memory_order_release);
+}
+
+// A weave thread's GuestReadbackOver: the published ranges read whole between two equal even sequence words (a range
+// meeting a request's published pages or bounds is over it). Yes when the GPU thread kept writing through every try.
+bool BufferCache::PublishedReadbackOver(uint64_t vaddr, uint64_t size) const {
+	const auto& published = g_published_readbacks;
+	for (uint32_t attempt = 0; attempt < 64; ++attempt) {
+		const auto sequence = published.sequence.load(std::memory_order_acquire);
+		if ((sequence & 1u) != 0) continue;
+		bool       over   = false;
+		const auto active = published.active.load(std::memory_order_relaxed);
+		for (size_t slot = 0; slot < GuestReadbackSlots && !over; ++slot) {
+			if (((active >> slot) & 1u) == 0) continue;
+			const auto& ranges = published.ranges[slot];
+			for (size_t i = 0; i < PublishedPages && !over; ++i) {
+				const auto begin = ranges[i * 2].load(std::memory_order_relaxed);
+				const auto end   = ranges[i * 2 + 1].load(std::memory_order_relaxed);
+				over             = begin < end && vaddr < end && begin < vaddr + size;
+			}
+		}
+		std::atomic_thread_fence(std::memory_order_acquire);
+		if (published.sequence.load(std::memory_order_relaxed) == sequence) return over;
+	}
+	return true;
 }
 
 // All metadata and mapped reads belong to the GPU thread. A slot is reused only
@@ -1249,6 +1341,10 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_region_registrations[region].store(epoch, std::memory_order_release);
 		BdaDirtyRegions::Mark(region);
 	}
+	// While the weave is enabled, the change's span by its epoch (RegisteredOverSince), before the epoch is published.
+	if (Weave::Enabled())
+		g_registration_log[epoch % RegistrationLog] = {epoch, m_slot_buffers[id].CpuAddress(),
+		                                               m_slot_buffers[id].Size()};
 	m_registration_epoch.store(epoch, std::memory_order_release);
 	LiveCounters::Add(LiveCounters::BufferRegistrations);
 	auto& buffer = m_slot_buffers[id];
@@ -2439,6 +2535,17 @@ BufferId BufferCache::RegisteredBuffer(uint64_t vaddr, uint64_t size) {
 	return buffer != nullptr && buffer->IsInBounds(vaddr, size) ? owner : BufferId {};
 }
 
+std::pair<const Buffer*, BufferId> BufferCache::FindLiveBuffer(uint64_t vaddr, uint64_t size) const {
+	if (vaddr == 0 || !GuestRange {vaddr, size}.Valid()) return {nullptr, BufferId {}};
+	// (A weave worker's lookup, unlocked: the entry read once (LoadOwner), and an unregister marks the buffer deleted
+	// before its slot is retired; the slot is erased only once no worker inside a draw may hold it, EraseRetired.)
+	const BufferId owner = LoadOwner(m_page_table.Find(vaddr >> PageTable::kPageBits)); // (one read: LoadOwner)
+	if (!owner) return {nullptr, BufferId {}};
+	const auto* buffer = m_slot_buffers.try_get(owner);
+	if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size)) return {nullptr, BufferId {}};
+	return {buffer, owner};
+}
+
 BufferId BufferCache::FindBufferSpec(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
@@ -3127,6 +3234,12 @@ void BufferCache::EnsureBufferContents(uint64_t vaddr, uint64_t size) {
 	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
 }
 
+void BufferCache::SynchronizeAtTurn(uint64_t vaddr, uint64_t size) {
+	// (EnsureBufferContents' mode-0 body is a read's, and the weave runs only while KYTY_SPECULATE is 0. The range's
+	// buffer is the one the worker found, as the strand's registration test proved before its actions.)
+	EnsureBufferContents(vaddr, size);
+}
+
 void BufferCache::EnsureTexelContents(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(Spec::Current() != nullptr);
 	// (As ObtainBuffer's for a texel buffer read.)
@@ -3280,6 +3393,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			InvalidateCopyFeedback(vaddr, size);
 			NoteGpuWrite(vaddr, size);
 			Spec::NoteGpuWrite(vaddr, size);
+			// (No change-ring mark for the weave: the range stayed GPU-written since the write below that made this memo
+			// and marked it, since every give-back moves m_gpu_coverage_epoch, so no worker's read of it could pass.)
 			LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
 			LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
 			return {buffer, buffer->Offset(vaddr)};
@@ -3303,6 +3418,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 		NoteGpuWrite(vaddr, size);
 		Spec::NoteGpuWrite(vaddr, size);
+		// (While workers run: the scout's change ring marks the range GPU-written, which the weave's open tests a
+		// parcel's pages against; the tickets' test passes over the mark.)
+		if (Weave::Active() && Scout::Running()) Scout::NoteGpuMark(vaddr, size);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
 		memo = {vaddr, size, RegistrationEpoch(), m_gpu_coverage_epoch, id, is_texel_buffer};
@@ -3612,8 +3730,11 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 			return;
 		}
 		CopyGuestMemory(dst_vaddr, src_vaddr, size);
+		// (While workers run: the copy this thread made, which the weave compares with the reader's record of it.)
+		if (Weave::Active()) Weave::t_copy_done = {.dst = dst_vaddr, .src = src_vaddr, .bytes = size, .path = 1};
 		return;
 	}
+	if (Weave::Active()) Weave::t_copy_done = {.dst = dst_vaddr, .src = src_vaddr, .bytes = size, .path = 2};
 
 	// spec_copy_image_refuse: nor a GPU copy over image memory. A speculation's InvalidateMemoryFromGPU only notes the
 	// range, replayed in its segment's Before, after the commit's image checks ("GPU work wrote an image it uses"): an
@@ -3718,7 +3839,9 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 			    (Libs::LibKernel::Memory::TryWriteCpuBacking(address, from, bytes) ||
 			     Libs::LibKernel::Memory::TryWriteBacking(address, from, bytes))) {
 				parts.Note();
-				if (Scout::Running()) Scout::NoteHostWrite(address, bytes);
+				// (A linear copy's write, so noted: the weave's ring test passes over it for a parcel that read through
+				// the copy.)
+				if (Scout::Running()) Scout::NoteHostWrite(address, bytes, false, /*copy=*/true);
 				return;
 			}
 			// (Memory the backing view does not hold: written through the guest's view, unprotected first.)
@@ -3735,7 +3858,7 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 		m_memory_tracker.NoteHostWrite(address, bytes);
 		std::memcpy(reinterpret_cast<void*>(address), from, bytes);
 		parts.Note();
-		if (Scout::Running()) Scout::NoteHostWrite(address, bytes);
+		if (Scout::Running()) Scout::NoteHostWrite(address, bytes, false, /*copy=*/true);
 	};
 	// Which destination pages differ: compared on helper threads too when the copy is large (the 4 MiB copy the culling
 	// chain makes every frame, on the frame's critical path: 0.39 ms on this thread alone, 0.24 ms shared at Latria).
@@ -3894,6 +4017,8 @@ void BufferCache::RetireStaleBuffers(uint64_t tick) {
 void BufferCache::EraseRetired() {
 	std::erase_if(m_retired, [&](const auto& retired) {
 		if (!Spec::PacketsPassed(retired.second)) return false;
+		// (A weave worker inside a draw may have found it before it was unregistered: kept until that draw ends.)
+		if (Weave::Active() && Weave::HoldsSlot(Weave::Slot::Buffer, retired.first.index)) return false;
 		// (A defragmentation move's new buffer destroyed before its pass ended: the pass frees the moved allocation, or,
 		// ending on the worker thread, Defragment once it ended. Defragment.)
 		for (const auto& move: m_defrag_moves) {
@@ -4221,6 +4346,19 @@ bool BufferCache::TakeRegistrationSpans(std::vector<GuestRange>& spans) {
 	spans.insert(spans.end(), m_registration_spans.begin(), m_registration_spans.end());
 	m_registration_spans.clear();
 	return !std::exchange(m_registration_spans_lost, false);
+}
+
+uint32_t BufferCache::RegisteredOverSince(uint64_t epoch, uint64_t vaddr, uint64_t size) const {
+	// (Each epoch after `epoch` is one change, read newest first; a slot holding another epoch is a change the log
+	// never held, one made before the weave was enabled.)
+	const auto now = m_registration_epoch.load(std::memory_order_relaxed);
+	if (epoch > now || now - epoch > RegistrationLog) return 2;
+	for (auto at = now; at > epoch; --at) {
+		const auto& logged = g_registration_log[at % RegistrationLog];
+		if (logged.epoch != at) return 2;
+		if (logged.address < vaddr + size && vaddr < logged.address + logged.size) return 1;
+	}
+	return 0;
 }
 
 void BufferCache::SynchronizeRegionRequest(SyncRegionRequest& request) {

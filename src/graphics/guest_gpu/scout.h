@@ -26,6 +26,7 @@
 #include <bit>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 extern "C" {
@@ -43,6 +44,8 @@ namespace Libs::Graphics::Scout {
 }
 // The thread runs (Start without a stop since).
 [[nodiscard]] bool Running() noexcept;
+// The write clock now (NoteHostWrite's), read before a reader of guest memory begins (RangesWrittenSince).
+[[nodiscard]] uint64_t WriteClock() noexcept;
 
 // GPU thread: after the performance switches (nothing without KYTY_SCOUT), and before the thread returns.
 void Start(GpuResourceManager& resources);
@@ -77,7 +80,12 @@ void CheckWait(const void* address, uint32_t size);
 // (labels, the game's linear copies, buffer fills, constant RAM dumps; `write_back`: GPU results copied back, by
 // readbacks, downloads and image write-backs): the write goes into a ring of recent writes with the next
 // value of the write clock. A ticket read before such a write over one of its pages is not used (WrittenSince).
-void NoteHostWrite(uint64_t address, uint64_t size, bool write_back = false);
+// `copy`: the write is a linear copy's (BufferCache::CopyGuestMemory), which RangesWrittenSince can pass over for a
+// reader that read through the copy.
+void NoteHostWrite(uint64_t address, uint64_t size, bool write_back = false, bool copy = false);
+// While the weave runs: a range made GPU-written (ObtainBuffer's write path), noted in the same ring with a mark that
+// the tickets' WrittenSince passes over and RangesWrittenSince reports.
+void NoteGpuMark(uint64_t address, uint64_t size);
 
 // A pair's flat form as TablePair::PackedRun has it, and where its slots' words are among the stage's in block order.
 struct Run {
@@ -161,6 +169,12 @@ static_assert(sizeof(Ticket) <= 4096);
 // Render thread: a host write since the ticket's clock covers one of its pages, or one isn't known yet (still being
 // noted), or the ring of writes wrapped since. `write_back`: the write that covers a page was a write-back.
 [[nodiscard]] bool WrittenSince(const Ticket& ticket, bool& write_back);
+// The weave's open (GPU thread): over the byte ranges a parcel read since write clock `clock` ([begin, end), sorted,
+// merged), the first kind of ring entry over one: 0 none, 1 a host write, 2 a write-back, 3 a GPU-written mark, 4 not
+// known (the ring wrapped since, or an entry still being noted). A linear copy's entry noted inside one of
+// `passed_over`'s write-clock windows (begin, end], sorted (the copies the parcel read through), is passed over.
+[[nodiscard]] uint32_t RangesWrittenSince(uint64_t clock, std::span<const std::pair<uint64_t, uint64_t>> ranges,
+                                          std::span<const std::pair<uint64_t, uint64_t>> passed_over = {});
 
 // Render thread, at TableDraw: the ticket of its current draw (tickets of earlier draws dropped), null when the scout
 // made none; and the draw's packet (the ticket's identity).

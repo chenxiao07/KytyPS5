@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -94,6 +96,93 @@ std::string CpuListResolved(const char* list) {
 	for (uint32_t cpu = 0; cpu < 64; ++cpu)
 		if ((mask >> cpu) & 1u) text += (text.empty() ? "" : ",") + std::to_string(cpu);
 	return text.empty() ? std::string("none") : text;
+}
+
+namespace {
+// A physical core: its logical CPUs (bit n: CPU n, CPUs 0-63 as the CPU lists reach) and its efficiency class (the
+// higher the faster; the same for every core where all are alike).
+struct Core {
+	uint64_t cpus;
+	uint32_t efficiency;
+};
+} // namespace
+
+// The machine's cores and, in `allowed`, the CPUs the process may run on (Windows: processor group 0,
+// GetLogicalProcessorInformationEx and the process's affinity mask; Linux: the sysfs topology of the online CPUs, the
+// performance class from /sys/devices/cpu_core/cpus where there is one, and the process's affinity). No cores where
+// the topology is not known.
+static std::vector<Core> MachineCores(uint64_t& allowed);
+
+// KeepRenderCoreAlone: the render thread's core (bit n: CPU n), 0 when it shares its core.
+static std::atomic<uint64_t> g_render_core {0};
+// ... and, when its caller's fallback chose that core, the CPUs the process could run on then (0 otherwise): what
+// ReleaseRenderCore gives back. The render thread's alone.
+static uint64_t g_render_core_fallback_allowed = 0;
+
+// The highest efficiency class among the cores the process may run on: the performance class.
+static uint32_t PerformanceClass(const std::vector<Core>& cores, uint64_t allowed) {
+	uint32_t fastest = 0;
+	for (const auto& core: cores)
+		if ((core.cpus & allowed) != 0) fastest = std::max(fastest, core.efficiency);
+	return fastest;
+}
+
+void CoreCounts(uint32_t& performance_cores, uint32_t& performance_logical, uint32_t& logical) {
+	uint64_t   allowed = 0;
+	const auto cores   = MachineCores(allowed);
+	const auto fastest = PerformanceClass(cores, allowed);
+	performance_cores = performance_logical = logical = 0;
+	if (cores.empty()) return;
+	for (const auto& core: cores)
+		if ((core.cpus & allowed) != 0 && core.efficiency == fastest) {
+			++performance_cores;
+			performance_logical += static_cast<uint32_t>(std::popcount(core.cpus & allowed));
+		}
+	logical = static_cast<uint32_t>(std::popcount(allowed));
+}
+
+// The CPU KYTY_RENDER_CORE names and, in `core`, the CPUs of its core the process may run on; -1: none (unset, 0, off,
+// a CPU the process may not run on, or a core that would leave the process no other CPU). An unset value takes the
+// Steam Deck build's 2, else `fallback`, unless KYTY_RENDER_CPUS is set (the render thread was placed by hand). "auto":
+// the lowest-numbered core of the performance class other than CPU 0's, which takes most interrupts on Windows (the
+// render threads measured best on the P-cores without it): CPUs 2 and 3 of an 8-core CPU with SMT, a P-core of a
+// hybrid Intel part. A numbered CPU without a known core is kept alone. `by_fallback`: `fallback` made the choice.
+static int RenderCoreChoice(const char* fallback, uint64_t& core, uint64_t& allowed, bool& by_fallback) {
+	const char* value = std::getenv("KYTY_RENDER_CORE");
+	by_fallback       = false;
+#if defined(KYTY_STEAM_DECK)
+	if (value == nullptr || *value == '\0') value = "2";
+#endif
+	if (value == nullptr || *value == '\0') {
+		const char* placed = std::getenv("KYTY_RENDER_CPUS");
+		if (placed == nullptr || *placed == '\0') value = fallback, by_fallback = fallback != nullptr;
+	}
+	if (value == nullptr || *value == '\0' || std::strcmp(value, "off") == 0) return -1;
+	const auto cores = MachineCores(allowed);
+	int        cpu   = -1;
+	if (std::strcmp(value, "auto") == 0) {
+		const auto fastest = PerformanceClass(cores, allowed);
+		core               = 0;
+		for (const auto& candidate: cores) {
+			const uint64_t cpus = candidate.cpus & allowed;
+			if (cpus == 0 || candidate.efficiency != fastest || (candidate.cpus & 1u) != 0) continue;
+			if (core == 0 || std::countr_zero(cpus) < std::countr_zero(core)) core = cpus;
+		}
+		if (core == 0) return -1;
+		cpu = std::countr_zero(core);
+	} else {
+		char*      end    = nullptr;
+		const long number = std::strtol(value, &end, 10);
+		if (*end != '\0' || number <= 0 || number >= 64) return -1;
+		cpu  = static_cast<int>(number);
+		core = uint64_t {1} << cpu;
+		for (const auto& candidate: cores)
+			if (((candidate.cpus >> cpu) & 1u) != 0) core |= candidate.cpus;
+	}
+	// The process may run on the CPU and on more CPUs than its core (else nothing is kept off it).
+	core &= allowed;
+	if (((allowed >> cpu) & 1u) == 0 || (allowed & ~core) == 0) return -1;
+	return cpu;
 }
 
 #if defined(_WIN32)
@@ -1255,8 +1344,11 @@ bool CurrentThreadStack(uint64_t* low, uint64_t* high) {
 }
 
 void AvoidCpuList(const char* avoid_cpus) {
-	DWORD_PTR process = 0, system = 0;
-	if (const auto avoid = static_cast<DWORD_PTR>(CpuListMask(avoid_cpus));
+	DWORD_PTR  process = 0, system = 0;
+	const auto core = g_render_core.load(std::memory_order_relaxed);
+	// With the render thread's core kept for it, that core is what other threads avoid, not the list, as on Linux: a
+	// thread's own mask wins over the process's default CPU set where the two don't meet, and could hold the core.
+	if (const auto avoid = static_cast<DWORD_PTR>(core != 0 ? core : CpuListMask(avoid_cpus));
 	    avoid != 0 && GetProcessAffinityMask(GetCurrentProcess(), &process, &system) != 0 && (process & ~avoid) != 0)
 		(void)SetThreadAffinityMask(GetCurrentThread(), process & ~avoid);
 }
@@ -1284,8 +1376,80 @@ NormalPriority::~NormalPriority() {
 	if (m_changed) (void)SetThreadPriority(GetCurrentThread(), m_saved);
 }
 
-int KeepRenderCoreAlone() {
-	return -1;
+static std::vector<Core> MachineCores(uint64_t& allowed) {
+	std::vector<Core> cores;
+	DWORD             length = 0;
+	(void)GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
+	std::vector<uint8_t> buffer(length);
+	if (length != 0 && GetLogicalProcessorInformationEx(
+	                       RelationProcessorCore,
+	                       reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data()), &length) != 0)
+		for (DWORD offset = 0; offset < length;) {
+			const auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
+			if (info->Relationship == RelationProcessorCore)
+				for (WORD group = 0; group < info->Processor.GroupCount; ++group)
+					if (const auto& mask = info->Processor.GroupMask[group]; mask.Group == 0 && mask.Mask != 0)
+						cores.push_back({static_cast<uint64_t>(mask.Mask), info->Processor.EfficiencyClass});
+			offset += info->Size;
+		}
+	DWORD_PTR process = 0, system = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) != 0) {
+		allowed = static_cast<uint64_t>(process);
+	} else {
+		allowed = 0;
+		for (const auto& core: cores)
+			allowed |= core.cpus;
+	}
+	return cores;
+}
+
+// The render thread runs on both CPUs of its core (the form that was measured). The process's default CPU set becomes
+// every other CPU of the process, and every thread without a CPU set or mask of its own takes it: the game's, the
+// driver's, the recording and upload workers, those made later too, so no thread has to watch for them as Linux's
+// does. A thread whose own mask names the core keeps it (KYTY_RECORDING_CPUS, if set, must leave the core out).
+int KeepRenderCoreAlone(const char* fallback) {
+	uint64_t  core = 0, allowed = 0;
+	bool      by_fallback = false;
+	const int cpu         = RenderCoreChoice(fallback, core, allowed, by_fallback);
+	if (cpu < 0 || !SetProcessDefaultCpuMask(allowed & ~core)) return -1;
+	if (SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(core)) == 0) {
+		(void)SetProcessDefaultCpuMask(0);
+		return -1;
+	}
+	g_render_core.store(core, std::memory_order_relaxed);
+	g_render_core_fallback_allowed = by_fallback ? allowed : 0;
+	return cpu;
+}
+
+// Every thread AvoidCpuList kept off the core was given the process's CPUs less it: those, and only those, get the
+// process's again (each mask read first, each thread id from the snapshot checked to be still this process's). They
+// keep it as a mask of their own where a thread never placed has none: the same CPUs, unless the default CPU set
+// changes later.
+void ReleaseRenderCore() {
+	const uint64_t core = g_render_core.load(std::memory_order_relaxed);
+	if (std::exchange(g_render_core_fallback_allowed, 0) == 0 || core == 0) return;
+	g_render_core.store(0, std::memory_order_relaxed);
+	(void)SetProcessDefaultCpuMask(0);
+	DWORD_PTR process = 0, system = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) == 0) return;
+	(void)SetThreadAffinityMask(GetCurrentThread(), process);
+	const DWORD_PTR narrowed = process & ~static_cast<DWORD_PTR>(core);
+	const HANDLE    snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) return;
+	THREADENTRY32 entry {};
+	entry.dwSize            = sizeof(entry);
+	const DWORD own_process = GetCurrentProcessId(), own_thread = GetCurrentThreadId();
+	for (BOOL more = Thread32First(snapshot, &entry); more != FALSE; more = Thread32Next(snapshot, &entry)) {
+		if (entry.th32OwnerProcessID != own_process || entry.th32ThreadID == own_thread) continue;
+		const HANDLE thread = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+		if (thread == nullptr) continue;
+		GROUP_AFFINITY affinity {};
+		if (GetProcessIdOfThread(thread) == own_process && GetThreadGroupAffinity(thread, &affinity) != 0 &&
+		    affinity.Group == 0 && affinity.Mask == narrowed)
+			(void)SetThreadAffinityMask(thread, process);
+		CloseHandle(thread);
+	}
+	CloseHandle(snapshot);
 }
 
 namespace {
@@ -2519,8 +2683,52 @@ bool CurrentThreadStack(uint64_t* low, uint64_t* high) {
 	return found;
 }
 
-// KeepRenderCoreAlone: the render thread's core (bit n: CPU n), 0 when it shares its core.
-static std::atomic<uint64_t> g_render_core {0};
+#if defined(__linux__)
+// A sysfs CPU list ("2-3", "0,8", "0-7,16-23") as a bit mask of CPUs 0..63; false where the file is missing.
+static bool ReadSysfsCpuList(const char* path, uint64_t& mask) {
+	mask       = 0;
+	FILE* file = std::fopen(path, "r");
+	if (file == nullptr) return false;
+	char list[256] = {};
+	if (std::fgets(list, sizeof(list), file) != nullptr) {
+		list[std::strcspn(list, "\n")] = '\0';
+		char* save                     = nullptr;
+		for (char* range = strtok_r(list, ",", &save); range != nullptr; range = strtok_r(nullptr, ",", &save)) {
+			int       first = 0, last = 0;
+			const int n = std::sscanf(range, "%d-%d", &first, &last);
+			for (int c = first; n >= 1 && c <= (n == 2 ? last : first) && c < 64; ++c)
+				mask |= uint64_t {1} << c;
+		}
+	}
+	std::fclose(file);
+	return true;
+}
+#endif
+
+static std::vector<Core> MachineCores(uint64_t& allowed) {
+	std::vector<Core> cores;
+	allowed = 0;
+#if defined(__linux__)
+	// (An Intel hybrid part lists its P-cores' CPUs here, its E-cores' under cpu_atom; elsewhere every core is alike.)
+	uint64_t performance = 0, seen = 0;
+	(void)ReadSysfsCpuList("/sys/devices/cpu_core/cpus", performance);
+	for (int cpu = 0; cpu < 64; ++cpu) {
+		if (((seen >> cpu) & 1u) != 0) continue;
+		char path[96];
+		std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+		uint64_t siblings = 0;
+		if (!ReadSysfsCpuList(path, siblings)) continue; // (offline, or no such CPU)
+		siblings |= uint64_t {1} << cpu;
+		seen |= siblings;
+		cores.push_back({siblings, (siblings & performance) != 0 ? 1u : 0u});
+	}
+	cpu_set_t process;
+	if (sched_getaffinity(getpid(), sizeof(process), &process) == 0)
+		for (int c = 0; c < 64; ++c)
+			if (CPU_ISSET(c, &process)) allowed |= uint64_t {1} << c;
+#endif
+	return cores;
+}
 
 void AvoidCpuList(const char* avoid_cpus) {
 	cpu_set_t  set;
@@ -2661,52 +2869,41 @@ uint64_t CoresOf(uint64_t mask) {
 #endif
 }
 
-int KeepRenderCoreAlone() {
 #if defined(__linux__)
-	const char* value = std::getenv("KYTY_RENDER_CORE");
-#if defined(KYTY_STEAM_DECK)
-	if (value == nullptr || *value == '\0') value = "2";
+// Kyty.CoreKeeper (KeepRenderCoreAlone): told to stop by ReleaseRenderCore, which wakes it from its sleep, and says
+// when it has. Made once and never freed (the keeper sleeps on it until the process exits).
+struct CoreKeeperStop {
+	std::mutex              mutex;
+	std::condition_variable woken;
+	bool                    stop = false;
+};
+static CoreKeeperStop& KeeperStop() {
+	static auto* const keeper = new CoreKeeperStop();
+	return *keeper;
+}
+static std::atomic<bool> g_core_keeper_running {false};
 #endif
-	if (value == nullptr || *value == '\0' || std::strcmp(value, "off") == 0) return -1;
-	char*      end = nullptr;
-	const auto cpu = static_cast<int>(std::strtol(value, &end, 10));
-	if (*end != '\0' || cpu <= 0 || cpu >= 64) return -1;
-	// The core: the CPU's SMT siblings ("2-3", "2,3"); the CPU alone where the file is missing.
-	uint64_t core = uint64_t {1} << cpu;
-	char     path[96];
-	std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
-	if (FILE* file = std::fopen(path, "r"); file != nullptr) {
-		char list[64] = {};
-		if (std::fgets(list, sizeof(list), file) != nullptr) {
-			list[std::strcspn(list, "\n")] = '\0';
-			char* save = nullptr;
-			for (char* range = strtok_r(list, ",", &save); range != nullptr; range = strtok_r(nullptr, ",", &save)) {
-				int first = 0, last = 0;
-				const int n = std::sscanf(range, "%d-%d", &first, &last);
-				for (int c = first; n >= 1 && c <= (n == 2 ? last : first) && c < 64; ++c) core |= uint64_t {1} << c;
-			}
-		}
-		std::fclose(file);
-	}
-	// The process may run on more CPUs than the core (else nothing is kept off it).
-	cpu_set_t process;
-	if (sched_getaffinity(getpid(), sizeof(process), &process) != 0 || !CPU_ISSET(cpu, &process)) return -1;
-	uint64_t allowed = 0;
-	for (int c = 0; c < 64; ++c)
-		if (CPU_ISSET(c, &process)) allowed |= uint64_t {1} << c;
-	if ((allowed & ~core) == 0) return -1;
+
+int KeepRenderCoreAlone(const char* fallback) {
+#if defined(__linux__)
+	uint64_t  core = 0, allowed = 0;
+	bool      by_fallback = false;
+	const int cpu         = RenderCoreChoice(fallback, core, allowed, by_fallback);
+	if (cpu < 0) return -1;
 	cpu_set_t own;
 	MaskToSet(uint64_t {1} << cpu, &own);
 	if (sched_setaffinity(0, sizeof(own), &own) != 0) return -1;
 	g_render_core.store(core, std::memory_order_relaxed);
-	const auto render = static_cast<pid_t>(ThreadId());
+	g_render_core_fallback_allowed = by_fallback ? allowed : 0;
+	const auto render              = static_cast<pid_t>(ThreadId());
 	std::thread([render, core, allowed] {
 		SetThreadName("Kyty.CoreKeeper");
 		(void)setpriority(PRIO_PROCESS, static_cast<id_t>(ThreadId()), 10);
 		cpu_set_t others;
 		MaskToSet(allowed & ~core, &others);
 		(void)sched_setaffinity(0, sizeof(others), &others);
-		for (;;) {
+		auto& keeper = KeeperStop();
+		for (bool stop = false; !stop;) {
 			if (DIR* tasks = opendir("/proc/self/task"); tasks != nullptr) {
 				while (const dirent* entry = readdir(tasks)) {
 					const auto tid = static_cast<pid_t>(std::strtol(entry->d_name, nullptr, 10));
@@ -2721,12 +2918,54 @@ int KeepRenderCoreAlone() {
 				}
 				closedir(tasks);
 			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+			std::unique_lock lock(keeper.mutex);
+			stop = keeper.woken.wait_for(lock, std::chrono::milliseconds(250), [&] { return keeper.stop; });
 		}
+		g_core_keeper_running.store(false, std::memory_order_release);
 	}).detach();
+	g_core_keeper_running.store(true, std::memory_order_release);
 	return cpu;
 #else
+	(void)fallback;
 	return -1;
+#endif
+}
+
+// The keeper stopped first (woken from its sleep, it ends after the pass it may be in), so it moves no thread after
+// this. Every thread it, AvoidCpuList or inheritance kept off the core has the process's CPUs less it, and a thread the
+// GPU thread made since the keeper's last pass is still on that thread's one CPU: those get the process's CPUs
+// again.
+void ReleaseRenderCore() {
+#if defined(__linux__)
+	const uint64_t core    = g_render_core.load(std::memory_order_relaxed);
+	const uint64_t allowed = std::exchange(g_render_core_fallback_allowed, 0);
+	if (allowed == 0 || core == 0) return;
+	auto& keeper = KeeperStop();
+	{
+		const std::lock_guard lock(keeper.mutex);
+		keeper.stop = true;
+	}
+	keeper.woken.notify_all();
+	while (g_core_keeper_running.load(std::memory_order_acquire))
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	g_render_core.store(0, std::memory_order_relaxed);
+	cpu_set_t set;
+	MaskToSet(allowed, &set);
+	(void)sched_setaffinity(0, sizeof(set), &set);
+	const uint64_t narrowed = allowed & ~core;
+	if (DIR* tasks = opendir("/proc/self/task"); tasks != nullptr) {
+		while (const dirent* entry = readdir(tasks)) {
+			const auto tid = static_cast<pid_t>(std::strtol(entry->d_name, nullptr, 10));
+			if (tid <= 0 || sched_getaffinity(tid, sizeof(set), &set) != 0) continue;
+			uint64_t mask = 0;
+			for (int c = 0; c < 64; ++c)
+				if (CPU_ISSET(c, &set)) mask |= uint64_t {1} << c;
+			if (mask != narrowed && (mask & ~core) != 0) continue;
+			MaskToSet(allowed, &set);
+			(void)sched_setaffinity(tid, sizeof(set), &set);
+		}
+		closedir(tasks);
+	}
 #endif
 }
 

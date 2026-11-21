@@ -126,4 +126,25 @@ public:
     PassiveProducerScope(const PassiveProducerScope&) = delete;
     PassiveProducerScope& operator=(const PassiveProducerScope&) = delete;
 };
+
+// A weave worker's calls recorded apart (weave.h). The worker has no producer: between BeginApart and EndApart every
+// call it records goes, numbered, into a buffer of its own, from a pool of this file's chunks, and none reaches the
+// driver. It records through ApartMarker() as its command buffer (the address of an object of this file's: no driver
+// handle equals it); a direct call on the marker fails the buffer. The GPU thread, a producer, splices parts of the
+// buffer into its own stream, in order: SpliceApartPart enqueues calls [begin, end) as one packet, published at once,
+// whose replay on the recording worker writes `target` over each call's marker and executes it, carrying on from where
+// the last part of the same buffer stopped; the calls before `begin` no part took are destroyed unexecuted, and with
+// `last` the calls after `end` too. A buffer no part takes destroys its calls unexecuted. Nothing here changes how any
+// other call is recorded or replayed.
+class Apart;
+VkCommandBuffer_T* ApartMarker();
+void BeginApart();
+// The open buffer closed and handed over: with `keep`, once every call's first captured word is proven the marker;
+// null when not kept or not so proven (the buffer destroyed).
+std::shared_ptr<Apart> EndApart(bool keep);
+// GPU thread: false, nothing enqueued, for a range the buffer doesn't hold or one before the last part's end.
+bool SpliceApartPart(const std::shared_ptr<Apart>& buffer, VkCommandBuffer_T* target, uint64_t begin, uint64_t end,
+                     bool last);
+// The calls the calling thread recorded into its open buffer so far (a made draw's calls are [before, after)).
+uint64_t ApartCalls();
 }

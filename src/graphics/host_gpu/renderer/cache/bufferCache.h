@@ -78,6 +78,22 @@ public:
 	// (Out of line, bufferCache.cpp: its page-table entry read once, LoadOwner; a worker calls it, table-xpr.inc's held
 	// index / indirect args lookup.)
 	[[nodiscard]] BufferId RegisteredBuffer(uint64_t vaddr, uint64_t size);
+	// The live buffer (registered, not deleted) that holds the range, and its id: FindBuffer's answer without making a
+	// buffer, read only; {nullptr, BufferId {}} (which tests false) when none does. Its page-table entry is read once
+	// (LoadOwner), so the id names the buffer returned. A weave worker asks too, while the GPU thread alone registers
+	// (weave.h).
+	[[nodiscard]] std::pair<const Buffer*, BufferId> FindLiveBuffer(uint64_t vaddr, uint64_t size) const;
+	// A pending guest readback holds pages of the range: what ObtainBuffer finishes first for a lookup that is no plain
+	// read (DrainGuestReadback). Read only. On a weave thread (Weave::OffGpuThread) it reads the copy the GPU thread
+	// publishes at each change of the readback slots (PublishGuestReadbacks); on the GPU thread, the slots.
+	[[nodiscard]] bool GuestReadbackOver(uint64_t vaddr, uint64_t size) const;
+	// The weave's turn (GPU thread): a read range of a live buffer made current as ObtainBuffer makes it for a read:
+	// the buffer touched, its CPU-dirty pages uploaded (EnsureBufferContents' body). Called only after the strand's
+	// registration test passed.
+	void SynchronizeAtTurn(uint64_t vaddr, uint64_t size);
+	// Whether a buffer registered or unregistered after registration epoch `epoch` spans any of [vaddr, vaddr + size):
+	// 0 none, 1 one does, 2 the log of the last 1,024 changes doesn't reach back. GPU thread, as every change is.
+	[[nodiscard]] uint32_t RegisteredOverSince(uint64_t epoch, uint64_t vaddr, uint64_t size) const;
 	void                   EnsureBufferContents(uint64_t vaddr, uint64_t size);
 	// As EnsureBufferContents, for a texel buffer: an image GPU work wrote over the range is copied in (SynchronizeBuffer).
 	void                   EnsureTexelContents(uint64_t vaddr, uint64_t size);
@@ -446,6 +462,10 @@ private:
 	std::array<std::shared_ptr<GuestReadback>, GuestReadbackSlots> m_guest_readbacks {};
 	std::array<std::unique_ptr<Buffer>, GuestReadbackSlots> m_guest_downloads {};
 	uint32_t m_active_guest_readbacks = 0;
+	// While the weave is enabled: the pending readbacks published for a weave thread (bufferCache.cpp's copy, kept
+	// outside the cache), and a weave thread's GuestReadbackOver read from it.
+	void               PublishGuestReadbacks();
+	[[nodiscard]] bool PublishedReadbackOver(uint64_t vaddr, uint64_t size) const;
 	struct CopyFeedback;
 	void InvalidateCopyFeedback(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t size);

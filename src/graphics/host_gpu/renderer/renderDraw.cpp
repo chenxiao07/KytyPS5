@@ -47,8 +47,10 @@
 #include "speculation-state.h"
 #include "draw-state-observer.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "common/guardedCopy.h"
 #include "vulkan-draw-packet.h"
 #include "vulkan-recording.h"
+#include "weave-parcel.h"
 #endif
 
 #include <algorithm>
@@ -63,6 +65,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1862,7 +1865,9 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "native-xpr.inc"
-#include "table-xpr.inc"
+#include "table-xpr.inc" // (with weave-draw.inc, the table path's worker instantiation)
+#include "weave-worker.inc"
+#include "weave-turn.inc"
 #endif
 
 bool BuildDrawIndexRun(std::span<const DrawIndexArgs> draws, DrawIndexRun& run) {

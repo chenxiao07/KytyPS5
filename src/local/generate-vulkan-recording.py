@@ -142,16 +142,24 @@ def generate(registry, header):
             # (descriptor writes, view destruction) are made at once, as on a thread without a producer. A discarded
             # segment must not leave a set its thread's caches published unwritten.
             stream_expr = 'RecordingStream()' if name.startswith('vkCmd') else '(kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && t_passive ? nullptr : RecordingStream())'
-            declarations.append(f'    if (auto* stream = pAllocator == nullptr ? {stream_expr} : nullptr) {{'
-                                if allocator else f'    if (auto* stream = {stream_expr}) {{')
-            declarations.append('        if (stream->Enqueue([&](Writer& writer) {')
-            declarations.extend('            ' + c for c in copies)
             mutates_state = (name.startswith('vkCmdSet') or name.startswith('vkCmdBindPipeline') or
                              name.startswith('vkCmdBindShaders') or name.startswith('vkCmdExecute') or
                              name.startswith('vkCmdBeginRenderPass') or name.startswith('vkCmdNextSubpass'))
             invalidate = 'InvalidateRawState(); ' if mutates_state else ''
-            declarations.append(f'            writer.Command([=] {{ {invalidate}original.{name}({", ".join(args)}); }});')
-            declarations.append(f'        }})) {{ {mark}return; }}')
+            declarations.append('    auto capture = [&](Writer& writer) {')
+            declarations.extend('        ' + c for c in copies)
+            declarations.append(f'        writer.Command([=] {{ {invalidate}original.{name}({", ".join(args)}); }});')
+            declarations.append('    };')
+            declarations.append(f'    if (auto* stream = pAllocator == nullptr ? {stream_expr} : nullptr) {{'
+                                if allocator else f'    if (auto* stream = {stream_expr}) {{')
+            declarations.append(f'        if (stream->Enqueue(capture)) {{ {mark}return; }}')
+            # A weave worker (no stream; between BeginApart and EndApart) records a command into its apart buffer,
+            # which a command it cannot record fails: none reaches the driver, whose command buffer is the GPU
+            # thread's. The thread-local is read only while some thread records apart (ApartStream).
+            if name.startswith('vkCmd'):
+                declarations.append('    } else if (auto* apart = ApartStream()) [[unlikely]] {')
+                declarations.append('        apart->Enqueue(capture);')
+                declarations.append('        return;')
             declarations.append('    }')
         # A progress query observes previously submitted work and neither
         # accesses a command pool nor executes commands still being recorded.
@@ -161,6 +169,10 @@ def generate(registry, header):
         if params and params[0].findtext('type') == 'VkCommandBuffer' and pnames[0] == 'commandBuffer':
             fail_value = '' if ret == 'void' else ' VK_ERROR_UNKNOWN' if ret == 'VkResult' else ' {}'
             declarations.append('    if (commandBuffer == Placeholder() && t_passive) [[unlikely]] { FailPassiveSegment(); '
+                                f'return{fail_value}; }}')
+            # A command on the apart marker that was not recorded (no recorded form) never reaches the driver either:
+            # the calling thread's apart buffer fails. One compare with the marker's address, no thread-local.
+            declarations.append('    if (commandBuffer == Marker()) [[unlikely]] { FailApart(); '
                                 f'return{fail_value}; }}')
         if name not in NO_DRAIN_CALLS:
             declarations.append('    BeforeDirect();')

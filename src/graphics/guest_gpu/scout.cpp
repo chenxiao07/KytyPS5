@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -115,14 +116,16 @@ std::array<std::atomic<uint64_t>, LabelEntries> g_labels {};
 std::array<uint32_t, LabelEntries>              g_label_values {};
 
 // The emulator's own writes to guest memory (NoteHostWrite), from any thread: the last ones, by their clock value
-// (their pages), and the clock the scout reads. (A 4 KiB page-hashed table of stamps cost the render thread a missed
+// (their bytes), and the clock the scout reads. (A 4 KiB page-hashed table of stamps cost the render thread a missed
 // load a page at every use: 0.2-0.3 ms a profiled frame.) A writer takes its clock value,
-// claims the entry (Busy, only from an older value), writes its pages and publishes the value: an entry whose clock
-// is not the one looked for, before and after its pages are read, is not known.
+// claims the entry (Busy, only from an older value), writes its range and publishes the value: an entry whose clock
+// is not the one looked for, before and after its range is read, is not known. The tickets read whole pages of it
+// (WrittenSince); the weave's open reads its bytes, and its two marks (RangesWrittenSince).
 struct HostWrite {
 	std::atomic<uint64_t>     clock {0};
-	std::atomic<uint64_t>     first {0}, last {0}; // pages; last's top bit: a write-back
-	static constexpr uint64_t Busy = 1ull << 63u, WriteBack = 1ull << 63u;
+	std::atomic<uint64_t>     first {0}, last {0}; // bytes; first's top bit: a GPU-written mark, last's: a write-back
+	static constexpr uint64_t Busy = 1ull << 63u, GpuMark = 1ull << 63u, WriteBack = 1ull << 63u;
+	static constexpr uint64_t Copy = 1ull << 62u, Address = Copy - 1u; // (last's next bit: a linear copy's write)
 };
 constexpr uint64_t                  WriteEntries = 4096;
 std::array<HostWrite, WriteEntries> g_writes;
@@ -779,6 +782,10 @@ bool Running() noexcept {
 	return g_running.load(std::memory_order_relaxed);
 }
 
+uint64_t WriteClock() noexcept {
+	return g_write_clock.load(std::memory_order_acquire);
+}
+
 void Start(GpuResourceManager& resources) {
 	if (Mode() == 0 || Running()) return;
 	g_resources = &resources;
@@ -874,9 +881,9 @@ void CheckWait(const void* address, uint32_t size) {
 	}
 }
 
-void NoteHostWrite(uint64_t address, uint64_t size, bool write_back) {
-	if (size == 0 || !Running()) return;
-	if (write_back) LiveCounters::Add(LiveCounters::ScoutWriteBacks);
+// A range into the ring of writes with the next write clock value, `first_marks` and `last_marks` (HostWrite's bits) on
+// its first and last byte.
+static void NoteRange(uint64_t address, uint64_t size, uint64_t first_marks, uint64_t last_marks) {
 	// (After the write: a scout that reads the clock at or past this value reads the bytes written.)
 	const auto clock = g_write_clock.fetch_add(1, std::memory_order_acq_rel) + 1;
 	auto&      entry = g_writes[clock % WriteEntries];
@@ -889,9 +896,20 @@ void NoteHostWrite(uint64_t address, uint64_t size, bool write_back) {
 			break;
 	}
 	std::atomic_thread_fence(std::memory_order_release);
-	entry.first.store(address >> 12u, std::memory_order_relaxed);
-	entry.last.store((address + size - 1) >> 12u | (write_back ? HostWrite::WriteBack : 0), std::memory_order_relaxed);
+	entry.first.store(address | first_marks, std::memory_order_relaxed);
+	entry.last.store((address + size - 1) | last_marks, std::memory_order_relaxed);
 	entry.clock.store(clock, std::memory_order_release);
+}
+
+void NoteHostWrite(uint64_t address, uint64_t size, bool write_back, bool copy) {
+	if (size == 0 || !Running()) return;
+	if (write_back) LiveCounters::Add(LiveCounters::ScoutWriteBacks);
+	NoteRange(address, size, 0, (write_back ? HostWrite::WriteBack : 0) | (copy ? HostWrite::Copy : 0));
+}
+
+void NoteGpuMark(uint64_t address, uint64_t size) {
+	if (size == 0 || !Running()) return;
+	NoteRange(address, size, HostWrite::GpuMark, 0);
 }
 
 bool WrittenSince(const Ticket& ticket, bool& write_back) {
@@ -902,11 +920,15 @@ bool WrittenSince(const Ticket& ticket, bool& write_back) {
 	for (auto clock = ticket.written + 1; clock <= now; ++clock) {
 		const auto& entry = g_writes[clock % WriteEntries];
 		if (entry.clock.load(std::memory_order_acquire) != clock) return true;
-		const auto first = entry.first.load(std::memory_order_relaxed);
-		const auto last  = entry.last.load(std::memory_order_relaxed);
+		const auto marked = entry.first.load(std::memory_order_relaxed);
+		const auto last   = entry.last.load(std::memory_order_relaxed);
 		std::atomic_thread_fence(std::memory_order_acquire);
 		if (entry.clock.load(std::memory_order_relaxed) != clock) return true;
-		const auto last_page = last & ~HostWrite::WriteBack;
+		// (A GPU-written mark is no host write: passed over, a ticket is answered as before marks were noted, except
+		// that the marks take ring entries.)
+		if ((marked & HostWrite::GpuMark) != 0) continue;
+		const auto first     = (marked & HostWrite::Address) >> 12u;
+		const auto last_page = (last & HostWrite::Address) >> 12u;
 		if (last_page < ticket.first_page || first > ticket.last_page) continue;
 		for (uint32_t i = 0; i < ticket.pages; ++i) {
 			const auto page = PageAt(pages, i);
@@ -918,6 +940,38 @@ bool WrittenSince(const Ticket& ticket, bool& write_back) {
 		}
 	}
 	return false;
+}
+
+uint32_t RangesWrittenSince(uint64_t clock, std::span<const std::pair<uint64_t, uint64_t>> ranges,
+                            std::span<const std::pair<uint64_t, uint64_t>> passed_over) {
+	const auto now = g_write_clock.load(std::memory_order_acquire);
+	if (now == clock || ranges.empty()) return 0;
+	if (now - clock >= WriteEntries) return 4;
+	for (auto at = clock + 1; at <= now; ++at) {
+		const auto& entry = g_writes[at % WriteEntries];
+		if (entry.clock.load(std::memory_order_acquire) != at) return 4;
+		const auto marked = entry.first.load(std::memory_order_relaxed);
+		const auto last   = entry.last.load(std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_acquire);
+		if (entry.clock.load(std::memory_order_relaxed) != at) return 4;
+		const auto first_byte = marked & HostWrite::Address, last_byte = last & HostWrite::Address;
+		if (last_byte < ranges.front().first || first_byte >= ranges.back().second) continue;
+		// (The last range that begins at or before the write's last byte holds a byte of it when it ends past the
+		// write's first: the ranges are sorted and apart.)
+		const auto after = std::upper_bound(ranges.begin(), ranges.end(), last_byte,
+		                                    [](uint64_t value, const auto& range) { return value < range.first; });
+		if (after == ranges.begin() || std::prev(after)->second <= first_byte) continue;
+		const bool gpu_mark = (marked & HostWrite::GpuMark) != 0;
+		if (!gpu_mark && (last & HostWrite::Copy) != 0 && !passed_over.empty()) {
+			// (The last window that opens before this entry's clock: the copy is one the reader read through when the
+			// entry is inside it.)
+			const auto window = std::upper_bound(passed_over.begin(), passed_over.end(), at,
+			                                     [](uint64_t value, const auto& w) { return value <= w.first; });
+			if (window != passed_over.begin() && at <= std::prev(window)->second) continue;
+		}
+		return gpu_mark ? 3u : (last & HostWrite::WriteBack) != 0 ? 2u : 1u;
+	}
+	return 0;
 }
 
 Reason CurrentReason() {

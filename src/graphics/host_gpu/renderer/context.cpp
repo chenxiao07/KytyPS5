@@ -31,6 +31,19 @@ namespace Libs::Graphics {
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
     : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
 
+// A weave worker's view (render.h): `real`'s context, graphics and handle (aimed at the apart marker next, Aim), with
+// the worker's own registers. Its graphics generation is one no other CommandBuffer object has had or will reach (2^20
+// InvalidateGraphicsState calls apart, from 2^61; Begin's placeholder segments take theirs from 2^62): the emission
+// caches that key on (handle, generation) never take another buffer's bound state for its own, the marker being every
+// view's handle.
+CommandBuffer::CommandBuffer(const CommandBuffer& real, HW::Context& registers, HW::UserConfig& user_config,
+                             HW::Shader& shaders)
+    : m_context(real.m_context), m_graphics(real.m_graphics), m_buffer(real.m_buffer), m_registers(&registers),
+      m_user_config(&user_config), m_shaders(&shaders) {
+	static std::atomic<uint64_t> g_view_generation {uint64_t {1} << 61u};
+	m_graphics_generation = g_view_generation.fetch_add(uint64_t {1} << 20u, std::memory_order_relaxed);
+}
+
 bool CommandBuffer::IsInvalid() const {
 	return m_buffer == nullptr;
 }
@@ -326,6 +339,17 @@ void CommandBuffer::ResumeRendering(const RenderState& state) const {
 	load.depth_stencil_attachment.stencil_clear = false;
 	BeginRendering(load);
 	m_render_state = state;
+}
+
+// A weave worker's view, inside its strand: the pass in progress ended and `next` begun, both recorded into the view's
+// buffer. The strand's first pass is the turn's, begun on the GPU thread's buffer, so the view keeps no pass of its
+// own: it stays as if outside one (the turn's splice adopts the pass a part leaves open, AdoptRendering).
+void CommandBuffer::PassChange(const RenderState& next) {
+	Handle().endRendering();
+	m_rendering = false;
+	BeginRendering(next);
+	m_rendering    = false;
+	m_render_state = {};
 }
 
 bool CommandBuffer::RenderingWith(const RenderState& state) const {
