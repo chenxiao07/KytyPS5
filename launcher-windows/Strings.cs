@@ -407,7 +407,6 @@ static class Strings {
 		{"error.title", "KytyPS5 启动器"},
 		{"error.start", "无法启动：\n{0}"},
 	};
-}
 
 	// Russian translation of the launcher UI by @rigeri1.
 	static readonly Dictionary<string, string> Russian = new Dictionary<string, string> {
@@ -675,4 +674,6 @@ static class Strings {
 		{"error.title", "Лаунчер KytyPS5"},
 		{"error.start", "Не удалось запустить:\n{0}"},
 	};
+}
+
 }
