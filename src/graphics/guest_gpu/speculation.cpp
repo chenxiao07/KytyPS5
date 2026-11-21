@@ -64,6 +64,13 @@ uint64_t Speculation::NowNs() noexcept {
 	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+// A processor's state, as a translation starts from it (Speculation::Translate).
+static CommandProcessorState StateOf(const CommandProcessor& cp) {
+	CommandProcessorState state;
+	cp.SaveStateTo(state);
+	return state;
+}
+
 // The packets a refusal makes a hole of: draws, dispatches, end-of-pipe events and waits (what they change besides
 // their work is checked when the commit translates them: Speculation::RunHole; a wait not satisfied then blocks it).
 static bool IsHole(uint32_t header) {
@@ -183,7 +190,7 @@ Speculation::Epochs Speculation::CurrentEpochs() const {
 
 Speculation::Outcome Speculation::TranslateAndCommit(CommandProcessor& cp, uint64_t serial,
                                                      std::span<const uint32_t> commands, Pm4Execution& execution) {
-	auto result    = Translate(*m_translators[0], cp, commands, execution);
+	auto result    = Translate(*m_translators[0], StateOf(cp), commands, execution);
 	result->serial = serial;
 	return Commit(std::move(result), cp, execution);
 }
@@ -216,8 +223,8 @@ void Speculation::Done(uint64_t serial, const CommandProcessor& cp) {
 		m_jobs.pop_front();
 	}
 	m_done_serial = serial;
-	if (!m_done_state) m_done_state = std::make_unique<CommandProcessor>(m_renderer, m_interrupt_id);
-	m_done_state->CopyStateFrom(cp, false);
+	if (!m_done_state) m_done_state = std::make_unique<CommandProcessorState>();
+	cp.SaveStateTo(*m_done_state);
 	m_ahead_wake.notify_all();
 }
 
@@ -225,7 +232,7 @@ void Speculation::ResyncStatePass() {
 	if (m_state_busy || m_done_serial == 0) return;
 	// (It cannot follow, and the GPU thread did that submission; or it is behind the GPU thread.)
 	if (m_broken ? m_done_serial >= m_broken_at : m_state_serial < m_done_serial) {
-		m_state->CopyStateFrom(*m_done_state, false);
+		m_state->CopyStateFrom(*m_done_state);
 		m_state_serial = m_done_serial;
 		m_broken       = false;
 	}
@@ -241,8 +248,8 @@ bool Speculation::StatePass(const Job& job, uint64_t which) {
 	for (;;) {
 		// A chunk from here: where it starts, and its record, which reads through the one before while that is not done.
 		Chunk chunk;
-		chunk.start = std::make_unique<CommandProcessor>(m_renderer, m_interrupt_id);
-		chunk.start->CopyStateFrom(*m_state, false);
+		chunk.start = std::make_unique<CommandProcessorState>();
+		m_state->SaveStateTo(*chunk.start);
 		chunk.at = execution;
 		{
 			std::lock_guard lock(m_mutex);
@@ -804,14 +811,14 @@ Speculation::Outcome Speculation::CommitAhead(CommandProcessor& cp, const Job& j
 		}
 	}
 	if (!result) {
-		result         = Translate(translator, cp, job.commands, execution);
+		result         = Translate(translator, StateOf(cp), job.commands, execution);
 		result->serial = job.serial;
 	}
 	// The ones queued after the last translated, from the state it leaves: while each takes the one before's place
 	// and none stopped before its end.
 	const Result* last = m_ahead.empty() ? result.get() : m_ahead.back().get();
 	auto&         from = m_chain;
-	from->CopyStateFrom(*last->end_state, false);
+	from->CopyStateFrom(*last->end_state);
 	uint64_t serial = last->serial;
 	for (const auto& next: queued) {
 		if (next.serial <= serial) continue;
@@ -823,16 +830,16 @@ Speculation::Outcome Speculation::CommitAhead(CommandProcessor& cp, const Job& j
 		if (next.kind == Job::Kind::Flip) continue;
 		from->ResetDeCe();
 		from->SetFlip({});
-		auto ahead    = Translate(translator, *from, next.commands, Pm4Execution {}, last);
+		auto ahead    = Translate(translator, StateOf(*from), next.commands, Pm4Execution {}, last);
 		ahead->serial = next.serial;
 		m_ahead.push_back(std::move(ahead));
 		last = m_ahead.back().get();
-		from->CopyStateFrom(*last->end_state, false);
+		from->CopyStateFrom(*last->end_state);
 	}
 	return Commit(std::move(result), cp, execution);
 }
 
-std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translator, const CommandProcessor& cp,
+std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translator, const CommandProcessorState& start,
                                                             std::span<const uint32_t> commands,
                                                             const Pm4Execution& execution, const Result* previous,
                                                             const Spec::State* record, const Pm4Execution* stop) {
@@ -898,8 +905,8 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 		result              = std::make_unique<Result>();
 		result->owner       = &translator;
 		result->recorder    = scheduler.CreateRecorder();
-		result->start_state = std::make_unique<CommandProcessor>(m_renderer, m_interrupt_id);
-		result->end_state   = std::make_unique<CommandProcessor>(m_renderer, m_interrupt_id);
+		result->start_state = std::make_unique<CommandProcessorState>();
+		result->end_state   = std::make_unique<CommandProcessorState>();
 	}
 	auto& r = *result;
 	// (A speculation's thread records and ends its buffers; the GPU thread's go through its recording stream.)
@@ -912,8 +919,8 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	r.recorder->packets = r.recorder->own_thread && worker_packets.load(std::memory_order_relaxed) != 0 &&
 	                      LocalVulkanRecording::HasPassiveProducer();
 	auto& processor          = *translator.cp;
-	processor.CopyStateFrom(cp, false); // (no packet it takes uses the constant RAM)
-	r.start_state->CopyStateFrom(cp, false);
+	processor.CopyStateFrom(start); // (no packet it takes uses the constant RAM)
+	*r.start_state = start;
 	r.serial = 0;
 	r.pass   = 0;
 	r.blind  = false;
@@ -1027,8 +1034,8 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 				break;
 			}
 			// A hole: the segment ends before it, the next begins after it, from the processor state there.
-			if (r.hole_states.size() == r.holes.size()) r.hole_states.push_back(std::make_unique<CommandProcessor>(m_renderer, m_interrupt_id));
-			r.hole_states[r.holes.size()]->CopyStateFrom(processor, false);
+			if (r.hole_states.size() == r.holes.size()) r.hole_states.push_back(std::make_unique<CommandProcessorState>());
+			processor.SaveStateTo(*r.hole_states[r.holes.size()]);
 			auto& hole  = r.holes.emplace_back();
 			hole.packet = packet;
 			hole.dwords = dwords;
@@ -1074,7 +1081,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 		r.segment_ends.push_back(r.end_ns);
 		r.stop_execution = std::move(spec);
 	}
-	r.end_state->CopyStateFrom(processor, false);
+	processor.SaveStateTo(*r.end_state);
 	{
 		std::lock_guard lock(m_mutex);
 		translator.since = 0;
@@ -1148,7 +1155,7 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 	if (progress == Progress::Complete) {
 		EXIT_IF(committed != r.state.closed.size());
 		// Committed whole: the processor state at its end (or at the packet it stopped at).
-		cp.CopyStateFrom(*r.end_state, false);
+		cp.CopyStateFrom(*r.end_state);
 		// (The registers are the worker's end state now, not what this thread's draw state shadow and state key saw
 		// before the chunk: without this, its next draw could be taken as clean, or keep the old context hash, and bind
 		// the draw state of the last draw it translated itself. As after a hole or spliced worker packets.)
@@ -2949,7 +2956,7 @@ Speculation::HoleRun Speculation::RunHole(Result& result, CommandProcessor& cp, 
 	const Spec::EffectSourceScope source(Spec::EffectSource::Hole);
 	const auto& hole  = result.holes[index];
 	const auto& state = *result.hole_states[index];
-	if (copy_state) cp.CopyStateFrom(state, false);
+	if (copy_state) cp.CopyStateFrom(state);
 	// (The draw state it starts from is not the shadow's.)
 	auto& executor = m_renderer.GetRenderExecutor();
 	DrawStateObserver::Invalidate();

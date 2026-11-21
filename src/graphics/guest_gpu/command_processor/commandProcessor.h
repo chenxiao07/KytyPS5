@@ -68,6 +68,8 @@ private:
 	bool                      m_made_progress = false;
 };
 
+struct CommandProcessorState;
+
 class CommandProcessor {
 public:
 	struct FlipInfo {
@@ -85,14 +87,15 @@ public:
 
 	void Reset();
 	void ApplyContextStateOperation(ContextStateOperation operation);
-	// The registers and the rest of the processor's state (with the constant RAM: `const_ram`), not the queue it
-	// serves: a speculative translation starts from the processor's state and, committed, leaves its own
-	// (speculation.cpp).
-	void CopyStateFrom(const CommandProcessor& other, bool const_ram);
+	// The registers and the rest of the processor's state, not the queue it serves nor the constant RAM, saved to a
+	// CommandProcessorState and taken from one: a speculative translation starts from the processor's state and,
+	// committed, leaves its own (speculation.cpp).
+	void SaveStateTo(CommandProcessorState& state) const;
+	void CopyStateFrom(const CommandProcessorState& state);
 	// The state draws and dispatches may change besides the registers they read is the same.
-	[[nodiscard]] bool SameDrawState(const CommandProcessor& other) const;
+	[[nodiscard]] bool SameDrawState(const CommandProcessorState& other) const;
 	// The same registers and draw state (all CopyStateFrom copies but the flip, submit id and constant engine).
-	[[nodiscard]] bool SameState(const CommandProcessor& other) const;
+	[[nodiscard]] bool SameState(const CommandProcessorState& other) const;
 	// A state pass (KYTY_SPECULATE=4): Process runs only the packets that change this processor's state (registers,
 	// index and indirect bases, instances, counters, predication, context pushes), translating and executing nothing:
 	// the state a command buffer leaves, before it is translated.
@@ -235,11 +238,17 @@ private:
 	void ProcessPm4(Pm4Execution& execution, size_t stop_depth);
 	void ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth);
 	void SuspendPm4();
+	// SaveStateTo's and CopyStateFrom's members, either way (graphicsRun.cpp): every CommandProcessorState member, a list
+	// kept by hand in step with that struct's.
+	template <typename To, typename From>
+	static void CopyStateParts(To& to, const From& from);
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 	void                CheckBuffer() const { GetScheduler().CheckActive(); }
 	GpuResourceManager& GetGpuResources() const { return m_renderer.GetGpuResources(); }
 
+	// (The state a speculation keeps of these is CommandProcessorState's, below: a member CopyStateFrom is to take goes
+	// there and in CopyStateParts too.)
 	RenderContext&   m_renderer;
 	HW::Context      m_ctx;
 	HW::Context      m_saved_ctx;
@@ -268,6 +277,36 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+};
+
+// A processor's state as CopyStateFrom takes it and SameState compares it (CommandProcessor's members of those names,
+// kept in step): the states a speculation keeps (speculation.cpp: a translation's start and end, the state at each of
+// its holes, a chunk's start), which run no packet. Without the processor's constant RAM, which no speculation copies
+// or compares: 48 KiB of its 55,944 bytes, zero-filled in every processor made. Its member list is kept by hand in step
+// with CommandProcessor::CopyStateParts (graphicsRun.cpp, which copies each member both ways) and with the processor's
+// own members: a member added to one goes in the others (SameState and SameDrawState compare all of them but m_flip,
+// m_submit_id and m_ce_complete).
+struct CommandProcessorState {
+	uint32_t                   m_draw_run_skip = 0;
+	HW::Context                m_ctx;
+	HW::Context                m_saved_ctx;
+	bool                       m_context_state_pushed = false;
+	HW::UserConfig             m_ucfg;
+	HW::Shader                 m_sh_ctx;
+	HW::UserSgprType           m_user_data_marker                 = HW::UserSgprType::Unknown;
+	uint32_t                   m_index_type_and_size              = 0;
+	uint32_t                   m_index_buffer_size                = 0;
+	uint64_t                   m_index_base_addr                  = 0;
+	uint64_t                   m_draw_indirect_args_base_addr     = 0;
+	uint64_t                   m_dispatch_indirect_args_base_addr = 0;
+	uint32_t                   m_num_instances                    = 1;
+	uint32_t                   m_de_count                         = 0;
+	uint32_t                   m_ce_count                         = 0;
+	bool                       m_ce_complete                      = false;
+	CommandProcessor::FlipInfo m_flip;
+	uint64_t                   m_submit_id                   = 0;
+	uint64_t                   m_synthetic_occlusion_counter = 0;
+	bool                       m_predicate_skip              = false;
 };
 
 } // namespace Libs::Graphics
