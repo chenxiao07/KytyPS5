@@ -239,9 +239,11 @@ public:
 	}
 	// spec_exact_reg_stop: as RegisteredSince, over the range's 16 KiB granules: a buffer registered or
 	// unregistered over the range itself since `epoch` (KYTY_SPECULATE=4 marks them; the render thread's, as the
-	// commit that asks). False also when nothing was marked (another mode).
+	// commit that asks). False also when nothing was marked (another mode). True for an epoch before the granules'
+	// floor (MarkExactEpochsFromNow): a change before it may have gone unmarked (made outside mode 4).
 	[[nodiscard]] bool RegisteredSinceExact(uint64_t vaddr, uint64_t size, uint64_t epoch) const {
 		if (size == 0) return false;
+		if (epoch < m_exact_floor.load(std::memory_order_acquire)) return true;
 		// (Each leaf looked up once for its granules.)
 		constexpr uint64_t leaf_mask = (uint64_t {1} << RegLeafBits) - 1;
 		for (uint64_t g = vaddr >> RegGranuleBits, last = (vaddr + size - 1) >> RegGranuleBits; g <= last;) {
@@ -254,6 +256,26 @@ public:
 			g = stop + 1;
 		}
 		return false;
+	}
+	// spec_regional_pending (KYTY_SPECULATE=4 only: the granule epochs): true when no buffer was registered or unregistered
+	// over the range since `epoch`, proven at a bounded cost: its 4 MiB tracker regions' epochs (at most 64 of them, the
+	// range inside the tracker's address space), then, when one of them moved, its 16 KiB granules' (at most 256). False
+	// (not proven) otherwise. No lock; the render thread's, as RegisteredSinceExact.
+	[[nodiscard]] bool RegistrationUnchangedSince(uint64_t vaddr, uint64_t size, uint64_t epoch) const {
+		constexpr uint64_t MaxRegions = 64, MaxGranules = 256;
+		if (size == 0 || vaddr + size < vaddr || vaddr + size > TRACKER_ADDRESS_SIZE) return false;
+		const auto last = vaddr + size - 1;
+		if (last / TRACKER_REGION_SIZE - vaddr / TRACKER_REGION_SIZE + 1 > MaxRegions) return false;
+		if (!RegisteredSince(vaddr, size, epoch)) return true;
+		return (last >> RegGranuleBits) - (vaddr >> RegGranuleBits) + 1 <= MaxGranules &&
+		       !RegisteredSinceExact(vaddr, size, epoch);
+	}
+	// The granule epochs' floor: every change from the registration epoch now on is marked in them (RegisteredSinceExact
+	// answers changed for an epoch before it). Called as mode 4's machinery starts (graphicsRun.cpp start_speculation: at
+	// a KYTY_SPECULATE=4 boot, and on a live `mode 4` after the mode reads 4), on the thread that registers, before any
+	// speculation exists to commit: a live switch from 4 to 0 and back leaves the changes made in mode 0 unmarked.
+	void MarkExactEpochsFromNow() {
+		m_exact_floor.store(m_registration_epoch.load(std::memory_order_relaxed), std::memory_order_release);
 	}
 	// The registration epoch of the last change of a buffer covering the tracker region of `vaddr`: a region
 	// request's proof only depends on the buffers of its own region.
@@ -518,6 +540,7 @@ private:
 	// spec_exact_reg_stop: per 16 KiB granule, the epoch of the last registration change over it (RegisteredSinceExact).
 	static constexpr uint64_t                                 RegGranuleBits = 14, RegLeafBits = 16;
 	std::unordered_map<uint64_t, std::unique_ptr<uint64_t[]>> m_reg_granule_epochs;
+	std::atomic<uint64_t>                                     m_exact_floor {0}; // (MarkExactEpochsFromNow)
 	std::vector<GuestRange> m_registration_spans; // see TakeRegistrationSpans
 	bool                    m_registration_spans_lost = true;
 	struct SyncBuffer {

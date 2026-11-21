@@ -2398,6 +2398,12 @@ void Speculation::Before(Result& result, size_t index) {
 	}
 	const bool take_pending_walk = pending_walk && !pending_skip;
 	bool       obtained_all      = true;
+	// spec_regional_pending (KYTY_SPECULATE=4 only, the mode test below): a found entry the global test
+	// below misses (a buffer registered or unregistered anywhere since its proof) proven instead from the epochs over its
+	// own range (BufferCache::RegistrationUnchangedSince: its tracker regions', then its granules'): nothing registered or
+	// unregistered over it since `since`, its range's buffer is the one it was proven over, as the global test concludes.
+	// Only mode 4 keeps the granule epochs (the mode test). Not proven: the walk as before.
+	const bool   regional        = take_pending_walk && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 	for (size_t i = pending_skip ? to.pending_buffers : from.pending_buffers; i < to.pending_buffers; ++i) {
 		// (As the owner's table path: the range's game buffer, made or joined, then made current, then obtained, which
 		// then gives that buffer, not a copy in the shader ring (no device address: an exit in a long run). Anything but
@@ -2407,11 +2413,18 @@ void Speculation::Before(Result& result, size_t index) {
 		// bytes; the patch step decides whether its address moved. None any more: obtained as a pending one. Over
 		// CPU-dirty memory (a collector's retire copies no bytes; read only, no region manager made) obtained too: its
 		// bytes uploaded to the live buffer.)
-		if (!entry.pending && (entry.since >= registration_now ||
-		                       (buffers.GetBufferIfLive(buffers.RegisteredBuffer(entry.address, entry.size)) != nullptr &&
-		                        !buffers.IsRegionCpuDirtyNoCreate(entry.address, entry.size)))) {
-			entry.obtained = true;
-			continue;
+		if (!entry.pending) {
+			// (spec_regional_pending: the global test, then the regional one; read after earlier entries' calls here, it
+			// also sees this walk's own registrations over the range.)
+			const bool old_hit      = entry.since >= registration_now;
+			const bool regional_hit = !old_hit && regional && buffers.RegistrationUnchangedSince(entry.address, entry.size, entry.since);
+			// A regional hit proves the owner, so only the lookup can be skipped.
+			if (old_hit ||
+			    ((regional_hit || buffers.GetBufferIfLive(buffers.RegisteredBuffer(entry.address, entry.size)) != nullptr) &&
+			     !buffers.IsRegionCpuDirtyNoCreate(entry.address, entry.size))) {
+				entry.obtained = true;
+				continue;
+			}
 		}
 		// For a pending non-texel read, the live owner replaces the repeated lookups. Check after the first
 		// LRU touch, where EnsureBufferContents would synchronize. A dirty range takes the full path below.

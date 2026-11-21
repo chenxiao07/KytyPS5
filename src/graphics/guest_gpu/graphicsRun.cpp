@@ -1512,6 +1512,9 @@ void GuestGpu::ThreadRun(void* data) {
 	};
 	// (Mode 4's machinery: at the start, and again on a live `mode 4` (mode-toggle.h, below).)
 	const auto start_speculation = [gpu] {
+		// (spec_exact_reg_stop / spec_regional_pending: the buffer cache's granule epochs complete from here on, the mode
+		// reading 4 already: BufferCache::MarkExactEpochsFromNow. Before the speculations below exist.)
+		gpu->m_renderer.GetBufferCache().MarkExactEpochsFromNow();
 		// KYTY_SPEC_PASS_THREAD (unset: on, mode 4 only as all of this; 0 off): the state pass on its own thread
 		// (Speculation::AheadRun), its packet slot after the workers'.
 		const char* pass_env    = std::getenv("KYTY_SPEC_PASS_THREAD");
