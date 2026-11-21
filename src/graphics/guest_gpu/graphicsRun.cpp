@@ -1587,7 +1587,9 @@ void GuestGpu::ThreadRun(void* data) {
 	// (Mode 4's machinery: at the start, and again on a live `mode 4` (mode-toggle.h, below).)
 	const auto start_speculation = [gpu] {
 		// (spec_exact_reg_stop / spec_regional_pending: the buffer cache's granule epochs complete from here on, the mode
-		// reading 4 already: BufferCache::MarkExactEpochsFromNow. Before the speculations below exist.)
+		// reading 4 already: BufferCache::MarkExactEpochsFromNow. Before the speculations below exist, not before every
+		// thread that reads the mode: on a live `mode 4` the weave's workers run on until the loop top pauses them, so
+		// they ask nothing this floor guards: BufferCache::RegionResolutionEpoch.)
 		gpu->m_renderer.GetBufferCache().MarkExactEpochsFromNow();
 		// KYTY_SPEC_PASS_THREAD (unset: on, mode 4 only as all of this; 0 off): the state pass on its own thread
 		// (Speculation::AheadRun), its packet slot after the workers'.

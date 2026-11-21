@@ -1302,15 +1302,88 @@ void BufferCache::ChangeRegister(BufferId id) {
 	// The page table first, one 8-byte store an entry (a speculation's thread reads it concurrently: LoadOwner), then the
 	// epochs: a speculation that acquires the new epoch then reads the new entry (an unregister's cleared one); one that
 	// read the old entry took the old epoch, which its commit's registration check finds moved.
+	//
+	// QUIET INSERTS (under KYTY_SPECULATE=4 only, from mode 4's first start: QuietResolution). A QUIET INSERT is a
+	// registration (insert) in mode 4 over pages no buffer holds. Every registration is meant to be one, because each
+	// caller unregistered whatever was there first - CreateBuffer joins every buffer ResolveOverlaps found (JoinOverlap ->
+	// DeleteBuffer -> Unregister) before Register; ServeAhead registers only a range ResolveOverlaps finds free;
+	// SplitUnmappedBuffers, MoveSpilledBufferBack and Defragment DeleteBuffer the old one, then Register its pieces / its
+	// move inside the old one's caching pages - and it is checked here, not assumed: the page table's old entries are
+	// read by the exchange that writes the new ones, and a registration that met an entry still held is LOUD (the
+	// change as before the quiet inserts; counted, reg_quiet_fallbacks). A quiet insert stores the page table,
+	// m_region_registrations and BdaDirtyRegions::Mark (the BDA region proofs, GpuResourceManager::SynchronizeDirtyBdaRegions
+	// and SynchronizeRegionRequest, are about the absence of a buffer: a new one's CPU-dirty pages must be synced before
+	// BDA reads reach them - they keep moving), the spans, the sync change, m_buffers, the LRU, the BDA entries and the
+	// hoist watch exactly as before; it writes no granule epoch, no resolution region epoch (m_region_resolution) and
+	// publishes no registration epoch. Every other change (each unregister; every registration outside mode 4) is LOUD:
+	// the page table, the granules, the regions (both arrays), then the published epoch, the order the comment above
+	// needs. m_change_counter gives every change its value: the published epoch + 1, as before, unless quiet inserts came
+	// since the last loud change (then above it; the next loud change publishes its own value, past theirs).
+	//
+	// WHY IT IS EXACT. (1) Every proof the published epoch, the resolution regions or the granules carry is about a range
+	// that HAD an owner at its lookup (a found buffer: NoteBufferRange, Changed's buffer ranges, RelocEligible, the pending
+	// walk's found entries and their summary, the patch step's moved test, the held V# entries, the args / index held
+	// entries, native records' deps, the write memo, the BDA head memo's "held", TableWorkerKeepsMoved's ranges), and its
+	// claim is "that owner is still the owner". An insert changes no owner: only an unregister ends one, and every
+	// unregister stays loud over the old owner's whole range. A worker that met the new buffer N read N's page entry after
+	// its victims' loud stores (the GPU thread's program order, LoadOwner's seq_cst load): a range in a victim's pages is
+	// stopped by the victim's granules, one in N's new pages had no owner before N. (2) No result rests on the absence of an
+	// owner through a published epoch; each absence is a hint or is tested again at the commit by the GPU thread's own
+	// state, never by an epoch:
+	//  - FindBufferSpec's miss: refused (the hole runs the lookup in order) and posted (PostAhead) - a hint;
+	//  - ServeAhead's overlap test: ResolveOverlaps over m_buffers on the GPU thread at the serve (quiet inserts keep
+	//    m_buffers as before), nothing kept;
+	//  - ObtainBufferSpec's miss: a table V# left pending - the commit's Before obtains it in order (FindBuffer,
+	//    EnsureBufferContents, ObtainBuffer) and the patch step writes the address RegisteredBuffer finds then for every
+	//    pending entry; spec_ring_index's ring copy and the small read-only direct read take guest bytes whatever the
+	//    owner (the in-order ObtainBuffer takes the same small read with or without a buffer), proven by their clean
+	//    reads' guest-memory epochs at the commit (Changed checks clean reads for unmaps only, never for registrations,
+	//    as before); else refused;
+	//  - TableBlocks' pending V#s (the same pending entries) and its ring copies (owner-independent, as in order);
+	//  - EnsureBdaReadable on a worker: a page with no owner goes to FindBufferSpec (refused); the BDA head memo keeps
+	//    "held" (presence) only, which only an unregister ends;
+	//  - IsRegionRegistered: GPU-thread callers only (eager feedback, the feedback read, the unmap / map paths, readbacks),
+	//    answered from the page table / m_buffers at the call, nothing cached under an epoch.
+	// The GPU thread's "the epoch moved" tests that inserts used to trip need only unregisters: TableDraw's "a later
+	// lookup that registers a buffer (a merge replaces an earlier one)" and the dispatch retry (a merge unregisters),
+	// Before's "preparation registered buffers" (a buffer merged away under the recorded work), the pending dedupe (an
+	// answer after its own FindBuffer). (3) Absence-of-owner readers that are not proofs keep moving: the BDA regions.
+	// THE MODE FLIP is exact both ways: m_region_resolution is written by every loud change in mode 4, so from the floor on
+	// (MarkExactEpochsFromNow, which makes it: the granules' floor, guarded in RegisteredSince and RegionResolutionEpoch)
+	// it holds every unregister. 0 -> 4: the readers move to the resolution array from the floor, and from then on (1)-(2)
+	// apply (the GPU thread, and the speculations, made after the floor; a weave worker, which runs on past the mode's
+	// store until the weave pauses, never moves: it asks m_region_registrations in either mode). 4 -> 0: the readers move
+	// back to m_region_registrations, which got every change, quiet inserts included, at
+	// values above the epoch published before them: a worker's epoch from mode 4 answers "moved" over a quiet insert's
+	// regions (a stop, never a miss), and the granules, which skipped the quiet inserts, are only ever asked about
+	// unregisters by (1). Mode 0: no change is quiet, so every change publishes its value (the first one after a live
+	// switch from mode 4 publishes past any quiet insert's); in a mode-0 boot the values and stores are the ones before
+	// the quiet inserts, the page table's stores plain ones, and m_region_resolution is never made.
+	const bool  mode4      = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+	auto* const resolution = mode4 ? m_region_resolution.load(std::memory_order_acquire) : nullptr;
+	bool        quiet      = insert && resolution != nullptr;
 	PageTable::PageRange pages {};
 	EXIT_IF(!PageTable::TryGetPageRange(m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size(), pages));
+	bool held = false; // (a quiet insert's page that still held a buffer: the change is loud)
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
 		const BufferId entry = insert ? id : BufferId {};
-		__atomic_store_n(reinterpret_cast<uint64_t*>(&m_page_table[page]), std::bit_cast<uint64_t>(entry), __ATOMIC_RELEASE);
+		if (quiet) {
+			const auto old =
+			    __atomic_exchange_n(reinterpret_cast<uint64_t*>(&m_page_table[page]), std::bit_cast<uint64_t>(entry), __ATOMIC_ACQ_REL);
+			held = held || static_cast<bool>(std::bit_cast<BufferId>(old));
+		} else {
+			__atomic_store_n(reinterpret_cast<uint64_t*>(&m_page_table[page]), std::bit_cast<uint64_t>(entry), __ATOMIC_RELEASE);
+		}
 	}
-	const auto epoch = m_registration_epoch.load(std::memory_order_relaxed) + 1;
-	// spec_exact_reg_stop: the granules' epochs, for RegisteredSinceExact (KYTY_SPECULATE=4 only).
-	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+	if (held) {
+		// (No registration is meant to meet one: the change made as before the quiet inserts, the epochs after the page
+		// table as there.)
+		quiet = false;
+		LiveCounters::Add(LiveCounters::RegQuietFallbacks);
+	}
+	const auto epoch = ++m_change_counter;
+	// spec_exact_reg_stop: the granules' epochs, for RegisteredSinceExact (KYTY_SPECULATE=4 only; not a quiet insert's).
+	if (mode4 && !quiet) {
 		constexpr uint64_t leaf_mask = (uint64_t {1} << RegLeafBits) - 1;
 		const auto         begin     = m_slot_buffers[id].CpuAddress();
 		const auto         bytes     = m_slot_buffers[id].Size();
@@ -1340,13 +1413,14 @@ void BufferCache::ChangeRegister(BufferId id) {
 	          last   = (m_slot_buffers[id].CpuAddress() + m_slot_buffers[id].Size() - 1) / TRACKER_REGION_SIZE;
 	     region <= last && region < TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE; ++region) {
 		m_region_registrations[region].store(epoch, std::memory_order_release);
+		if (resolution != nullptr && !quiet) resolution[region].store(epoch, std::memory_order_release); // (quiet inserts)
 		BdaDirtyRegions::Mark(region);
 	}
 	// While the weave is enabled, the change's span by its epoch (RegisteredOverSince), before the epoch is published.
 	if (Weave::Enabled())
 		g_registration_log[epoch % RegistrationLog] = {epoch, m_slot_buffers[id].CpuAddress(),
 		                                               m_slot_buffers[id].Size()};
-	m_registration_epoch.store(epoch, std::memory_order_release);
+	if (!quiet) m_registration_epoch.store(epoch, std::memory_order_release);
 	LiveCounters::Add(LiveCounters::BufferRegistrations);
 	auto& buffer = m_slot_buffers[id];
 	// The batch's hoist check: a registration over a hoisted range of a KernelBatchMap2 call in progress marks it touched.

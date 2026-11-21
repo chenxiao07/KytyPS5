@@ -3108,7 +3108,11 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				// registration began proved them for later translations too.)
 				for (auto region = held.address / TRACKER_REGION_SIZE, last = (held.address + held.size - 1) / TRACKER_REGION_SIZE;
 				     current && region <= last; ++region)
-					current = buffer_cache.RegionRegistrationEpoch(region * TRACKER_REGION_SIZE) <= held.registration;
+					// (Quiet inserts: a quiet insert moves no owner, so not the resolution epoch: BufferCache::ChangeRegister. A
+					// weave worker keeps the epoch every change moves: on a live 0 -> 4 it can read the mode as 4 before the
+					// floor moves and before the weave pauses, and an unregister made in mode 0 moved that epoch alone.)
+					current = (P::worker ? buffer_cache.RegionRegistrationEpoch(region * TRACKER_REGION_SIZE)
+					                     : buffer_cache.RegionResolutionEpoch(region * TRACKER_REGION_SIZE)) <= held.registration;
 				if (current) held.registration = registration;
 			}
 			if (current && held.size != 0) {
