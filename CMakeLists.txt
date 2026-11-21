@@ -933,6 +933,7 @@ if(LINUX)
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/textureCache.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/image/image.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/image/tiler.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 		"${KYTY_SOURCE_DIR}/local/jit-arena.cpp"
