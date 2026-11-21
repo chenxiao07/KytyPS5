@@ -865,13 +865,13 @@ partial class MainWindow : Window {
 		redzone = Switch(S.Bool("redzone"));
 		safeGpu = Switch(S.Bool("safegpu"));
 		var saved = S.Str("ui_language");
-		uiLanguage = Combo(new[] { new Choice(T("uilang.auto"), ""), new Choice("English", "en"), new Choice("中文（简体）", "zh") },
-			saved == "en" ? 1 : saved == "zh" ? 2 : 0, 220);
+		uiLanguage = Combo(new[] { new Choice(T("uilang.auto"), ""), new Choice("English", "en"), new Choice("中文（简体）", "zh"), new Choice("Русский", "ru") },
+			saved == "en" ? 1 : saved == "zh" ? 2 : saved == "ru" ? 3 : 0, 220);
 		uiLanguage.SelectionChanged += (s, e) => {
 			if (building) return;
 			var value = Value(uiLanguage) as string ?? "";
 			S.Set("ui_language", value);
-			Strings.Language = value == "zh" ? UiLanguage.Chinese : value == "en" ? UiLanguage.English : Strings.SystemLanguage();
+			Strings.Language = value == "zh" ? UiLanguage.Chinese : value == "ru" ? UiLanguage.Russian : value == "en" ? UiLanguage.English : Strings.SystemLanguage();
 			ReadForm();
 			Build();
 		};
