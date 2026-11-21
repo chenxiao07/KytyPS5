@@ -1,5 +1,6 @@
 #include "keyboard_prompts.h"
 
+#include "page_marks.h"
 #include "prompt_assets.h"
 #include "prompt_texture.h"
 
@@ -170,6 +171,80 @@ bool KnownGenerated(const fs::path& root, const fs::path& backup, const std::str
 	return why.empty() && bytes.size() == current.size() && Hash(bytes) == hash;
 }
 
+// ------------------------------------------------------------- the page marks
+
+// A file or link of that name is there (a link is not followed).
+bool Present(const fs::path& path) {
+	std::error_code error;
+	return fs::exists(fs::symlink_status(path, error));
+}
+
+std::vector<std::string> RecordLines(const fs::path& path) {
+	std::vector<std::string> lines;
+	std::ifstream            file(path);
+	for (std::string line; std::getline(file, line);) {
+		if (!line.empty() && line.back() == '\r') line.pop_back();
+		lines.push_back(line);
+	}
+	return lines;
+}
+
+// The page marks have no shipped replacement, so every version the launcher writes is recorded, as custom icons
+// are: one short file beside the backup that lists each version's SHA-256 (the Windows launcher's own record).
+// A record that cannot be read lists nothing: the spots are then not taken for the launcher's own.
+bool KnownMarks(const fs::path& backup, const std::string& hash) {
+	const auto lines = RecordLines(backup / PageMarks::RecordName);
+	return std::find(lines.begin(), lines.end(), hash) != lines.end();
+}
+
+void RecordMarks(const fs::path& root, const fs::path& backup, const std::string& hash) {
+	const auto path = backup / PageMarks::RecordName;
+	NoLinks(root, path);
+	auto lines = RecordLines(path);
+	if (std::find(lines.begin(), lines.end(), hash) != lines.end()) return;
+	lines.push_back(hash);
+	std::string text;
+	for (const auto& line: lines) text += line + "\n";
+	WriteAtomic(path, Buffer(text.begin(), text.end()));
+}
+
+// The sheet of the marks, its folders found like the icons' (a dump made on Windows keeps its own case).
+fs::path AtlasPath(const fs::path& root) {
+	const auto& relative = PageMarks::RelativePath();
+	fs::path    path     = root;
+	for (size_t start = 0; start < relative.size();) {
+		size_t end = relative.find('/', start);
+		if (end == std::string::npos) end = relative.size();
+		path  = Insensitive(path, relative.substr(start, end - start));
+		start = end + 1;
+	}
+	return path;
+}
+
+// The two spots of the sheet, as far as the launcher can look at them: false when the sheet is absent, linked, of
+// another size or cannot be read. `gone` says there is no sheet of the expected size here at all.
+bool Spots(const fs::path& root, const fs::path& sheet, Buffer& spots, bool& gone) {
+	gone = false;
+	std::error_code error;
+	if (!fs::is_regular_file(sheet, error)) {
+		gone = true;
+		return false;
+	}
+	if (PageMarks::Linked(root, sheet)) return false;
+	const auto size = fs::file_size(sheet, error);
+	if (error) return false;
+	if (size != PageMarks::ExpectedSize()) {
+		gone = true;
+		return false;
+	}
+	try {
+		spots = PageMarks::ReadRegions(sheet);
+	} catch (const PromptError&) {
+		return false;
+	}
+	return true;
+}
+
 struct LockFile {
 	int fd = -1;
 	~LockFile() {
@@ -249,12 +324,77 @@ void ApplyCore(const Game& game, bool enabled, const KeyboardLayout* layout) {
 		}
 		steps.push_back({target, current, enabled ? icon.replacement : saved});
 	}
+	// The square and triangle page-switch marks are two spots in a UI sheet, rewritten in place. A sheet the launcher
+	// has not written to never stops a Play the icons alone would allow: absent, linked, of another size, unreadable,
+	// with other bytes in the two spots, still original but hard-linked or not writable, or with no font here to
+	// draw the marks, it is left alone. Only its own work is strict: marks it wrote, or a write it did not finish
+	// on this sheet (page-marks.pending), need the original bytes and a sheet it can write.
+	fs::path       atlas; // (empty: the sheet is not part of this batch)
+	const auto     marks_backup       = backup / PageMarks::BackupName;
+	const auto     marks_pending      = backup / PageMarks::PendingName;
+	const bool     marks_were_pending = Present(marks_pending);
+	// A mark with nothing left to finish (no sheet, another sheet, original spots) is only removed.
+	bool           stale_mark = false;
+	Buffer         marks_before, marks_desired, marks_original;
+	{
+		const auto sheet = AtlasPath(root);
+		Buffer     spots;
+		bool       sheet_gone = false;
+		if (!Spots(root, sheet, spots, sheet_gone))
+			stale_mark = sheet_gone && marks_were_pending;
+		else {
+			const auto spots_hash = Hash(spots);
+			const bool untouched  = spots_hash == PageMarks::OriginalHash();
+			if (untouched && (!enabled || !PageMarks::Startable(sheet)))
+				// Nothing to restore; and an untouched sheet is not started on when it has a second hard link
+				// or cannot be opened for writing.
+				stale_mark = marks_were_pending;
+			else if (untouched || marks_were_pending || KnownMarks(backup, spots_hash)) {
+				NoLinks(root, marks_backup);
+				NoLinks(root, marks_pending);
+				// The original bytes: the sheet itself while it is untouched, otherwise the saved copy.
+				Buffer saved = spots;
+				if (!untouched) {
+					const std::string advice = " Restore " + PageMarks::RelativePath() + " from your own original game files first.";
+					if (!Present(marks_backup))
+						throw PromptError(std::string("Original prompt backup is missing: ") + PageMarks::BackupName + "." + advice);
+					saved = ReadFile(marks_backup);
+					if (Hash(saved) != PageMarks::OriginalHash())
+						throw PromptError(std::string("Invalid original prompt backup: ") + PageMarks::BackupName + "." + advice);
+				}
+				Buffer desired = saved;
+				bool   usable  = true;
+				if (enabled) {
+					const KeyboardLayout& labels = layout != nullptr ? *layout : defaults;
+					try {
+						desired = PageMarks::Render(labels.IconLabel("ps4_button_square.ctxr"), labels.IconLabel("ps4_button_triangle.ctxr"));
+					} catch (const PromptError&) {
+						// The default icons are drawn in the pack, but the marks are always drawn here: a PC with no
+						// usable font cannot make them. Over an untouched sheet that only means no marks.
+						if (!untouched) throw;
+						usable = false;
+					}
+				}
+				if (usable) {
+					atlas          = sheet;
+					marks_before   = spots;
+					marks_desired  = desired;
+					marks_original = saved;
+				} else
+					stale_mark = marks_were_pending;
+			}
+		}
+	}
 	// Persist every original before replacing anything. An interrupted batch can be completed or
 	// restored on the next Play; originals are kept when the option is off too.
 	for (size_t i = 0; i < icons.size(); ++i) {
 		const auto original = backup / icons[i].name;
 		if (!fs::exists(original, error)) WriteAtomic(original, steps[i].before);
 	}
+	// The marks' original bytes are saved too (kept, or written again if damaged, only from a sheet that still
+	// holds them: that was checked by hash above).
+	if (!atlas.empty() && enabled && !(Present(marks_backup) && Hash(ReadFile(marks_backup)) == PageMarks::OriginalHash()))
+		WriteAtomic(marks_backup, marks_original);
 	// Record each generated variant before any game write: it recognizes a mix of old and new
 	// profiles after an interruption, without accepting unrelated texture mods.
 	if (enabled)
@@ -267,12 +407,28 @@ void ApplyCore(const Game& game, bool enabled, const KeyboardLayout* layout) {
 			if (error) throw PromptError("Cannot create " + path.parent_path().string() + ": " + error.message());
 			WriteAtomic(path, Bytes::GzipStored(icon.replacement));
 		}
+	if (!atlas.empty() && enabled) RecordMarks(root, backup, Hash(marks_desired));
 	std::vector<size_t> changed;
+	bool                sheet_changed = false;
 	try {
 		for (size_t i = 0; i < steps.size(); ++i) {
 			if (Hash(steps[i].before) == Hash(steps[i].desired)) continue;
 			changed.push_back(i);
 			WriteAtomic(steps[i].target, steps[i].desired);
+		}
+		if (!atlas.empty() && marks_before != marks_desired) {
+			// The mark goes down once the sheet is open for writing and before its first byte changes, so a sheet
+			// that cannot be opened leaves none; the next Play redoes or restores a marked write.
+			PageMarks::WriteRegions(atlas, marks_desired, [&] {
+				WriteAtomic(marks_pending, Buffer());
+				sheet_changed = true;
+			});
+		}
+		if ((!atlas.empty() || stale_mark) && Present(marks_pending)) {
+			// A mark that outlived its write, or has nothing to finish, is harmless: failing to remove it must not
+			// fail the batch.
+			std::error_code ignored;
+			fs::remove(marks_pending, ignored);
 		}
 	} catch (const PromptError& failure) {
 		std::string message = std::string("Could not finish changing keyboard prompts: ") + failure.what();
@@ -282,6 +438,20 @@ void ApplyCore(const Game& game, bool enabled, const KeyboardLayout* layout) {
 				WriteAtomic(steps[i].target, steps[i].before);
 			} catch (const PromptError& again) {
 				message += "\n(Putting " + steps[i].target.string() + " back also failed: " + again.what() + ")";
+			}
+		}
+		// The sheet is restored in place; page-marks.pending stays if that fails (or was there before), so the next
+		// Play still knows.
+		if (sheet_changed) {
+			try {
+				PageMarks::WriteRegions(atlas, marks_before);
+				if (!marks_were_pending) {
+					std::error_code removal;
+					fs::remove(marks_pending, removal);
+					if (removal) throw PromptError("Cannot remove " + marks_pending.string() + ": " + removal.message());
+				}
+			} catch (const PromptError& again) {
+				message += "\n(Putting " + atlas.string() + " back also failed: " + again.what() + ")";
 			}
 		}
 		throw PromptError(message);

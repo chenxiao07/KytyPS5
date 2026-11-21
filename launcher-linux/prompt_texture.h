@@ -25,6 +25,11 @@ Buffer Draw(const std::string& label);
 // The key cap at width x width (a power of two up to 512), RGBA.
 Buffer Scaled(const Buffer& drawn, int width);
 
+// The key cap at width x width (any size from 1 to 512), RGBA: each pixel averages the part of the
+// 512x512 drawing it covers, its edge pixels weighted by the share they cover and the colours by
+// alpha, as Scaled does; the page marks (66x66) need the sizes Scaled does not take.
+Buffer Resampled(const Buffer& drawn, int width);
+
 // The eight mip levels, 128x128 down to 1x1, RGBA bytes.
 std::array<Buffer, 8> Pixels(const std::string& label);
 

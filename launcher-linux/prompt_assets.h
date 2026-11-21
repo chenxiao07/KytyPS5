@@ -8,7 +8,8 @@
 
 // The keyboard prompt pack compiled into the program: launcher-windows/KeyboardPrompts' files
 // (the Windows launcher embeds the same ones as resources): manifest.txt, blank.ctxr.gz,
-// pixel-offsets.bin.gz and the 22 <icon>.ctxr.gz.
+// pixel-offsets.bin.gz, the 22 <icon>.ctxr.gz, and the page marks' page-marks.txt.gz and
+// page-marks-offsets.bin.gz.
 namespace PromptAssets {
 
 struct Asset {

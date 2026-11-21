@@ -15,6 +15,14 @@
 // .kyty-keyboard-prompts-v1 inside the game folder (the same folder and files as the Windows
 // launcher's, so a game folder used from both keeps working); a modified, missing or damaged
 // icon stops the whole batch before anything is written.
+//
+// The square and triangle page-switch marks of the UI sheet (ui/textures/_ps5/_ps5/global_pages.ctxr,
+// see page_marks.h) are relabelled in place in the same batch, and put back the same way. A sheet
+// the launcher has not written to never stops a Play the icons alone would allow (it is absent,
+// linked, of another size, unreadable, holds other bytes in the two spots, is hard-linked or not
+// writable, or there is no font to draw the marks with): it is left alone. Marks the launcher did
+// write, or a write it did not finish (page-marks.pending), need the saved original bytes
+// (page-marks.bin) and a sheet it can write, or the batch stops.
 namespace KeyboardPrompts {
 
 struct Game {
