@@ -346,6 +346,45 @@ Buffer Scaled(const Buffer& drawn, int width) {
 	return out;
 }
 
+Buffer Resampled(const Buffer& drawn, int width) {
+	if (width < 1 || width > CanvasSize || drawn.size() != static_cast<size_t>(CanvasSize) * CanvasSize * 4)
+		throw PromptError("Invalid prompt texture size");
+	// In units of 1/width of a source pixel a destination pixel d covers [d * 512, (d + 1) * 512) and the source
+	// pixel s [s * width, (s + 1) * width): the overlaps are whole numbers, so the sums stay exact.
+	auto overlap = [&](int d, int s) -> uint64_t {
+		const int low = std::max(s * width, d * CanvasSize), high = std::min((s + 1) * width, (d + 1) * CanvasSize);
+		return high > low ? static_cast<uint64_t>(high - low) : 0;
+	};
+	const uint64_t area = static_cast<uint64_t>(CanvasSize) * CanvasSize;
+	Buffer         out(static_cast<size_t>(width) * static_cast<size_t>(width) * 4);
+	for (int y = 0; y < width; ++y)
+		for (int x = 0; x < width; ++x) {
+			uint64_t r = 0, g = 0, b = 0, a = 0;
+			for (int sy = y * CanvasSize / width; sy <= ((y + 1) * CanvasSize - 1) / width; ++sy) {
+				const uint64_t row = overlap(y, sy);
+				for (int sx = x * CanvasSize / width; sx <= ((x + 1) * CanvasSize - 1) / width; ++sx) {
+					const auto* p = &drawn[(static_cast<size_t>(sy) * CanvasSize + static_cast<size_t>(sx)) * 4];
+					const uint64_t weight = row * overlap(x, sx) * p[3];
+					r += weight * p[0];
+					g += weight * p[1];
+					b += weight * p[2];
+					a += weight;
+				}
+			}
+			auto* q = &out[(static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * 4];
+			if (a == 0) {
+				q[0] = q[1] = q[2] = q[3] = 0;
+			} else {
+				// (a is the alpha-weighted area: the pixel's alpha is that over the whole area.)
+				q[0] = static_cast<uint8_t>((r + a / 2) / a);
+				q[1] = static_cast<uint8_t>((g + a / 2) / a);
+				q[2] = static_cast<uint8_t>((b + a / 2) / a);
+				q[3] = static_cast<uint8_t>((a + area / 2) / area);
+			}
+		}
+	return out;
+}
+
 std::array<Buffer, 8> Pixels(const std::string& label) {
 	std::array<Buffer, 8> result;
 	const auto            drawn = Draw(label);

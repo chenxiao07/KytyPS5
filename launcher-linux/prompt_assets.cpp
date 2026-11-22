@@ -46,6 +46,8 @@ KYTY_PROMPT_ASSET(a21, "ps4_stick_r.ctxr.gz");
 KYTY_PROMPT_ASSET(a22, "ps4_touchpad.ctxr.gz");
 KYTY_PROMPT_ASSET(a23, "ps4_touchpad_left.ctxr.gz");
 KYTY_PROMPT_ASSET(a24, "ps4_touchpad_right.ctxr.gz");
+KYTY_PROMPT_ASSET(a25, "page-marks.txt.gz");
+KYTY_PROMPT_ASSET(a26, "page-marks-offsets.bin.gz");
 
 namespace PromptAssets {
 
@@ -80,6 +82,8 @@ const Asset Assets[] = {
 	KYTY_PROMPT_ENTRY(a22, "ps4_touchpad.ctxr.gz"),
 	KYTY_PROMPT_ENTRY(a23, "ps4_touchpad_left.ctxr.gz"),
 	KYTY_PROMPT_ENTRY(a24, "ps4_touchpad_right.ctxr.gz"),
+	KYTY_PROMPT_ENTRY(a25, "page-marks.txt.gz"),
+	KYTY_PROMPT_ENTRY(a26, "page-marks-offsets.bin.gz"),
 };
 
 } // namespace

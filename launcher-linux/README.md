@@ -86,12 +86,23 @@ The originals are checked by SHA-256 and kept in `.kyty-keyboard-prompts-v1` ins
 folder and files as the Windows launcher's: a game folder used from both keeps working). A modified, missing or
 damaged icon stops the whole batch before anything is written; a failed write is rolled back; the emulator must not
 be running. Links inside the game folder are refused (the game folder itself may be a link), and the folder names
-are matched ignoring case. The pack (the textures, the blank template, the pixel map: `launcher-windows/KeyboardPrompts`)
+are matched ignoring case. The pack (the textures, the blank template, the pixel maps: `launcher-windows/KeyboardPrompts`)
 is linked into the program, so nothing is installed.
+
+The square and triangle page-switch marks at the bottom of the inventory and status panels are not among the 22 icons:
+they are two 66x66 sprites inside `ui/textures/_ps5/_ps5/global_pages.ctxr`. With the option on they show the Square
+and Triangle keys too: the launcher writes the two labels into those spots in place and puts the original bytes back
+when the option is off, with the Windows launcher's own files in `.kyty-keyboard-prompts-v1` (`page-marks.bin`,
+`page-marks.generated`, `page-marks.pending`). The sheet is left alone, and Play goes ahead with the icons only, when it
+is missing, linked (or below a linked folder), of another size or unreadable, when the two spots hold bytes the launcher
+did not write (a mod, another game version), when it is still original but hard-linked or not writable, or when there is
+no font to draw the marks with. Once the launcher has written the marks, changing or restoring them needs their saved
+original bytes and a sheet it can write, or the operation stops, as it does for a missing icon backup.
 
 Custom key caps are drawn with the desktop's bold sans font (fontconfig's `sans-serif:bold`; DejaVu Sans, Liberation
 Sans or Noto Sans work, a CFF/OpenType-only font does not) to look like the pack's own icons; without a usable TrueType
-font only the default layout's icons can be applied, and the editor says so.
+font only the default layout's icons can be applied, and the editor says so. (The two page marks are always drawn with
+it, so without one they are left as they are.)
 
 `--dry-run` reports the option (`prompts:`) and prints the `--keymap` pairs it would pass; it changes no file.
 `--screenshot` also draws the editor (`keyboard-controls`). The tests need no game or ImGui:

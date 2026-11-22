@@ -15,6 +15,7 @@ add_executable(kyty_launcher
 	keyboard_layout_settings.cpp
 	keyboard_prompts.cpp
 	keyboard_editor.cpp
+	page_marks.cpp
 	prompt_assets.cpp
 	prompt_texture.cpp
 	"${KYTY_THIRD_PARTY_DIR}/imgui/backends/imgui_impl_sdl2.cpp"
@@ -53,6 +54,7 @@ if(BUILD_TESTING)
 		bytes.cpp
 		keyboard_layout.cpp
 		keyboard_prompts.cpp
+		page_marks.cpp
 		prompt_assets.cpp
 		prompt_texture.cpp
 	)
