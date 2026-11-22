@@ -36,4 +36,9 @@ struct BdaReadPlan {
 // Transactional: a missing field, invalid address or overflow preserves output.
 [[nodiscard]] bool EvaluateBdaReadPlan(const BdaReadPlan& plan, const ResourceSnapshot& snapshot,
                                        std::vector<GuestRange>& output);
+// EvaluateBdaReadPlan's ranges from the words
+// where they lie, appended to `output` (what it holds already is not merged with them). Transactional: a failure leaves
+// `output` as it was.
+[[nodiscard]] bool AppendBdaReadRanges(const BdaReadPlan& plan, std::span<const uint32_t> user_data,
+                                       std::span<const uint32_t> flattened_srt, std::vector<GuestRange>& output);
 } // namespace Libs::Graphics::ShaderRecompiler::IR

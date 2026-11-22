@@ -657,7 +657,8 @@ private:
 	                                      const NativeXprDrawState* draw_state);
 	[[nodiscard]] bool           TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
 	                                         std::array<vk::DeviceAddress, 2>& blocks, bool* writes);
-	void                         TablePrepareBda(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
+	void                         TablePrepareBda(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
+	                                            bool flat);
 	[[nodiscard]] bool           TableTransit(const TableImageSet& set, vk::CommandBuffer vk_buffer,
 	                                          const NativeXprDrawState* draw_state);
 	// TableTransit would record nothing: the set's images are those the draw state's targets allow, none awaits an

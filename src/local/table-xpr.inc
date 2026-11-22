@@ -3414,7 +3414,8 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 // does at every use (the read plans' words from the user data and the blocks' slots); an unbounded plan, all of them.
 // (Without it, particle simulations at Stonefang read stale pages: readbacks the game crashed on, and indirect
 // arguments that lost the device.)
-void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data) {
+void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
+                                     bool flat) {
 	const auto global = [&](uint32_t st) { return pair.programs[st] != nullptr && pair.programs[st]->table_plan.global_memory; };
 	if (!global(0) && !global(1)) return;
 	auto&                                               table = OwnTable();
@@ -3425,6 +3426,13 @@ void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span
 	for (uint32_t st = 0; st < 2 && bounded; ++st) {
 		if (!global(st)) continue;
 		const auto& program = *pair.programs[st];
+		if (flat) {
+			// Read the words the snapshot below would hold directly from their source.
+			bounded = ShaderRecompiler::IR::AppendBdaReadRanges(
+			    program.bda_read_plan, user_data[st],
+			    std::span<const uint32_t>(table.blocks[st].data(), program.table_plan.slots.size()), ranges);
+			continue;
+		}
 		snapshot.user_data.assign(user_data[st].begin(), user_data[st].end());
 		snapshot.flattened_srt.assign(table.blocks[st].begin(), table.blocks[st].begin() + program.table_plan.slots.size());
 		bounded = ShaderRecompiler::IR::EvaluateBdaReadPlan(program.bda_read_plan, snapshot, stage_ranges);
@@ -4289,7 +4297,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		for (uint32_t st = 0; st < stages; ++st)
 			if (pair.programs[st]->table_plan.global_memory) return WeaveMiss(Weave::Miss::Memory), TableResult::Native;
 	} else {
-		TablePrepareBda(pair, user_data);
+		TablePrepareBda(pair, user_data, speculate_mode == 4);
 	}
 	// The blocks take each buffer's device address as it resolves: a later lookup that registers a buffer (a merge
 	// replaces an earlier one) leaves an earlier address stale, where the normal path binds after all its lookups
@@ -5039,6 +5047,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	    (!pair.programs[0]->table_plan.indirect.empty() || pair.programs[0]->table_plan.dynamic_reads))
 		return m_dispatch_declined = "table: indirect off", false;
 	if (!TableEvaluate(pair, user_data)) return m_dispatch_declined = "table: tables unmapped", false;
+	const bool mode_four = Spec::ModeFour();
 	TableGather(pair, user_data);
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 2);
@@ -5057,8 +5066,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	// once, from the epoch then; a second move refuses as before. A first take that recorded work (RecordedWrites moved)
 	// is refused as before, never taken again, so no recorded work outlives its notes. What the first take did besides
 	// its notes (ring copies no command reads, posted ranges) is what a refused packet's Rollback leaves too.
-	auto* const retry_spec =
-	    kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? Spec::Current() : nullptr;
+	auto* const retry_spec = mode_four ? Spec::Current() : nullptr;
 	std::optional<Spec::Counts> retry_mark;
 	bool                        retry_bda  = false;
 	uint64_t                    retry_work = 0;
@@ -5068,7 +5076,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 		retry_work = LocalVulkanRecording::RecordedWrites();
 	}
 	for (uint32_t attempt = 0;; ++attempt) {
-		TablePrepareBda(pair, user_data); // (as TableDraw's: before the blocks)
+		TablePrepareBda(pair, user_data, mode_four); // (as TableDraw's: before the blocks)
 		const auto registration = cache.RegistrationEpoch(); // (as TableDraw's)
 		if (!TableBlocks(pair, user_data, blocks, &storage_writes)) return m_dispatch_declined = "table: blocks", false;
 		if (indirect_args != 0) {
