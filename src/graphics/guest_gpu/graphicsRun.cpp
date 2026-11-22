@@ -1480,17 +1480,12 @@ void GuestGpu::ThreadRun(void* data) {
 	InitializePerformanceSwitches();
 #if defined(__linux__)
 	static const auto check_write_guard_uffd = [] { // (static: apply_mode calls it too)
-	// KYTY_WRITE_GUARD with the userfaultfd write watch (KYTY_UFFD_WP=1, the Steam Deck build's default unless 0;
-	// sysLinuxVirtual.cpp WriteWatchInit): the GPU thread faulted forever on a WAIT_REG_MEM label read before the menu
-	// (issue #289: a view page's protection unrecorded, see sysLinuxVirtual.cpp). The guard stays off with it unless
-	// KYTY_WRITE_GUARD_UFFD=1.
+	// KYTY_WRITE_GUARD with the userfaultfd write watch (KYTY_UFFD_WP=1, the Steam Deck build's and the weave's default
+	// unless 0; sysLinuxVirtual.cpp WriteWatchInit): the GPU thread faulted forever on a WAIT_REG_MEM label read before
+	// the menu (issue #289: a view page's protection unrecorded, see sysLinuxVirtual.cpp). The guard stays off with it
+	// unless KYTY_WRITE_GUARD_UFFD=1. (The watch as start-up made it: a live `mode 4` after a start with the weave.)
 	if (WriteGuard::Enabled()) {
-		const char* uffd = std::getenv("KYTY_UFFD_WP");
-#if defined(KYTY_STEAM_DECK)
-		const bool watch = uffd == nullptr || uffd[0] == '\0' || uffd[0] == '1';
-#else
-		const bool watch = uffd != nullptr && uffd[0] == '1';
-#endif
+		const bool watch = Common::VirtualMemory::WriteWatchByUffd();
 		// KYTY_WRITE_GUARD_UFFD=1 (default 0): the cause fixed (the views' protection recorded, sysLinuxVirtual.cpp), the
 		// guard kept.
 		const char* fixed = std::getenv("KYTY_WRITE_GUARD_UFFD");

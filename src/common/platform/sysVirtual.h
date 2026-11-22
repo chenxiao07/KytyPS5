@@ -28,6 +28,8 @@ void     SysVirtualWriteWatchUnmapped(uint64_t address, uint64_t size);
 // (Linux) VirtualMemory::ZapNoAccess; a SIGBUS of a minor-mode page, or of a write protection the bits lost, served
 // (sysLinuxVirtual.cpp).
 void     SysVirtualZapNoAccess(bool on);
+// (Linux) Whether the trackers' write watch is userfaultfd write protection (VirtualMemory::WriteWatchByUffd).
+bool     SysVirtualWriteWatchByUffd();
 bool     SysVirtualResolveMinorFault(uint64_t address, bool present, bool write);
 
 } // namespace Common

@@ -102,17 +102,39 @@ static int OpenUffd(uint64_t features) {
 	return fd;
 }
 
+// KYTY_WEAVE=1 without KYTY_SPECULATE=4 (which the weave stands down for), as performance-switches.h reads them; read
+// here, before any guest memory is mapped, so before the weave's own start gates (Weave::ApplyStartGates).
+static bool WeaveAsked() {
+	const char* weave     = std::getenv("KYTY_WEAVE");
+	const char* speculate = std::getenv("KYTY_SPECULATE");
+	return weave != nullptr && std::strtoul(weave, nullptr, 10) != 0 &&
+	       (speculate == nullptr || std::strtoul(speculate, nullptr, 10) == 0);
+}
+
 static void WriteWatchInit() {
 	// VirtualMemory::Init() runs more than once (main and the kernel memory module).
 	if (g_uffd >= 0) return;
-	const char* value = std::getenv("KYTY_UFFD_WP");
-	const char* minor = std::getenv("KYTY_UFFD_MINOR");
+	const char* value   = std::getenv("KYTY_UFFD_WP");
+	const char* minor   = std::getenv("KYTY_UFFD_MINOR");
+	bool        by_weave = false;
 #if defined(KYTY_STEAM_DECK)
 	// On by default in the Steam Deck build (KYTY_UFFD_WP=0: mprotect): there the upload worker's re-arms took 4.4 ms a
 	// frame as mprotect calls, 2.3 ms as write protections; 1-1 at 360p, same boots alternating: stand 29.0/29.3 ->
 	// 29.8/30.2 fps, a camera spin 28.0/26.9 -> 29.4/29.0.
 	if (value == nullptr || value[0] == '\0') value = "1";
 	if (minor == nullptr || minor[0] == '\0') minor = "1";
+#else
+	// On by default with the weave (KYTY_WEAVE=1; KYTY_UFFD_WP=0: mprotect). There the game threads' write faults, the
+	// upload worker's re-arms and the GPU thread made ~1,600 mprotect calls a frame, each taking the process's memory-map
+	// lock to write: they queued there, a write fault's call slept a few hundred us now and then while it held the
+	// trackers' region lock and the texture cache's lock, and the weave's workers, turned away by that lock, left their
+	// draws to the GPU thread (holes). As write protections ~84% of those calls go, and none splits a mapping. Inner
+	// Ward, standing, one exe alternating off/on/on/off: 60.5/62.1 -> 65.9/67.5 fps, holes 346/336 -> 265/248 a frame,
+	// p99 25.2/23.3 -> 18.3/18.3 ms; walking 52.9/59.9 -> 69.2/69.5 fps.
+	if ((value == nullptr || value[0] == '\0') && WeaveAsked()) {
+		value    = "1";
+		by_weave = true;
+	}
 #endif
 	if (value == nullptr || value[0] != '1') return;
 	constexpr uint64_t features = UFFD_FEATURE_SIGBUS | UFFD_FEATURE_WP_HUGETLBFS_SHMEM | UFFD_FEATURE_WP_UNPOPULATED;
@@ -131,7 +153,8 @@ static void WriteWatchInit() {
 	}
 	g_watch_pages = static_cast<uint8_t*>(pages);
 	g_uffd        = fd;
-	std::printf("KYTY_UFFD_WP: write watch by userfaultfd write protection\n");
+	std::printf("KYTY_UFFD_WP: write watch by userfaultfd write protection%s\n",
+	            by_weave ? " (the weave's default; KYTY_UFFD_WP=0 keeps mprotect)" : "");
 	if (!want_minor) return;
 	g_minor_on = has_minor;
 	if (g_minor_on) g_minor_blocks = new std::map<uint64_t, uint64_t>;
@@ -929,6 +952,10 @@ void SysVirtualZapNoAccess(bool on) {
 	g_zap_no_access = on;
 }
 
+bool SysVirtualWriteWatchByUffd() {
+	return g_uffd >= 0;
+}
+
 // SIGBUS (before the fault handlers): a page not zapped whose PTE is missing, in minor mode (first touched in the view,
 // reclaimed, a zap's lift that found it mapped by a fault) mapped again, whatever its bits say (a registration they do
 // not show would fault forever), write-protected as its bits say once mapped (a protection's change meanwhile went to a
@@ -987,6 +1014,10 @@ void SysVirtualWriteWatchMapped(uint64_t /*address*/, uint64_t /*size*/, Virtual
 void SysVirtualWriteWatchUnmapped(uint64_t /*address*/, uint64_t /*size*/) {}
 
 void SysVirtualZapNoAccess(bool /*on*/) {}
+
+bool SysVirtualWriteWatchByUffd() {
+	return false;
+}
 
 bool SysVirtualResolveMinorFault(uint64_t /*address*/, bool /*present*/, bool /*write*/) {
 	return false;
