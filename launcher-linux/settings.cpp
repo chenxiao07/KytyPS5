@@ -40,6 +40,7 @@ const nlohmann::ordered_json& Defaults() {
 		d["antilag"]             = false;
 		d["keep_resident"]       = false;
 		d["fps30"]               = false;
+		d["mode4"]               = false; // (Experimental page: KYTY_SPECULATE=4 where it is offered)
 		d["extra_args"]          = "";
 		d["gpu"]                 = "";
 		d["dlss_preset"]         = "";

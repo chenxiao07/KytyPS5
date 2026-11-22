@@ -49,7 +49,7 @@ $safeGpuTip = "Prevents the crashes and blue screens that come from the graphics
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true; cheats = $false;
 	ecores = $false; fps120 = $false; render = 1440; ratio = '16:9'; quality = 'standard'; vsync = $false; hdr = $false; framegen = 0
 	hud = 0; streamline = ''; safegpu = $false; upscaler = ''; render_dlss = 1080; fsr = $false; output = 'auto'
-	lowlatency = $false; present_direct = $false; vrr_flips = $false; antilag = $false; keep_resident = $false; fps30 = $false; pad_speaker = $true
+	lowlatency = $false; present_direct = $false; vrr_flips = $false; antilag = $false; keep_resident = $false; fps30 = $false; mode4 = $false; pad_speaker = $true
 	extra_args = ''; dlss_preset = ''; dlss_sharpness = ''; fsr_sharpness = ''; gpu = ''; output_auto = $true; audio_output = '' }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
@@ -83,6 +83,19 @@ public static int[] Query() {
 		Marshal.FreeHGlobal(buffer);
 	}
 	return result.ToArray();
+}
+// The physical memory (GlobalMemoryStatusEx, as the emulator reads it), or 0.
+[StructLayout(LayoutKind.Sequential)]
+public struct MemoryStatus {
+	public uint dwLength, dwMemoryLoad;
+	public ulong ullTotalPhys, ullAvailPhys, ullTotalPageFile, ullAvailPageFile, ullTotalVirtual, ullAvailVirtual, ullAvailExtendedVirtual;
+}
+[DllImport("kernel32.dll")]
+static extern bool GlobalMemoryStatusEx(ref MemoryStatus status);
+public static ulong TotalRam() {
+	var status = new MemoryStatus();
+	status.dwLength = (uint)Marshal.SizeOf(typeof(MemoryStatus));
+	return GlobalMemoryStatusEx(ref status) ? status.ullTotalPhys : 0;
 }
 '@
 	$values = [KytyLauncher.CpuSets]::Query()
@@ -412,6 +425,8 @@ function Get-PlayCommand {
 	if ($settings.antilag) { $sets += 'KYTY_ANTI_LAG=1' }
 	if ($settings.fps30) { $sets += 'KYTY_FLIP_RATE=1' }
 	if ($settings.keep_resident) { $sets += @('KYTY_RESIDENT_MB=6144', 'KYTY_WORKING_SET_TRIM=0') }
+	# KytyLauncher.exe's parallel translation (mode 4), only where the emulator would not stand it down (Test-Mode4Offered).
+	if ($settings.mode4 -and (Test-Mode4Offered (Get-ExtraOptions))) { $sets += 'KYTY_SPECULATE=4' }
 	# The DualSense's speaker silent, over USB or Bluetooth: the pad's own volume 0 (the haptics stay).
 	if (-not $settings.pad_speaker) { $sets += 'KYTY_DUALSENSE_SPEAKER_VOLUME=0' }
 	# KytyLauncher.exe's DLSS model (a preset letter; none: the DLSS version's own choice).
@@ -473,6 +488,72 @@ function Get-ExtraOptions {
 	}
 	return , $options
 }
+# KytyLauncher.exe's mode 4 gate (Mode4.cs): the emulator's, as it applies it at its start (speculation-ram-gate.h,
+# performance-switches.h), on the variables as the game will see them: the extra options' -Set pair, else this process's
+# environment, which the game inherits.
+# (Each -Set piece as run-windows.ps1 applies it: split at its first "=", an empty value or a piece without "=" giving 0
+# for a variable neither the config nor the script sets; the last one naming it wins.)
+function Get-Mode4Variable([string]$name, $extra) {
+	$value = $null
+	foreach ($option in $extra) {
+		if ($option[0] -ne '-Set' -or $null -eq $option[1]) { continue }
+		foreach ($pair in ($option[1] -split ',(?=[A-Za-z_][A-Za-z0-9_]*=)')) {
+			$key, $text = $pair -split '=', 2
+			if ($key -eq $name) { $value = $(if ($text) { $text } else { '0' }) }
+		}
+	}
+	if ($null -ne $value) { return $value }
+	return [Environment]::GetEnvironmentVariable($name)
+}
+# The C library's reading of a number (strtoull: $max [uint64]::MaxValue; Windows' strtoul: [uint32]::MaxValue): the
+# leading digits after white space and a sign (none: 0), $max past the range, a minus negated as unsigned; and whether
+# nothing else is there.
+function ConvertFrom-CNumber([string]$text, [uint64]$max) {
+	if ($text -notmatch '^[ \t\n\v\f\r]*([+-]?)([0-9]+)') { return @([uint64]0, $false) }
+	$value = [System.Numerics.BigInteger]::Parse($Matches[2])
+	if ($value -gt $max) { $value = [System.Numerics.BigInteger]$max }
+	elseif ($Matches[1] -eq '-' -and !$value.IsZero) { $value = [System.Numerics.BigInteger]$max - $value + 1 }
+	return @([uint64]$value, ($Matches[0].Length -eq $text.Length))
+}
+# The logical CPUs on the performance cores (the highest efficiency class, processor group 0) this process may run on, as
+# the emulator counts them (PerformanceLogicalCpus), or 0.
+function Get-PerformanceCpus {
+	$affinity = [int64]-1
+	try { $affinity = [int64][System.Diagnostics.Process]::GetCurrentProcess().ProcessorAffinity } catch { }
+	$values = [KytyLauncher.CpuSets]::Query()
+	$classes = for ($i = 0; $i + 1 -lt $values.Count; $i += 2) {
+		if ($values[$i] -lt 64 -and (($affinity -shr $values[$i]) -band 1) -ne 0) { $values[$i + 1] }
+	}
+	if (!$classes) { return 0 }
+	$fastest = ($classes | Measure-Object -Maximum).Maximum
+	return @($classes | Where-Object { $_ -eq $fastest }).Count
+}
+# Whether mode 4 would run: memory (KYTY_SIMULATE_RAM_MB stands for it; KYTY_SPECULATE_RAM_GB the threshold, 28 unless
+# whole digits up to 4096, 0 lifting it), then the performance cores (KYTY_SPECULATE_CPUS lifts the check; else
+# 3 + KYTY_SPECULATE_THREADS (1 to 12, else 4) + 2 of them, KYTY_SIMULATE_PCORES standing for the count, 0 not checked).
+function Test-Mode4Offered($extra) {
+	$simulated = Get-Mode4Variable 'KYTY_SIMULATE_RAM_MB' $extra
+	if ($simulated) { $ram = ([uint64]((ConvertFrom-CNumber $simulated ([uint64]::MaxValue))[0])) -shl 20 }
+	else { $ram = [KytyLauncher.CpuSets]::TotalRam() }
+	$gib = [uint64]28
+	$threshold = Get-Mode4Variable 'KYTY_SPECULATE_RAM_GB' $extra
+	if ($threshold) {
+		$number = ConvertFrom-CNumber $threshold ([uint64][uint32]::MaxValue)
+		if ($number[1] -and $number[0] -le 4096) { $gib = $number[0] }
+	}
+	if ($gib -ne 0 -and $ram -lt ($gib -shl 30)) { return $false }
+	if (Get-Mode4Variable 'KYTY_SPECULATE_CPUS' $extra) { return $true }
+	$workers = [uint64]4
+	$text = Get-Mode4Variable 'KYTY_SPECULATE_THREADS' $extra
+	if ($text) {
+		$number = ConvertFrom-CNumber $text ([uint64][uint32]::MaxValue)
+		if ($number[1] -and $number[0] -ge 1 -and $number[0] -le 12) { $workers = $number[0] }
+	}
+	$simulated = Get-Mode4Variable 'KYTY_SIMULATE_PCORES' $extra
+	if ($simulated) { $cpus = [uint64]((ConvertFrom-CNumber $simulated ([uint64][uint32]::MaxValue))[0]) }
+	else { $cpus = [uint64](Get-PerformanceCpus) }
+	return !($cpus -ne 0 -and $cpus -lt 3 + $workers + 2)
+}
 # KytyLauncher.exe's graphics card (Advanced page, a PC with more than one), by its name, for the game and the precompile
 # alike (issue #132); one holding a character cmd would act on is left out.
 function Get-GpuArguments {
@@ -494,6 +575,7 @@ if ($DryRun) {
 	"precompile: cmd /s /c `"$(Get-PrecompileCommand)`""
 	"hints:      cmd /s /c `"$(Get-PrecompileCommand '-ExportHints')`""
 	"efficiency cores: 0x{0:X}" -f $efficiencyMask
+	"mode 4 offered: $(Test-Mode4Offered (Get-ExtraOptions))"
 	"display: $displayHeight lines"
 	"frame generation: $(if ($frameGenAvailable) { "NVIDIA's Streamline runtime in $streamline" } elseif (!$rtxGpu) { 'no NVIDIA RTX graphics card (DLSS off)' } else { "no NVIDIA-signed Streamline runtime (settings: '$($settings.streamline)')" })"
 	return

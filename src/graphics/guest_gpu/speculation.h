@@ -150,17 +150,17 @@ private:
 	// into its recorder), the holes between them and the processor state each is translated from, the processor state
 	// at its end or stop; the translator whose it is.
 	struct Result {
-		Translator*                                    owner  = nullptr;
-		uint64_t                                       serial = 0; // its command buffer's (Job::serial)
-		uint32_t                                       chunk  = 0; // (mode 4)
-		uint64_t                                       pass   = 0; // the state pass it started from (mode 4)
-		Spec::State                                    state;
-		std::vector<Hole>                              holes;
-		std::vector<std::unique_ptr<CommandProcessor>> hole_states; // (more than holes: kept for reuse)
-		std::unique_ptr<CommandProcessor>              start_state, end_state;
-		std::unique_ptr<CommandScheduler::Recorder>    recorder;
-		Epochs                                         epochs;
-		uint64_t                                       effects_from = 0; // the effects log's end when it began
+		Translator*                                         owner  = nullptr;
+		uint64_t                                            serial = 0; // its command buffer's (Job::serial)
+		uint32_t                                            chunk  = 0; // (mode 4)
+		uint64_t                                            pass   = 0; // the state pass it started from (mode 4)
+		Spec::State                                         state;
+		std::vector<Hole>                                   holes;
+		std::vector<std::unique_ptr<CommandProcessorState>> hole_states; // (more than holes: kept for reuse)
+		std::unique_ptr<CommandProcessorState>              start_state, end_state;
+		std::unique_ptr<CommandScheduler::Recorder>         recorder;
+		Epochs                                              epochs;
+		uint64_t                                            effects_from = 0; // the effects log's end when it began
 		// Why it stopped before the end (null: it did not; stop_execution is at that packet), whether nothing it
 		// recorded can be committed, whether it translated anything.
 		const char*  stop = nullptr;
@@ -223,11 +223,11 @@ private:
 	// where it ends (where the next begins; `last`: the submission's end), the pass's record of it (Spec::t_record),
 	// whether a translation took it.
 	struct Chunk {
-		std::unique_ptr<CommandProcessor> start;
-		Pm4Execution                      at, end;
-		bool                              last  = false;
-		bool                              taken = false;
-		std::unique_ptr<Spec::State>      record;
+		std::unique_ptr<CommandProcessorState> start;
+		Pm4Execution                           at, end;
+		bool                                   last  = false;
+		bool                                   taken = false;
+		std::unique_ptr<Spec::State>           record;
 	};
 	// A submission (mode 4), until the GPU thread did it: its chunks so far and which pass gave them.
 	struct Entry {
@@ -239,7 +239,7 @@ private:
 	// (From `previous`'s state when it is a speculation not committed yet, else from `record` while it is the record of
 	// a submission not done: Spec::State::previous.)
 	// (Up to `stop` when it is given: a chunk's end.)
-	[[nodiscard]] std::unique_ptr<Result> Translate(Translator& translator, const CommandProcessor& cp,
+	[[nodiscard]] std::unique_ptr<Result> Translate(Translator& translator, const CommandProcessorState& start,
 	                                                std::span<const uint32_t> commands, const Pm4Execution& execution,
 	                                                const Result* previous = nullptr, const Spec::State* record = nullptr,
 	                                                const Pm4Execution* stop = nullptr);
@@ -353,10 +353,10 @@ private:
 	uint32_t                          m_taken_chunk = 0;
 	// Mode 4, the graphics instance: the chunk last checked for a ready front elsewhere (one check, so one yield, a
 	// chunk; under m_mutex).
-	uint64_t                          m_ready_checked_serial = 0;
-	uint32_t                          m_ready_checked_chunk  = UINT32_MAX;
-	std::unique_ptr<CommandProcessor> m_done_state;
-	Spec::State*                      m_pass_record = nullptr; // the record the state pass fills
+	uint64_t                               m_ready_checked_serial = 0;
+	uint32_t                               m_ready_checked_chunk  = UINT32_MAX;
+	std::unique_ptr<CommandProcessorState> m_done_state;
+	Spec::State*                           m_pass_record = nullptr; // the record the state pass fills
 	std::vector<std::pair<uint64_t, std::unique_ptr<Spec::State>>> m_retired_records; // (when: m_clock)
 	uint64_t                          m_waits_for_ahead = 0, m_ahead_misses = 0; // (the report's)
 	uint64_t                          m_blind = 0, m_stopped = 0, m_blind_stopped = 0; // (the report's)

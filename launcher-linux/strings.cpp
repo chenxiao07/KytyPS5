@@ -94,6 +94,7 @@ const Table& English() {
 	    {"summary.wideBars", "16:9 movies and menus"},
 	    {"summary.antilag", "Anti-Lag"},
 	    {"summary.fps30", "30 fps lock"},
+	    {"summary.mode4", "mode 4"},
 	    {"summary.extra", "extra options"},
 	    {"summary.mangohud", "MangoHud"},
 	    {"summary.gamemode", "GameMode"},
@@ -389,6 +390,7 @@ const Table& English() {
 	    {"experimental.display", "Display"},
 	    {"experimental.amd", "AMD graphics cards"},
 	    {"experimental.framerate", "Frame rate"},
+	    {"experimental.translation", "Command translation"},
 	    {"fps30", "Lock to 30 fps (slower PCs)"},
 	    {"fps30.desc",
 	     "The game runs at a steady 30 fps (like the PS5's cinematic mode) instead of up to 60: "
@@ -415,6 +417,17 @@ const Table& English() {
 	     "(which it "
 	     "turns on too). Tested on Linux; without the driver's support Low latency works alone."},
 	    {"antilag.notAmd", "AMD Radeon graphics cards only."},
+	    {"mode4", "Parallel translation (mode 4)"},
+	    {"mode4.desc",
+	     "Worker threads translate the game's graphics commands ahead of the render thread, which "
+	     "takes their work instead of translating it itself (KYTY_SPECULATE=4): faster where the "
+	     "render thread limits the frame rate. It uses about {0} GB more memory than with it off. "
+	     "If the game runs worse or shows something wrong, turn it off again."},
+	    {"mode4.lowRam",
+	     "Needs {0} GB of memory or more: on this PC the emulator would not run it."},
+	    {"mode4.fewCores",
+	     "Needs {0} logical CPUs on the performance cores, and this PC has {1}: the emulator would not "
+	     "run it."},
 	    {"feedback", "Feedback: issue #{0}"},
 
 	    {"dialog.game", "The game folder (eboot.bin, sce_sys)"},
@@ -519,6 +532,7 @@ const Table& Chinese() {
 	    {"summary.wideBars", "过场与菜单 16:9"},
 	    {"summary.antilag", "Anti-Lag"},
 	    {"summary.fps30", "锁定 30 帧"},
+	    {"summary.mode4", "模式 4"},
 	    {"summary.extra", "附加参数"},
 	    {"summary.mangohud", "MangoHud"},
 	    {"summary.gamemode", "GameMode"},
@@ -760,6 +774,7 @@ const Table& Chinese() {
 	    {"experimental.display", "显示"},
 	    {"experimental.amd", "AMD 显卡"},
 	    {"experimental.framerate", "帧率"},
+	    {"experimental.translation", "命令转译"},
 	    {"fps30", "锁定 30 帧（较慢的电脑）"},
 	    {"fps30.desc",
 	     "游戏稳定在 30 帧（和 PS5 的电影模式一样），而不是最高 60 "
@@ -779,6 +794,13 @@ const Table& Chinese() {
 	                     "驱动安排游戏帧的时机，在「低延迟」的基础上进一步降低输入延迟（会同时打开"
 	                     "低延迟）。已在 Linux 上测试；驱动不支持时只有低延迟生效。"},
 	    {"antilag.notAmd", "仅限 AMD Radeon 显卡。"},
+	    {"mode4", "并行转译（模式 4）"},
+	    {"mode4.desc",
+	     "由工作线程提前转译游戏的图形命令，渲染线程直接采用它们的结果，而不必自己转译"
+	     "（KYTY_SPECULATE=4）：在帧率受渲染线程限制时更快。比关闭时多占用约 {0} GB "
+	     "内存。如果游戏变慢或画面出错，请再关掉。"},
+	    {"mode4.lowRam", "需要 {0} GB 或更多内存：在这台电脑上模拟器不会启用它。"},
+	    {"mode4.fewCores", "需要性能核心上有 {0} 个逻辑处理器，这台电脑只有 {1} 个：模拟器不会启用它。"},
 	    {"feedback", "反馈：issue #{0}"},
 
 	    {"dialog.game", "游戏文件夹（eboot.bin、sce_sys）"},
@@ -887,6 +909,7 @@ const Table& Portuguese() {
 	    {"summary.wideBars", "vídeos e menus em 16:9"},
 	    {"summary.antilag", "Anti-Lag"},
 	    {"summary.fps30", "trava em 30 fps"},
+	    {"summary.mode4", "modo 4"},
 	    {"summary.extra", "opções extras"},
 	    {"summary.mangohud", "MangoHud"},
 	    {"summary.gamemode", "GameMode"},
@@ -1178,6 +1201,7 @@ const Table& Portuguese() {
 	    {"experimental.display", "Tela"},
 	    {"experimental.amd", "Placas de vídeo AMD"},
 	    {"experimental.framerate", "Taxa de quadros"},
+	    {"experimental.translation", "Tradução de comandos"},
 	    {"fps30", "Travar em 30 fps (PCs mais lentos)"},
 	    {"fps30.desc", "O jogo roda a 30 fps estáveis (como o modo cinema do PS5) em vez de até "
 	                   "60: metade do trabalho para "
@@ -1204,6 +1228,16 @@ const Table& Portuguese() {
 	                     "driver, só a Baixa latência "
 	                     "funciona."},
 	    {"antilag.notAmd", "Só placas AMD Radeon."},
+	    {"mode4", "Tradução paralela (modo 4)"},
+	    {"mode4.desc",
+	     "Threads de trabalho traduzem os comandos gráficos do jogo antes da thread de renderização, que "
+	     "usa o trabalho delas em vez de traduzir ela mesma (KYTY_SPECULATE=4): mais rápido quando a "
+	     "thread de renderização limita a taxa de quadros. Usa cerca de {0} GB a mais de memória do que "
+	     "desligada. Se o jogo ficar pior ou mostrar algo errado, desligue de novo."},
+	    {"mode4.lowRam", "Precisa de {0} GB de memória ou mais: neste PC o emulador não a usaria."},
+	    {"mode4.fewCores",
+	     "Precisa de {0} CPUs lógicas nos núcleos de desempenho, e este PC tem {1}: o emulador não a "
+	     "usaria."},
 	    {"feedback", "Comentários: issue #{0}"},
 
 	    {"dialog.game", "A pasta do jogo (eboot.bin, sce_sys)"},

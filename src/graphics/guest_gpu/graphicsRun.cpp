@@ -602,7 +602,7 @@ void CommandProcessor::SkipSuspendedPacket(Pm4Execution& execution) {
 	execution.m_made_progress = true;
 }
 
-bool CommandProcessor::SameDrawState(const CommandProcessor& other) const {
+bool CommandProcessor::SameDrawState(const CommandProcessorState& other) const {
 	return m_context_state_pushed == other.m_context_state_pushed && m_user_data_marker == other.m_user_data_marker &&
 	       m_index_type_and_size == other.m_index_type_and_size && m_index_buffer_size == other.m_index_buffer_size &&
 	       m_index_base_addr == other.m_index_base_addr &&
@@ -656,7 +656,7 @@ static bool StatePassPredicationReads(const uint32_t* packet) {
 	return ((flags >> 16u) & 0x7u) != 0;
 }
 
-bool CommandProcessor::SameState(const CommandProcessor& other) const {
+bool CommandProcessor::SameState(const CommandProcessorState& other) const {
 	// KYTY_SPEC_START_INSTANCE_FREE (live spec_start_instance_free, on by default under KYTY_SPECULATE=4): not the
 	// start-instance user SGPR (HW::Shader::
 	// SameButStartInstance): a draw's hole sets it where the state pass, which passes draws over, does not, and a chunk's
@@ -671,32 +671,37 @@ bool CommandProcessor::SameState(const CommandProcessor& other) const {
 	       m_ucfg == other.m_ucfg && same_sh && SameDrawState(other);
 }
 
-void CommandProcessor::CopyStateFrom(const CommandProcessor& other, bool const_ram) {
-	m_draw_run_skip                    = other.m_draw_run_skip;
-	m_ctx                              = other.m_ctx;
-	m_saved_ctx                        = other.m_saved_ctx;
-	m_context_state_pushed             = other.m_context_state_pushed;
-	m_ucfg                             = other.m_ucfg;
-	m_sh_ctx                           = other.m_sh_ctx;
-	m_user_data_marker                 = other.m_user_data_marker;
-	m_index_type_and_size              = other.m_index_type_and_size;
-	m_index_buffer_size                = other.m_index_buffer_size;
-	m_index_base_addr                  = other.m_index_base_addr;
-	m_draw_indirect_args_base_addr     = other.m_draw_indirect_args_base_addr;
-	m_dispatch_indirect_args_base_addr = other.m_dispatch_indirect_args_base_addr;
-	m_num_instances                    = other.m_num_instances;
-	m_de_count                         = other.m_de_count;
-	m_ce_count                         = other.m_ce_count;
-	m_ce_complete                      = other.m_ce_complete;
-	if (const_ram) {
-		std::memcpy(m_const_ram, other.m_const_ram,
-		            size_t {std::max(m_const_ram_used, other.m_const_ram_used)} * sizeof(uint32_t));
-		m_const_ram_used = other.m_const_ram_used;
-	}
-	m_flip                        = other.m_flip;
-	m_submit_id                   = other.m_submit_id;
-	m_synthetic_occlusion_counter = other.m_synthetic_occlusion_counter;
-	m_predicate_skip              = other.m_predicate_skip;
+// Every member of CommandProcessorState (commandProcessor.h), in its order: a list kept by hand in step with that struct's.
+template <typename To, typename From>
+void CommandProcessor::CopyStateParts(To& to, const From& from) {
+	to.m_draw_run_skip                    = from.m_draw_run_skip;
+	to.m_ctx                              = from.m_ctx;
+	to.m_saved_ctx                        = from.m_saved_ctx;
+	to.m_context_state_pushed             = from.m_context_state_pushed;
+	to.m_ucfg                             = from.m_ucfg;
+	to.m_sh_ctx                           = from.m_sh_ctx;
+	to.m_user_data_marker                 = from.m_user_data_marker;
+	to.m_index_type_and_size              = from.m_index_type_and_size;
+	to.m_index_buffer_size                = from.m_index_buffer_size;
+	to.m_index_base_addr                  = from.m_index_base_addr;
+	to.m_draw_indirect_args_base_addr     = from.m_draw_indirect_args_base_addr;
+	to.m_dispatch_indirect_args_base_addr = from.m_dispatch_indirect_args_base_addr;
+	to.m_num_instances                    = from.m_num_instances;
+	to.m_de_count                         = from.m_de_count;
+	to.m_ce_count                         = from.m_ce_count;
+	to.m_ce_complete                      = from.m_ce_complete;
+	to.m_flip                             = from.m_flip;
+	to.m_submit_id                        = from.m_submit_id;
+	to.m_synthetic_occlusion_counter      = from.m_synthetic_occlusion_counter;
+	to.m_predicate_skip                   = from.m_predicate_skip;
+}
+
+void CommandProcessor::SaveStateTo(CommandProcessorState& state) const {
+	CopyStateParts(state, *this);
+}
+
+void CommandProcessor::CopyStateFrom(const CommandProcessorState& state) {
+	CopyStateParts(*this, state);
 }
 
 void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operation) {

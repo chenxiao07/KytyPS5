@@ -20,10 +20,21 @@ sealed class LauncherContext {
 	public readonly bool RtxGpu;          // DLSS (the upscaler and frame generation) needs an NVIDIA RTX graphics card
 	public readonly bool AmdGpu;          // an AMD Radeon graphics card (AMD Anti-Lag)
 	public readonly ulong RamBytes;
+	public readonly int PerformanceCpus;  // the logical CPUs on the performance cores (mode 4's check), or 0
 	public readonly int DisplayHeight;    // the primary display's height in pixels (Game output: Automatic), or 0
 	public readonly bool FsrAvailable;    // AMD's signed FSR runtime next to the emulator (FSR frame generation)
 	public string Streamline { get; private set; } // NVIDIA's signed Streamline runtime folder, or null
 	public bool FrameGenAvailable { get { return Streamline != null && RtxGpu; } }
+
+	// (Tests, tests/LauncherMode4Tests.cs: these settings, memory and performance cores, nothing else found.)
+	internal LauncherContext(string root, Settings settings, ulong ramBytes, int performanceCpus) {
+		Root = root;
+		EmulatorExe = Path.Combine(root, "kyty_emulator.exe");
+		Settings = settings;
+		Gpus = new List<GpuInfo>();
+		RamBytes = ramBytes;
+		PerformanceCpus = performanceCpus;
+	}
 
 	public LauncherContext() {
 		Root = FindRoot();
@@ -39,6 +50,7 @@ sealed class LauncherContext {
 		RtxGpu = Gpus.Any(g => g.Name.IndexOf("NVIDIA", StringComparison.OrdinalIgnoreCase) >= 0 && HasWord(g.Name, "RTX"));
 		AmdGpu = Gpus.Any(g => g.Name.IndexOf("AMD", StringComparison.OrdinalIgnoreCase) >= 0 || g.Name.IndexOf("Radeon", StringComparison.OrdinalIgnoreCase) >= 0);
 		RamBytes = Native.TotalRam();
+		PerformanceCpus = Native.PerformanceLogicalCpus();
 		DisplayHeight = Native.DisplayHeight();
 		Streamline = ResolveStreamline();
 		// AMD's runtime next to the emulator, signed by AMD: FSR SDK 2's loader with its frame generation DLL (FSR 4 frame
@@ -514,6 +526,42 @@ static class Native {
 			long mask = 0;
 			foreach (var set in sets.Where(s => s.Value == slowest && s.Key < 63)) mask |= 1L << set.Key;
 			return mask;
+		} catch (Exception) {
+			return 0;
+		}
+	}
+
+	// The logical CPUs on the performance cores (the highest efficiency class; every core on a CPU of one kind) that this
+	// process may run on, in processor group 0, as the emulator counts them for mode 4 (local-platform.cpp's
+	// PerformanceLogicalCpus), or 0 when not known.
+	public static int PerformanceLogicalCpus() {
+		try {
+			long affinity;
+			try {
+				affinity = (long)System.Diagnostics.Process.GetCurrentProcess().ProcessorAffinity;
+			} catch (Exception) {
+				affinity = -1;
+			}
+			uint length;
+			GetSystemCpuSetInformation(IntPtr.Zero, 0, out length, IntPtr.Zero, 0);
+			if (length == 0) return 0;
+			var buffer = Marshal.AllocHGlobal((int)length);
+			var classes = new List<int>(); // (the efficiency class of each)
+			try {
+				if (!GetSystemCpuSetInformation(buffer, length, out length, IntPtr.Zero, 0)) return 0;
+				for (int offset = 0; offset < length; offset += Marshal.ReadInt32(buffer, offset)) {
+					int index = Marshal.ReadByte(buffer, offset + 14);
+					if (Marshal.ReadInt32(buffer, offset + 4) == 0 && Marshal.ReadInt16(buffer, offset + 12) == 0 && index < 64 &&
+					    ((affinity >> index) & 1) != 0)
+						classes.Add(Marshal.ReadByte(buffer, offset + 18));
+					if (Marshal.ReadInt32(buffer, offset) <= 0) break;
+				}
+			} finally {
+				Marshal.FreeHGlobal(buffer);
+			}
+			if (classes.Count == 0) return 0;
+			var fastest = classes.Max();
+			return classes.Count(c => c == fastest);
 		} catch (Exception) {
 			return 0;
 		}

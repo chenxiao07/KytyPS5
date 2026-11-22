@@ -106,7 +106,7 @@ language, cheats), **Shaders** (precompile, optionally on the efficiency cores o
 export shader hints), **Advanced** (performance overlay, red-zone protection, safe GPU mode, the graphics card on a
 PC with more than one, extra command-line options, the launcher's language, the logs folder) and **Experimental** (options still being tried out, each with
 the issue that collects how it goes: a 30 fps lock, direct presentation for VRR displays, keep memory resident,
-AMD Anti-Lag). It remembers the settings (`launcher-settings.json`) and needs nothing installed (.NET
+AMD Anti-Lag, parallel translation). It remembers the settings (`launcher-settings.json`) and needs nothing installed (.NET
 Framework 4.7.2, part of Windows 10 and 11). Windows may ask before its first start ("More info", "Run anyway"):
 it is not signed. The earlier PowerShell window (`launcher.ps1`) still works.
 `KytyLauncher.exe --play` starts the game right away with the launcher's settings, without its window: for a
@@ -273,7 +273,7 @@ shortcut):
 | `-Set KYTY_FSR_SHARPNESS=0.3` | With `-Upscaler fsr`: FSR 3's own sharpening, 0 (none) to 1 (the launcher's "Sharpening"; 0.6, Medium, by default) |
 | `-FrameGen 1` | DLSS frame generation, the number of generated frames per rendered one (`1` = 2x, up to `5`; RTX 40 or newer, needs Streamline) |
 | `-Gpu 1` | The graphics card on a PC with more than one: its number in the log's `Vulkan GPU <n>:` lines, or a part of its name (`-Gpu 4090`); give `precompile.cmd` the same `-Gpu`, so the shaders are compiled for that card. Without it the first discrete GPU, in the order Windows' graphics settings give |
-| `-Set KYTY_SPECULATE=4` | Experimental: the game's GPU work translated ahead by worker threads (parallel translation, mode 4), faster where the render thread limits the frame rate (+6% to +16% over the worlds in one test at 120 fps: Core i9-12900K, RTX 5090). Needs 28 GB of RAM or more (it uses about 3.6 GB more) and at least 9 logical CPUs on the performance cores; otherwise it stays off and the log says so |
+| `-Set KYTY_SPECULATE=4` | Experimental: the game's GPU work translated ahead by worker threads (parallel translation, mode 4), faster where the render thread limits the frame rate (+6% to +16% over the worlds in one test at 120 fps: Core i9-12900K, RTX 5090). Needs 28 GB of RAM or more (it uses about 2.2 GB more than mode 0) and at least 9 logical CPUs on the performance cores; otherwise it stays off and the log says so (the launcher's Experimental "Parallel translation (mode 4)", off by default and offered only on such a PC; the figure is launcher-windows/Mode4.cs's ExtraMemoryGb) |
 | `-Set KEY=VALUE` | An emulator switch, e.g. `-Set KYTY_SHADER_PREFETCH=0` (several: `-Set A=1,B=2`); the issues name the ones worth trying |
 
 The launcher has a box for these too (Advanced, "Command-line options"), written as after `run.cmd`: its `-Set`

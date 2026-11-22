@@ -70,7 +70,8 @@ partial class MainWindow : Window {
 	// The Sharpening row's value for each upscaler ("0" to "0.9"), and the upscaler whose value it shows.
 	string dlssSharpness = "0", fsrSharpness = "0.6", sharpnessShown = "";
 	CheckBox fullscreen, aspect, wideBars, hdr, fps120, vsync, lowLatency, fsr, cheats, redzone, safeGpu, ecores, presentDirect, vrrFlips,
-		antiLag, keepResident, fps30, padSpeaker, reopenLauncher, keyboardPrompts;
+		antiLag, keepResident, fps30, mode4, padSpeaker, reopenLauncher, keyboardPrompts;
+	TextBlock mode4Desc; // (what it does, or why it is not offered: UpdateMode4)
 	TextBlock renderNote, outputNote, upscalerNote, frameGenNote, streamlineText, cheatState, bannerTitle, bannerLine, storeLine;
 	Image banner;
 	Border bannerFallback;
@@ -913,6 +914,12 @@ partial class MainWindow : Window {
 		antiLag = Switch(S.Bool("antilag") && context.AmdGpu, context.AmdGpu);
 		keepResident = Switch(S.Bool("keep_resident"));
 		fps30 = Switch(S.Bool("fps30"));
+		// (Not offered where the emulator would stand it down: why, in its place. Its feedback: issue #335, the mode-4 numbers
+		// from other CPUs.)
+		var mode4Verdict = commands.Mode4Verdict;
+		var mode4Offered = mode4Verdict.Gate == Mode4.Gate.Available;
+		mode4 = Switch(S.Bool("mode4") && mode4Offered, mode4Offered);
+		mode4Desc = Desc(Mode4.Description(mode4Verdict));
 		return Page("experimental.title",
 			Desc(T("experimental.intro")),
 			Section("experimental.framerate"),
@@ -928,7 +935,10 @@ partial class MainWindow : Window {
 			Row(null, Feedback(50)),
 			Section("experimental.amd"),
 			Row("antilag", antiLag, Desc(T(context.AmdGpu ? "antilag.desc" : "antilag.notAmd"))),
-			Row(null, Feedback(80)));
+			Row(null, Feedback(80)),
+			Section("experimental.translation"),
+			Row("mode4", mode4, mode4Desc),
+			Row(null, Feedback(335)));
 	}
 
 	TextBlock Feedback(int issue) {
@@ -949,7 +959,23 @@ partial class MainWindow : Window {
 	void Changed() {
 		if (building) return;
 		ReadForm();
+		UpdateMode4();
 		UpdateSummary();
+	}
+
+	// The parallel translation's gate again after a change (the Command-line options can set its variables): offered or
+	// not, and its text. (Its saved choice shown again where it becomes offered.)
+	void UpdateMode4() {
+		if (mode4 == null || mode4Desc == null) return;
+		var verdict = commands.Mode4Verdict;
+		var offered = verdict.Gate == Mode4.Gate.Available;
+		if (mode4.IsEnabled != offered) {
+			building = true; // (no Changed from the switch set here)
+			mode4.IsChecked = S.Bool("mode4") && offered;
+			mode4.IsEnabled = offered;
+			building = false;
+		}
+		mode4Desc.Text = Mode4.Description(verdict);
 	}
 
 	// The Sharpening row's value back to the upscaler it shows (the other's stays as it was).
@@ -1004,6 +1030,8 @@ partial class MainWindow : Window {
 		S.Set("antilag", antiLag.IsChecked == true && context.AmdGpu);
 		S.Set("keep_resident", keepResident.IsChecked == true);
 		S.Set("fps30", fps30.IsChecked == true);
+		// (Not offered here: the saved choice kept; Play gates it.)
+		if (mode4.IsEnabled) S.Set("mode4", mode4.IsChecked == true);
 		S.Save();
 	}
 
@@ -1039,6 +1067,7 @@ partial class MainWindow : Window {
 		if (S.Bool("vrr_flips")) options.Add(T("summary.vrrFlips"));
 		if (S.Bool("antilag")) options.Add(T("summary.antilag"));
 		if (S.Bool("keep_resident")) options.Add(T("summary.keepResident"));
+		if (commands.Mode4On) options.Add(T("summary.mode4"));
 		if (!S.Bool("pad_speaker")) options.Add(T("summary.padSpeakerOff"));
 		if (S.Str("extra_args").Length != 0) options.Add(T("summary.extra"));
 
