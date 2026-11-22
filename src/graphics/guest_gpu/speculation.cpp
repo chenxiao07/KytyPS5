@@ -1980,7 +1980,9 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 				// path for each. Made in After as the GPU copy, with the refusals below; else After's processor copy
 				// would read the read-watched page (CopyGuestMemory's fault: a full GPU drain on this thread).
 				static auto& copy_gpu_dirty = LiveSwitch::Find("copy_gpu_dirty_src", 0);
-				const bool   gpu_dirty_fix  = copy_gpu_dirty.load(std::memory_order_relaxed) != 0;
+				const auto   gpu_dirty_mode = copy_gpu_dirty.load(std::memory_order_relaxed);
+				const bool   gpu_dirty_fix  = gpu_dirty_mode != 0;
+				const bool   gpu_dirty_chain = gpu_dirty_mode >= 2;
 				auto&        fix_buffers    = m_renderer.GetBufferCache();
 				auto&        fix_textures   = m_renderer.GetTextureCache();
 				constexpr uint64_t FixPage  = 4096; // (TRACKER_PAGE_SIZE)
@@ -1998,12 +2000,11 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 					return copy_written(begin, size) ||
 					       (gpu_dirty_fix && (fix_buffers.IsRegionGpuModified(begin, size) || segment_writes_page(begin, size)));
 				};
+				// (An image over a copy's source made since its translation is not looked for: a lookup a copy, and
+				// none seen. Such a copy stays the processor copy, as before.)
 				bool copies_written = false;
 				for (size_t i = from.cpu_copies; i < to.cpu_copies && !copies_written; ++i)
 					copies_written = copy_dirty(state.cpu_copies[i].begin, state.cpu_copies[i].end - state.cpu_copies[i].begin);
-				if (!copies_written && gpu_dirty_fix && from.cpu_copies < to.cpu_copies)
-					for (size_t i = from.writes; i < to.writes && !copies_written; ++i)
-						copies_written = state.writes[i].copy && fix_textures.FindImageFromRange(state.writes[i].value, state.writes[i].size);
 				if (copies_written) {
 					// Under KYTY_SPECULATE=4 each such copy is made in After as the in-order path makes it now
 					// (BufferCache::CopyBuffer on the GPU thread, in the journal's place: WriteLabels), instead of the stop.
@@ -2091,9 +2092,10 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 				}
 				for (size_t i = from.chain_reads; i < to.chain_reads; ++i) {
 					const auto& read = state.chain_reads[i];
-					// (copy_gpu_dirty_src: a word on a GPU-modified page (read watched): read here it faults into a full
-					// GPU drain on this thread; a GPU copy made at an earlier commit leaves such destinations.)
-					if (gpu_dirty_fix && fix_buffers.IsRegionGpuModified(read.address, 4u))
+					// (copy_gpu_dirty_src=2: a word on a GPU-modified page (read watched): read here it faults into a full
+					// GPU drain on this thread; a GPU copy made at an earlier commit leaves such destinations. A lookup a
+					// word: ~0.4 ms a frame of this thread at 1, so only at 2.)
+					if (gpu_dirty_chain && fix_buffers.IsRegionGpuModified(read.address, 4u))
 						return "commit: a command buffer before wrote otherwise";
 					// (KYTY_WRITE_GUARD_SPEC: a page a pending guest write guards, through the backing view: wg2's census had this
 					// read fault ~1 a frame.)
