@@ -1878,6 +1878,34 @@ struct WriteStamps {
 			granule.latest = stamp;
 		}
 	}
+	// KYTY_SPEC_LOG_FLAT: Stamp's stores, one fill a granule: the same units or blocks, the same coarse and latest, the
+	// same leaves taken in the same order (a write of at most BigWrite is in one granule or two).
+	void StampRuns(uint64_t address, uint64_t size, uint64_t stamp) {
+		if (size == 0 || address >= AddressLimit) return;
+		const auto end = std::min(address + size, AddressLimit);
+		if (end - address > BigWrite) {
+			for (auto g = address >> GranuleBits, last = (end - 1) >> GranuleBits; g <= last; ++g)
+				granules[g].coarse = granules[g].latest = stamp;
+			return;
+		}
+		const bool by_block = end - address > MidWrite;
+		const auto bits     = by_block ? BlockBits : UnitBits;
+		const auto shift    = GranuleBits - bits; // (a granule's units, or blocks, as a power of two)
+		for (auto at = address >> bits, stop = ((end - 1) >> bits) + 1; at < stop;) {
+			const auto g       = at >> shift;
+			const auto to      = std::min(stop, (g + 1) << shift);
+			auto&      granule = granules[g];
+			if (!granule.leaf) {
+				granule.leaf = TakeLeaf(); // (KYTY_SPEC_LEAF_POOL)
+				leafed.push_back(static_cast<uint32_t>(g));
+			}
+			auto* const slots = by_block ? granule.leaf->blocks.data() : granule.leaf->units.data();
+			const auto  first = at - (g << shift);
+			std::fill(slots + first, slots + first + (to - at), stamp);
+			granule.latest = stamp;
+			at             = to;
+		}
+	}
 	// Whether an effect logged at index `from` or later may be over [address, address + size).
 	[[nodiscard]] bool MaybeSince(uint64_t address, uint64_t size, uint64_t from) const {
 		if (size == 0) return false;
@@ -1936,7 +1964,67 @@ struct EffectsLog {
 		EffectSource source = EffectSource::Normal;
 		uint64_t     address = 0, size = 0; // a set: its handle
 	};
-	std::deque<Entry>     entries;
+	// KYTY_SPEC_LOG_FLAT=1 (1 under KYTY_SPECULATE=4, 0 otherwise; read once, at the first log: the containers do not
+	// flip live): an Add of the same entry, stamps and index, cheaper (AddFlat): a ring for the deque, a table in front of
+	// the index's map (index_lists), one fill a granule (WriteStamps::StampRuns). 0: the deque, the map and Stamp as they
+	// were. Mode 0: no log is made (Speculation's m_log alone), so nothing of it is reached, the switch not even read.
+	//
+	// The ring. MSVC's deque keeps one element a block above 8 bytes, so a block for each of these 24-byte entries: each
+	// its own allocation (made once, then reused), reached through the map at every push and read. The ring keeps 1024
+	// entries a block and, as the deque, never moves one: a block is used again only once every entry in it was popped,
+	// and growing moves the blocks' pointers alone. So an Entry* a reader holds (IndexedWalk's, FirstWriteOver's) stays
+	// good across an Add. Nothing is cleared at a pop; a block is made at the high-water mark alone.
+	struct EntryRing {
+		static constexpr uint64_t BlockBits = 10, BlockEntries = uint64_t {1} << BlockBits;
+		std::vector<std::unique_ptr<Entry[]>> blocks; // (a power of two of them, by an entry's count since the log began)
+		uint64_t                              head = 0, tail = 0;
+		[[nodiscard]] const Entry& operator[](uint64_t i) const noexcept {
+			const auto at = head + i;
+			return blocks[(at >> BlockBits) & (blocks.size() - 1)][at & (BlockEntries - 1)];
+		}
+		void push_back(const Entry& entry) {
+			if ((tail & (BlockEntries - 1)) == 0) [[unlikely]] NextBlock();
+			blocks[(tail >> BlockBits) & (blocks.size() - 1)][tail & (BlockEntries - 1)] = entry;
+			++tail;
+		}
+		// (The tail enters a block: its slot free unless the head's block is `blocks.size()` behind; then all are live.)
+		void NextBlock() {
+			const auto next = tail >> BlockBits, first = head >> BlockBits;
+			if (next - first >= blocks.size()) {
+				std::vector<std::unique_ptr<Entry[]>> grown(std::max<size_t>(16, blocks.size() * 2));
+				for (auto b = first; b < next; ++b) grown[b & (grown.size() - 1)] = std::move(blocks[b & (blocks.size() - 1)]);
+				blocks = std::move(grown);
+			}
+			auto& block = blocks[next & (blocks.size() - 1)];
+			if (!block) block = std::make_unique_for_overwrite<Entry[]>(BlockEntries);
+		}
+	};
+	// The entries, base first: the deque, or the ring with the switch on. A deque's calls, so the readers read either.
+	struct EntryList {
+		[[nodiscard]] static bool FlatSwitch() {
+			// (spec_log_flat, mode-toggle row {1, 0}: the first log is made with mode 4's table applied, ApplyTable(4)
+			// before start_speculation; read here once, a later `set` does not reach it.)
+			static const bool on = [] {
+				const bool set =
+				    LiveSwitch::Find("spec_log_flat", ModeToggle::Default("spec_log_flat")).load(std::memory_order_relaxed) != 0;
+				if (set) std::printf("Effects log: flat (KYTY_SPEC_LOG_FLAT=1): the entries' ring, the index's table, stamp runs\n");
+				return set;
+			}();
+			return on;
+		}
+		const bool        flat = FlatSwitch();
+		std::deque<Entry> deque;
+		EntryRing         ring;
+		[[nodiscard]] uint64_t     size() const noexcept { return flat ? ring.tail - ring.head : deque.size(); }
+		[[nodiscard]] bool         empty() const noexcept { return size() == 0; }
+		[[nodiscard]] const Entry& operator[](uint64_t i) const noexcept { return flat ? ring[i] : deque[i]; }
+		void                       push_back(const Entry& entry) { deque.push_back(entry); } // (off: Add's; on: AddFlat's ring)
+		void                       pop_front() {
+			if (flat) ++ring.head;
+			else deque.pop_front();
+		}
+	};
+	EntryList             entries;
 	uint64_t              base = 0;  // the index of entries.front() since the log began
 	std::atomic<uint64_t> end {0};   // entries since the log began (read where a speculation begins)
 	[[nodiscard]] uint64_t End() const noexcept { return end.load(std::memory_order_acquire); }
@@ -1950,6 +2038,13 @@ struct EffectsLog {
 	// appends and walks.
 	static constexpr uint64_t IndexGranuleBits = 22, IndexWideGranules = 256;
 	std::unordered_map<uint64_t, std::vector<uint64_t>> index;
+	// KYTY_SPEC_LOG_FLAT (empty without it): by granule below AddressLimit, the list `index` holds for it, or null until
+	// AddFlat first wants it. The map keeps the lists (its nodes never move; a granule above the table asks the map) and
+	// the readers read the map: a slot is nulled where its list leaves it (the prune, the switch to mode 0), never the
+	// table cleared. A table, not the last granule alone: a dispatch's written buffers alternate granules. 2 MiB a log,
+	// made with it (as each stamp set's 6 MiB of granules).
+	std::vector<std::vector<uint64_t>*> index_lists = std::vector<std::vector<uint64_t>*>(
+	    entries.flat ? WriteStamps<8>::AddressLimit >> IndexGranuleBits : 0);
 	std::vector<uint64_t>                               index_wide;
 	uint64_t                                            index_from = UINT64_MAX, index_pruned = 0;
 	// (Under KYTY_SPECULATE=4, kept with `index`:) the indices of the RetiredSet entries, ascending, from index_from on, so
@@ -1958,7 +2053,41 @@ struct EffectsLog {
 	[[nodiscard]] static int64_t IndexSwitch() {
 		return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 1 : 0;
 	}
+	// KYTY_SPEC_LOG_FLAT: Add's entry, stamps, index lists and end, in Add's order.
+	void AddFlat(Kind kind, uint64_t address, uint64_t size) {
+		const uint64_t at = base + (entries.ring.tail - entries.ring.head);
+		if (IndexSwitch() != 0) {
+			if (index_from == UINT64_MAX) index_from = at;
+			if (kind == Kind::RetiredSet) {
+				retired.push_back(at);
+			} else if (size != 0) {
+				const uint64_t g0 = address >> IndexGranuleBits, g1 = (address + size - 1) >> IndexGranuleBits;
+				if (g1 - g0 >= IndexWideGranules) index_wide.push_back(at);
+				else
+					for (uint64_t g = g0; g <= g1; ++g) {
+						if (g >= index_lists.size()) [[unlikely]] {
+							index[g].push_back(at);
+							continue;
+						}
+						auto*& list = index_lists[g];
+						if (list == nullptr) [[unlikely]] list = &index[g];
+						list->push_back(at);
+					}
+			}
+		} else if (index_from != UINT64_MAX) {
+			for (const auto& item: index) ForgetList(item.first);
+			index_from = UINT64_MAX, index.clear(), index_wide.clear(), retired.clear();
+		}
+		if (kind != Kind::RetiredSet) stamps.StampRuns(address, size, at + 1);
+		if (kind == Kind::HostWrite) host_stamps.StampRuns(address, size, at + 1);
+		entries.ring.push_back({kind, t_effect_source, address, size});
+		end.store(at + 1, std::memory_order_release);
+	}
+	void ForgetList(uint64_t granule) noexcept {
+		if (granule < index_lists.size()) index_lists[granule] = nullptr;
+	}
 	void                   Add(Kind kind, uint64_t address, uint64_t size) {
+		                  if (entries.flat) return AddFlat(kind, address, size);
 		                  if (IndexSwitch() != 0) {
 			                  const uint64_t at = base + entries.size();
 			                  if (index_from == UINT64_MAX) index_from = at;
@@ -2072,6 +2201,7 @@ struct EffectsLog {
 			for (auto it = index.begin(); it != index.end();) {
 				auto& list = it->second;
 				list.erase(list.begin(), std::lower_bound(list.begin(), list.end(), base));
+				if (entries.flat && list.empty()) ForgetList(it->first);
 				it = list.empty() ? index.erase(it) : std::next(it);
 			}
 			index_wide.erase(index_wide.begin(), std::lower_bound(index_wide.begin(), index_wide.end(), base));

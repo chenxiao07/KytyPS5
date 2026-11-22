@@ -43,6 +43,7 @@ inline constexpr Row Table[] = {
     {"spec_pair_push_fit", 1, 0},       {"spec_pair_dense_indirect", 1, 0},
     {"front_unblock_retest", 1, 0}, // (graphicsRun.cpp: a blocked front's stored wait re-read, not unblocked untested)
     {"spec_format_ahead", 1, 0}, // (a table pair born with its recorded pair's vertex format mask: local/format-ahead.h)
+    {"spec_log_flat", 1, 0}, // (the effects log's Add cheaper, the same contents; read at the first log: speculation-state.h)
 };
 // KYTY_TABLE_TARGET_READ (not a live switch: read where image sets are made): on under mode 4.
 inline constexpr uint32_t TableTargetRead4 = 1, TableTargetRead0 = 0;
