@@ -70,6 +70,10 @@ void WriteWatchUnmapped(uint64_t address, uint64_t size) {
 	SysVirtualWriteWatchUnmapped(address, size);
 }
 
+bool WriteWatchByUffd() {
+	return SysVirtualWriteWatchByUffd();
+}
+
 void ZapNoAccess(bool on) {
 	SysVirtualZapNoAccess(on);
 }

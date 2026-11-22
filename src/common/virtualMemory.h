@@ -49,6 +49,9 @@ void WriteWatchUnmapped(uint64_t address, uint64_t size);
 // protection of short runs of registered views may drop their PTEs under userfaultfd minor mode instead of an mprotect
 // (Linux, KYTY_UFFD_MINOR=1: sysLinuxVirtual.cpp); elsewhere nothing changes.
 void ZapNoAccess(bool on);
+// Whether ProtectWriteWatch's write watch is a userfaultfd write protection: Linux with KYTY_UFFD_WP=1, or unset in the
+// Steam Deck build or with KYTY_WEAVE=1 (sysLinuxVirtual.cpp WriteWatchInit), and userfaultfd available. False elsewhere.
+[[nodiscard]] bool WriteWatchByUffd();
 
 } // namespace VirtualMemory
 
