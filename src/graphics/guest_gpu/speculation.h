@@ -118,6 +118,7 @@ public:
 	// What the normal translation does while a speculation is not committed (Spec::t_effects of the thread that
 	// commits).
 	[[nodiscard]] Spec::EffectsLog& Log() noexcept { return m_log; }
+	[[nodiscard]] bool SharesEffectsLog() const noexcept { return m_shared != nullptr; }
 	[[nodiscard]] static uint64_t NowNs() noexcept;
 	// The GPU thread (KYTY_SPEC_GPU_AFFINITY, live spec_gpu_affinity; on under KYTY_SPECULATE=4): its CPUs without the
 	// speculation workers' cores, taken at a guest flip in mode 4 and given back out of it (speculation.cpp).
@@ -324,8 +325,28 @@ private:
 	std::unique_ptr<CommandProcessor>        m_chain;     // mode 3: the state the next one ahead starts from
 	static constexpr size_t                  MaxAhead = 8;
 	std::atomic<uint64_t>                    m_pending {CommandScheduler::PendingTick}; // the latest pending tick
-	// What the normal translation did, and what of it was logged since the result being committed began.
-	Spec::EffectsLog                     m_log;
+	// In mode 4, `m_live`: the effects_from of every result of this instance from its sample to Finish,
+	// wherever it is meanwhile (translated, ahead, abandoned, in hand, blocked; under m_mutex); `m_oldest_live`: their
+	// least, LiveNone, or LiveSampling while one is being sampled: the shared drop reads it without the lock.
+	struct SharedEffects;
+	static constexpr uint64_t LiveNone = UINT64_MAX, LiveSampling = UINT64_MAX - 1;
+	[[nodiscard]] static std::shared_ptr<SharedEffects> AcquireSharedEffects();
+	[[nodiscard]] Spec::EffectsLog&                     SelectEffectsLog();
+	void                   JoinSharedEffects();
+	void                   NoteLive(const Result& result);
+	void                   DropLive(const Result& result);
+	void                   PublishLive();
+	[[nodiscard]] uint64_t DropShared();
+	void                   BeginShared(const Result& result);
+	void                   TakeShared();
+	std::shared_ptr<SharedEffects>    m_shared = AcquireSharedEffects(); // (null outside mode 4)
+	std::unique_ptr<Spec::EffectsLog> m_own_log =
+	    m_shared ? nullptr : std::make_unique<Spec::EffectsLog>();
+	// What the normal translation did, and what of it was logged since the result being committed began (its own log, or
+	// the shared log in mode 4).
+	Spec::EffectsLog& m_log = SelectEffectsLog();
+	std::vector<std::pair<const Result*, uint64_t>> m_live;
+	std::atomic<uint64_t>                           m_oldest_live {LiveNone};
 	int                                  m_interrupt_id = 0; // its queue's processor's
 	Spec::Effects                        m_effects;
 	// Outcomes since the last report: command buffers committed whole, partly, not at all; segments and holes

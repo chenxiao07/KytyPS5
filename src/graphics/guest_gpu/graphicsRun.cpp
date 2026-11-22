@@ -1968,6 +1968,12 @@ bool GuestGpu::Process(Submission& submission) {
 		EffectsScope(Speculation* speculation, Speculation* async) {
 			Spec::t_effects       = speculation != nullptr ? &speculation->Log() : nullptr;
 			Spec::t_effects_async = async != nullptr ? &async->Log() : nullptr;
+			// (In mode 4 every instance's Log() is the shared log, written once.)
+			auto* const any = speculation != nullptr ? speculation : async;
+			if (any != nullptr && any->SharesEffectsLog()) [[unlikely]] {
+				Spec::t_effects       = &any->Log();
+				Spec::t_effects_async = nullptr;
+			}
 		}
 		~EffectsScope() {
 			Spec::t_effects       = nullptr;

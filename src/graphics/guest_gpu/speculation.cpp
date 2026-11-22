@@ -128,6 +128,158 @@ Speculation::Translator::Translator(RenderContext& renderer, uint32_t number, in
 	compute->ReadCatalogOf(renderer.DefaultComputeRenderExecutor(), 1 + number);
 }
 
+// In mode 4 the speculations share one effects log and stamp set with per-instance cursors.
+//
+// THE STREAM. Today every road into the logs (Spec::NoteGpuWrite, NoteHostWrite, NoteRetiredSet; HostWriteParts through
+// the second) writes t_effects and each t_effects_async, set together for a Process and cleared together, off together
+// in Translate: each instance's log is the same stream from that instance's making. One log written once holds it, its
+// positions an instance's plus a constant (the log's end when that was made: 0 for those made together).
+//
+// THE POSITIONS (every holder of one):
+//   a) Result::effects_from, sampled in Translate;
+//   b) a late read's `since`: that log's end later in the same translation, never under its effects_from, read as
+//      max(effects_from, since);
+//   c) Effects::next of the commit going on or blocked: from its effects_from at Commit, only up;
+//   d) DropBefore's bound and the stamps' trim: derived from a) and the end.
+// No other: the state pass and a worker sample none but a) and b) (a State's log_end is read by b) alone), and the
+// workers' other use of the log is the stamps' leaf pools, which take any number of threads.
+// So the live effects_from's cover all. A result holds one from its sample to its Finish, in every place it can be
+// (m_ahead, a translator's, abandoned, in the GPU thread's hand, m_blocked): the span kyty_local_speculations_live
+// counts, and every way out of those places is a Finish (Stop's too).
+//
+// THE BOUND: the least of the end and every instance's live ones. No lock of another instance is taken (the GPU thread
+// waits for no worker):
+//   a sampler (under its m_mutex): M: m_oldest_live = LiveSampling; Fs: a seq_cst fence; L: loads the end;
+//                                  m_oldest_live = the least, with it
+//   the drop (the GPU thread):     W: the end's last store, its own; Fd: a seq_cst fence; O: loads each m_oldest_live
+// THE ORDERING. The store buffer is the hazard, as for the repeat skip's test: W may still be unseen as O completes.
+//   - If L reads older than W, Fs is before Fd in the fences' one order.
+//   - If O reads older than M, Fd is before Fs.
+//   - So not both: either the sampler's position is the drop's end or later, or the drop reads M (it drops nothing this
+//     time) or a later value. Each later value has that position in it until the Finish, which is the GPU thread's own.
+//   - A value O reads that is older than the newest can only be lower or LiveSampling, or miss a position that is, by
+//     the above, at the end or later: never a drop past a position.
+// THE OTHERS CROSS NO THREAD, or only upwards: base, entries, index, retired, the stamps and Effects::next are the GPU
+// thread's alone; a late read's `since` is a later load of the same atomic by the thread that sampled (never lower); a
+// result's effects_from reaches the GPU thread through the instance's mutex. So the log's begin <= every position held
+// or taken later, and <= every cursor.
+//
+// THE SAMPLES. Today a worker samples its own log's end, stored as each of this thread's Adds is made; here the same
+// stream's end, stored as the same Add is made. No thread reads two logs' ends, so each sample is one today's can take.
+//
+// THE ANSWERS. A reader asks from a position of its own over the entries since: the same entries in the same order as
+// in its own log, none of them dropped in either (today's bound holds every result of the committing instance; the
+// blocked one's by there being no commit of that instance meanwhile). The stamps are the last index a unit, over the
+// same stream: every MaybeSince and LatestSince from such a position answers the same; a freed leaf is one no such
+// position can ask. So every walk, Take's lists and where it starts, each verdict and its text are the same.
+//
+// THE GROWTH. An instance's own log already takes every entry and drops only at that instance's commits, never past a
+// result of its own: its begin is at or under each of its live ones. The bound, taken at every commit of any instance,
+// is therefore at or above the least of the own logs' begins: the one log is never longer than the longest of today's
+// (but for a drop LiveSampling put off, until the next commit). An instance that stalls (a blocked commit, results left
+// ahead on a queue gone quiet) holds it exactly as it holds its own log today, once in place of beside the others.
+//
+struct Speculation::SharedEffects {
+	Spec::EffectsLog          log;
+	std::vector<Speculation*> instances; // (the GPU thread's: made and dropped there)
+	uint64_t below = 0, not_live = 0;
+
+	// A cursor under the log's begin: a reader would start past what it must see.
+	void Below(const char* where, uint64_t cursor, uint64_t begin) {
+		if (++below <= 16) {
+			std::printf("Effects shared CURSOR BELOW BEGIN at %s: %llu < %llu\n", where, static_cast<unsigned long long>(cursor),
+			            static_cast<unsigned long long>(begin));
+			std::fflush(stdout);
+		}
+	}
+	void NotLive(int interrupt_id, uint64_t cursor) {
+		if (++not_live <= 16) {
+			std::printf("Effects shared HELD RESULT NOT LIVE (interrupt id %d, from entry %llu)\n", interrupt_id,
+			            static_cast<unsigned long long>(cursor));
+			std::fflush(stdout);
+		}
+	}
+};
+
+std::shared_ptr<Speculation::SharedEffects> Speculation::AcquireSharedEffects() {
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return nullptr;
+	// (The GPU thread's: the instances are made there. Gone with the last, so a live switch to mode 4 starts a new one.)
+	static std::weak_ptr<SharedEffects> made;
+	auto shared = made.lock();
+	if (!shared) {
+		shared = std::make_shared<SharedEffects>();
+		made   = shared;
+	}
+	return shared;
+}
+
+Spec::EffectsLog& Speculation::SelectEffectsLog() { return m_own_log ? *m_own_log : m_shared->log; }
+
+void Speculation::JoinSharedEffects() {
+	m_shared->instances.push_back(this);
+}
+
+// (Under m_mutex, all three.)
+void Speculation::PublishLive() {
+	uint64_t oldest = LiveNone;
+	for (const auto& [live, from]: m_live) oldest = std::min(oldest, from);
+	m_oldest_live.store(oldest, std::memory_order_seq_cst);
+}
+void Speculation::NoteLive(const Result& result) {
+	m_live.emplace_back(&result, result.effects_from);
+	PublishLive();
+}
+void Speculation::DropLive(const Result& result) {
+	std::erase_if(m_live, [&](const auto& live) { return live.first == &result; });
+	PublishLive();
+}
+
+// A commit's end, under this instance's m_mutex, in DropBefore's place.
+// Returns what the stamps' trim starts from.
+uint64_t Speculation::DropShared() {
+	auto& shared = *m_shared;
+	auto& log    = shared.log;
+	// Every held result must have its cursor in the live list before the log is trimmed.
+	const auto check_live = [&](const Result& result) {
+		if (std::ranges::none_of(m_live, [&](const auto& live) {
+			    return live.first == &result && live.second == result.effects_from;
+		    })) [[unlikely]] {
+			shared.NotLive(m_interrupt_id, result.effects_from);
+		}
+	};
+	for (const auto& ahead: m_ahead) check_live(*ahead);
+	for (const auto& translator: m_translators)
+		if (translator->translating != 0 && translator->current != nullptr && translator->current->retired == 0)
+			check_live(*translator->current);
+	if (m_blocked) check_live(*m_blocked);
+
+	const uint64_t end   = log.End();
+	uint64_t       bound = end;
+	bool           sampling = false;
+	std::atomic_thread_fence(std::memory_order_seq_cst); // (THE BOUND, above)
+	for (const auto* instance: shared.instances) {
+		const uint64_t oldest = instance->m_oldest_live.load(std::memory_order_seq_cst);
+		if (oldest == LiveSampling) sampling = true;
+		else if (oldest != LiveNone) bound = std::min(bound, oldest);
+	}
+	if (bound < log.base) shared.Below("the bound (a position under the begin)", bound, log.base);
+	if (!sampling) log.DropBefore(bound);
+	return sampling ? 0 : bound;
+}
+
+void Speculation::BeginShared(const Result& result) {
+	auto&          shared = *m_shared;
+	const uint64_t from   = result.effects_from;
+	if (from < shared.log.base) shared.Below("Commit", from, shared.log.base);
+}
+
+void Speculation::TakeShared() {
+	auto& shared = *m_shared;
+	auto& log    = shared.log;
+	if (m_effects.next < log.base) shared.Below("Take", m_effects.next, log.base);
+	m_effects.Take(log);
+}
+
 Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t base, uint32_t threads, bool pass_thread)
     : m_renderer(renderer), m_chain(std::make_unique<CommandProcessor>(renderer, interrupt_id)),
       m_state(std::make_unique<CommandProcessor>(renderer, interrupt_id)), m_interrupt_id(interrupt_id) {
@@ -145,6 +297,7 @@ Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t bas
 		m_translators.back()->pass_only = true;
 		m_pass_thread                   = true;
 	}
+	if (m_shared) JoinSharedEffects(); // (Before its threads: Push makes them.)
 }
 
 void Speculation::Stop() {
@@ -176,6 +329,7 @@ Speculation::~Speculation() {
 	m_ahead_wake.notify_all();
 	for (auto& translator: m_translators)
 		if (translator->thread.joinable()) translator->thread.join();
+	if (m_shared) std::erase(m_shared->instances, this); // (The shared log holds nothing from this instance from here on.)
 	auto& scheduler = m_renderer.GetCommandScheduler();
 	if (m_blocked) scheduler.DestroyRecorder(std::move(m_blocked->recorder));
 	for (auto& result: m_ahead) scheduler.DestroyRecorder(std::move(result->recorder));
@@ -960,7 +1114,12 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 		// Count around the end sample so the repeat test either sees this translation or precedes its sample.
 		const bool count_effects_sample = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 		if (count_effects_sample) Spec::g_effects_begun.fetch_add(1, std::memory_order_seq_cst);
+		if (m_shared) [[unlikely]] { // (See THE BOUND above.)
+			m_oldest_live.store(LiveSampling, std::memory_order_seq_cst);
+			std::atomic_thread_fence(std::memory_order_seq_cst);
+		}
 		r.effects_from     = m_log.End();
+		if (m_shared) [[unlikely]] NoteLive(r);
 		if (count_effects_sample) Spec::g_effects_sampled.fetch_add(1, std::memory_order_seq_cst);
 		r.state.log_end    = &m_log.end;
 		translator.current = &r;
@@ -1114,6 +1273,7 @@ Speculation::Outcome Speculation::Commit(std::unique_ptr<Result> result, Command
 	}
 	if (r.stop != nullptr && r.stop != ChunkEnd) ++m_stop_reasons[r.stop];
 	m_effects.Clear(r.effects_from);
+	if (m_shared) [[unlikely]] BeginShared(r);
 	return Continue(std::move(result), cp, execution);
 }
 
@@ -1199,12 +1359,17 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 		// What no result began before: of those translated ahead (in the order they were done, not begun) and those
 		// being translated (from when their translator took them: its current result's until then).
 		std::lock_guard lock(m_mutex);
-		auto            oldest = m_log.End();
-		for (const auto& ahead: m_ahead) oldest = std::min(oldest, ahead->effects_from);
-		for (const auto& translator: m_translators)
-			if (translator->translating != 0 && translator->current != nullptr)
-				oldest = std::min(oldest, translator->current->effects_from);
-		m_log.DropBefore(oldest);
+		uint64_t oldest;
+		if (m_shared) [[unlikely]] {
+			oldest = DropShared(); // (The bound over every instance.)
+		} else {
+			oldest = m_log.End();
+			for (const auto& ahead: m_ahead) oldest = std::min(oldest, ahead->effects_from);
+			for (const auto& translator: m_translators)
+				if (translator->translating != 0 && translator->current != nullptr)
+					oldest = std::min(oldest, translator->current->effects_from);
+			m_log.DropBefore(oldest);
+		}
 		// KYTY_SPEC_STAMP_TRIM (live spec_stamp_trim; 0, the default: off): every 1024 commits, the stamps' leaves
 		// (128 KiB and 8.5 KiB, one a 4 MiB granule written, kept for good without it) of granules nothing was written
 		// over since what no result began before (nor the one waiting at a wait hole) freed: every question is asked
@@ -1212,7 +1377,9 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 		// taken here; the leaves are freed after the lock (up to ~270 MiB the first time, which workers would otherwise
 		// wait out on m_mutex): only this thread stamps and reads them (workers read the log's end alone).
 		static auto& stamp_trim = LiveSwitch::Find("spec_stamp_trim", 0);
-		if (stamp_trim.load(std::memory_order_relaxed) != 0 && ++m_stamp_trim_commits >= 1024) {
+		// (A drop deferred by a sampler returns 0. Keep the count until there is a trim bound.)
+		const bool put_off = m_shared && oldest == 0;
+		if (stamp_trim.load(std::memory_order_relaxed) != 0 && ++m_stamp_trim_commits >= 1024 && !put_off) {
 			m_stamp_trim_commits = 0;
 			trim                 = true;
 			trim_from            = m_blocked ? std::min(oldest, m_blocked->effects_from) : oldest;
@@ -1780,7 +1947,8 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 	}
 	while (result.next < segments) {
 		const auto index = result.next;
-		m_effects.Take(m_log);
+		if (m_shared) [[unlikely]] TakeShared();
+		else m_effects.Take(m_log);
 		// The checks after Changed(): the stop's reason, or null when they all hold. (Under KYTY_SPECULATE=4 a stop here
 		// runs the segment as a hole, as Changed()'s do: nothing of its preparation ran, so the run is the in-order
 		// path's from the true state.)
@@ -3203,6 +3371,7 @@ void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {
 	// (Its pending writes are made or dropped: what was translated after it reads through its command buffer's record
 	// while that is not done, else memory.)
 	Unlink(&r.state, RecordOf(r.serial, r.chunk));
+	if (m_shared) [[unlikely]] DropLive(r); // (Its positions are asked no more.)
 	// (Its commands are submitted or discarded: none of them binds a pipeline later.)
 	kyty_local_speculations_live.fetch_sub(1, std::memory_order_seq_cst);
 	r.retired = ++m_clock;
