@@ -502,6 +502,8 @@ static void TableMemoChecked(uint32_t differ, uint64_t vs, uint64_t ps, uint64_t
 		            (differ & 4u) != 0 ? 1 : 0);
 }
 
+#include "weave-draw.inc"
+
 // A draw pair's key as TableTry hashes it (the scout's view directory too).
 template <typename Pair>
 static uint64_t TableScoutHash(const Pair& pair) {
@@ -516,7 +518,13 @@ void RenderExecutor::TableReset(TablePair& pair) {
 	auto& table = *m_table_xpr;
 	EXIT_IF(Role() != 0);
 	++table.memo_epoch;
-	for (auto& [words, set]: pair.sets) NativeXprRetireSet(set->pool, set->set);
+	// (Its callers hold the weave's workers outside a draw. The pair is rebuilt in place: what a worker kept of it
+	// goes.)
+	if (Weave::Active()) Weave::NoteFreed(&pair);
+	for (auto& [words, set]: pair.sets) {
+		if (Weave::Active()) Weave::NoteFreed(set.get());
+		NativeXprRetireSet(set->pool, set->set);
+	}
 	if (table.store == &pair) table.store = nullptr;
 	if (table.last_pair == &pair) table.last_pair = nullptr;
 	table.last_set = nullptr;
@@ -654,6 +662,7 @@ void RenderExecutor::TableSweepPairs() {
 		table->pairs_swept = frame - TableXpr::PairSweepFrames;
 		return;
 	}
+	const Weave::Hold hold; // (the pairs a weave worker finds pairs in)
 	const size_t before = table->pairs.size() + table->dispatches.size();
 	for (auto* pairs: {&table->pairs, &table->dispatches})
 		std::erase_if(*pairs, [&](auto& item) {
@@ -662,7 +671,11 @@ void RenderExecutor::TableSweepPairs() {
 			if (pair.used_frame + TableXpr::PairKeepFrames >= frame || pair.waiting) return false;
 			// (KYTY_SCOUT: its view retired too, as TableReset does: else it stays in the directory, its slot lost to others.)
 			if (pair.scout_version != 0) Scout::Retire(TableScoutHash(pair), pair.scout_version);
-			for (auto& [words, set]: pair.sets) NativeXprRetireSet(set->pool, set->set);
+			for (auto& [words, set]: pair.sets) {
+				if (Weave::Active()) Weave::NoteFreed(set.get());
+				NativeXprRetireSet(set->pool, set->set);
+			}
+			if (Weave::Active()) Weave::NoteFreed(&pair);
 			return true;
 		});
 	const size_t after = table->pairs.size() + table->dispatches.size();
@@ -687,7 +700,10 @@ void RenderExecutor::TableSweepPairs() {
 }
 
 RenderExecutor::TableXpr& RenderExecutor::OwnTable() {
-	if (!m_table_xpr) m_table_xpr = std::make_shared<TableXpr>();
+	if (!m_table_xpr) {
+		const Weave::Hold hold; // (a weave worker reads the pointer)
+		m_table_xpr = std::make_shared<TableXpr>();
+	}
 	return *m_table_xpr;
 }
 
@@ -879,16 +895,35 @@ struct CatalogReadScope {
 RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands,
                                                      uint64_t index_base, uint64_t index_bytes,
                                                      vk::IndexType index_type, const NativeXprDirectDraw* direct) {
-	auto& table = OwnTable();
+	return TableTry<Weave::Ordered>(buffer, commands, index_base, index_bytes, index_type, direct);
+}
+
+// (Under Weave::Worker: the executor's pairs are read, the worker's own table holds its lookups and last draw, and the
+// draw-state key and the state found last are the worker's. What the GPU thread's draw would write, a worker skips,
+// keeps or declines: weave-draw.inc.)
+template <typename P>
+RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands,
+                                                     uint64_t index_base, uint64_t index_bytes,
+                                                     vk::IndexType index_type, const NativeXprDirectDraw* direct) {
+	auto& table  = TableOf<P>();
+	auto& common = P::worker ? OwnTable() : table; // (the executor's: its pairs)
 	// (Another executor's catalog is read under its lock.)
 	std::shared_lock<std::shared_mutex> catalog_read;
 	if (Role() != 0) CatalogGate(Catalog().m_catalog_writer_waiting, CatalogWriterFirst()), catalog_read = CatalogRead();
 	const CatalogReadScope catalog_read_scope(&catalog_read); // (spec_worker_sets)
 	DropStaleCatalog();
-	TableSweepPairs();
-	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1e, 0); // census: the table path's phases (b)
+	if constexpr (!P::worker) TableSweepPairs();
+	TableCensus<P> census(LiveCensus::DrawPhase, 0x7ab1e, 0); // census: the table path's phases (b)
 	auto*       catalog = CatalogTable();
 	auto&       cache   = *m_native_xpr;
+	// (The draw-state key and the state found last: the GPU thread's in the native cache, a worker's in its scratch.)
+	auto& keys = [&]() -> auto& {
+		if constexpr (P::worker)
+			return WeaveHere();
+		else
+			return cache;
+	}();
+	if constexpr (P::worker) WeaveMiss(Weave::Miss::Pair);
 	const auto& sh      = buffer.GetShaders();
 	const auto& vs      = sh.GetVs();
 	// The vertex program is the ES stage's (ShaderGetInputInfoVS), without tessellation.
@@ -897,7 +932,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	const auto frame      = m_context.FrameNumber();
 	const auto vs_address = vs.es_regs.data_addr, ps_address = sh.GetPs().ps_regs.data_addr;
 	const std::array<uint64_t, 3> pair_key {vs_address, ps_address, static_cast<uint32_t>(vs.start_instance_user_sgpr)};
-	auto* own   = Role() != 0 ? nullptr : &table.pairs;
+	auto* own   = Role() != 0 ? nullptr : &common.pairs;
 	auto* known = own != nullptr && table.found_key == pair_key ? table.found_pair : nullptr;
 	if (known == nullptr) {
 		const auto pair_hash = XXH3_64bits(pair_key.data(), sizeof(pair_key));
@@ -915,9 +950,12 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		auto&      cached  = table.pair_cache[pair_hash & (entries - 1)];
 		known        = own != nullptr && cached.first == pair_hash ? cached.second : nullptr;
 		if (known == nullptr) {
+			// (A weave worker reads the pairs unlocked: the GPU thread holds it outside a draw to insert or erase one.)
 			auto it = own != nullptr ? own->find(pair_hash) : found;
 			if (own != nullptr && it == own->end()) {
+				if constexpr (P::worker) return TableResult::Native; // (a new pair: the GPU thread's to make)
 				const auto write    = CatalogWrite();
+				const Weave::Hold hold;
 				it                  = own->try_emplace(pair_hash).first;
 				auto& fresh         = it->second;
 				fresh.vs            = vs_address;
@@ -936,25 +974,49 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	TablePrefetchPair(pair);
 	// (A speculation's thread notes the pair in its segment, whose commit stamps it (Speculation::After): only the GPU
 	// thread writes it, and a pair only speculations use is not swept as unused. A refused draw's note goes with it.)
-	if (Role() == 0) pair.used_frame = frame;
-	else if (auto* spec = Spec::Current(); spec != nullptr) spec->NoteUsedPair(&pair.used_frame);
+	// (A weave worker's draw leaves the pair's last use to the turn's stamp.)
+	if constexpr (!P::worker) {
+		if (Role() == 0) pair.used_frame = frame;
+		else if (auto* spec = Spec::Current(); spec != nullptr) spec->NoteUsedPair(&pair.used_frame);
+	}
 	if (pair.vs != vs_address || pair.ps != ps_address || pair.start_instance != vs.start_instance_user_sgpr)
 		return Spec::Refuse("table: pair key"), TableResult::Native;
-	if (const auto generation = ShaderMapGeneration(); generation != pair.Generation(Role())) {
-		if (pair.programs[0] != nullptr &&
-		    (ShaderHashNoFaultScope {Role() != 0 && !GuestGpu::IsGpuThread()}, ShaderHashAt(vs_address) != pair.programs[0]->shader_hash ||
-		     (pair.programs[1] != nullptr && ShaderHashAt(ps_address) != pair.programs[1]->shader_hash))) {
+	if constexpr (P::worker) {
+		// Proving the shaders again and a reset are the GPU thread's. A worker proves them read only, the code read
+		// from the backing, never through a page that can fault (ShaderHashAtNoFault), and takes the draw when both are
+		// still the pair's programs, noting the generation it proved them at for the turn, which stamps the pair with
+		// it while the shader map is still there. A pair to compile again is a hole.
+		WeaveMiss(Weave::Miss::Shaders);
+		if (const auto generation = ShaderMapGeneration();
+		    pair.programs[0] != nullptr &&
+		    generation != std::atomic_ref<uint64_t>(pair.generation).load(std::memory_order_relaxed)) {
+			uint64_t vs_hash = 0, ps_hash = 0;
+			if (!ShaderHashAtNoFault(vs_address, vs_hash) || vs_hash != pair.programs[0]->shader_hash ||
+			    (pair.programs[1] != nullptr &&
+			     (!ShaderHashAtNoFault(ps_address, ps_hash) || ps_hash != pair.programs[1]->shader_hash)))
+				return TableResult::Native;
+			WeaveParcel().result->made.back().pair_proved = generation;
+		}
+		if (pair.respecialize) return TableResult::Native;
+	} else {
+		if (const auto generation = ShaderMapGeneration(); generation != pair.Generation(Role())) {
+			if (pair.programs[0] != nullptr &&
+			    (ShaderHashNoFaultScope {Role() != 0 && !GuestGpu::IsGpuThread()}, ShaderHashAt(vs_address) != pair.programs[0]->shader_hash ||
+			     (pair.programs[1] != nullptr && ShaderHashAt(ps_address) != pair.programs[1]->shader_hash))) {
+				if (Role() != 0) return Spec::Refuse("table: shaders changed"), TableResult::Native;
+				const auto write = CatalogWrite();
+				const Weave::Hold hold;
+				pair.portable    = {};
+				TableReset(pair);
+			}
+			pair.Generation(Role()) = generation;
+		}
+		if (pair.respecialize) {
 			if (Role() != 0) return Spec::Refuse("table: shaders changed"), TableResult::Native;
 			const auto write = CatalogWrite();
-			pair.portable    = {};
+			const Weave::Hold hold;
 			TableReset(pair);
 		}
-		pair.Generation(Role()) = generation;
-	}
-	if (pair.respecialize) {
-		if (Role() != 0) return Spec::Refuse("table: shaders changed"), TableResult::Native;
-		const auto write = CatalogWrite();
-		TableReset(pair);
 	}
 	if (pair.refused) return Spec::Refuse(Spec::TablePairRefusedText), TableResult::Native;
 	// KYTY_FRAMEGEN: the frame's first G-buffer draw goes the normal way (or a native record's), whose hook reads the
@@ -962,10 +1024,11 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	// first G-buffer draw of its speculation to the GPU thread (a hole, the normal way there while the frame has no
 	// camera) and draws the others the table way. The frame's first G-buffer draw is the first of the speculation that
 	// holds it, so the camera comes from the same draw as without speculation. (Leaving them all made ~30 holes a frame,
-	// 4-9 ms of the commit's, issue #378.)
+	// 4-9 ms of the commit's, issue #378.) A weave worker's draw is marked instead, and the turn leaves the frame's first
+	// to the GPU thread (Weave::Made::gbuffer).
 	if (FrameGen::Enabled() && pair.programs[0] != nullptr &&
 	    FrameGen::IsGbufferVertexShader(pair.programs[0]->shader_hash) &&
-	    (Role() == 0 ? FrameGen::WantsCamera() : Spec::LeaveCameraDraw()))
+	    (!P::worker && (Role() == 0 ? FrameGen::WantsCamera() : Spec::LeaveCameraDraw())))
 		return Spec::Refuse("table: frame generation camera"), TableResult::Native;
 	// A store at most once a frame per pair and draw state, within the frame's budget (kyty_local_table_store_budget):
 	// while its programs and pipeline compile, the pair's draws take the normal path (Deferred). (Once a frame per pair
@@ -973,6 +1036,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	// stored native records too, which the table variant replaced a frame or two later: 100-230 a slow frame walking
 	// into new parts of Boletarian Palace 1-3 (each traced and sorted, ~3 ms of the frame).
 	const auto request_store = [&] {
+		if constexpr (P::worker) return TableResult::Native; // (a store is the GPU thread's: its own draw asks for it)
 		if (Spec::Current() != nullptr) return Spec::Refuse("table store"), TableResult::Native;
 		if (pair.waiting) {
 			if (!pair.waiting->load(std::memory_order_acquire))
@@ -997,7 +1061,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		return TableResult::Store;
 	};
 	// KYTY_TABLE_MEMO: what this pair and state key drew with last (the main executor's), its variant still that key's.
-	const bool memo = Role() == 0 && TableMemoOn();
+	const bool memo = !P::worker && Role() == 0 && TableMemoOn();
 	if (memo) {
 		auto& entry = table.MemoAt(&pair, cache.state_key);
 		if (entry.pair == &pair && entry.key == cache.state_key && entry.epoch == table.memo_epoch &&
@@ -1044,8 +1108,8 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 				LiveCounters::Add(LiveCounters::TableMemoHits);
 				table.memo_set     = entry.set;
 				table.memo_verify  = verify;
-				const auto result  = TableDraw(buffer, pair, memo_variant, memo_state, commands, index_base, index_bytes,
-				                               index_type, direct);
+				const auto result  = TableDraw<P>(buffer, pair, memo_variant, memo_state, commands, index_base, index_bytes,
+				                                  index_type, direct);
 				table.memo_set     = nullptr;
 				table.memo_verify  = false;
 				// (Mode 4: a derived state's draw refused for a target in its set: the store path, as below.)
@@ -1054,12 +1118,15 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 			}
 		}
 	}
-	// (The variant found last first: a pair's variants are a cold line each, its draws mostly keep their state.)
-	const bool hint    = (kyty_local_table_mru.load(std::memory_order_relaxed) & 2u) != 0 &&
-	                  pair.variant_hint < pair.variants.size() && pair.variants[pair.variant_hint].state == cache.state_key;
+	// (The variant found last first: a pair's variants are a cold line each, its draws mostly keep their state. A weave
+	// worker finds it: the hint is the GPU thread's, rewritten at every draw.)
+	if constexpr (P::worker) WeaveMiss(Weave::Miss::Variant);
+	const bool hint    = !P::worker && (kyty_local_table_mru.load(std::memory_order_relaxed) & 2u) != 0 &&
+	                  pair.variant_hint < pair.variants.size() && pair.variants[pair.variant_hint].state == keys.state_key;
 	const auto variant = hint ? pair.variants.begin() + pair.variant_hint
-	                          : std::ranges::find(pair.variants, cache.state_key, &TableXpr::Variant::state);
-	if (variant != pair.variants.end()) pair.variant_hint = static_cast<uint32_t>(variant - pair.variants.begin());
+	                          : std::ranges::find(pair.variants, keys.state_key, &TableXpr::Variant::state);
+	if constexpr (!P::worker)
+		if (variant != pair.variants.end()) pair.variant_hint = static_cast<uint32_t>(variant - pair.variants.begin());
 	if (variant != pair.variants.end() && variant->refused) return Spec::Refuse("table: variant refused"), TableResult::Native;
 	if (pair.programs[0] == nullptr || variant == pair.variants.end() || variant->pipeline == nullptr) {
 		// (Mode 4: the worker makes the variant, and the draw state if the key has none, TableWorkerEntry.)
@@ -1071,12 +1138,15 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		if (Role() != 0 && pair.programs[0] == nullptr && WorkerEntryOn())
 			if (const auto drawn = TableEntryOverlay(buffer, &pair, commands, index_base, index_bytes, index_type, direct))
 				return *drawn;
-		return LiveCounters::Add(LiveCounters::TableStoreVariant), request_store();
+		return TableAdd<P>(LiveCounters::TableStoreVariant), request_store();
 	}
 	// The draw state (TableStore captures it).
-	if (cache.last_state == nullptr || cache.last_state_key != cache.state_key) {
+	if constexpr (P::worker) WeaveMiss(Weave::Miss::State);
+	if (keys.last_state == nullptr || keys.last_state_key != keys.state_key) {
+		// (A weave worker reads the draw states unlocked: the GPU thread holds it outside a draw to insert or erase
+		// one.)
 		const auto& states   = Catalog().NativeXprState().states;
-		const auto  state_it = states.find(cache.state_key);
+		const auto  state_it = states.find(keys.state_key);
 		if (state_it == states.end()) {
 			// (Mode 4: the worker derives the draw state from a sibling's, TableWorkerEntry.)
 			if (Role() != 0 && WorkerEntryOn())
@@ -1084,13 +1154,13 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 					return *drawn;
 			return request_store();
 		}
-		cache.last_state_key = cache.state_key;
-		cache.last_state     = state_it->second.get();
+		keys.last_state_key = keys.state_key;
+		keys.last_state     = state_it->second.get();
 	}
-	const auto& draw_state = *cache.last_state;
+	const auto& draw_state = *keys.last_state;
 	TablePrefetchArrays(pair, pair.LastSet(Role()));
-	if (!NativeXprTargetsCurrent(draw_state)) return LiveCounters::Add(LiveCounters::TableStoreTargets), request_store();
-	const auto result = TableDraw(buffer, pair, *variant, draw_state, commands, index_base, index_bytes, index_type, direct);
+	if (!TableTargetsCurrent<P>(draw_state)) return TableAdd<P>(LiveCounters::TableStoreTargets), request_store();
+	const auto result = TableDraw<P>(buffer, pair, *variant, draw_state, commands, index_base, index_bytes, index_type, direct);
 	// (Mode 4, the GPU thread: a state a worker derived from a sibling's capture whose draw TableDraw refused for a target in
 	// its set: the store path for it, as for a draw whose state has no capture or whose targets are not current; TableStore's
 	// capture then replaces the derived state.)
@@ -1104,31 +1174,39 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 
 bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
                                    uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct) {
+	return TableContinue<Weave::Ordered>(buffer, commands, index_base, index_bytes, index_type, direct);
+}
+
+// (Under Weave::Worker the last draw is the worker's, in its strand's buffer: false when it has none to continue.)
+template <typename P>
+bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
+                                   uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct) {
 	if (kyty_local_table_xpr_mode.load(std::memory_order_relaxed) < 2 || !m_table_xpr || !m_native_xpr) return false;
 	std::shared_lock<std::shared_mutex> catalog_read;
 	if (Role() != 0) CatalogGate(Catalog().m_catalog_writer_waiting, CatalogWriterFirst()), catalog_read = CatalogRead();
 	const CatalogReadScope catalog_read_scope(&catalog_read); // (spec_worker_sets)
 	DropStaleCatalog();
-	auto& table = OwnTable();
+	auto& table = TableOf<P>();
 	if (table.last_pair == nullptr || buffer.IsInvalid() || index_base == 0 || index_bytes == 0 ||
 	    commands.size() > 64 || table.last_pair->Generation(Role()) != ShaderMapGeneration() ||
 	    table.last_pair->start_instance != buffer.GetShaders().GetVs().start_instance_user_sgpr)
 		return false;
 	auto&       variant = table.last_pair->variants[table.last_variant];
-	const auto& emit    = m_native_xpr->emit;
+	const auto& emit    = TableEmit<P>();
 	if (emit.command != buffer.Handle() || emit.generation != buffer.GraphicsGeneration() ||
 	    emit.state != table.last_state || emit.pipeline != variant.pipeline)
 		return false;
-	// (The GPU thread's: a speculation's thread does not take it.)
+	// (The GPU thread's: a speculation's thread does not take it, nor a weave worker, which records apart.)
 	std::optional<RenderLockGuard> lock;
-	if (Role() == 0) lock.emplace(m_context.GetMutex());
-	if (!NativeXprTargetsCurrent(*table.last_state)) return false;
-	const auto drawn = TableDraw(buffer, *table.last_pair, variant, *table.last_state, commands, index_base, index_bytes,
-	                             index_type, direct);
+	if constexpr (!P::worker)
+		if (Role() == 0) lock.emplace(m_context.GetMutex());
+	if (!TableTargetsCurrent<P>(*table.last_state)) return false;
+	const auto drawn = TableDraw<P>(buffer, *table.last_pair, variant, *table.last_state, commands, index_base, index_bytes,
+	                                index_type, direct);
 	// (Mode 4: a derived state's refusal mark cleared: the packet goes to NativeXprTry again, whose TableTry asks the store.)
 	if (table.last_state->derived) t_store_derived = false;
 	if (drawn != TableResult::Drawn) return false;
-	LiveCounters::Add(LiveCounters::TableContinued, std::max<size_t>(commands.size(), 1));
+	TableAdd<P>(LiveCounters::TableContinued, std::max<size_t>(commands.size(), 1));
 	return true;
 }
 
@@ -1459,8 +1537,10 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			return raw;
 		}
 		const auto write = CatalogWrite();
+		const Weave::Hold hold; // (the pair's sets a weave worker finds a set in)
 		auto&      slot  = pair.sets[XXH3_64bits(words.data(), words.size() * sizeof(uint32_t))];
 		if (slot) {
+			if (Weave::Active()) Weave::NoteFreed(slot.get());
 			NativeXprRetireSet(slot->pool, slot->set);
 			pair.ClearSets();
 			++m_table_xpr->epoch;
@@ -1585,6 +1665,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				}
 				if (!other && ((pair.portable[0] | masks[0]) != pair.portable[0] || (pair.portable[1] | masks[1]) != pair.portable[1])) {
 					const auto write = CatalogWrite();
+					const Weave::Hold hold;
 					pair.portable[0] |= masks[0];
 					pair.portable[1] |= masks[1];
 					pair.respecialize = true;
@@ -1948,6 +2029,12 @@ static void TableEarlyEntry(Image& image) {
 // none changed; the registrations, every frame, one depth surface's memory taken as a color target and back), and
 // every use in full once in TouchTicks flips or frames, which touches it (KYTY_TABLE_SET_PROOFS: 0 checks all of
 // them in full, 2 does and counts the uses a proof held for that did not pass).
+// (A use is held by its proof while its image's validity is the one proven and, when registrations moved, none stamped
+// the view's pages since the proof: `registered`, the texture cache's answer for the view, asked only then.)
+template <typename Use, typename Held, typename Registered>
+[[nodiscard]] static bool TableUseHeld(const Use& dep, const Held& image, bool moved, Registered&& registered) {
+	return dep.proven && image.validity == dep.validity && (!moved || !registered());
+}
 bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 	auto&      textures   = m_context.GetTextureCache();
 	const auto frame      = m_context.FrameNumber();
@@ -1987,9 +2074,10 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 	for (auto& dep: set.images) {
 		auto* image = textures.m_slot_images.try_get(dep.id);
 		if (image == nullptr || image->serial != dep.serial) return false;
-		const bool held = !full && dep.proven && image->validity == dep.validity &&
-		                  (!moved || !textures.RegistrationsSince(dep.desc.info.data.address, dep.desc.info.data.size,
-		                                                          set.resolution_epoch));
+		const bool held = !full && TableUseHeld(dep, *image, moved, [&] {
+			const auto& data = dep.desc.info.data;
+			return textures.RegistrationsSince(data.address, data.size, set.resolution_epoch);
+		});
 		if (held && mode != 2) continue;
 		const auto refuse = [&] {
 			if (held) {
@@ -2081,6 +2169,37 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 	if (own && full) {
 		set.touched_tick  = textures.GcTick();
 		set.touched_frame = textures.CurrentFrame();
+	}
+	return true;
+}
+
+// TableValidateSet's first answer, or the one it reaches having changed nothing but the stamps it writes after the
+// checks: every use held by its proof (KYTY_TABLE_SET_PROOFS=1, the full check not due). Images are registered,
+// unregistered and their slots erased on the GPU thread, a slot only when no weave worker may be in a draw that saw it
+// (Weave::HoldsSlot; a worker asks nothing of a retiring one, Weave::ImageRetiring); an image's validity is atomic. The
+// set's proof stamps are the GPU thread's, read as hints. The registration log is not read here (the GPU thread appends
+// to it and erases from it): moved registrations ask each view's pages.
+bool RenderExecutor::TableSetProven(const TableImageSet& set) const {
+	auto&      textures   = m_context.GetTextureCache();
+	const auto frame      = m_context.FrameNumber();
+	const auto resolution = textures.ResolutionEpoch();
+	if (set.bda_generation != BufferCache::BdaTableGeneration()) return false;
+	auto&      stamps    = const_cast<TableImageSet&>(set);
+	const auto validated = std::atomic_ref<uint64_t>(stamps.validated_frame).load(std::memory_order_relaxed);
+	const auto proven    = std::atomic_ref<uint64_t>(stamps.resolution_epoch).load(std::memory_order_relaxed);
+	if (validated == frame && proven == resolution) return true;
+	if (kyty_local_table_set_proofs.load(std::memory_order_relaxed) != 1 ||
+	    textures.GcTick() >= set.touched_tick + TableImageSet::TouchTicks ||
+	    textures.CurrentFrame() >= set.touched_frame + TableImageSet::TouchTicks)
+		return false;
+	const bool moved = proven != resolution;
+	for (const auto& dep: set.images) {
+		const auto* image = textures.m_slot_images.try_get(dep.id);
+		if (image == nullptr || image->serial != dep.serial ||
+		    !TableUseHeld(dep, *image, moved, [&] {
+			    return textures.RegistrationsSince(dep.desc.info.data.address, dep.desc.info.data.size, proven);
+		    }))
+			return false;
 	}
 	return true;
 }
@@ -2179,8 +2298,16 @@ static std::array<uint32_t, 8> TableDenseLodMasked(const ShaderRecompiler::IR::D
 // slots (a pointer read from memory may hold anything: what is read through it must be mapped), and the T#/S# words
 // they make (TableXpr::words, the set's key) and the pixel stage's LOD statistics words. False: something unmapped.
 bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data) {
-	auto&      table     = OwnTable();
+	return TableEvaluate<Weave::Ordered>(pair, user_data);
+}
+
+// (Under Weave::Worker: into the worker's own table, read through its reader, which fails on a page it may not read: a
+// hole. An indirect image's candidates are enumerated by the materialization's readers: the GPU thread's.)
+template <typename P>
+bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data) {
+	auto&      table     = TableOf<P>();
 	const auto stages    = pair.programs[1] != nullptr ? 2u : 1u;
+	if constexpr (P::worker) WeaveMiss(Weave::Miss::Tables);
 	auto&      resources = m_context.GetGpuResources();
 	if (const auto epoch = resources.MappingEpoch(); epoch != table.mapping_epoch) {
 		table.mapped.fill(UINT64_MAX);
@@ -2190,7 +2317,7 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 	auto& words = table.words;
 	words.clear();
 	table.lod_stats.clear();
-	NativeXprReader reader(resources);
+	std::conditional_t<P::worker, WeaveScratch::Reader, NativeXprReader> reader(resources);
 	// A run's address, its pages proven mapped and its lines loading.
 	// (A bounded run, read through a V#: within its range, NUM_RECORDS bytes or NUM_RECORDS strides, as the normal
 	// path's evaluation, which fails past it: so does this one.)
@@ -2246,6 +2373,8 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 					return false;
 			}
 			for (size_t i = begin; i < end; ++i) reader.Read(table.addresses[i], runs[i].count, slots.data() + runs[i].first);
+			if constexpr (P::worker)
+				if (reader.Failed()) return WeaveMiss(Weave::Miss::Memory), false;
 		}
 		for (size_t i = 0; i < plan.images.size(); ++i) {
 			const auto& descriptor = plan.images[i];
@@ -2355,6 +2484,8 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 	for (uint32_t st = 0; st < stages; ++st) {
 		const auto& program = *pair.programs[st];
 		const auto& form    = pair.packed[st];
+		if constexpr (P::worker)
+			if (!program.table_plan.indirect.empty()) return false;
 		// (Slots no stage reads keep what an earlier draw left: the block carries them unread.)
 		auto& slots = table.blocks[st];
 		slots.resize(program.table_plan.BlockDwords());
@@ -2378,6 +2509,8 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 					return false;
 			}
 			for (auto i = begin; i < end; ++i) reader.Read(table.addresses[i], form.runs[i].count, slots.data() + form.runs[i].first);
+			if constexpr (P::worker)
+				if (reader.Failed()) return WeaveMiss(Weave::Miss::Memory), false;
 			begin = end;
 		}
 		const auto first = words.size();
@@ -2405,7 +2538,36 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, TablePair& pair,
                                                         const TableVariant*       variant,
                                                         const NativeXprDrawState* draw_state) {
-	auto&       table = OwnTable();
+	return TableSet<Weave::Ordered>(buffer, pair, variant, draw_state);
+}
+
+template <typename P>
+RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, TablePair& pair,
+                                                        const TableVariant*       variant,
+                                                        const NativeXprDrawState* draw_state) {
+	if constexpr (P::worker) {
+		// A set is made, tried again, retired and swept by the GPU thread: a weave worker takes one the pair has for
+		// the words, or declines the draw. The set its last draw of the pair took first; else the pair's sets, read
+		// unlocked: the GPU thread holds it outside a draw to insert or erase one.
+		WeaveMiss(Weave::Miss::Set);
+		auto&       scratch = WeaveHere();
+		const auto& words   = scratch.table.words;
+		auto&       hint    = scratch.set_hints[(reinterpret_cast<uintptr_t>(&pair) * 0x9e3779b97f4a7c15ull) >> 56u];
+		auto*       set     = hint.first == &pair ? hint.second : nullptr;
+		if (set == nullptr || set->words != words) {
+			const auto found = pair.sets.find(XXH3_64bits(words.data(), words.size() * sizeof(uint32_t)));
+			set = found != pair.sets.end() && found->second->words == words ? found->second.get() : nullptr;
+			if (set == nullptr) return nullptr;
+			hint = {&pair, set};
+		}
+		// (Refused, or made for a page table that grew since, which TableValidateSet retires it for: a hole.) Proven as
+		// TableValidateSet would find it with nothing to write but its stamps, or its validation is a need of the
+		// turn's. Its last use and the pair's last sets are the turn's stamps.
+		if (set->refused || set->bda_generation != BufferCache::BdaTableGeneration()) return nullptr;
+		if (!scratch.SetProven(*this, *set)) scratch.NoteNeed(Weave::NeedKind::Validate, nullptr, set, 0);
+		return set;
+	}
+	auto&       table = TableOf<P>();
 	const auto& words = table.words;
 	const auto  frame = m_context.FrameNumber();
 	auto*       set   = pair.LastSet(Role());
@@ -2465,6 +2627,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 					// the last reference to the old job's flag. The old one is released after the unlock.)
 					auto       waiting = m_context.GetPipelineCache().TableWaiting();
 					const auto write   = CatalogWrite();
+					const Weave::Hold hold;
 					retried->retry_wait.swap(waiting);
 				}
 			}
@@ -2509,10 +2672,12 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 		} else { // (the owner's path, as before)
 			// Resolved again at the next draw that uses it.
 			const auto write = CatalogWrite();
+			const Weave::Hold hold; // (the set erased: a weave worker finds sets in the pair's)
 			if (table.last_set == set) table.last_set = nullptr;
 			pair.ClearSets();
 			++table.epoch;
 			const auto found = pair.sets.find(XXH3_64bits(set->words.data(), set->words.size() * sizeof(uint32_t)));
+			if (Weave::Active()) Weave::NoteFreed(set);
 			NativeXprRetireSet(set->pool, set->set);
 			if (found != pair.sets.end() && found->second.get() == set) pair.sets.erase(found);
 			return nullptr;
@@ -2521,6 +2686,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 	// Unused image sets leave once a second (the catalog's owner drops them).
 	if (Role() == 0 && frame >= table.collected + 60) {
 		const auto write = CatalogWrite();
+		const Weave::Hold hold; // (sets erased)
 		table.collected  = frame;
 		for (auto* pairs: {&table.pairs, &table.dispatches})
 			for (auto& [key, held]: *pairs)
@@ -2529,6 +2695,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 					held.ClearSets();
 					if (table.last_set == item.second.get()) table.last_set = nullptr;
 					++table.epoch;
+					if (Weave::Active()) Weave::NoteFreed(item.second.get());
 					NativeXprRetireSet(item.second->pool, item.second->set);
 					return true;
 				});
@@ -2543,8 +2710,14 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 // The V#s' words and their resolved entries (TableXpr::entries), as soon as TableEvaluate made the slots they are read
 // from: the entries' lines (a 4 MiB direct-mapped table: TLB misses too) load while the image set is found (TableSet).
 void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data) {
+	TableGather<Weave::Ordered>(pair, user_data);
+}
+
+// (Under Weave::Worker: the worker's own entries.)
+template <typename P>
+void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data) {
 	using Kind        = ShaderRecompiler::IR::TablePlan::Operand::Kind;
-	auto&      table  = OwnTable();
+	auto&      table  = TableOf<P>();
 	const auto stages = pair.programs[1] != nullptr ? 2u : 1u;
 	for (uint32_t st = 0; st < stages; ++st) {
 		const auto& program = *pair.programs[st];
@@ -2587,19 +2760,114 @@ void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<con
 			}
 			__builtin_prefetch(entry);
 		}
-		if (memo_hits != 0) LiveCounters::Add(LiveCounters::TableGatherMemoHits, memo_hits);
+		if (memo_hits != 0) TableAdd<P>(LiveCounters::TableGatherMemoHits, memo_hits);
 	}
 	table.gathered = &pair;
 }
 
+// As ObtainBuffer: a small range the guest wrote, [address, address + size), read from a copy in the ring (nothing
+// held: the main executor's later uses share it while it holds, TableXpr::RingCopy) instead of uploaded into its
+// buffer: the copy of the range shared under the same terms, else a new one, kept for them. 0: no room, or the bytes
+// unreadable. `shareable`: the copy may be shared and kept (TableBlocks says when). `observation` and `cpu`: the terms
+// a held entry keeps it under (`cpu` 0: none, it is not shared). `copied`: a new copy was read (not a shared one).
+// TableBlocks' and the weave turn's recopy of a range a worker held (the form without a policy: the GPU thread's, the
+// main executor's, shareable). Under Weave::Worker: in the worker's slab, read through the copies listed before its
+// parcel, shared within the parcel only.
+vk::DeviceAddress RenderExecutor::TableRingCopy(uint64_t address, uint64_t size) {
+	uint64_t observation = 0, cpu = 0;
+	bool     copied      = false;
+	return TableRingCopy<Weave::Ordered>(address, size, true, observation, cpu, copied);
+}
+
+template <typename P>
+vk::DeviceAddress RenderExecutor::TableRingCopy(uint64_t address, uint64_t size, bool shareable, uint64_t& observation,
+                                                uint64_t& cpu, bool& copied) {
+	auto&       table        = TableOf<P>();
+	auto&       buffer_cache = m_context.GetBufferCache();
+	auto* const shared =
+	    shareable ? &table.ring_copies[((address ^ (size << 40u)) * 0x9e3779b97f4a7c15ull) >> 52u] : nullptr;
+	observation              = [&] {
+		if constexpr (P::worker)
+			return WeaveParcelSerial() | uint64_t {1} << 62u;
+		else
+			return PageManager::ObservationEpoch();
+	}();
+	const auto tick = P::worker ? WeaveParcelSerial() : m_context.GetCommandScheduler().CurrentTick();
+	cpu             = buffer_cache.CpuModificationEpoch(address, size); // (before the copy)
+	vk::DeviceAddress device = 0;
+	if (shared != nullptr && cpu != 0 && shared->address == address && shared->size == size &&
+	    shared->observation == observation && shared->tick == tick && shared->cpu_epoch == cpu) {
+		device = shared->device;
+		TableAdd<P>(LiveCounters::TableRingShared);
+		TableAdd<P>(LiveCounters::TableRingSharedBytes, size);
+	} else {
+		auto& ring = [&]() -> auto& {
+			if constexpr (P::worker)
+				return WeaveHere().slab;
+			else
+				return buffer_cache.GetTableUploadBuffer();
+		}();
+		const auto read = [&](void* out) {
+			if constexpr (P::worker)
+				return WeaveHere().ReadBacking(address, out, size);
+			else
+				return Libs::LibKernel::Memory::TryReadBackingToHost(address, out, size);
+		};
+		if (auto [mapped, offset] = ring.Map(size, 16, false); mapped != nullptr && read(mapped)) {
+			ring.Commit();
+			copied = true;
+			device = ring.BufferDeviceAddress() + offset;
+			TableAdd<P>(LiveCounters::TableRingCopies);
+			TableAdd<P>(LiveCounters::TableRingBytes, size);
+			if (shared != nullptr && cpu != 0)
+				*shared = {.address     = address,
+				           .size        = size,
+				           .observation = observation,
+				           .tick        = tick,
+				           .cpu_epoch   = cpu,
+				           .device      = device};
+		}
+	}
+	if (shared == nullptr) cpu = 0;
+	return device;
+}
+
+bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
+                                 std::array<vk::DeviceAddress, 2>& blocks, bool* writes) {
+	return TableBlocks<Weave::Ordered>(pair, user_data, blocks, writes);
+}
+
+// Under Weave::Worker: the worker's own entries, ring copies and special generation; its blocks and ring copies in the
+// parcel's slab, shared within the parcel only (WeaveParcelSerial). A V# the GPU thread would resolve through the
+// buffer cache (ObtainBuffer: a lookup, an upload, a buffer made or registered) is taken from a live buffer that holds
+// its range clean, as ObtainBuffer would return it with nothing to upload, the buffer's last use a stamp; anything
+// else, a buffer the shaders write, or a format the pair isn't compiled for (a respecialization), is a hole. Every V#
+// taken from a game buffer is noted with its range's CPU epoch (a held use, its five block words kept for the turn's
+// recopy), every ring copy with its range.
+template <typename P>
 bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
                                  std::array<vk::DeviceAddress, 2>& blocks, bool* writes) {
 	using Kind         = ShaderRecompiler::IR::TablePlan::Operand::Kind;
-	auto&      table        = OwnTable();
+	auto&      table        = TableOf<P>();
 	auto&      buffer_cache = m_context.GetBufferCache();
 	auto&      textures     = m_context.GetTextureCache();
 	auto&      upload       = buffer_cache.GetTableUploadBuffer();
+	// (Where the blocks and the ring copies go: the table upload ring, or a worker's slab.)
+	auto& ring = [&]() -> auto& {
+		if constexpr (P::worker)
+			return WeaveHere().slab;
+		else
+			return upload;
+	}();
+	// (The ring copies' sharing terms: the GPU thread's observation epoch and tick; a worker's parcel.)
+	const auto observation_now = [&] {
+		if constexpr (P::worker)
+			return WeaveParcelSerial() | uint64_t {1} << 62u;
+		else
+			return PageManager::ObservationEpoch();
+	};
 	const auto stages       = pair.programs[1] != nullptr ? 2u : 1u;
+	if constexpr (P::worker) WeaveMiss(Weave::Miss::Buffers);
 	const auto start_epoch  = textures.StartEpoch(); // (before any question below: a later image start moves it)
 	const auto image_starts = [&](uint64_t address) {
 		auto& known = table.no_image_start[(address * 0x9e3779b97f4a7c15ull) >> 54u];
@@ -2626,9 +2894,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 	// A range none of whose pages the guest wrote since they were uploaded (with no write protection still queued:
 	// a page marked clean can change unseen until it lands).
 	const auto range_clean = [&](uint64_t address, uint64_t size) {
-		for (auto region = address / TRACKER_REGION_SIZE; region <= (address + size - 1) / TRACKER_REGION_SIZE; ++region)
-			if (buffer_cache.DeferredProtectionPending(region * TRACKER_REGION_SIZE)) return false;
-		return !buffer_cache.IsRegionCpuModified(address, size);
+		return TableRangeClean(buffer_cache, address, size);
 	};
 	// A null buffer's device address: valid memory (the shaders' loads of a buffer are not branched around its bounds:
 	// out of bounds they load its first dword).
@@ -2681,8 +2947,22 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 		       (!resource.formatted || resource.descriptor_format == Prospero::BufferFormat::kInvalid ||
 		        (descriptor.Format() == resource.descriptor_format && descriptor.DstSelXYZW() == resource.descriptor_swizzle));
 	};
-	if (table.gathered != &pair) TableGather(pair, user_data);
+	if (table.gathered != &pair) TableGather<P>(pair, user_data);
 	table.gathered = nullptr; // (taken: a later draw or dispatch gathers its own)
+	// (A weave worker's notes: a V# taken from a game buffer, its five block words placed once the stage's block is
+	// made; a ring copy; a buffer whose last use the turn stamps.)
+	const auto note_held = [&](uint32_t st, size_t i, uint64_t address, uint64_t size, uint64_t epoch) {
+		if constexpr (P::worker)
+			WeaveParcel().result->held_uses.push_back({.stage     = static_cast<uint8_t>(st),
+			                                           .buffer    = static_cast<uint32_t>(i),
+			                                           .word      = UINT32_MAX,
+			                                           .address   = address,
+			                                           .size      = size,
+			                                           .cpu_epoch = epoch});
+	};
+	const auto note_ring = [&](uint64_t address, uint64_t size) {
+		if constexpr (P::worker) WeaveParcel().result->ring_uses.push_back({.address = address, .size = size});
+	};
 	// spec_pending_buffers: the stage's V#s left to the commit (their dword in the block, range, written, texel).
 	// (spec_reloc_refs: the V#s of found game buffers too, with the epoch their address was proven at.)
 	struct PendingHere {
@@ -2721,15 +3001,19 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 			const bool  formatted = resource.formatted;
 			if ((resource.written || resource.atomic) != (n < plan.buffers.size())) continue;
 			if (!specialized(resource, words4)) {
+				if constexpr (P::worker) return false; // (the pair compiled again: the GPU thread's)
 				if (Role() != 0) return Spec::Refuse("table: another format"), false;
 				if (ShaderRecompiler::IR::RuntimeBufferFormat(resource) && i < 32 && ((pair.portable[st] >> i) & 1u) == 0) {
 					const auto write = CatalogWrite();
+					const Weave::Hold hold;
 					pair.portable[st] |= 1u << i;
 					pair.respecialize = true;
 				}
 				return false;
 			}
 			if (resource.written || resource.atomic) {
+				// (Obtained as written at every use, its pages marked: the GPU thread's.)
+				if constexpr (P::worker) return false;
 				// The shader writes it: marked GPU-written now, whatever an earlier use proved. (A write hazard as
 				// HasShaderBufferWrites sees one: a V# of a nonempty range.)
 				if (writes != nullptr && resource.written && (uint64_t {words4[0]} | (words4[1] & 0xffffu)) != 0 &&
@@ -2795,11 +3079,12 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				// Its ring copy (RingCopy's terms: the same observation epoch, the regions' epoch unchanged, no page
 				// GPU-written).
 				if (Role() == 0 && Spec::Current() == nullptr &&
-				    held.registration == (TableXpr::RingCopyMark | PageManager::ObservationEpoch()) &&
+				    held.registration == (TableXpr::RingCopyMark | observation_now()) &&
 				    cpu_epoch(held.address, held.size) == held.cpu_epoch &&
 				    !buffer_cache.IsRegionGpuModified(held.address, held.size)) {
-					LiveCounters::Add(LiveCounters::TableRingShared);
-					LiveCounters::Add(LiveCounters::TableRingSharedBytes, held.size);
+					TableAdd<P>(LiveCounters::TableRingShared);
+					TableAdd<P>(LiveCounters::TableRingSharedBytes, held.size);
+					note_ring(held.address, held.size);
 					const auto [word, stride]      = word_of(words4);
 					block[plan.BufferDword(i)]     = static_cast<uint32_t>(held.device);
 					block[plan.BufferDword(i) + 1] = static_cast<uint32_t>(held.device >> 32u);
@@ -2829,7 +3114,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 			if (current && held.size != 0) {
 				// Another page of its tracker regions was written: the range itself may still be clean.
 				if (const auto epoch = cpu_epoch(held.address, held.size); epoch == 0 || epoch != held.cpu_epoch) {
-					LiveCensus::Scope reprove(LiveCensus::DrawPhase, 0x7ab1e, 6);
+					TableCensus<P> reprove(LiveCensus::DrawPhase, 0x7ab1e, 6);
 					current = range_clean(held.address, held.size);
 					// (Inside a speculation range_clean's BufferCache::IsRegionCpuModified answers clean for a range in the
 					// translation's current_set, its pages CPU-dirty still: noted current by a packet a Rollback took back
@@ -2852,7 +3137,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				}
 			}
 			if (!current) {
-				LiveCensus::Scope resolve(LiveCensus::DrawPhase, 0x7ab1e, 5);
+				TableCensus<P> resolve(LiveCensus::DrawPhase, 0x7ab1e, 5);
 				// (Kept only once resolved: a refusal leaves nothing a later use could take.)
 				held = {};
 				TableXpr::ResolvedBuffer fresh {.words = words4, .device = null_device};
@@ -2872,89 +3157,155 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						// As ObtainBuffer: a small range the guest wrote is read from a copy in the ring (nothing held: the
 						// main executor's later uses share it while it holds, TableXpr::RingCopy), not uploaded into its
 						// buffer.
-						auto* const shared = spec == nullptr && Role() == 0
-						                         ? &table.ring_copies[((address ^ (size << 40u)) * 0x9e3779b97f4a7c15ull) >> 52u]
-						                         : nullptr;
-						const auto observation = PageManager::ObservationEpoch();
-						const auto tick        = m_context.GetCommandScheduler().CurrentTick();
-						const auto cpu         = buffer_cache.CpuModificationEpoch(address, size); // (before the copy)
-						vk::DeviceAddress device = 0;
-						// (Mode 4: a speculation's copy used again within its translation, on the GPU thread's RingCopy
-						// terms (the same range, observation epoch, tick and tracker regions' CPU epoch, none 0; the checks
-						// above, CPU-dirty, not GPU-modified, no journaled write over it, made as before), in the same
-						// segment and wait count, with no Rollback since. What keeps the bytes is what keeps the GPU
-						// thread's share: the observation epoch, this thread's, which ProcessPm4Spec steps before every
-						// packet that is not a draw, dispatch or register packet (FlushDeferredProtection), so a share
-						// never crosses a label, write, wait or DMA. The use's note is the copy's (NoteCleanRead of the
-						// same range: the commit's checks see the same lists); the shader reads the copy's bytes at its
-						// address, in the same ring, fenced for the same commit.)
-						TableXpr::SpecRingCopy* spec_shared = nullptr;
-						if (spec != nullptr && cpu != 0 && ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
-							if (!table.spec_ring_copies)
-								table.spec_ring_copies = std::make_unique<TableXpr::SpecRingCopy[]>(TableXpr::RingCopies);
-							spec_shared = &table.spec_ring_copies[((address ^ (size << 40u)) * 0x9e3779b97f4a7c15ull) >> 52u];
+						// (A weave worker's copy: in its parcel's slab, shared within the parcel only, TableRingCopy<P>. The
+						// GPU thread's and a speculation's: the else branch, the copy's terms and notes in their order.)
+						if constexpr (P::worker) {
+							uint64_t   observation = 0, cpu = 0;
+							bool       copied      = false;
+							const auto device =
+							    TableRingCopy<P>(address, size, spec == nullptr && Role() == 0, observation, cpu, copied);
+							if (spec != nullptr && copied) spec->NoteCleanRead(address, size);
+							// (The V#'s later uses take it from its held entry.)
+							if (device != 0 && cpu != 0)
+								held = {.words        = words4,
+								        .dwords       = static_cast<uint32_t>(size / 4),
+								        .special      = fresh.special,
+								        .device       = device,
+								        .address      = address,
+								        .size         = size,
+								        .cpu_epoch    = cpu,
+								        .registration = TableXpr::RingCopyMark | observation};
+							if (device != 0) {
+								note_ring(address, size);
+								const auto [word, stride]      = word_of(words4);
+								block[plan.BufferDword(i)]     = static_cast<uint32_t>(device);
+								block[plan.BufferDword(i) + 1] = static_cast<uint32_t>(device >> 32u);
+								block[plan.BufferDword(i) + 2] = static_cast<uint32_t>(size / 4);
+								block[plan.BufferDword(i) + 3] = word;
+								block[plan.BufferDword(i) + 4] = stride;
+								continue;
+							}
+						} else {
+							auto* const shared = spec == nullptr && Role() == 0
+							                         ? &table.ring_copies[((address ^ (size << 40u)) * 0x9e3779b97f4a7c15ull) >> 52u]
+							                         : nullptr;
+							const auto observation = PageManager::ObservationEpoch();
+							const auto tick        = m_context.GetCommandScheduler().CurrentTick();
+							const auto cpu         = buffer_cache.CpuModificationEpoch(address, size); // (before the copy)
+							vk::DeviceAddress device = 0;
+							// (Mode 4: a speculation's copy used again within its translation, on the GPU thread's RingCopy
+							// terms (the same range, observation epoch, tick and tracker regions' CPU epoch, none 0; the checks
+							// above, CPU-dirty, not GPU-modified, no journaled write over it, made as before), in the same
+							// segment and wait count, with no Rollback since. What keeps the bytes is what keeps the GPU
+							// thread's share: the observation epoch, this thread's, which ProcessPm4Spec steps before every
+							// packet that is not a draw, dispatch or register packet (FlushDeferredProtection), so a share
+							// never crosses a label, write, wait or DMA. The use's note is the copy's (NoteCleanRead of the
+							// same range: the commit's checks see the same lists); the shader reads the copy's bytes at its
+							// address, in the same ring, fenced for the same commit.)
+							TableXpr::SpecRingCopy* spec_shared = nullptr;
+							if (spec != nullptr && cpu != 0 && ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+								if (!table.spec_ring_copies)
+									table.spec_ring_copies = std::make_unique<TableXpr::SpecRingCopy[]>(TableXpr::RingCopies);
+								spec_shared = &table.spec_ring_copies[((address ^ (size << 40u)) * 0x9e3779b97f4a7c15ull) >> 52u];
+							}
+							const auto spec_waits = [&] { return uint64_t {spec->waits.size()} + spec->covered_waits; };
+							const auto spec_own   = [&] {
+								const auto& own = spec_shared->copy;
+								return own.address == address && own.size == size && own.observation == observation &&
+								       own.tick == tick && own.cpu_epoch == cpu && own.device != 0 && spec_shared->id == spec->id &&
+								       spec_shared->segment == spec->closed.size() && spec_shared->rollbacks == spec->rollbacks &&
+								       spec_shared->waits == spec_waits();
+							};
+							if (shared != nullptr && cpu != 0 && shared->address == address && shared->size == size &&
+							    shared->observation == observation && shared->tick == tick && shared->cpu_epoch == cpu) {
+								device = shared->device;
+								LiveCounters::Add(LiveCounters::TableRingShared);
+								LiveCounters::Add(LiveCounters::TableRingSharedBytes, size);
+							} else if (spec_shared != nullptr && spec_own()) {
+								device = spec_shared->copy.device;
+								spec->NoteCleanRead(address, size);
+							} else if (auto [mapped, offset] = upload.Map(size, 16, false);
+							           mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(address, mapped, size)) {
+								upload.Commit();
+								if (spec != nullptr) spec->NoteCleanRead(address, size);
+								device = upload.BufferDeviceAddress() + offset;
+								LiveCounters::Add(LiveCounters::TableRingCopies);
+								LiveCounters::Add(LiveCounters::TableRingBytes, size);
+								if (spec_shared != nullptr) // (after its note)
+									*spec_shared = {.copy      = {.address     = address,
+									                              .size        = size,
+									                              .observation = observation,
+									                              .tick        = tick,
+									                              .cpu_epoch   = cpu,
+									                              .device      = device},
+									                .id        = spec->id,
+									                .rollbacks = spec->rollbacks,
+									                .waits     = spec_waits(),
+									                .segment   = spec->closed.size()};
+								if (shared != nullptr && cpu != 0)
+									*shared = {.address     = address,
+									           .size        = size,
+									           .observation = observation,
+									           .tick        = tick,
+									           .cpu_epoch   = cpu,
+									           .device      = device};
+							}
+							// (The V#'s later uses take it from its held entry.)
+							if (device != 0 && shared != nullptr && cpu != 0)
+								held = {.words        = words4,
+								        .dwords       = static_cast<uint32_t>(size / 4),
+								        .special      = fresh.special,
+								        .device       = device,
+								        .address      = address,
+								        .size         = size,
+								        .cpu_epoch    = cpu,
+								        .registration = TableXpr::RingCopyMark | observation};
+							if (device != 0) {
+								const auto [word, stride]      = word_of(words4);
+								block[plan.BufferDword(i)]     = static_cast<uint32_t>(device);
+								block[plan.BufferDword(i) + 1] = static_cast<uint32_t>(device >> 32u);
+								block[plan.BufferDword(i) + 2] = static_cast<uint32_t>(size / 4);
+								block[plan.BufferDword(i) + 3] = word;
+								block[plan.BufferDword(i) + 4] = stride;
+								continue;
+							}
 						}
-						const auto spec_waits = [&] { return uint64_t {spec->waits.size()} + spec->covered_waits; };
-						const auto spec_own   = [&] {
-							const auto& own = spec_shared->copy;
-							return own.address == address && own.size == size && own.observation == observation &&
-							       own.tick == tick && own.cpu_epoch == cpu && own.device != 0 && spec_shared->id == spec->id &&
-							       spec_shared->segment == spec->closed.size() && spec_shared->rollbacks == spec->rollbacks &&
-							       spec_shared->waits == spec_waits();
-						};
-						if (shared != nullptr && cpu != 0 && shared->address == address && shared->size == size &&
-						    shared->observation == observation && shared->tick == tick && shared->cpu_epoch == cpu) {
-							device = shared->device;
-							LiveCounters::Add(LiveCounters::TableRingShared);
-							LiveCounters::Add(LiveCounters::TableRingSharedBytes, size);
-						} else if (spec_shared != nullptr && spec_own()) {
-							device = spec_shared->copy.device;
-							spec->NoteCleanRead(address, size);
-						} else if (auto [mapped, offset] = upload.Map(size, 16, false);
-						           mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(address, mapped, size)) {
-							upload.Commit();
-							if (spec != nullptr) spec->NoteCleanRead(address, size);
-							device = upload.BufferDeviceAddress() + offset;
-							LiveCounters::Add(LiveCounters::TableRingCopies);
-							LiveCounters::Add(LiveCounters::TableRingBytes, size);
-							if (spec_shared != nullptr) // (after its note)
-								*spec_shared = {.copy      = {.address     = address,
-								                              .size        = size,
-								                              .observation = observation,
-								                              .tick        = tick,
-								                              .cpu_epoch   = cpu,
-								                              .device      = device},
-								                .id        = spec->id,
-								                .rollbacks = spec->rollbacks,
-								                .waits     = spec_waits(),
-								                .segment   = spec->closed.size()};
-							if (shared != nullptr && cpu != 0)
-								*shared = {.address     = address,
-								           .size        = size,
-								           .observation = observation,
-								           .tick        = tick,
-								           .cpu_epoch   = cpu,
-								           .device      = device};
-						}
-						// (The V#'s later uses take it from its held entry.)
-						if (device != 0 && shared != nullptr && cpu != 0)
-							held = {.words        = words4,
-							        .dwords       = static_cast<uint32_t>(size / 4),
-							        .special      = fresh.special,
-							        .device       = device,
-							        .address      = address,
-							        .size         = size,
-							        .cpu_epoch    = cpu,
-							        .registration = TableXpr::RingCopyMark | observation};
-						if (device != 0) {
-							const auto [word, stride]      = word_of(words4);
-							block[plan.BufferDword(i)]     = static_cast<uint32_t>(device);
-							block[plan.BufferDword(i) + 1] = static_cast<uint32_t>(device >> 32u);
-							block[plan.BufferDword(i) + 2] = static_cast<uint32_t>(size / 4);
-							block[plan.BufferDword(i) + 3] = word;
-							block[plan.BufferDword(i) + 4] = stride;
-							continue;
-						}
+					}
+					if constexpr (P::worker) {
+						// (A small range the guest wrote whose copy found no room in the slab or could not be read: a
+						// hole.) A live buffer that holds the range, none of it CPU-modified, is what ObtainBuffer
+						// returns with nothing to upload. For a formatted V# too: no image starts at it (asked above),
+						// so the buffer is not made from an image, unless a guest readback is pending over the range,
+						// which ObtainBuffer finishes first. Kept in the worker's own entry (under the special
+						// generation where the image starts or the mappings bear on it); the buffer's last use is the
+						// turn's stamp. Anything else is the GPU thread's.
+						if (cpu_written && size <= BufferCache::CACHING_PAGESIZE) return false;
+						if (formatted && buffer_cache.GuestReadbackOver(address, size)) return false;
+					// (The epochs before the lookup and before the clean check.)
+						const auto registration_before = buffer_cache.RegistrationEpoch();
+						const auto epoch               = buffer_cache.CpuModificationEpoch(address, size);
+						const auto [found, id]         = buffer_cache.FindLiveBuffer(address, size);
+						if (found == nullptr || !range_clean(address, size)) return false;
+						fresh.device       = found->BufferDeviceAddress() + found->Offset(address);
+						fresh.dwords       = static_cast<uint32_t>(std::min<uint64_t>(size / 4, UINT32_MAX));
+						fresh.address      = address;
+						fresh.size         = size;
+						fresh.cpu_epoch    = epoch;
+						fresh.registration = registration_before;
+						held               = fresh;
+						WeaveParcel().result->touched.push_back(
+						    {.buffer  = std::bit_cast<uint64_t>(id),
+						     .handle  = WeaveHandleBits(static_cast<VkBuffer>(found->Handle())),
+						     .address = address,
+						     .size    = size});
+						note_held(st, i, address, size, epoch);
+						const auto [word, stride]      = word_of(words4);
+						block[plan.BufferDword(i)]     = static_cast<uint32_t>(held.device);
+						block[plan.BufferDword(i) + 1] = static_cast<uint32_t>(held.device >> 32u);
+						block[plan.BufferDword(i) + 2] = held.dwords;
+						block[plan.BufferDword(i) + 3] = word;
+						block[plan.BufferDword(i) + 4] = stride;
+						continue;
 					}
 					if (cpu_written) buffer_cache.EnsureBufferContents(address, size);
 					const auto registration_before = buffer_cache.RegistrationEpoch(); // (a speculation's: before its lookup)
@@ -3007,6 +3358,8 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				else
 					spec->NoteBufferRange(held.address, held.size), spec->NoteUnrel(held.address, held.size);
 			}
+			if constexpr (P::worker)
+				if (held.size != 0) note_held(st, i, held.address, held.size, held.cpu_epoch); // (its entry, as it is)
 			const auto [word, stride]      = word_of(words4);
 			block[plan.BufferDword(i)]     = static_cast<uint32_t>(held.device);
 			block[plan.BufferDword(i) + 1] = static_cast<uint32_t>(held.device >> 32u);
@@ -3017,10 +3370,22 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 		if (plan.BlockDwords() != 0) { // (a stage with neither slots nor buffers reads no block)
 			// (A speculation's thread never waits for its ring: it holds the catalog shared; the hole runs the draw.)
 			const auto copied = Spec::Current() == nullptr
-			                        ? std::optional<uint64_t> {upload.Copy(block.data(), block.size() * sizeof(uint32_t), 16)}
-			                        : upload.TryCopy(block.data(), block.size() * sizeof(uint32_t), 16);
+			                        ? std::optional<uint64_t> {ring.Copy(block.data(), block.size() * sizeof(uint32_t), 16)}
+			                        : ring.TryCopy(block.data(), block.size() * sizeof(uint32_t), 16);
 			if (!copied) return Spec::Refuse("table: upload ring busy"), false;
-			blocks[st] = upload.BufferDeviceAddress() + *copied;
+			blocks[st] = ring.BufferDeviceAddress() + *copied;
+			if constexpr (P::worker) {
+				// (Its held uses' five words each, as the block has them, for the turn's recopy of one the guest
+				// wrote.)
+				auto& result = *WeaveParcel().result;
+				for (auto use = result.held_uses.rbegin();
+				     use != result.held_uses.rend() && use->word == UINT32_MAX && use->stage == st; ++use) {
+					use->word         = static_cast<uint32_t>(result.held_words.size());
+					const auto* words = block.data() + plan.BufferDword(use->buffer);
+					result.held_words.insert(result.held_words.end(), words, words + 5);
+				}
+				result.made.back().blocks[st] = blocks[st];
+			}
 			// (spec_pending_buffers: where the commit writes each one's buffer.)
 			if (!pending_here.empty()) {
 				auto& pending = Spec::Current()->pending_buffers;
@@ -3134,6 +3499,18 @@ static uint64_t TableTargetsKey(const State& draw_state) {
 	return key;
 }
 
+// A target of the draw: NativeXprEmitTargets put it in its attachment layout, which the set must have been made for
+// (the access the set holds it with: the target's, with its shaders' sampling access added); an image the set holds as
+// a texture must not be one. `is_target`: `dep` is one of the draw's targets.
+template <typename Dep, typename State>
+[[nodiscard]] static bool TableTargetFits(const Dep& dep, const State* draw_state, bool& is_target) {
+	const auto target = draw_state == nullptr ? decltype(draw_state->targets.end()) {}
+	                                          : std::ranges::find(draw_state->targets, dep.id, &State::Target::id);
+	is_target = draw_state != nullptr && target != draw_state->targets.end();
+	return is_target == dep.target &&
+	       (!is_target || (target->layout == dep.layout && (target->access | dep.target_read) == dep.access));
+}
+
 // A set's images in their layouts (other work may have moved them since the set was last bound), a DCC image's
 // pending fast clear applied first, as the normal path's FindTexture does (a speculation's refuses: its packet is a
 // hole), unless the draw's targets are not those the set was made for (an image held as a texture became a target,
@@ -3201,15 +3578,8 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 			say(past, "a speculation's set viewed past its image's levels or layers, refused");
 			return Spec::Refuse("table: view past its image"), false;
 		}
-		// A target of the draw: NativeXprEmitTargets put it in its attachment layout, which the set must have been
-		// made for; an image the set holds as a texture must not be one.
-		const auto target = draw_state == nullptr
-		                        ? decltype(draw_state->targets.end()) {}
-		                        : std::ranges::find(draw_state->targets, dep.id, &NativeXprDrawState::Target::id);
-		const bool is_target = draw_state != nullptr && target != draw_state->targets.end();
-		if (is_target != dep.target ||
-		    (is_target && (target->layout != dep.layout || (target->access | dep.target_read) != dep.access)))
-			return false;
+		bool is_target = false;
+		if (!TableTargetFits(dep, draw_state, is_target)) return false;
 		if (is_target) continue;
 		if (open_writes && (open_writer->OpenSegmentWritesImage(image->info) || open_writer->OpenSegmentWritesImage(dep.desc.info)))
 			return reused_written();
@@ -3283,6 +3653,38 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 			                                       vk_buffer, draw_state != nullptr && dep.whole && dep.storage);
 		else if (dep.target_read) // (as CommitBindings transits a target the shaders sample: the whole image)
 			textures.m_slot_images[dep.id].Transit(dep.layout, dep.access, std::nullopt, vk_buffer);
+	return true;
+}
+
+// (Read only, off the GPU thread, which transits images as it records: each image's barrier state is read under its
+// state lock, and its CPU-written state by its flags alone, game threads changing its dirty ranges. A DCC image's
+// pending clears, a depth image with HTile metadata (a pending HTile clear, KYTY_SAMPLE_PENDING_HTILE_CLEAR), a target
+// the shaders sample, an image the shaders write and one in states of its own are left to TableTransit.)
+bool RenderExecutor::TableTransitPlaced(const TableImageSet& set, const NativeXprDrawState* draw_state) const {
+	auto&          textures = m_context.GetTextureCache();
+	constexpr auto writes   = vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite |
+	                        vk::AccessFlagBits2::eMemoryWrite;
+	for (const auto& dep: set.images) {
+		const auto* image = textures.m_slot_images.try_get(dep.id);
+		if (image == nullptr || image->serial != dep.serial) return false;
+		bool is_target = false;
+		if (!TableTargetFits(dep, draw_state, is_target)) return false;
+		if (is_target) {
+			if (dep.target_read) return false;
+			continue;
+		}
+		if (dep.storage || dep.desc.info.metadata.kind == ImageMetadataKind::Dcc || image->IsBufferModified() ||
+		    image->IsStencilModified() || image->IsMaybeCpuDirty() || image->IsDefinitelyCpuDirty())
+			return false;
+		if (image->info.IsDepth() && (dep.desc.info.metadata.kind == ImageMetadataKind::Htile ||
+		                              image->info.metadata.kind == ImageMetadataKind::Htile))
+			return false;
+		const Image::StateLock lock(*image);
+		const auto&            state = image->backing.state;
+		if (!image->backing.subresource_states.empty() || state.layout != dep.layout ||
+		    state.access_mask != dep.access || static_cast<bool>(dep.access & writes))
+			return false;
+	}
 	return true;
 }
 
@@ -3700,18 +4102,42 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
                                                       std::span<const uint64_t> commands, uint64_t index_base,
                                                       uint64_t index_bytes, vk::IndexType index_type,
                                                       const NativeXprDirectDraw* direct) {
-	auto&       table  = OwnTable();
+	return TableDraw<Weave::Ordered>(buffer, pair, variant, draw_state, commands, index_base, index_bytes, index_type,
+	                                 direct);
+}
+
+// Under Weave::Worker the draw is recorded into the worker's strand (its view of the GPU thread's command buffer,
+// through the apart marker) with what its strand has bound. The worker begins no render pass (the turn begins the
+// part's; WeavePass ends one and begins the next inside a strand), takes the indices and arguments from live buffers
+// that hold them clean (or CPU-written indices, for the turn to upload), binds the pipeline's handle as it is, and
+// leaves to the turn the targets' emission and the set's transit (found in place, or a need each), the BDA page table
+// (a hole), and every stamp (the draw state's use, the pipeline's, the buffers').
+// (TableDraw's table buffer lookups under relocation: their references recorded relocatable. At file scope: a local
+// class of the generic lambda inside the TableDraw template would get no inline destructor from clang.)
+struct RelocScope {
+	uint8_t old;
+	explicit RelocScope(uint8_t kind): old(std::exchange(Spec::t_reloc_scope, kind)) {}
+	~RelocScope() { Spec::t_reloc_scope = old; }
+};
+
+template <typename P>
+RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
+                                                      const NativeXprDrawState& draw_state,
+                                                      std::span<const uint64_t> commands, uint64_t index_base,
+                                                      uint64_t index_bytes, vk::IndexType index_type,
+                                                      const NativeXprDirectDraw* direct) {
+	if constexpr (P::worker) WeavePass(buffer, draw_state.rendering);
+	auto&       table  = TableOf<P>();
 	// (A speculative translation's state, read once behind a plain global: KYTY_SPECULATE unset, no thread-local
 	// reads in the draw. The mode kept for the set's target test below.)
 	const auto         speculate_mode = ::kyty_local_speculate_mode.load(std::memory_order_relaxed);
 	Spec::State* const spec_state     = speculate_mode != 0 ? Spec::Current() : nullptr;
 	// (A speculation's relocatable index buffer and draw arguments, TableRelocRecord: nothing of it runs without one.)
 	const bool reloc = spec_state != nullptr && spec_state->reloc_on;
-	auto&       cache  = *m_native_xpr;
 	const auto& sh     = buffer.GetShaders();
 	const auto  stages = pair.programs[1] != nullptr ? 2u : 1u;
 	// (KYTY_SPEC_PAIR_PUSH_FIT's row, mode 4 only: the mode in a register, the pair's flag not read in the other modes.)
-	if (speculate_mode == 4 && pair.push_fit) [[unlikely]] LiveCounters::Add(LiveCounters::SpecPairPushFitDraws);
+	if (speculate_mode == 4 && pair.push_fit) [[unlikely]] TableAdd<P>(LiveCounters::SpecPairPushFitDraws);
 	const std::array<std::span<const uint32_t>, 2> user_data {std::span<const uint32_t> {sh.GetVs().gs_user_sgpr.value},
 	                                                          std::span<const uint32_t> {sh.GetPs().ps_user_sgpr.value}};
 	// (The index buffer's held entry, a cold line of a 320 KiB table, loads while the tables are evaluated.)
@@ -3720,29 +4146,33 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		__builtin_prefetch(held);
 		__builtin_prefetch(reinterpret_cast<const char*>(held + 1) - 1);
 	}
-	std::optional<LiveCensus::Scope> phase;
+	std::optional<TableCensus<P>> phase;
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 1);
 	// KYTY_SCOUT: the scout's evaluation when its ticket holds (2: compared with the render thread's own); not in a
-	// speculation (the scout follows the render thread's submissions).
-	const auto* scout = Scout::Running() && spec_state == nullptr ? TableScoutTicket(pair, user_data, stages, m_context.GetGpuResources()) : nullptr;
+	// speculation (the scout follows the render thread's submissions), nor on a weave worker (its tickets are the GPU
+	// thread's packets').
+	const auto* scout = !P::worker && Scout::Running() && spec_state == nullptr ? TableScoutTicket(pair, user_data, stages, m_context.GetGpuResources()) : nullptr;
 	if (scout != nullptr && Scout::Mode() == 1) {
 		TableScoutApply(table, pair, *scout, stages);
 	} else {
-		const bool evaluated = TableEvaluate(pair, user_data);
-		if (evaluated) TableGather(pair, user_data);
+		const bool evaluated = TableEvaluate<P>(pair, user_data);
+		if (evaluated) TableGather<P>(pair, user_data);
 		if (scout != nullptr) TableScoutVerify(table, pair, *scout, stages, evaluated);
 		if (!evaluated)
-			return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: evaluation"), TableResult::Native;
+			return TableAdd<P>(LiveCounters::TableDrawNative), Spec::Refuse("table: evaluation"), TableResult::Native;
 	}
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 2);
-	auto* set = TableSet(buffer, pair, &variant, &draw_state);
+	auto* set = TableSet<P>(buffer, pair, &variant, &draw_state);
 	// (Mode 4: a set resolved under another draw state, TableDrawStateSet, out of line.)
-	if (set != nullptr && speculate_mode == 4) [[unlikely]]
-		set = TableDrawStateSet(buffer, pair, variant, draw_state, set, spec_state);
+	// (Not a weave worker's: it writes the GPU thread's table and catalog. A worker's set made for other targets
+	// fails TableTransitPlaced: a Transit need, which the turn's TableTransit refuses.)
+	if constexpr (!P::worker)
+		if (set != nullptr && speculate_mode == 4) [[unlikely]]
+			set = TableDrawStateSet(buffer, pair, variant, draw_state, set, spec_state);
 	if (spec_state != nullptr && set != nullptr)
 		spec_state->NoteSet(reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(set->set)));
-	if (set == nullptr) return LiveCounters::Add(LiveCounters::TableNoSet), Spec::Refuse("table: no set"), TableResult::Native;
+	if (set == nullptr) return TableAdd<P>(LiveCounters::TableNoSet), Spec::Refuse("table: no set"), TableResult::Native;
 	// (Mode 4: a state a worker derived from a sibling's capture has that capture's attachment layouts, made for shaders that
 	// sampled no target: a set that holds a target leaves the table path, and an entry not yet published with it. The GPU
 	// thread's in-order draw: its caller takes the store path, t_store_derived.)
@@ -3770,6 +4200,12 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		if (known.first != region) known = {region, buffer_cache.CpuModificationEpoch(address, size)};
 		return known.second;
 	};
+	// (A weave worker's note of an index or argument range it took, tested by its CPU epoch at the turn.)
+	const auto note_buffer = [&](bool args, uint64_t begin, uint64_t end, uint64_t epoch) {
+		if constexpr (P::worker)
+			WeaveParcel().result->held_buffers.push_back(
+			    {.args = args, .begin = begin, .end = end, .cpu_epoch = epoch});
+	};
 	const auto obtain = [&](TableXpr::HeldBuffer& held, uint64_t address, uint64_t size,
 	                        auto&& prepare) -> std::pair<Buffer*, uint64_t> {
 		const auto* spec = spec_state; // (its guest memory writes wait for its commit: ObtainBuffer decides)
@@ -3778,20 +4214,42 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		    cpu_epoch(held.begin, held.end - held.begin) == held.cpu_epoch &&
 		    (spec == nullptr || !spec->JournalIntersects(address, size))) {
 			if (spec != nullptr) spec_state->NoteBufferRange(address, size);
+			note_buffer(&held == &table.args, held.begin, held.end, held.cpu_epoch);
 			return {held.buffer, held.buffer->Offset(address)};
 		}
+		if constexpr (P::worker) {
+			// A lookup in the buffer cache, an upload, the GPU thread's held entry are the GPU thread's. A live buffer
+			// that holds the range, none of it CPU-modified, is what ObtainBuffer returns with nothing to upload (no
+			// small copy into the ring, nothing to synchronize): kept in the worker's own entry, the buffer's last use
+			// the turn's stamp. One that holds CPU-written indices is taken too, noted with an epoch no range has
+			// (~epoch): the turn uploads them (BufferCache::SynchronizeAtTurn) before the splice. Anything else is a
+			// hole.
+		// (The epochs before the lookup and before the clean check.)
+			const bool args                = &held == &table.args;
+			const auto registration_before = buffer_cache.RegistrationEpoch();
+			const auto epoch               = buffer_cache.CpuModificationEpoch(address, size);
+			const auto [found, id]         = buffer_cache.FindLiveBuffer(address, size);
+			if (found == nullptr || epoch == 0) return {};
+			const bool clean = TableRangeClean(buffer_cache, address, size);
+			if (!clean && args) return {};
+			auto* const live = const_cast<Buffer*>(found); // (bound by its handle and offset)
+			if (clean) held = {address, address + size, epoch, registration_before, live};
+			auto& result = *WeaveParcel().result;
+			result.touched.push_back({.buffer  = std::bit_cast<uint64_t>(id),
+			                          .handle  = WeaveHandleBits(static_cast<VkBuffer>(live->Handle())),
+			                          .address = address,
+			                          .size    = size});
+			note_buffer(args, address, address + size, clean ? epoch : ~epoch);
+			if (!clean) result.made.back().cpu_indices = true;
+			return {live, live->Offset(address)};
+		}
 		held = {};
-		LiveCensus::Scope miss(LiveCensus::DrawPhase, 0x7ab1e, &held == &table.args ? 10 : 11);
+		TableCensus<P> miss(LiveCensus::DrawPhase, 0x7ab1e, &held == &table.args ? 10 : 11);
 		prepare();
 		const auto registration_before = buffer_cache.RegistrationEpoch(); // (a speculation's: before its lookup)
 		std::optional<BufferCache::AheadSite> ahead_site; // (the lookup's site: read by a speculation's lookup only)
 		if (spec_state != nullptr) ahead_site.emplace(&held == &table.args ? 4 : 3);
-		// (Relocation on: these lookups' references are recorded relocatable, not noted as other references.)
-		struct RelocScope {
-			uint8_t old;
-			explicit RelocScope(uint8_t kind): old(std::exchange(Spec::t_reloc_scope, kind)) {}
-			~RelocScope() { Spec::t_reloc_scope = old; }
-		};
+		// (Relocation on: these lookups' references are recorded relocatable, not noted as other references: RelocScope.)
 		const auto lookup = [&] { return buffer_cache.ObtainBuffer(address, size, false); };
 		const auto result = reloc ? (RelocScope(&held == &table.args ? Spec::RelocArgs : Spec::RelocIndex), lookup()) : lookup();
 		region_epochs.fill({UINT64_MAX, 0}); // (its uploads may have moved them)
@@ -3819,14 +4277,20 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	std::array<vk::DeviceAddress, 2> blocks {};
 	bool                             writes = false;
 	// (Before the blocks, which it does not depend on (the slots TableEvaluate read): the entries TableGather asked
-	// for meanwhile arrive.)
-	TablePrepareBda(pair, user_data);
+	// for meanwhile arrive.) (The page table ranges a stage's global loads read are made current at every use: the GPU
+	// thread's, a weave worker's draw with one a hole.)
+	if constexpr (P::worker) {
+		for (uint32_t st = 0; st < stages; ++st)
+			if (pair.programs[st]->table_plan.global_memory) return WeaveMiss(Weave::Miss::Memory), TableResult::Native;
+	} else {
+		TablePrepareBda(pair, user_data);
+	}
 	// The blocks take each buffer's device address as it resolves: a later lookup that registers a buffer (a merge
 	// replaces an earlier one) leaves an earlier address stale, where the normal path binds after all its lookups
 	// (RebindBuffers). Such a draw takes the normal path; the next use finds the buffers registered.
 	const auto registration = buffer_cache.RegistrationEpoch();
-	if (!TableBlocks(pair, user_data, blocks, &writes))
-		return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: blocks"), TableResult::Native;
+	if (!TableBlocks<P>(pair, user_data, blocks, &writes))
+		return TableAdd<P>(LiveCounters::TableDrawNative), Spec::Refuse("table: blocks"), TableResult::Native;
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 9);
 	std::array<std::pair<Buffer*, uint64_t>, 64> arguments;
@@ -3842,7 +4306,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		++groups;
 		first += count;
 	}
-	auto&      emit       = cache.emit;
+	auto&      emit       = TableEmit<P>();
 	const bool indexed    = direct == nullptr || direct->indexed; // (a draw of vertices binds no indices)
 	const bool same_index = !indexed || (emit.command == buffer.Handle() && emit.generation == buffer.GraphicsGeneration() &&
 	                                     emit.index_base == index_base && emit.index_bytes == index_bytes &&
@@ -3858,7 +4322,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	}
 	if (buffer_cache.RegistrationEpoch() != registration &&
 	    (spec_state == nullptr || !TableWorkerKeepsMoved(*spec_state, buffer_cache, registration)))
-		return LiveCounters::Add(LiveCounters::TableRegistered), TableResult::Native;
+		return TableAdd<P>(LiveCounters::TableRegistered), TableResult::Native;
 	// (A speculation's lookups and preparation refuse without failing: nothing is recorded for a refused draw.)
 	if (spec_state != nullptr && spec_state->refused != nullptr) return TableResult::Native;
 	phase.reset();
@@ -3868,14 +4332,18 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	const bool same_command = emit.command == vk_buffer && emit.generation == buffer.GraphicsGeneration();
 	// The targets and the set's images as the last table draw in this command buffer left them (the same state and
 	// set), no image's state, registration, metadata or bytes changed since: in place, nothing to check or transit.
+	// (A weave worker's last draw is in its strand, whose targets and set the turn places with the strand's first: in
+	// place too. Its draw state's and set's stamps are the GPU thread's: never `own`.)
 	auto&      texture_cache = m_context.GetTextureCache();
 	const auto images_epoch  = texture_cache.ImagesEpoch();
-	const bool own           = spec_state == nullptr;
+	const bool own           = !P::worker && spec_state == nullptr;
 	// (A set with an image the draw reads and writes is transited for every draw: KYTY_DRAW_READ_AFTER_WRITE.)
 	const bool read_after_write =
 	    set->read_after_write && kyty_local_draw_read_after_write.load(std::memory_order_relaxed) != 0;
+	if constexpr (P::worker)
+		if (read_after_write) return WeaveMiss(Weave::Miss::Set), TableResult::Native; // (a barrier at every draw)
 	const bool in_place      = same_command && emit.state == &draw_state && table.last_set == set &&
-	                      table.images_epoch == images_epoch && own && !read_after_write;
+	                      table.images_epoch == images_epoch && (own || P::worker) && !read_after_write;
 	// (Mode 4) A speculation's draw in place too (spec_in_place: NativeXprEmitTargets and TableTransit skipped) when its
 	// executor's last table draw (TableXpr::spec_place, taken at that draw's end) drew the same draw state (and capture)
 	// and set into the same command buffer, as the GPU thread's in_place, in the same translation, segment and chain
@@ -3892,7 +4360,8 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	// answers came from the cache, whose bits some changes move without moving ImagesEpoch), nor does a worker-captured
 	// draw state (its depth access follows its target's uniformity, which a partial transit splits).
 	// (TableSpecInPlace, TableSpecFacts, TableSpecPlaceNote: out of line.)
-	const bool spec_emit     = !own && speculate_mode == 4;
+	// (Never a weave worker's: its `own` is false with no speculation state.)
+	const bool spec_emit     = !P::worker && !own && speculate_mode == 4;
 	const bool spec_in_place = spec_emit && same_command && emit.state == &draw_state && table.last_set == set &&
 	                           !read_after_write && TableSpecInPlace(table, *spec_state, images_epoch, draw_state.capture_id);
 	const size_t spec_facts_before = spec_emit ? TableSpecFacts(*spec_state) : 0;
@@ -3904,9 +4373,12 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		const bool epoch_targets = !own || draw_state.emitted_epoch != images_epoch;
 		const auto targets_sum   = serials != 0 ? TableTargetSerials(draw_state) : 0;
 		const bool sum_targets   = !own || draw_state.emitted_serials != targets_sum;
-		const bool due_targets   = serials == 1 ? sum_targets : epoch_targets;
+		// (A weave worker's targets and set are found in place, read only, or are needs of the turn's: the layouts
+		// follow the GPU thread's recording order.)
+		const bool due_targets   = !P::worker && (serials == 1 ? sum_targets : epoch_targets);
 		if (serials != 0 && epoch_targets != sum_targets)
 			LiveCounters::Add(sum_targets ? LiveCounters::SerialsExtra : LiveCounters::SerialsSkipped);
+		if constexpr (P::worker) WeaveHere().TargetsPlaced(*this, draw_state, *set, images_epoch);
 		if (due_targets && !NativeXprEmitTargets(draw_state, vk_buffer, set, &buffer)) {
 			if (serials == 2 && !sum_targets) TableSerialsUnsafe("targets refused");
 			return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: targets"), TableResult::Native;
@@ -3919,9 +4391,10 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		const bool sum_transit   = !own || set->transit_serials != set_sum ||
 		                         ((set->transit_state != &draw_state || set->transit_capture != draw_state.capture_id) &&
 		                          !TableSetApart(*set, draw_state));
-		const bool due_transit   = (serials == 1 ? sum_transit : epoch_transit) || read_after_write;
+		const bool due_transit   = !P::worker && ((serials == 1 ? sum_transit : epoch_transit) || read_after_write);
 		if (serials != 0 && epoch_transit != sum_transit)
 			LiveCounters::Add(sum_transit ? LiveCounters::SerialsExtra : LiveCounters::SerialsSkipped);
+		if constexpr (P::worker) WeaveHere().TransitPlaced(*this, *set, draw_state, images_epoch);
 		if (due_transit && !TableTransit(*set, vk_buffer, &draw_state)) {
 			if (serials == 2 && !sum_transit && !read_after_write) TableSerialsUnsafe("transit refused");
 			return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: transit"), TableResult::Native;
@@ -3939,20 +4412,33 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			}
 		}
 	}
-	if (spec_state != nullptr && draw_state.virtual_targets != nullptr) {
-		// (Mode 4: its rendering names colour targets its commit makes: the begin recorded with view cells.)
-		const CommandBuffer::RenderingHookScope hook(&TableVirtualRendering, draw_state.virtual_targets.get());
-		m_context.GetCommandScheduler().BeginRendering(draw_state.rendering);
-	} else {
-		m_context.GetCommandScheduler().BeginRendering(draw_state.rendering);
+	// (A weave worker's pass: WeavePass, first in its draw.)
+	if constexpr (!P::worker) {
+		if (spec_state != nullptr && draw_state.virtual_targets != nullptr) {
+			// (Mode 4: its rendering names colour targets its commit makes: the begin recorded with view cells.)
+			const CommandBuffer::RenderingHookScope hook(&TableVirtualRendering, draw_state.virtual_targets.get());
+			m_context.GetCommandScheduler().BeginRendering(draw_state.rendering);
+		} else {
+			m_context.GetCommandScheduler().BeginRendering(draw_state.rendering);
+		}
 	}
 	if (same_command && emit.state != &draw_state && emit.state != nullptr &&
 	    emit.state->dynamic_hash == draw_state.dynamic_hash &&
 	    std::memcmp(&emit.state->dynamic, &draw_state.dynamic, sizeof(draw_state.dynamic)) == 0)
 		emit.state = &draw_state;
-	if (!same_command || emit.state != &draw_state) NativeXprEmitDynamic(cache, vk_buffer, draw_state, same_command);
+	if (!same_command || emit.state != &draw_state) NativeXprEmitDynamicInto(emit, vk_buffer, draw_state, same_command);
 	const auto& pipeline = *variant.pipeline;
-	if (!same_command || emit.pipeline != &pipeline) {
+	if constexpr (P::worker) {
+		// (A weave worker reads the handle once and binds it as it is, noted: the pipeline's last use,
+		// BindPipelineHandle's, is a stamp. A handle that left while idle (null) is made again at its bind, the GPU
+		// thread's: the draw is a hole, and no bind of a null handle is ever recorded.)
+		const vk::Pipeline handle = pipeline.pipeline;
+		if (!handle) return WeaveMiss(Weave::Miss::Variant), TableResult::Native;
+		if (!same_command || emit.pipeline != &pipeline) {
+			WeaveParcel().result->made.back().pipeline_handle = WeaveHandleBits(static_cast<VkPipeline>(handle));
+			vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+		}
+	} else if (!same_command || emit.pipeline != &pipeline) {
 		// (Mode 4: a parked entry's stand-in (no handle): bound through a cell its commit writes.)
 		if (spec_state != nullptr && t_entry_parked != nullptr && &pipeline == t_entry_parked->parked_stand_in.get()) {
 			if (!TableParkedBind(vk_buffer, *t_entry_parked)) return Spec::Refuse("parked pipeline: bind not recorded"), TableResult::Native;
@@ -4031,7 +4517,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	emit.MovedTo(vk_buffer, buffer.GraphicsGeneration());
 	emit.state       = &draw_state;
 	emit.pipeline    = &pipeline;
-	draw_state.Use(m_context.FrameNumber());
+	if constexpr (!P::worker) draw_state.Use(m_context.FrameNumber());
 	if (indexed) {
 		emit.index_base  = index_base;
 		emit.index_bytes = index_bytes;
@@ -4047,7 +4533,23 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (spec_emit) [[unlikely]]
 		TableSpecPlaceNote(table, *spec_state, images_epoch, draw_state.capture_id, spec_facts_before,
 		                   !draw_state.worker_captured);
-	if (vertex_arguments && groups != 0) { // (KYTY_SPEC_DRAW_INDIRECT_VERIFY: what it read)
+	if constexpr (P::worker) {
+		// (What the turn stamps, tests and lists of the draw; the rest of its record is the worker's walk's.)
+		auto& made         = WeaveParcel().result->made.back();
+		made.pair          = &pair;
+		made.set           = set;
+		made.state         = &draw_state;
+		made.vs            = pair.vs;
+		made.ps            = pair.ps;
+		made.variant_index = static_cast<uint32_t>(&variant - pair.variants.data());
+		made.pipeline      = &pipeline;
+		made.indexed       = indexed;
+		made.index_base    = indexed ? index_base : 0;
+		made.index_bytes   = indexed ? index_bytes : 0;
+		made.gbuffer       = FrameGen::Enabled() && pair.programs[0] != nullptr &&
+		               FrameGen::IsGbufferVertexShader(pair.programs[0]->shader_hash);
+	}
+	if (!P::worker && vertex_arguments && groups != 0) { // (KYTY_SPEC_DRAW_INDIRECT_VERIFY: what it read)
 		auto&       noted  = m_table_args_emit;
 		const auto* source = arguments[0].first;
 		const auto  mapped = source->Mapped();
@@ -4056,7 +4558,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		noted.copy = source->CpuAddress() == 0 && mapped.size() >= arguments[0].second + sizeof(noted.copied);
 		if (noted.copy) std::memcpy(noted.copied.data(), mapped.data() + arguments[0].second, sizeof(noted.copied));
 	}
-	LiveCounters::Add(LiveCounters::TableDraws, std::max<size_t>(commands.size(), 1));
+	TableAdd<P>(LiveCounters::TableDraws, std::max<size_t>(commands.size(), 1));
 	return TableResult::Drawn;
 }
 
@@ -4252,6 +4754,7 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 			std::printf("Table: VS 0x%llx PS 0x%llx refused: %s\n", static_cast<unsigned long long>(pair->vs),
 			            static_cast<unsigned long long>(pair->ps), reason);
 		const auto write = CatalogWrite();
+		const Weave::Hold hold;
 		pair->refused    = true;
 	};
 	if (!table_state.programs.vertex || vertex == nullptr || !vertex->table_mode)
@@ -4263,6 +4766,7 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 	if (pair->programs[0] == nullptr) {
 		{
 			const auto write = CatalogWrite();
+			const Weave::Hold hold;
 			pair->programs   = programs;
 			pair->push_fit   = Spec::On() && PipelineCache::t_push_fit_taken; // (the lookup above: mode 4 sets it)
 			TableRuns(*pair);
@@ -4304,6 +4808,7 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 			}
 			if (!other && ((pair->portable[0] | masks[0]) != pair->portable[0] || (pair->portable[1] | masks[1]) != pair->portable[1])) {
 				const auto write = CatalogWrite();
+				const Weave::Hold hold;
 				pair->portable[0] |= masks[0];
 				pair->portable[1] |= masks[1];
 				pair->respecialize = true;
@@ -4313,6 +4818,7 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 		// Another specialization (the pixel program's export of another draw state's targets): this state's draws
 		// keep the native path.
 		const auto write = CatalogWrite();
+		const Weave::Hold hold;
 		const auto found = std::ranges::find(pair->variants, table.store_state, &TableXpr::Variant::state);
 		if (found == pair->variants.end()) pair->variants.push_back({.state = table.store_state, .refused = true});
 		return;
@@ -4324,6 +4830,7 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 	if (pipeline == nullptr) pair->waiting = pipelines.PipelineWaiting();
 	{
 		const auto write   = CatalogWrite();
+		const Weave::Hold hold;
 		auto       variant = std::ranges::find(pair->variants, table.store_state, &TableXpr::Variant::state);
 		if (variant == pair->variants.end()) variant = pair->variants.insert(variant, {.state = table.store_state});
 		variant->pipeline       = pipeline;

@@ -17,6 +17,7 @@
 #include "graphics/shader/shaderVertexMetadata.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
+#include "weave.h"
 
 #include <algorithm>
 #include <array>
@@ -69,6 +70,14 @@ static std::unique_ptr<std::unordered_map<uint64_t, ShaderMappedData>> g_shader_
 static std::mutex                                                      g_shader_map_mutex;
 // Bumped on every registration: invalidates the per-thread last lookup below.
 static std::atomic<uint64_t> g_shader_map_generation {0};
+// While the weave is on: each registration's address by the generation it made, the last ShaderLog of them (written
+// and read under g_shader_map_mutex; the generation goes up by one a registration). The weave's open asks it whether a
+// parcel's shaders were registered again since its workers proved them (ShaderRegisteredAtSince).
+static constexpr uint64_t ShaderLog = 4096;
+struct LoggedShader {
+	uint64_t generation = 0, addr = 0;
+};
+static std::array<LoggedShader, ShaderLog> g_shader_log {};
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -82,11 +91,28 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	(*g_shader_map)[addr] = data;
-	g_shader_map_generation.fetch_add(1, std::memory_order_release);
+	const auto generation = g_shader_map_generation.fetch_add(1, std::memory_order_release) + 1;
+	if (Weave::Enabled()) g_shader_log[generation % ShaderLog] = {generation, addr};
 }
 
 uint64_t ShaderMapGeneration() {
 	return g_shader_map_generation.load(std::memory_order_acquire);
+}
+
+bool ShaderRegisteredAtSince(uint64_t generation, std::span<const uint64_t> sorted_addresses) {
+	const auto now         = g_shader_map_generation.load(std::memory_order_acquire);
+	const auto logged_from = now > ShaderLog ? now - ShaderLog : 0; // (the oldest generation the log answers from)
+	if (generation >= now || sorted_addresses.empty()) return false;
+	if (generation < logged_from) return true;
+	std::scoped_lock lock(g_shader_map_mutex);
+	// (Under the lock every generation up to `now` is logged; one written over since by a newer generation, or not
+	// written while the weave was off, is not known: true.)
+	for (auto at = generation + 1; at <= now; ++at) {
+		const auto& entry = g_shader_log[at % ShaderLog];
+		if (entry.generation != at || std::binary_search(sorted_addresses.begin(), sorted_addresses.end(), entry.addr))
+			return true;
+	}
+	return false;
 }
 
 bool ShaderLookupMappedData(uint64_t addr, ShaderMappedData* out) {
@@ -172,17 +198,35 @@ static inline bool ReadGuestHere(void* out, const void* guest, size_t bytes) {
 	return ShaderReadGuest(out, guest, bytes);
 }
 
-static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
-	EXIT_IF(shader_addr == 0);
+// The code's declared hash (0: it has none), its words read by `read(address, out, bytes)`, which is false when they
+// cannot be read (and then so is the hash: false).
+template <class Read>
+static bool ReadDeclaredShaderHash(uint64_t shader_addr, Read&& read, uint64_t& declared) {
+	declared = 0;
 	std::array<uint32_t, 2> code {};
-	ReadShaderMemory(shader_addr, code.data(), sizeof(code));
-	if (code[0] != 0xBEEB03FF) return 0;
+	if (!read(shader_addr, code.data(), sizeof(code))) return false;
+	if (code[0] != 0xBEEB03FF) return true;
 	// The header's hash0 and hash1 (ShaderBinaryInfo).
 	std::array<uint32_t, 2> hash {};
-	ReadShaderMemory(shader_addr + static_cast<uint64_t>(code[1] + 1u) * 2u * sizeof(uint32_t) +
-	                     offsetof(ShaderBinaryInfo, hash0),
-	                 hash.data(), sizeof(hash));
-	return (static_cast<uint64_t>(hash[1]) << 32u) | hash[0];
+	if (!read(shader_addr + static_cast<uint64_t>(code[1] + 1u) * 2u * sizeof(uint32_t) +
+	              offsetof(ShaderBinaryInfo, hash0),
+	          hash.data(), sizeof(hash)))
+		return false;
+	declared = (static_cast<uint64_t>(hash[1]) << 32u) | hash[0];
+	return true;
+}
+
+static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
+	EXIT_IF(shader_addr == 0);
+	uint64_t declared = 0;
+	(void)ReadDeclaredShaderHash(
+	    shader_addr,
+	    [](uint64_t address, void* out, size_t bytes) {
+		    ReadShaderMemory(address, out, bytes);
+		    return true;
+	    },
+	    declared);
+	return declared;
 }
 
 static uint64_t HashShaderCode(std::span<const uint32_t> code) {
@@ -258,6 +302,37 @@ uint64_t ShaderHashAt(uint64_t addr) {
 	const auto data = ShaderGetMappedData(addr, "ShaderHashAt");
 	if (data.code_size_bytes == 0 || data.code_size_bytes % sizeof(uint32_t) != 0) return 0;
 	return ShaderCodeHash(addr, std::span {reinterpret_cast<const uint32_t*>(addr), data.code_size_bytes / sizeof(uint32_t)});
+}
+
+// ShaderCodeHash's answer (the declared hash, else the code's), never through the guest's view: a load from a page the
+// GPU wrote faults into a readback only the GPU thread serves, and a weave worker waiting for one inside a draw holds
+// up the GPU thread's next safepoint while the GPU thread waits there: both wait for good. The bytes come from the
+// backing, read between two looks at their pages' read watchers: with none before and after, the backing holds what
+// the guest's view would give. A watched page gives no answer (the worker's draw is a hole). No memo (ShaderCodeHash's
+// is per thread, kept by that thread's own uses). The map is read by ShaderLookupMappedData, under its lock, so an
+// address the map doesn't hold is no answer rather than ShaderGetMappedData's exit.
+bool ShaderHashAtNoFault(uint64_t addr, uint64_t& hash) {
+	hash = 0;
+	ShaderMappedData data {};
+	if (!ShaderLookupMappedData(addr, &data)) return false;
+	const uint64_t bytes = data.code_size_bytes;
+	if (bytes == 0 || bytes % sizeof(uint32_t) != 0) return true; // (ShaderHashAt's 0)
+	if (bytes > 1024 * 1024) return false;
+	using LibKernel::Memory::ReadFaults, LibKernel::Memory::TryReadBackingToHost;
+	const auto read = [](uint64_t address, void* out, uint64_t size) {
+		return !ReadFaults(address, size) && TryReadBackingToHost(address, out, size) && !ReadFaults(address, size);
+	};
+	uint64_t declared = 0;
+	if (!ReadDeclaredShaderHash(addr, read, declared)) return false;
+	if (declared != 0) {
+		hash = declared;
+		return true;
+	}
+	thread_local std::vector<uint32_t> scratch;
+	if (scratch.size() < bytes / sizeof(uint32_t)) scratch.resize(bytes / sizeof(uint32_t));
+	if (!read(addr, scratch.data(), bytes)) return false;
+	hash = XXH3_64bits(scratch.data(), bytes);
+	return true;
 }
 
 static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, std::span<const uint32_t> user_data,

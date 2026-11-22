@@ -38,6 +38,7 @@
 #include "mode-toggle.h"
 #include "slow-log.h"
 #include "speculation-state.h"
+#include "spin-gate.h"
 #include "startup-progress.h"
 
 #include <algorithm>
@@ -1997,6 +1998,8 @@ struct PipelineCache::ProgramCache {
 			                 p.groups.size(), p.inputs.records.size(), added, ranked, threads, p.gentle_threads,
 			                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
 			p.ready.store(true, std::memory_order_release);
+			// (Nothing spins while it translates beside the weave, until the "all" line: spin-gate.h's Quiet.)
+			if (!p.groups.empty()) SpinGate::Quiet(SpinGate::QuietPrefetch, true);
 			// (No program at all, every input the warmup's: no worker reaches the "all" line, so it is written here.)
 			if (p.groups.empty()) {
 				PipelineCacheLog("Shader prefetch: all 0 programs translated (every input the warmup's)");
@@ -2051,6 +2054,7 @@ struct PipelineCache::ProgramCache {
 				                 "of SPIR-V made ({} MiB compressed in the file)",
 				                 p.groups.size(), p.cache_loaded, p.spirv_bytes.load(std::memory_order_relaxed) >> 20u,
 				                 p.spill_end.load(std::memory_order_relaxed) >> 20u);
+				SpinGate::Quiet(SpinGate::QuietPrefetch, false);
 				if (!p.spill_owned) SaveDiskCache(disk, true);
 				std::vector<std::vector<uint32_t>>().swap(p.inputs.records); // no longer read
 				const auto mib = [&](PrefetchMemoryPart part) { return p.memory[part].load(std::memory_order_relaxed) >> 20u; };
@@ -4312,6 +4316,13 @@ vk::Pipeline BindPipelineHandle(const PipelineCache::Pipeline& pipeline) {
 	return pipeline.pipeline;
 }
 
+// (EvictIdlePipelines, on the GPU thread, adds to the count, a release, after it destroyed and cleared the handles: a
+// weave worker that reads it before its first handle read, and finds it unmoved at the turn, read no handle an eviction
+// cleared; one that reads it moved reads none of those handles as it was before the clear.)
+uint64_t PipelineEvictionCount() {
+	return g_pipeline_evictions.evicted.load(std::memory_order_acquire);
+}
+
 // With the video memory in use within EvictMargin of the GPU's budget (checked every CheckFlips flips), up to MaxEvictions
 // a check of the pipelines the static store gave that no binding used for KYTY_PIPELINE_EVICT_SECONDS (default 180, at
 // least 5) leave it: their handles destroyed (BindPipelineHandle makes one again from the store, ~1-2 ms). Their shader
@@ -4432,11 +4443,12 @@ void PipelineCache::EvictIdlePipelines() {
 		            static_cast<double>(g_pipeline_evictions.remake_us.load(std::memory_order_relaxed)) / 1000.0);
 		std::fflush(stdout);
 	}
+	// (Release, for PipelineEvictionCount; on x86-64 the same locked add as relaxed, with MS STL and libstdc++.)
 	if (evicted == left) {
-		(void)g_pipeline_evictions.evicted.fetch_add(evicted, std::memory_order_relaxed);
+		(void)g_pipeline_evictions.evicted.fetch_add(evicted, std::memory_order_release);
 		return;
 	}
-	const auto total = g_pipeline_evictions.evicted.fetch_add(evicted, std::memory_order_relaxed) + evicted;
+	const auto total = g_pipeline_evictions.evicted.fetch_add(evicted, std::memory_order_release) + evicted;
 	// (A line at most every 30 s: the totals so far.)
 	static auto logged = std::chrono::steady_clock::time_point {};
 	if (now - logged < std::chrono::seconds(30)) return;

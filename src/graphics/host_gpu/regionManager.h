@@ -86,16 +86,22 @@ public:
 	// The query then costs no locked instruction and leaves the lock's line to the writers.
 	template <typename Read>
 	auto ReadShared(Read&& read) {
-		const auto before = m_seq.load(std::memory_order_acquire);
-		if ((before & 1u) == 0) {
-			auto result = read();
-			std::atomic_thread_fence(std::memory_order_acquire);
-			if (m_seq.load(std::memory_order_relaxed) == before) return result;
-		}
+		if (decltype(read()) result {}; TryReadShared(read, result)) return result;
 		lock();
 		auto result = read();
 		unlock();
 		return result;
+	}
+	// ReadShared's read without the lock: false (`result` untouched) when a holder was inside.
+	template <typename Read, typename Result>
+	[[nodiscard]] bool TryReadShared(Read&& read, Result& result) {
+		const auto before = m_seq.load(std::memory_order_acquire);
+		if ((before & 1u) != 0) return false;
+		auto value = read();
+		std::atomic_thread_fence(std::memory_order_acquire);
+		if (m_seq.load(std::memory_order_relaxed) != before) return false;
+		result = value;
+		return true;
 	}
 
 	static void YieldCpu() noexcept {
@@ -237,6 +243,12 @@ public:
 		if (m_shared.load(std::memory_order_relaxed) && t_shared_depth != 0) [[unlikely]]
 			EXIT("texture cache lock read (ReadShared) while held shared\n");
 		return m_exclusive.ReadShared(std::forward<Read>(read));
+	}
+	// ReadShared's first look alone (TrackingSpinLock::TryReadShared): false while an exclusive holder is inside (a window
+	// open too). For the weave's reader and workers, which never hold it shared.
+	template <typename Read, typename Result>
+	[[nodiscard]] bool TryReadShared(Read&& read, Result& result) {
+		return m_exclusive.TryReadShared(std::forward<Read>(read), result);
 	}
 
 private:

@@ -44,7 +44,9 @@
 #include "speculation-state.h"
 #include "xpr-capture.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "vulkan-recording.h"
+#include "weave-parcel.h"
 #endif
 
 #include <algorithm>
@@ -52,6 +54,7 @@
 #include <atomic>
 #include <bit>
 #include <x86intrin.h>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -61,6 +64,7 @@
 #include <optional>
 #include <thread>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -1308,6 +1312,14 @@ void GuestGpu::Enqueue(Submission submission) {
 		submission.scout_sequence = ++m_scout_sequence;
 		Scout::Feed(submission.scout_sequence, submission.commands, !submission.constant_commands.empty(),
 		            submission.reset_processor || m_scout_reset);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		// (The weave's reader is fed as the scout is, with the reset a flip preparation carries, while KYTY_SPECULATE
+		// is 0: weave-reader.inc.)
+		if (Weave::Enabled() && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 0) [[unlikely]]
+			CommandProcessor::WeaveFeed(submission.scout_sequence, submission.commands,
+			                            !submission.constant_commands.empty(),
+			                            submission.reset_processor || m_scout_reset);
+#endif
 		m_scout_reset = false;
 	} else if (submission.type == SubmissionType::FlipPreparation && submission.reset_processor) {
 		m_scout_reset = true;
@@ -1611,6 +1623,12 @@ void GuestGpu::ThreadRun(void* data) {
 
 	for (;;) {
 		if (ModeToggle::g_request.load(std::memory_order_relaxed) >= 0) apply_mode();
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		// KYTY_WEAVE: paused once a live change has set KYTY_SPECULATE to 4, before another packet or guest command
+		// runs (weave-order.inc).
+		if (Weave::Active() && kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) [[unlikely]]
+			gpu->m_gfx_cp->WeaveModeChanged();
+#endif
 		PageManager::FlushDeferredProtection(); // (before a guest command, an idle wait, another queue's turn)
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
@@ -1716,6 +1734,9 @@ void GuestGpu::ThreadRun(void* data) {
 			}
 		}
 		if (should_stop) {
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+			if (Weave::Enabled()) Weave::StopAll(); // (before the scout: its threads read the scout's write clock)
+#endif
 			Scout::Stop();
 			gpu->m_gfx_cp->BufferWait();
 			gpu->m_renderer.GetMutex().ResignOwner();
@@ -1821,6 +1842,12 @@ bool GuestGpu::Process(Submission& submission) {
 	if (first_slice) {
 		submission.started = true;
 		if (submission.type == SubmissionType::Graphics && Scout::Running()) Scout::BeginSubmission(submission.scout_sequence);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		// (The weave: queue 0's graphics submissions woven, its others not; paused while KYTY_SPECULATE=4,
+		// weave-order.inc.)
+		if (Weave::Enabled() && submission.queue_id == 0) [[unlikely]]
+			cp.WeaveSubmission(submission.type == SubmissionType::Graphics ? submission.scout_sequence : 0);
+#endif
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
 		cp.SetFlip({});
@@ -2297,12 +2324,28 @@ static int32_t GsUserSgprAt(uint32_t location) {
 	return id < 32u ? static_cast<int32_t>(id) : -1;
 }
 
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "weave-reader.inc"
+#include "weave-order.inc"
+#include "weave-copies.inc"
+#endif
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 	// (KYTY_SPECULATE=4: the state pass, the speculation's threads and the GPU thread's chunked runs take
 	// ProcessPm4Spec. Mode 0 runs main's loop: none of their per-packet checks. The mode is 4 from before the first
 	// speculation until its results are discarded, so a run never changes copies midway.)
 	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) [[unlikely]]
 		return ProcessPm4Spec(execution, stop_depth);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	// (KYTY_WEAVE=1: queue 0's processor while the weave runs on it, the same loop with its hooks at the draw packets.)
+	if (g_weave_order.turns == this) [[unlikely]]
+		return ProcessPm4Loop<true>(execution, stop_depth);
+#endif
+	ProcessPm4Loop<false>(execution, stop_depth);
+}
+
+template <bool kWeave>
+void CommandProcessor::ProcessPm4Loop(Pm4Execution& execution, size_t stop_depth) {
 	while (execution.m_buffer_stack.size() > stop_depth) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
@@ -2345,6 +2388,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			     total_dw - remaining_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
 		}
 
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		// KYTY_WEAVE: at a top-level draw packet, a parcel opened or passed, a part of a worker's strand spliced here
+		// (its packets skipped: true), or the packet the GPU thread's own (weave-order.inc).
+		if constexpr (kWeave)
+			if (buffer_index == 0 && WeaveDrawPacket(opcode) && WeaveAt(execution)) continue;
+#endif
 		// KYTY_SCOUT: queue 0's draws, numbered as the scout numbers them (skipped ones too).
 		if (Scout::IsDraw(opcode) && !IsAsyncComputeQueue() && Scout::Running()) Scout::NoteDraw(packet);
 
@@ -2496,6 +2545,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 				}
 			}
 		}
+		// KYTY_WEAVE: a draw of the open parcel that a handler makes is watched: if it changes the registers, the
+		// parcel closes (weave-order.inc).
+		if constexpr (kWeave)
+			if (g_weave_order.open && WeaveDrawPacket(opcode)) [[unlikely]]
+				WeaveYieldBegin(execution);
 #endif
 		if (opcode != Pm4::IT_DRAW_INDEX_INDIRECT) m_draw_run_skip = 0;
 		if (packet_header == 0xc0032500u && !GraphicsRunDebugDumpEnabled()) {
@@ -2505,6 +2559,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 				execution.m_buffer_stack[buffer_index].offset_dw += consumed;
 				execution.m_made_progress = true;
 				GetScheduler().CompleteDraws(consumed / 5u);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+				if constexpr (kWeave)
+					if (g_weave_order.yield) [[unlikely]]
+						WeaveYieldEnd();
+#endif
 				continue;
 			}
 		}
@@ -2525,6 +2584,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		// KYTY_WEAVE: a queue-0 top-level DISPATCH_DIRECT tested against the reader's record of it (weave-copies.inc).
+		bool weave_copy = false;
+		if constexpr (kWeave)
+			weave_copy = buffer_index == 0 && opcode == Pm4::IT_DISPATCH_DIRECT && WeaveCopyBefore(execution);
+#endif
 		const uint32_t packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
@@ -2534,8 +2599,17 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			return;
 		}
 		EXIT_IF(execution.m_buffer_stack.size() != buffer_index + 1);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		if constexpr (kWeave)
+			if (weave_copy) WeaveCopyAfter();
+#endif
 		execution.m_buffer_stack[buffer_index].offset_dw += packet_dw;
 		execution.m_made_progress = true;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		if constexpr (kWeave)
+			if (g_weave_order.yield) [[unlikely]]
+				WeaveYieldEnd();
+#endif
 		if (opcode == Pm4::IT_DRAW_INDEX_2 || opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_AUTO ||
 		    opcode == Pm4::IT_DRAW_INDIRECT || opcode == Pm4::IT_DRAW_INDEX_INDIRECT ||
 		    opcode == Pm4::IT_DRAW_INDIRECT_MULTI || opcode == Pm4::IT_DRAW_INDEX_INDIRECT_MULTI)
@@ -3319,6 +3393,87 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	DrawIndex({.index_count = index_count, .index_addr = index_addr});
 }
 
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+bool CommandProcessor::NativeXprDrawsArgs(std::span<const uint32_t> packets, NativeDrawArgs& args) const {
+	static_assert(NativeDrawArgs::MaxDraws == DrawIndirectRunMax);
+	if (packets.size() < 5 || (packets[4] & ~0x20u) != 2u || m_index_type_and_size > 1 || !m_index_base_addr ||
+	    !m_index_buffer_size || !m_draw_indirect_args_base_addr ||
+	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList)
+		return false;
+	// A run: consecutive packets that differ only in the argument offset draw
+	// the same object (no register write between them).
+	uint32_t count = 1;
+	while (count < NativeDrawArgs::MaxDraws && (count + 1u) * 5u <= packets.size()) {
+		const auto* next = packets.data() + count * 5u;
+		if (next[0] != 0xc0032500u || next[2] != packets[2] || next[3] != packets[3] ||
+		    next[4] != packets[4])
+			break;
+		++count;
+	}
+	for (uint32_t i = 0; i < count; ++i) args.commands[i] = m_draw_indirect_args_base_addr + packets[i * 5u + 1u];
+	const uint64_t element = m_index_type_and_size == 0 ? 2 : 4;
+	args.count             = count;
+	args.index_base        = m_index_base_addr;
+	args.index_bytes       = uint64_t {m_index_buffer_size} * element;
+	args.index_type        = m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
+	args.is_direct         = false;
+	args.dwords            = count * 5u;
+	return true;
+}
+
+bool CommandProcessor::NativeMultiDrawArgs(std::span<const uint32_t> packet, NativeDrawArgs& args) const {
+	// What CpOpDrawIndirectMulti takes, of a count the packet holds (not read from memory), the arguments one after
+	// another: the draws of as many DRAW_INDEX_INDIRECT (TryNativeXprDraws).
+	if (packet.size() < 10 || ((packet[4] >> 30u) & 1u) != 0 || packet[5] == 0 ||
+	    packet[5] > NativeDrawArgs::MaxDraws || packet[8] != sizeof(DrawIndexedIndirectArgs) ||
+	    (packet[9] & ~0x20u) != 2u || m_index_type_and_size > 1 || !m_index_base_addr || !m_index_buffer_size ||
+	    !m_draw_indirect_args_base_addr || m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList)
+		return false;
+	const uint32_t count = packet[5];
+	for (uint32_t i = 0; i < count; ++i)
+		args.commands[i] = m_draw_indirect_args_base_addr + packet[1] + uint64_t {i} * sizeof(DrawIndexedIndirectArgs);
+	const uint64_t element = m_index_type_and_size == 0 ? 2 : 4;
+	args.count             = count;
+	args.index_base        = m_index_base_addr;
+	args.index_bytes       = uint64_t {m_index_buffer_size} * element;
+	args.index_type        = m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
+	args.is_direct         = false;
+	args.dwords            = 10;
+	return true;
+}
+
+bool CommandProcessor::NativeDirectDrawArgs(std::span<const uint32_t> packet, NativeDrawArgs& args) const {
+	if (m_index_type_and_size > 1 || m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList) return false;
+	// What CpOpDrawIndex / CpOpDrawIndexOffset accept (anything else takes them).
+	const uint64_t element = m_index_type_and_size == 0 ? 2 : 4;
+	uint64_t       index_address = 0;
+	uint32_t       index_count = 0, size = 0;
+	if (packet.size() >= 6 && packet[0] == 0xc0042700u) {
+		index_address = packet[2] | (uint64_t {packet[3]} << 32u);
+		index_count   = packet[4];
+		size          = 6;
+		if (index_count > packet[1] || (packet[5] & ~0x20u) != 0) return false;
+	} else if (packet.size() >= 5 && packet[0] == 0xc0033500u && m_index_base_addr != 0) {
+		index_address = m_index_base_addr + uint64_t {packet[2]} * element;
+		index_count   = packet[3];
+		size          = 5;
+		if (index_count > packet[1] || (packet[4] & ~0x20u) != 0) return false;
+	} else {
+		return false;
+	}
+	// A zero-sized draw draws nothing on the normal path either (it returns first).
+	if (index_count == 0 || index_address == 0 || index_address % element != 0) return false;
+	args.count       = 0;
+	args.index_base  = index_address;
+	args.index_bytes = uint64_t {index_count} * element;
+	args.index_type  = m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
+	args.is_direct   = true;
+	args.direct      = {index_address, index_count, m_num_instances};
+	args.dwords      = size;
+	return true;
+}
+#endif
+
 uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, bool clean) {
 	LiveCensus::Scope census(LiveCensus::NativeXpr, 0);
 	LiveTrace::MarkAfter gpu_mark {[&] { return GetScheduler().Current().RawHandle(); }, LiveTrace::MarkNativeXpr,
@@ -3330,40 +3485,21 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 		executor.NativeXprForgetState();
 		return 0;
 	}
-	if (packets.size() < 5 || (packets[4] & ~0x20u) != 2u || m_index_type_and_size > 1 ||
-	    !m_index_base_addr || !m_index_buffer_size || !m_draw_indirect_args_base_addr ||
-	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList ||
-	    HudAnchor::Scaled(m_ctx, m_sh_ctx.GetVs(), m_sh_ctx.GetPs())) {
+	NativeDrawArgs args;
+	if (!NativeXprDrawsArgs(packets, args) || HudAnchor::Scaled(m_ctx, m_sh_ctx.GetVs(), m_sh_ctx.GetPs())) {
 		// The cached draw-state key covers only draws the native path saw.
 		executor.NativeXprForgetState();
 		return 0;
 	}
-	// A run: consecutive packets that differ only in the argument offset draw
-	// the same object (no register write between them).
-	constexpr uint32_t max_draws = DrawIndirectRunMax;
-	uint32_t           count     = 1;
-	while (count < max_draws && (count + 1u) * 5u <= packets.size()) {
-		const auto* next = packets.data() + count * 5u;
-		if (next[0] != 0xc0032500u || next[2] != packets[2] || next[3] != packets[3] ||
-		    next[4] != packets[4])
-			break;
-		++count;
-	}
-	std::array<uint64_t, max_draws> commands; // the first `count` are written, only they are read
-	for (uint32_t i = 0; i < count; ++i) commands[i] = m_draw_indirect_args_base_addr + packets[i * 5u + 1u];
 	CheckBuffer();
-	const uint64_t element = m_index_type_and_size == 0 ? 2 : 4;
-	if (clean && executor.TableContinue(CurrentBuffer(), {commands.data(), count}, m_index_base_addr,
-	                                    uint64_t {m_index_buffer_size} * element,
-	                                    m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32,
-	                                    nullptr))
-		return count * 5u;
+	if (clean && executor.TableContinue(CurrentBuffer(), {args.commands.data(), args.count}, args.index_base,
+	                                    args.index_bytes, args.index_type, nullptr))
+		return args.dwords;
 	// On refusal NativeXprTry has asked the normal path to store when that helps.
-	if (!executor.NativeXprTry(CurrentBuffer(), clean, {commands.data(), count}, m_index_base_addr,
-	                           uint64_t {m_index_buffer_size} * element,
-	                           m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32))
+	if (!executor.NativeXprTry(CurrentBuffer(), clean, {args.commands.data(), args.count}, args.index_base,
+	                           args.index_bytes, args.index_type))
 		return 0;
-	return count * 5u;
+	return args.dwords;
 #else
 	(void)packets;
 	(void)clean;
@@ -3381,29 +3517,19 @@ uint32_t CommandProcessor::TryNativeMultiDraw(std::span<const uint32_t> packet) 
 		executor.NativeXprForgetState();
 		return 0u;
 	};
-	// What CpOpDrawIndirectMulti takes, of a count the packet holds (not read from memory), the arguments one after
-	// another: the draws of as many DRAW_INDEX_INDIRECT (TryNativeXprDraws).
-	constexpr uint32_t max_draws = 64;
-	if (FrameCapture::Active() || packet.size() < 10 || ((packet[4] >> 30u) & 1u) != 0 || packet[5] == 0 ||
-	    packet[5] > max_draws || packet[8] != sizeof(DrawIndexedIndirectArgs) || (packet[9] & ~0x20u) != 2u ||
-	    m_index_type_and_size > 1 || !m_index_base_addr || !m_index_buffer_size || !m_draw_indirect_args_base_addr ||
-	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList || HudAnchor::Scaled(m_ctx, m_sh_ctx.GetVs(), m_sh_ctx.GetPs()))
+	NativeDrawArgs args;
+	if (FrameCapture::Active() || !NativeMultiDrawArgs(packet, args) ||
+	    HudAnchor::Scaled(m_ctx, m_sh_ctx.GetVs(), m_sh_ctx.GetPs()))
 		return skip();
-	const uint32_t                  count = packet[5];
-	std::array<uint64_t, max_draws> commands; // the first `count` are written, only they are read
-	for (uint32_t i = 0; i < count; ++i)
-		commands[i] = m_draw_indirect_args_base_addr + packet[1] + uint64_t {i} * sizeof(DrawIndexedIndirectArgs);
 	CheckBuffer();
-	const uint64_t element    = m_index_type_and_size == 0 ? 2 : 4;
-	const auto     index_type = m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
 	if (DrawStateObserver::g_shadow.last_clean &&
-	    executor.TableContinue(CurrentBuffer(), {commands.data(), count}, m_index_base_addr,
-	                           uint64_t {m_index_buffer_size} * element, index_type, nullptr))
-		return 10;
-	if (!executor.NativeXprTry(CurrentBuffer(), DrawStateObserver::g_shadow.last_clean, {commands.data(), count},
-	                           m_index_base_addr, uint64_t {m_index_buffer_size} * element, index_type))
+	    executor.TableContinue(CurrentBuffer(), {args.commands.data(), args.count}, args.index_base, args.index_bytes,
+	                           args.index_type, nullptr))
+		return args.dwords;
+	if (!executor.NativeXprTry(CurrentBuffer(), DrawStateObserver::g_shadow.last_clean,
+	                           {args.commands.data(), args.count}, args.index_base, args.index_bytes, args.index_type))
 		return 0;
-	return 10;
+	return args.dwords;
 #else
 	(void)packet;
 	return 0;
@@ -3424,36 +3550,16 @@ uint32_t CommandProcessor::TryNativeDirectDraw(std::span<const uint32_t> packet)
 	if (FrameCapture::Active() || XprCapture::Enabled() || m_index_type_and_size > 1 ||
 	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList || HudAnchor::Scaled(m_ctx, m_sh_ctx.GetVs(), m_sh_ctx.GetPs()))
 		return skip();
-	// What CpOpDrawIndex / CpOpDrawIndexOffset accept (anything else takes them).
-	const uint64_t element = m_index_type_and_size == 0 ? 2 : 4;
-	uint64_t       index_address = 0;
-	uint32_t       index_count = 0, size = 0;
-	if (packet.size() >= 6 && packet[0] == 0xc0042700u) {
-		index_address = packet[2] | (uint64_t {packet[3]} << 32u);
-		index_count   = packet[4];
-		size          = 6;
-		if (index_count > packet[1] || (packet[5] & ~0x20u) != 0) return skip();
-	} else if (packet.size() >= 5 && packet[0] == 0xc0033500u && m_index_base_addr != 0) {
-		index_address = m_index_base_addr + uint64_t {packet[2]} * element;
-		index_count   = packet[3];
-		size          = 5;
-		if (index_count > packet[1] || (packet[4] & ~0x20u) != 0) return skip();
-	} else {
-		return skip();
-	}
-	// A zero-sized draw draws nothing on the normal path either (it returns first).
-	if (index_count == 0 || index_address == 0 || index_address % element != 0) return skip();
+	NativeDrawArgs args;
+	if (!NativeDirectDrawArgs(packet, args)) return skip();
 	CheckBuffer();
-	const RenderExecutor::NativeXprDirectDraw draw {index_address, index_count, m_num_instances};
-	const auto index_type = m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
 	if (DrawStateObserver::g_shadow.last_clean &&
-	    executor.TableContinue(CurrentBuffer(), {}, index_address, uint64_t {index_count} * element, index_type, &draw))
-		return size;
-	if (!executor.NativeXprTry(CurrentBuffer(), DrawStateObserver::g_shadow.last_clean, {}, index_address,
-	                           uint64_t {index_count} * element,
-	                           m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32, &draw))
+	    executor.TableContinue(CurrentBuffer(), {}, args.index_base, args.index_bytes, args.index_type, &args.direct))
+		return args.dwords;
+	if (!executor.NativeXprTry(CurrentBuffer(), DrawStateObserver::g_shadow.last_clean, {}, args.index_base,
+	                           args.index_bytes, args.index_type, &args.direct))
 		return 0;
-	return size;
+	return args.dwords;
 #else
 	(void)packet;
 	return 0;

@@ -114,16 +114,30 @@ bool CurrentThreadStack(uint64_t* low, uint64_t* high);
 // the caller's stores (the slow side of an asymmetric lock, RenderMutex). False where the host has no such call.
 bool FlushProcessWriteBuffers();
 
-// The calling thread kept off the CPUs of a list (KYTY_RENDER_CPUS; null or empty: any CPU); with
-// below-normal priority too: background work that must not hold up the game's threads.
+// The calling thread kept off the CPUs of a list (KYTY_RENDER_CPUS; null or empty: any CPU) and off the core
+// KeepRenderCoreAlone keeps; with below-normal priority too: background work that must not hold up the game's threads.
 void AvoidCpuList(const char* avoid_cpus);
 void MakeBackgroundThread(const char* avoid_cpus);
-// Linux, the render thread (KYTY_RENDER_CORE=<cpu>; 0 or off: not; default on the Steam Deck build: 2): the calling
-// thread on that CPU and the core it is on (its SMT siblings) kept for it alone: every other thread of the process, the
-// game's included, is moved off that core now and every 250 ms (a thread of its own; new threads inherit their
-// creator's CPUs). On a 4-core CPU the game's ten job workers shared the render thread's core: its work per frame
-// 31.5 ms with them, 28.4 ms alone. Returns the CPU (-1: not done). Windows: -1.
-int KeepRenderCoreAlone();
+// The render thread (KYTY_RENDER_CORE=<cpu>, or auto: the lowest-numbered core of the performance class other than
+// CPU 0's, which takes most interrupts; 0 or off: not; default on the Steam Deck build: 2): the calling thread on that
+// CPU (Windows: on both CPUs of its core) and the core it is on (its SMT siblings) kept for it alone, every other
+// thread of the process, the game's included, kept off that core. Linux: they are moved off it now and every 250 ms
+// (a thread of its own; new threads inherit their creator's CPUs). Windows: the process's default CPU set is every
+// other CPU of the process, which every thread without a CPU set or mask of its own takes, those made later too. On a
+// 4-core CPU the game's ten job workers shared the render thread's core: its work per frame 31.5 ms with them, 28.4 ms
+// alone. `fallback` stands for an unset KYTY_RENDER_CORE (a caller's default, such as "auto"; null: unset); with
+// KYTY_RENDER_CPUS set it is not taken (the thread is placed). Returns the CPU (-1: not done).
+int KeepRenderCoreAlone(const char* fallback = nullptr);
+// The core KeepRenderCoreAlone kept because of its caller's `fallback` let go, on the thread it placed, as if it had
+// never been kept (a weave that could not start: the run goes on in mode 0). Windows: the default CPU set every CPU,
+// the thread's mask the process's, and every thread AvoidCpuList kept off the core given it back. Linux: the keeper
+// stopped, the thread on the process's CPUs, and every thread kept off the core given it back. A core KYTY_RENDER_CORE
+// asked for, or the Steam Deck build's default, stays.
+void ReleaseRenderCore();
+// The cores of the performance class (the highest efficiency class; every core where all are alike) the process may run
+// on, their logical CPUs, and all the logical CPUs it may run on (Windows: GetLogicalProcessorInformationEx; Linux: the
+// sysfs topology, the class from /sys/devices/cpu_core/cpus where there is one). 0s where not known.
+void CoreCounts(uint32_t& performance_cores, uint32_t& performance_logical, uint32_t& logical);
 // The calling thread above the normal priority of the game's threads (Windows: THREAD_PRIORITY_HIGHEST; Linux:
 // nice -10 where the nice limit allows, unless KYTY_LINUX_FAST_LOCKS=0): the render thread, which every frame waits for, is not time-sliced against them on its CPUs.
 void MakeCriticalThread();

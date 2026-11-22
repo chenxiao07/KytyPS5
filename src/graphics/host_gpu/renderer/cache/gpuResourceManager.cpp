@@ -25,6 +25,7 @@
 #include "speculation-state.h"
 #include "fresh-memory.h"
 #include "texture-offload.h"
+#include "weave.h"
 
 extern "C" {
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_bda_dirty_regions_mode {1};
@@ -34,6 +35,23 @@ extern "C" {
 }
 
 namespace Libs::Graphics {
+
+namespace {
+
+// While the weave is enabled (from the start-up gates on): the latest WeaveLogEntries maps and unmaps with their
+// mapping epochs, kept here rather than in the manager (there is one, the render context's). Written by MapOnGpuThread
+// (under m_mapped_ranges_mutex) and UnmapOnGpuThread, read by MappedSinceLogged and UnmappedSinceLogged, all on the
+// GPU thread.
+struct WeaveLogEntry {
+	uint64_t epoch = 0, vaddr = 0, size = 0;
+};
+constexpr uint64_t                         WeaveLogEntries = 256;
+std::array<WeaveLogEntry, WeaveLogEntries> g_weave_map_log {};
+uint64_t                                   g_weave_map_logged = 0;
+std::array<WeaveLogEntry, WeaveLogEntries> g_weave_unmap_log {};
+uint64_t                                   g_weave_unmap_logged = 0;
+
+} // namespace
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
     : m_scheduler(scheduler), m_buffer_cache(graphics, scheduler, m_page_manager, m_texture_cache, this),
@@ -225,6 +243,11 @@ void GpuResourceManager::MapOnGpuThread(uint64_t vaddr, uint64_t size) {
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Add(vaddr, size);
 		++m_mapping_epoch;
+		// (While the weave is enabled, the map by its epoch, the one just raised under this lock: MappingMovedSince.)
+		if (Weave::Enabled()) {
+			const auto epoch                                        = m_mapping_epoch.load(std::memory_order_relaxed);
+			g_weave_map_log[g_weave_map_logged++ % WeaveLogEntries] = {epoch, vaddr, size};
+		}
 		if (size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size)) NoteBdaSpan(vaddr, size);
 	}
 	FreshWatch(vaddr, size);
@@ -325,6 +348,8 @@ void GpuResourceManager::UnmapOnGpuThread(uint64_t vaddr, uint64_t size, bool re
 	if (registered) NoteBdaSpan(vaddr, size);
 	if (size == 0) return;
 	m_unmap_latest = epoch;
+	// (While the weave is enabled, the unmap by its epoch: UnmappedSinceLogged.)
+	if (Weave::Enabled()) g_weave_unmap_log[g_weave_unmap_logged++ % WeaveLogEntries] = {epoch, vaddr, size};
 	{ // (spec_unmap_list, under KYTY_SPECULATE=4: the unmap in the log, rounded out to granules, the granule walk's grain;
 	  // otherwise nothing logged and the log marked incomplete up to here, so a list after a flip to mode 4 answers only
 	  // what it saw)
@@ -492,6 +517,67 @@ int GpuResourceManager::UnmappedSinceByList(uint64_t epoch, uint64_t vaddr, uint
 	const auto it = std::upper_bound(m_unmap_list.begin(), m_unmap_list.end(), begin,
 	                                 [](uint64_t b, const std::pair<uint64_t, uint64_t>& r) { return b < r.second; });
 	return it != m_unmap_list.end() && it->first < end ? 1 : 0;
+}
+
+// The weave's open over a parcel's pages in one call: the unmap epochs' granules of every range (as UnmappedSince reads
+// them, a leaf looked up once while the ranges ascend through it), then each map since, newest first, matched by a
+// binary search of the ranges. A map within a granule of a range counts too: a map beside one may extend a clamp.
+bool GpuResourceManager::MappingMovedSince(uint64_t                                       epoch,
+                                           std::span<const std::pair<uint64_t, uint64_t>> sorted) const noexcept {
+	if (std::none_of(sorted.begin(), sorted.end(), [](const auto& range) { return range.second > range.first; }))
+		return false;
+	if (m_unmap_latest > epoch) {
+		constexpr uint64_t leaf_mask = (uint64_t {1} << UnmapLeafBits) - 1;
+		uint64_t           leaf_key  = ~uint64_t {0};
+		const uint64_t*    epochs    = nullptr;
+		for (const auto& [begin, end]: sorted) {
+			if (end <= begin) continue;
+			for (uint64_t g = begin >> UnmapGranuleBits, last = (end - 1) >> UnmapGranuleBits; g <= last;) {
+				const auto stop = std::min(last, g | leaf_mask);
+				if (const auto key = g >> UnmapLeafBits; key != leaf_key) {
+					leaf_key        = key;
+					const auto leaf = m_unmap_epochs.find(key);
+					epochs          = leaf != m_unmap_epochs.end() ? leaf->second.get() : nullptr;
+				}
+				if (epochs != nullptr)
+					for (auto i = g & leaf_mask; i <= (stop & leaf_mask); ++i)
+						if (epochs[i] > epoch) return true;
+				g = stop + 1;
+			}
+		}
+	}
+	return MappedSinceLogged(epoch, sorted);
+}
+
+bool GpuResourceManager::MappedSinceLogged(uint64_t                                       epoch,
+                                           std::span<const std::pair<uint64_t, uint64_t>> sorted) const noexcept {
+	constexpr uint64_t     pad = uint64_t {1} << UnmapGranuleBits;
+	const std::shared_lock lock(m_mapped_ranges_mutex); // (the map log's writer holds it: MapOnGpuThread)
+	for (uint64_t i = g_weave_map_logged; i != 0; --i) {
+		if (g_weave_map_logged - i >= WeaveLogEntries) return true; // (it turned over: not every map since is in it)
+		const auto& entry = g_weave_map_log[(i - 1) % WeaveLogEntries];
+		if (entry.epoch <= epoch) return false;
+		// (The first range ending past the map's start less the pad; then on while one begins before its end and pad.)
+		auto range = std::partition_point(sorted.begin(), sorted.end(),
+		                                  [&](const auto& r) { return r.second + pad <= entry.vaddr; });
+		for (; range != sorted.end() && range->first < entry.vaddr + entry.size + pad; ++range)
+			if (range->second > range->first) return true;
+	}
+	// (Every map is logged from the weave's start-up gates on, and a caller's epoch was read after them.)
+	return false;
+}
+
+int GpuResourceManager::UnmappedSinceLogged(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept {
+	if (size == 0 || m_unmap_latest <= epoch) return 0;
+	const uint64_t first = vaddr >> UnmapGranuleBits, last = (vaddr + size - 1) >> UnmapGranuleBits;
+	for (uint64_t i = g_weave_unmap_logged; i != 0; --i) {
+		if (g_weave_unmap_logged - i >= WeaveLogEntries) return 2; // (it turned over: not every unmap since is in it)
+		const auto& entry = g_weave_unmap_log[(i - 1) % WeaveLogEntries];
+		if (entry.epoch <= epoch) return 0;
+		if ((entry.vaddr >> UnmapGranuleBits) <= last && first <= ((entry.vaddr + entry.size - 1) >> UnmapGranuleBits))
+			return 1;
+	}
+	return 2; // (no entry as old as `epoch`: UnmappedSince's walk answers)
 }
 
 // KYTY_BDA_SPAN_CAP (live bda_span_cap; -1, the default: 4096 under KYTY_SPECULATE=4, else 0; 0: 256 as before; N: N): the

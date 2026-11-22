@@ -29,6 +29,7 @@
 #include "local-platform.h"
 #include "native-resource-state.h"
 #include "scene-tags.h"
+#include "weave.h"
 
 #include <algorithm>
 #include <array>
@@ -69,6 +70,41 @@
 namespace Libs::Graphics {
 
 namespace {
+
+// The longest the weave's reader or a worker waits for m_lock before its question gives the answer that declines. A
+// holder inside one of the cache's calls is usually out within it; declined at the first look, each such question of a
+// worker's was a hole (Inner Ward: 830-1,385 holes a frame with 8 workers and the GPU thread asking).
+constexpr auto AskWait = std::chrono::microseconds {5};
+
+// m_lock for a question the weave's reader or one of its workers asks (Weave::OffGpuThread; a worker inside its draw,
+// the reader as it reads guest memory, Memory::TryReadGpuCleanBackingToHost): waited for at most AskWait there, never
+// without limit, since the GPU thread may hold it while it keeps a slot a worker's draw holds (EraseRetired,
+// Weave::HoldsSlot, under InsertImage's retries; the reader holds none: a declined answer there fails its read, the
+// conservative way). False: still held after the wait, and the caller gives the answer that declines. Every other
+// thread takes it as before.
+[[nodiscard]] bool LockToAsk(std::unique_lock<TextureCacheLock>& lock) {
+	if (!Weave::OffGpuThread()) {
+		lock.lock();
+		return true;
+	}
+	if (lock.try_lock()) return true;
+	// (try_lock looks with a plain load first: the wait leaves the lock's line to the holder, as lock()'s spin does.)
+	const auto until = std::chrono::steady_clock::now() + AskWait;
+	do {
+		for (int i = 0; i < 4; ++i) _mm_pause();
+		if (lock.try_lock()) return true;
+	} while (std::chrono::steady_clock::now() < until);
+	return false;
+}
+// The lock-free first look of such a question (TextureCacheLock::ReadShared): on the reader or a worker, a holder
+// inside reads as `held`, not waited for here (each caller's `held` goes on to its locked question, whose LockToAsk
+// waits).
+template <typename Read>
+[[nodiscard]] bool ReadToAsk(TextureCacheLock& lock, Read&& read, bool held) {
+	if (!Weave::OffGpuThread()) return lock.ReadShared(read);
+	bool result = held;
+	return lock.TryReadShared(read, result) ? result : held;
+}
 
 // Guest frames an overlapping image must stay unused before a lookup of another image may delete
 // it. (Compared with scheduler ticks before, dozens a frame: a 4K target and a 2560x1440 one the
@@ -4492,8 +4528,11 @@ bool TextureCache::IsSampledDepthCurrent(ImageId id, const ImageDesc& desc, uint
 }
 
 bool TextureCache::IsTargetCurrent(ImageId id, const ImageInfo& requested, uint64_t& epoch) {
-	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
-	const auto     current = m_resolution_epoch.load(std::memory_order_relaxed);
+	std::optional<ReadLock> lock; // (mode 4: shared on a speculation's thread)
+	std::unique_lock        ask {m_lock, std::defer_lock};
+	if (!Weave::OffGpuThread()) lock.emplace(m_lock);
+	else if (!LockToAsk(ask)) return false; // (a weave worker's: not proven)
+	const auto current = m_resolution_epoch.load(std::memory_order_relaxed);
 	if (m_lock.SharedMode()) // (mode 4, UploadWindow: a target being uploaded is not current)
 		if (const auto* target = m_slot_images.try_get(id); target != nullptr && target->refreshing) return false;
 	// FindImage takes the last owner with the requested backing (on the first page or in the region);
@@ -4559,8 +4598,9 @@ void TextureCache::UpdateImage(ImageId id) {
 
 bool TextureCache::HasImageStartingAt(uint64_t address) {
 	// (The bucket bits are written under m_lock: a clear one needs neither the lock nor the map.)
-	if (!m_lock.ReadShared([&] { return MayStartAt(address); })) return false;
-	std::scoped_lock lock {m_lock};
+	if (!ReadToAsk(m_lock, [&] { return MayStartAt(address); }, true)) return false;
+	std::unique_lock lock {m_lock, std::defer_lock};
+	if (!LockToAsk(lock)) return true; // (a weave worker's: one may)
 	return MayStartAt(address) && m_image_starts.contains(address);
 }
 
@@ -6066,8 +6106,9 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	// No image over the range: neither the lock nor the page walk. (The command processor asks for every indirect
 	// register table, ~11K a frame at 1-1, in memory the CPU writes; the locked instruction alone was 0.7% of the GPU
 	// thread.) A registration racing a reader without the lock makes no image the GPU wrote.
-	if (!m_lock.ReadShared([&] { return MayHaveImagesRead(address, size); })) return false;
-	std::scoped_lock lock {m_lock};
+	if (!ReadToAsk(m_lock, [&] { return MayHaveImagesRead(address, size); }, true)) return false;
+	std::unique_lock lock {m_lock, std::defer_lock};
+	if (!LockToAsk(lock)) return true; // (the weave reader's or a worker's: one may be)
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		const auto& image = m_slot_images[id];
 		// Guest memory holds the CPU's write into the image, and the image can no longer
@@ -6165,8 +6206,11 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 		return false;
 	};
 	if (!MetaFilterMayHold(address)) return not_cleared();
-	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
-	const auto     found = m_surface_metas.find(address);
+	std::optional<ReadLock> lock; // (mode 4: shared on a speculation's thread)
+	std::unique_lock        ask {m_lock, std::defer_lock};
+	if (!Weave::OffGpuThread()) lock.emplace(m_lock);
+	else if (!LockToAsk(ask)) return true; // (a weave worker's: one may be pending)
+	const auto found = m_surface_metas.find(address);
 	// KYTY_SPEC_PREDICT_DCC (live spec_predict_dcc): a surface DCC fills clear (every frame, in the game) is read by a
 	// speculation as cleared when it finds it not: a fill in work not committed yet, of its command buffer or an earlier
 	// one it is not chained to, may clear it before its commit ("commit: a surface cleared"). The draw that would consume
@@ -6416,6 +6460,9 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 void TextureCache::EraseRetired() {
 	std::erase_if(m_retired, [&](const auto& retired) {
 		if (!Spec::PacketsPassed(retired.second)) return false;
+		// (A weave worker inside a draw may have found it by its id: kept until that draw ends. Weave::ImageRetiring.)
+		if (Weave::Active() && Weave::HoldsSlot(Weave::Slot::Image, retired.first.index, retired.first.generation))
+			return false;
 		ImageSerials::Move(m_slot_images[retired.first].serial_slot);
 		ForgetMetaSlot(m_slot_images[retired.first].serial_slot);
 		m_slot_images.erase(retired.first);

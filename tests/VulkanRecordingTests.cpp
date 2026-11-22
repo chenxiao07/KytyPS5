@@ -1,6 +1,7 @@
 #include "vulkan-recording.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstdio>
@@ -17,6 +18,10 @@ void SetThreadName(const char*) {}
 uint32_t ThreadId() { return 0; }
 void PinThreadToCpuList(const char*) {}
 bool ProcessCpusIdleTime(uint64_t*, uint64_t*) { return false; }
+}
+// The mode global the generated wrappers read (graphics/guest_gpu, not linked into this test either).
+extern "C" {
+volatile std::atomic<uint32_t> kyty_local_speculate_mode {0};
 }
 extern "C" volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode;
 namespace {
@@ -85,6 +90,11 @@ VKAPI_ATTR VkResult VKAPI_CALL Counter(VkDevice, VkSemaphore, uint64_t* value) {
     *value = 123;
     return VK_SUCCESS;
 }
+// A command the recording has no form for: made only directly, and never reached here.
+VKAPI_ATTR void VKAPI_CALL DirectOnly(VkCommandBuffer, VkDescriptorUpdateTemplate, VkPipelineLayout, uint32_t,
+                                      const void*) {
+    Check(false);
+}
 }
 
 int main() {
@@ -97,6 +107,7 @@ int main() {
     api.vkEndCommandBuffer = End;
     api.vkGetSemaphoreCounterValue = Counter;
     api.vkCmdSetLineWidth = LineWidth;
+    api.vkCmdPushDescriptorSetWithTemplateKHR = DirectOnly;
     LocalVulkanRecording::Install();
     {
         LocalVulkanRecording::ProducerScope scope;
@@ -269,6 +280,121 @@ int main() {
             splice_lo = UINT32_MAX;
             splice_hi = 0;
         }
+
+        // A weave worker's calls recorded apart: a thread with no producer records through the apart marker into a
+        // buffer of its own, and none of it reaches the driver. This thread splices parts of the buffer into its
+        // stream, each replayed in the stream's order on the target, from where the last part stopped. Calls no part
+        // takes (before a part, after a last part, in a buffer never spliced) are destroyed unexecuted.
+        auto* const marker = LocalVulkanRecording::ApartMarker();
+        auto* const apart_target = reinterpret_cast<VkCommandBuffer>(uintptr_t {0x2000});
+        // Draw numbers: 10 of this thread's own; part A; 2 own on the target (the GPU thread's own draws between two
+        // parts); part B; 1 own; part C; 10 own; then the fine buffer's. A part of 1,000 draws crosses a chunk's end
+        // (about 1,300 draws a chunk).
+        constexpr uint32_t part = 1000, fine = 3000;
+        const uint32_t first = static_cast<uint32_t>(draws.load());
+        const uint32_t a = first + 10, b = a + part + 2, c = b + part + 1, after = c + part, d = after + 10;
+        std::shared_ptr<LocalVulkanRecording::Apart> parts, fine_parts, failed_chain, failed_direct, unproven, dropped,
+            restarted, unspliced;
+        uint64_t cut[4] {}, parts_calls = 0, restarted_calls = 0;
+        std::thread recorder([&] {
+            constexpr uint32_t never = 999999; // (a draw that must not reach the driver)
+            Check(LocalVulkanRecording::ApartCalls() == 0);
+            LocalVulkanRecording::BeginApart();
+            Check(!LocalVulkanRecording::PacketsEnabled() && !LocalVulkanRecording::DeferredSubmitEnabled());
+            {
+                uint32_t values[] {100, 101, 102, 103};
+                api.vkCmdPushConstants(marker, nullptr, 0, 0, sizeof(values), values);
+                values[0] = 0;
+            }
+            for (uint32_t i = 0; i < part; ++i) api.vkCmdDraw(marker, 3, 1, a + i, 7);
+            cut[0] = LocalVulkanRecording::ApartCalls();
+            for (uint32_t i = 0; i < 5; ++i) api.vkCmdDraw(marker, 3, 1, never, 7);
+            cut[1] = LocalVulkanRecording::ApartCalls();
+            for (uint32_t i = 0; i < part; ++i) api.vkCmdDraw(marker, 3, 1, b + i, 7);
+            cut[2] = LocalVulkanRecording::ApartCalls();
+            for (uint32_t i = 0; i < part; ++i) api.vkCmdDraw(marker, 3, 1, c + i, 7);
+            cut[3] = LocalVulkanRecording::ApartCalls();
+            for (uint32_t i = 0; i < 7; ++i) api.vkCmdDraw(marker, 3, 1, never, 7);
+            parts_calls = LocalVulkanRecording::ApartCalls();
+            parts = LocalVulkanRecording::EndApart(true);
+            Check(LocalVulkanRecording::ApartCalls() == 0);
+            LocalVulkanRecording::BeginApart();
+            for (uint32_t i = 0; i < fine; ++i) api.vkCmdDraw(marker, 3, 1, d + i, 7);
+            fine_parts = LocalVulkanRecording::EndApart(true);
+            // A command that cannot be recorded (an unknown extension chain) fails the buffer, and so does one on the
+            // marker with no recorded form, which never reaches the driver.
+            LocalVulkanRecording::BeginApart();
+            api.vkCmdDraw(marker, 3, 1, never, 7);
+            api.vkCmdPipelineBarrier2(marker, &extension);
+            failed_chain = LocalVulkanRecording::EndApart(true);
+            LocalVulkanRecording::BeginApart();
+            api.vkCmdDraw(marker, 3, 1, never, 7);
+            api.vkCmdPushDescriptorSetWithTemplateKHR(marker, nullptr, nullptr, 0, nullptr);
+            failed_direct = LocalVulkanRecording::EndApart(true);
+            // A call made through another handle is recorded, but the buffer is not proven.
+            LocalVulkanRecording::BeginApart();
+            api.vkCmdDraw(marker, 3, 1, never, 7);
+            api.vkCmdDraw(nullptr, 3, 1, never, 7);
+            unproven = LocalVulkanRecording::EndApart(true);
+            // Not kept; begun again (the first buffer's call destroyed); kept and never spliced.
+            LocalVulkanRecording::BeginApart();
+            api.vkCmdDraw(marker, 3, 1, never, 7);
+            dropped = LocalVulkanRecording::EndApart(false);
+            LocalVulkanRecording::BeginApart();
+            api.vkCmdDraw(marker, 3, 1, never, 7);
+            LocalVulkanRecording::BeginApart();
+            api.vkCmdDraw(marker, 3, 1, never, 7);
+            restarted_calls = LocalVulkanRecording::ApartCalls();
+            restarted = LocalVulkanRecording::EndApart(true);
+            LocalVulkanRecording::BeginApart();
+            api.vkCmdDraw(marker, 3, 1, never, 7);
+            unspliced = LocalVulkanRecording::EndApart(true);
+            // Outside a buffer a command on the marker still never reaches the driver.
+            api.vkCmdPushDescriptorSetWithTemplateKHR(marker, nullptr, nullptr, 0, nullptr);
+            Check(LocalVulkanRecording::ApartCalls() == 0 && !LocalVulkanRecording::EndApart(true));
+        });
+        recorder.join();
+        Check(parts && fine_parts && restarted && unspliced);
+        Check(!failed_chain && !failed_direct && !unproven && !dropped);
+        Check(cut[0] == part + 1 && cut[1] == cut[0] + 5 && cut[2] == cut[1] + part && cut[3] == cut[2] + part);
+        Check(parts_calls == cut[3] + 7 && restarted_calls == 1 && draws.load() == first);
+        restarted.reset();
+        unspliced.reset();
+        splice_target = apart_target;
+        splice_lo = a;
+        splice_hi = after;
+        for (uint32_t i = 0; i < 10; ++i) api.vkCmdDraw(nullptr, 3, 1, first + i, 7);
+        Check(LocalVulkanRecording::SpliceApartPart(parts, apart_target, 0, cut[0], false));
+        Check(!LocalVulkanRecording::SpliceApartPart(parts, apart_target, 0, 1, false)); // (before the last part's end)
+        api.vkCmdDraw(apart_target, 3, 1, a + part, 7);
+        api.vkCmdDraw(apart_target, 3, 1, a + part + 1, 7);
+        Check(LocalVulkanRecording::SpliceApartPart(parts, apart_target, cut[1], cut[2], false));
+        api.vkCmdDraw(apart_target, 3, 1, b + part, 7);
+        Check(!LocalVulkanRecording::SpliceApartPart(parts, apart_target, cut[2], parts_calls + 1, true));
+        Check(!LocalVulkanRecording::SpliceApartPart(parts, apart_target, cut[2], cut[2], true));
+        Check(!LocalVulkanRecording::SpliceApartPart(parts, nullptr, cut[2], cut[3], true));
+        Check(LocalVulkanRecording::SpliceApartPart(parts, apart_target, cut[2], cut[3], true));
+        Check(!LocalVulkanRecording::SpliceApartPart(parts, apart_target, cut[3], parts_calls, true)); // (after last)
+        Check(!LocalVulkanRecording::SpliceApartPart(nullptr, apart_target, 0, 1, true));
+        for (uint32_t i = 0; i < 10; ++i) api.vkCmdDraw(nullptr, 3, 1, after + i, 7);
+        std::weak_ptr<LocalVulkanRecording::Apart> apart_weak = parts;
+        parts.reset();
+        Check(api.vkEndCommandBuffer(nullptr) == VK_SUCCESS);
+        Check(apart_weak.expired() && draws.load() == d);
+        // Parts of every size from 1 to 17 calls, each resumed where the last stopped, across the chunks' ends.
+        splice_lo = d;
+        splice_hi = d + fine;
+        for (uint64_t begin = 0, size = 1; begin < fine; begin += size, size = size % 17 + 1) {
+            const uint64_t end = std::min<uint64_t>(begin + size, fine);
+            Check(LocalVulkanRecording::SpliceApartPart(fine_parts, apart_target, begin, end, end == fine));
+        }
+        apart_weak = fine_parts;
+        fine_parts.reset();
+        Check(api.vkEndCommandBuffer(nullptr) == VK_SUCCESS);
+        Check(apart_weak.expired() && draws.load() == d + fine);
+        splice_target = nullptr;
+        splice_lo = UINT32_MAX;
+        splice_hi = 0;
     }
-    std::puts("Vulkan recording: raw/packet ordering, pointer/plan ownership, state invalidation, ring reuse, query, fallback and passive splice / discard passed");
+    std::puts("Vulkan recording: raw/packet ordering, pointer/plan ownership, state invalidation, ring reuse, query, fallback, passive splice / discard and apart parts passed");
 }

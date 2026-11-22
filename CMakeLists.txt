@@ -483,6 +483,9 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.cpp"
 	"${KYTY_SOURCE_DIR}/local/jit-arena.h"
 	"${KYTY_SOURCE_DIR}/local/jit-arena.cpp"
+	"${KYTY_SOURCE_DIR}/local/weave.h"
+	"${KYTY_SOURCE_DIR}/local/weave-parcel.h"
+	"${KYTY_SOURCE_DIR}/local/weave.cpp"
 )
 list(REMOVE_DUPLICATES kyty_emulator_src)
 
@@ -941,6 +944,7 @@ if(LINUX)
 		"${KYTY_SOURCE_DIR}/loader/redZonePatcher.cpp"
 		"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
 		"${KYTY_SOURCE_DIR}/local/static-seeds.cpp"
+		"${KYTY_SOURCE_DIR}/local/weave.cpp"
 		"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
 		"${KYTY_SOURCE_DIR}/libs/libKernel.cpp"
 		"${KYTY_SOURCE_DIR}/kernel/syncOnAddress.cpp"

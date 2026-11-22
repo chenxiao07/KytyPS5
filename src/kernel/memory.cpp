@@ -23,6 +23,7 @@
 #include "texture-offload.h"
 #include "write-guard.h"
 #include "speculation-state.h"
+#include "weave.h"
 
 #include <algorithm>
 #include <array>
@@ -1505,7 +1506,8 @@ static bool SpeculationReadsClean(uint64_t vaddr, uint64_t size) {
 
 bool TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
-		if (!Graphics::GuestGpu::IsTranslatingThread() ||
+		// (A weave thread's read is proven too: both caches' tests take the lock another thread's question needs.)
+		if (!(Graphics::GuestGpu::IsTranslatingThread() || Weave::OffGpuThread()) ||
 		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
 		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
 			return false;

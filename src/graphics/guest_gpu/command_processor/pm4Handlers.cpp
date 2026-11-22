@@ -20,6 +20,7 @@
 #include "draw-state-observer.h"
 #include "live-counters.h"
 #include "speculation-state.h"
+#include "weave.h"
 
 #include <algorithm>
 #include <array>
@@ -96,6 +97,11 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	// (KYTY_SPECULATE unset: a plain global, not the two thread-locals, on every indirect table.)
 	const bool speculating = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0;
 	if (speculating && Spec::Record() != nullptr) return true;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	// (Nor the weave's reader and workers: they read the table in GuardTable's guarded copy, and the readback and the
+	// counters are the GPU thread's.)
+	if (Weave::OffGpuThread()) return true;
+#endif
 	LiveCounters::Add(LiveCounters::IndirectTables);
 	LiveCensus::Scope census(LiveCensus::CommandSync, 0, 0);
 	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(address, bytes)) {
@@ -189,23 +195,18 @@ void ReportOtherData(uint32_t cmd_id, uint32_t offset) {
 			}
 		}
 	}
-	for (uint32_t i = 0; i < pairs; ++i) {
-		const uint32_t raw = words[size_t {i} * 2u];
-		if (raw == 0xffffffffu) continue;
-		const uint32_t offset = NormalizeRegisterOffset(raw);
-		const bool     known  = bank == 0   ? offset < Pm4::CX_NUM || HwCtxIsFakeRegister(offset)
-		                        : bank == 1 ? offset < Pm4::SH_NUM || offset == Pm4::SH_NOP
-		                                    : offset < Pm4::UC_NUM || offset == Pm4::UC_NOP;
-		if (!known) {
-			static std::atomic<uint32_t> reports {0};
-			if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
-				std::printf("Speculation: an indirect register table at 0x%016llx not applied off the GPU thread: entry %u of %u "
-				            "names register 0x%08x, past its bank (%s)\n",
-				            static_cast<unsigned long long>(reinterpret_cast<uint64_t>(table)), i, pairs, raw,
-				            bank == 0 ? "context" : bank == 1 ? "sh" : "uconfig");
-			if (Spec::Current() != nullptr) Spec::Refuse("indirect register table of other data");
-			return false;
-		}
+	if (const uint32_t i = RegisterTableFirstPastBank(words, pairs, bank); i != pairs) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+			std::printf(
+			    "Speculation: an indirect register table at 0x%016llx not applied off the GPU thread: entry %u of %u "
+			    "names register 0x%08x, past its bank (%s)\n",
+			    static_cast<unsigned long long>(reinterpret_cast<uint64_t>(table)), i, pairs, words[size_t {i} * 2u],
+			    bank == 0   ? "context"
+			    : bank == 1 ? "sh"
+			                : "uconfig");
+		if (Spec::Current() != nullptr) Spec::Refuse("indirect register table of other data");
+		return false;
 	}
 	table = words;
 	return true;
@@ -559,6 +560,19 @@ static bool HwCtxIsFakeRegister(uint32_t cmd_offset) {
 		case Pm4::CX_NOP: return true;
 		default: return false;
 	}
+}
+
+uint32_t RegisterTableFirstPastBank(const uint32_t* words, uint32_t pairs, uint32_t bank) {
+	for (uint32_t i = 0; i < pairs; ++i) {
+		const uint32_t raw = words[size_t {i} * 2u];
+		if (raw == 0xffffffffu) continue;
+		const uint32_t offset = NormalizeRegisterOffset(raw);
+		const bool     known  = bank == 0   ? offset < Pm4::CX_NUM || HwCtxIsFakeRegister(offset)
+		                        : bank == 1 ? offset < Pm4::SH_NUM || offset == Pm4::SH_NOP
+		                                    : offset < Pm4::UC_NUM || offset == Pm4::UC_NOP;
+		if (!known) return i;
+	}
+	return pairs;
 }
 
 static void HwCtxIgnoreFakeRegister([[maybe_unused]] uint32_t cmd_offset,

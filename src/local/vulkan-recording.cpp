@@ -294,8 +294,10 @@ public:
         if (active || was_recording) state_epoch.fetch_add(1, std::memory_order_relaxed);
         was_recording = active;
     }
+    // (By reference: the wrappers pass a named capture, which a by-value parameter would copy on the GPU thread's
+    // hottest path.)
     template<typename Capture>
-    bool Enqueue(Capture capture) {
+    bool Enqueue(Capture&& capture) {
         if (passive) [[unlikely]] return EnqueuePassive(capture);
         for (int attempt = 0; attempt < 2; ++attempt) {
             WaitForRoom();
@@ -532,6 +534,7 @@ void InvalidateRawState() {
 thread_local uint64_t g_writing_calls = 0; // (the work calls that change memory or images)
 thread_local uint64_t g_sync_calls    = 0; // (and the others: barriers, render pass begins, timestamps)
 thread_local uint64_t g_packets       = 0;
+#include "weave-recording.inc"
 #include "local-vulkan-recording.inc"
 } // namespace
 
@@ -690,4 +693,5 @@ ProducerScope::ProducerScope() {
     producer = std::make_unique<Stream>();
 }
 ProducerScope::~ProducerScope() { producer.reset(); }
+#include "weave-recording-api.inc"
 } // namespace LocalVulkanRecording
