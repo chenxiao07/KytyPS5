@@ -781,6 +781,8 @@ struct State {
 	// packet could be a hole (Stop).
 	const char* refused = nullptr;
 	bool        stop    = false;
+	// (KYTY_FRAMEGEN) its first G-buffer draw was left to the GPU thread for the frame's camera (LeaveCameraDraw).
+	bool camera_left = false;
 	// The speculation of the command buffer before this one while it is not committed (run-ahead): its pending guest
 	// memory writes, the ranges its work writes and the image states it leaves are this one's too (ReadJournaled,
 	// JournalIntersects, WrittenIntersects, ChainImage). Null: none. What the speculations before it write, merged
@@ -1553,9 +1555,10 @@ struct State {
 		overlay.clear();
 		overlay_index.clear();
 		used.clear();
-		refused  = nullptr;
-		stop     = false;
-		previous = nullptr;
+		refused     = nullptr;
+		stop        = false;
+		camera_left = false;
+		previous    = nullptr;
 		chain_journal.Clear();
 		chain_written.Clear();
 		chain_members.clear();
@@ -1656,6 +1659,13 @@ inline void Stop(const char* why) noexcept {
 	if (!On()) return;
 	Refuse(why);
 	if (t_state != nullptr) t_state->stop = true;
+}
+// (KYTY_FRAMEGEN, a translation thread other than the GPU thread's, at a G-buffer draw) whether to leave it to the GPU
+// thread, whose normal way reads the frame's camera from it: a speculation's first one, which the commit runs as a hole
+// (taking the camera when its frame has none yet), and every one on a thread without a speculation.
+[[nodiscard]] inline bool LeaveCameraDraw() noexcept {
+	auto* state = Current();
+	return state == nullptr || !std::exchange(state->camera_left, true);
 }
 
 // The guest memory the command processor writes (labels): a wait on one is satisfied by work of the GPU queues, which

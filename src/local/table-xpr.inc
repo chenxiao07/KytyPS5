@@ -958,9 +958,14 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	}
 	if (pair.refused) return Spec::Refuse(Spec::TablePairRefusedText), TableResult::Native;
 	// KYTY_FRAMEGEN: the frame's first G-buffer draw goes the normal way (or a native record's), whose hook reads the
-	// camera from its constants (a speculation's thread leaves them all to the GPU thread's).
+	// camera from its constants. A speculation's thread cannot see whether its frame has the camera yet: it leaves the
+	// first G-buffer draw of its speculation to the GPU thread (a hole, the normal way there while the frame has no
+	// camera) and draws the others the table way. The frame's first G-buffer draw is the first of the speculation that
+	// holds it, so the camera comes from the same draw as without speculation. (Leaving them all made ~30 holes a frame,
+	// 4-9 ms of the commit's, issue #378.)
 	if (FrameGen::Enabled() && pair.programs[0] != nullptr &&
-	    FrameGen::IsGbufferVertexShader(pair.programs[0]->shader_hash) && (Role() != 0 || FrameGen::WantsCamera()))
+	    FrameGen::IsGbufferVertexShader(pair.programs[0]->shader_hash) &&
+	    (Role() == 0 ? FrameGen::WantsCamera() : Spec::LeaveCameraDraw()))
 		return Spec::Refuse("table: frame generation camera"), TableResult::Native;
 	// A store at most once a frame per pair and draw state, within the frame's budget (kyty_local_table_store_budget):
 	// while its programs and pipeline compile, the pair's draws take the normal path (Deferred). (Once a frame per pair
