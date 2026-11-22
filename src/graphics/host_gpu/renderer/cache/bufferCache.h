@@ -320,15 +320,19 @@ public:
 	// A pending freed range whose copies were submitted (FreedReadbackReady will be true without new work).
 	[[nodiscard]] bool   FreedReadbackSubmitted() const;
 	[[nodiscard]] size_t FreedReadbackPendingCount() const { return m_freed_readbacks.size(); }
-	// GPU thread. That range's bytes written back where the GPU still owns their pages and wrote nothing since, then its
+	// GPU thread. That range's bytes written back where the GPU still owns their pages and wrote nothing since (and, with
+	// KYTY_FREED_READBACK_BYTE_GATE, only those still GPU-written themselves: not ones given to the CPU since), then its
 	// buffers let go as DropFreedRange's are (none where GPU-written bytes stayed in it: in use again); `let_go` adds the
 	// bytes of buffers let go. False when no pending range was ready.
 	bool ServiceFreedReadback(FreeBlocksQuery free_blocks, FreeBlockSplits* splits, uint64_t* let_go);
 	// The pending freed ranges' counts since the last call (the 30 s report): ranges left pending, their GPU-written bytes,
 	// ranges read back at the free instead (no room in the ring), ranges serviced, ranges whose buffers stayed (GPU-written
-	// bytes left), bytes not written back (written by the GPU since, or given back to the CPU by a fault's readback).
+	// bytes left), bytes not written back (written by the GPU since, or given back to the CPU by a fault's readback), bytes
+	// written back, and bytes on pages the GPU owns again that the byte gate did not write back (CPU-owned since the free,
+	// KYTY_FREED_READBACK_BYTE_GATE; not in stale_bytes) or written back already by an older pending range over them.
 	struct FreedReadbackCounts {
 		uint64_t pending = 0, pending_bytes = 0, at_free = 0, serviced = 0, kept = 0, stale_bytes = 0;
+		uint64_t written_bytes = 0, refused_bytes = 0, older_bytes = 0;
 	};
 	[[nodiscard]] FreedReadbackCounts TakeFreedReadbackCounts() { return std::exchange(m_freed_counts, {}); }
 	// The mapped parts of registered buffers in [begin, end), adjacent ones merged.

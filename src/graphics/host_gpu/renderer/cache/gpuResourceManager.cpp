@@ -404,7 +404,8 @@ void GpuResourceManager::FreedByGame(uint64_t vaddr, uint64_t size) {
 		            "buffers over other free blocks too, the allocator's lists read %llu times), %.1f ms on the GPU thread (at most "
 		            "%.2f ms a block); BDA reads of unbuffered pages so far %llu (KYTY_ENGINE_FREE_BUFFERS); read back later %llu "
 		            "(%.1f MiB; %llu at the free), %llu done in %.1f ms of the idle GPU thread (at most %.2f ms), %llu kept "
-		            "(written again), %.2f MiB not written back (written since)\n",
+		            "(written again), %.2f MiB not written back (written since), %.2f MiB written back, %.2f MiB refused "
+		            "(CPU-owned since the free), %.2f MiB written back already (an older freed range's)\n",
 		            static_cast<unsigned long long>(report.blocks), static_cast<double>(report.bytes) / 1048576.0,
 		            static_cast<double>(report.let_go) / 1048576.0, static_cast<double>(report.splits.cut) / 1048576.0,
 		            static_cast<unsigned long long>(report.splits.lists), static_cast<double>(report.ns) / 1e6,
@@ -413,7 +414,9 @@ void GpuResourceManager::FreedByGame(uint64_t vaddr, uint64_t size) {
 		            static_cast<unsigned long long>(counts.pending), static_cast<double>(counts.pending_bytes) / 1048576.0,
 		            static_cast<unsigned long long>(counts.at_free), static_cast<unsigned long long>(counts.serviced),
 		            static_cast<double>(report.idle_ns) / 1e6, static_cast<double>(report.idle_max_ns) / 1e6,
-		            static_cast<unsigned long long>(counts.kept), static_cast<double>(counts.stale_bytes) / 1048576.0);
+		            static_cast<unsigned long long>(counts.kept), static_cast<double>(counts.stale_bytes) / 1048576.0,
+		            static_cast<double>(counts.written_bytes) / 1048576.0, static_cast<double>(counts.refused_bytes) / 1048576.0,
+		            static_cast<double>(counts.older_bytes) / 1048576.0);
 		std::fflush(stdout);
 		const auto next = start + std::chrono::seconds(30);
 		report          = {};
