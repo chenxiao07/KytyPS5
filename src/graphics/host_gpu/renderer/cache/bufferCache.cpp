@@ -3808,13 +3808,11 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	// uncommitted speculation's GPU work writes takes the GPU path here, as in order (where that write marked the whole
 	// 4 KiB page GPU-modified before the copy: the memory tracker's grain), instead of a journaled processor copy whose
 	// commit then reads the read-watched page (CopyGuestMemory's fault: a full GPU drain and download on this thread).
-	// (WrittenIntersects is byte-exact; IsRegionGpuModified's page test is the tracker's.) GPU-written bytes not yet
-	// downloaded (HasGpuDirtyBytes) count too.
+	// (WrittenIntersects is byte-exact; IsRegionGpuModified's page test is the tracker's, and covers the GPU-written
+	// bytes not yet downloaded, HasGpuDirtyBytes: every range those hold is on a GPU-modified page.)
 	static auto& copy_gpu_dirty = LiveSwitch::Find("copy_gpu_dirty_src", 0);
 	const auto   gpu_dirty      = [&](uint64_t vaddr) {
-		if (copy_gpu_dirty.load(std::memory_order_relaxed) == 0) return false;
-		if (HasGpuDirtyBytes(vaddr, size)) return true;
-		if (spec == nullptr) return false;
+		if (spec == nullptr || copy_gpu_dirty.load(std::memory_order_relaxed) == 0) return false;
 		const auto begin = vaddr & ~(TRACKER_PAGE_SIZE - 1);
 		const auto end   = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 		return spec->WrittenIntersects(begin, end - begin);

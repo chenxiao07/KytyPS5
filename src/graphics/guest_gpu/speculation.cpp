@@ -1973,7 +1973,9 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 				};
 				// copy_gpu_dirty_src (live, default 0; the flyby GPU drain): a copy is also "written" when its source or
 				// destination is now on a GPU-modified page (the tracker's 4 KiB grain: a neighbour's GPU write since the
-				// translation), holds GPU-written bytes, shares a page with the segment's own GPU writes (Before marks it
+				// translation; it covers GPU-written bytes not read back, HasGpuDirtyBytes, which is not asked: that range
+				// set's query cost ~4.5% of this thread over ~1100 ranges a frame), shares a page with the segment's own
+				// GPU writes (Before marks it
 				// GPU-modified, before After's copy), or has an image over its source: in order CopyBuffer takes its GPU
 				// path for each. Made in After as the GPU copy, with the refusals below; else After's processor copy
 				// would read the read-watched page (CopyGuestMemory's fault: a full GPU drain on this thread).
@@ -1994,8 +1996,7 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 				};
 				const auto copy_dirty = [&](uint64_t begin, uint64_t size) {
 					return copy_written(begin, size) ||
-					       (gpu_dirty_fix && (fix_buffers.IsRegionGpuModified(begin, size) ||
-					                          fix_buffers.HasGpuDirtyBytes(begin, size) || segment_writes_page(begin, size)));
+					       (gpu_dirty_fix && (fix_buffers.IsRegionGpuModified(begin, size) || segment_writes_page(begin, size)));
 				};
 				bool copies_written = false;
 				for (size_t i = from.cpu_copies; i < to.cpu_copies && !copies_written; ++i)
@@ -2090,9 +2091,9 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 				}
 				for (size_t i = from.chain_reads; i < to.chain_reads; ++i) {
 					const auto& read = state.chain_reads[i];
-					// (copy_gpu_dirty_src: a word GPU work wrote that is not read back yet: read here it faults into a
-					// full GPU drain on this thread; a GPU copy made at an earlier commit leaves such destinations.)
-					if (gpu_dirty_fix && fix_buffers.HasGpuDirtyBytes(read.address, 4u))
+					// (copy_gpu_dirty_src: a word on a GPU-modified page (read watched): read here it faults into a full
+					// GPU drain on this thread; a GPU copy made at an earlier commit leaves such destinations.)
+					if (gpu_dirty_fix && fix_buffers.IsRegionGpuModified(read.address, 4u))
 						return "commit: a command buffer before wrote otherwise";
 					// (KYTY_WRITE_GUARD_SPEC: a page a pending guest write guards, through the backing view: wg2's census had this
 					// read fault ~1 a frame.)
