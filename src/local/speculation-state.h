@@ -1957,6 +1957,45 @@ struct WriteStamps {
 // before it must see, in order (each speculation is checked against what was logged since it began): the ranges its
 // GPU work writes, the guest memory it writes on the CPU (the processor's writes, copies, fills), the descriptor sets
 // it retires.
+// Under KYTY_SPECULATE=4, ObtainBuffer can skip the effects note at a write memo hit (NoteGpuWriteRepeat)
+// when the slot's last entry P has the same range, source and logs, P still stands in each log, and no
+// translation has sampled a log's end since P.
+//
+// EXACT. Say R is the entry not made, p < q the two positions.
+// 1. Who holds a position. A translation's effects_from (Translate, the one sample of End between the counts below)
+//    and what is derived from it (Effects::next from its Clear, DropBefore's and the trim's bound: such a sample, or
+//    the log's end then). A late read's `since` is sampled anywhere, but FirstWriteOver(since) is asked only once
+//    FirstGpuWriteOver(effects_from) found nothing over the same read: with P or R there it is not reached.
+// 2. No effects_from is in (p, q]. Translate counts begun (an RMW), samples End, counts sampled. P's slot keeps
+//    `sampled` as read (acquire) before P's end store: each translation in it sampled before that store, p or less.
+//    R's test is an RMW on begun, fetch_add(0), and R is skipped only when it returns P's `sampled`. begun's RMWs have
+//    one order:
+//    - a count before the test's is in the value returned; as many are in P's `sampled`, and those all come before
+//      it, so they are the same translations: p or less, each has P (and R, were it made);
+//    - a count after the test's reads what the test's wrote or a later value, so it happens after the test, and with it
+//      after every end store this thread made before: its sample is q or more, past P and every entry up to R's
+//      place. It is today's translation that began after R's entry.
+//    A load in the test's place does not give the second: an end store of an entry I between P and R may still be in
+//    this thread's store buffer as the load completes; a count the load missed could then sample p + 1, under I and
+//    past P, where the original walk would find R.
+// 3. So a reader has P and R both at or after its position, or neither; and P, the earlier, is the same range and kind.
+//    - FirstWriteOver, FirstGpuWriteOver, IndexedWalk: the first is never R (P is before it). The same answer.
+//    - the stamps: a filter only, each MaybeSince followed by one of those walks, and P's stamps cover R's units at any
+//      such position. `End() > from` likewise: P is there.
+//    - WriteOverFromStamp: non-null just the same. The entry it names may be another one over the read than R, so the
+//      stop's text (its kind and source) and spec_walk_direct may differ: counters and prints, no decision.
+//    - ReadValuesHold, copy_written, JournalReadsMoved: whether a GPU write is there. P is.
+//    - host writes (ForEachHostWriteOver, their stamps) and retired sets (Effects::Take) are never skipped and keep
+//      their order among themselves; Take's unstamped range set holds P's range, which is R's.
+//    - DropBefore: its bound is never in (p, q] (1, 2), and P still stands when R is skipped (p >= base): whatever
+//      would keep R keeps P, also for a result it does not track (m_blocked).
+// 4. Writers. The skip and P are ObtainBuffer's written notes alone, whoever calls: queue 1 in order, the holes (source
+//    Hole), a commit's Before (source Commit: the committing result's own log takes them too, and it has both or
+//    neither as any reader). A commit's host notes (After's labels and copies), the holes' other notes, images' notes
+//    and retired sets between P and R are entries as today: none moves before or after another.
+// All translations count around the sample of their log's end in mode 4.
+alignas(64) inline std::atomic<uint64_t> g_effects_begun {0};
+alignas(64) inline std::atomic<uint64_t> g_effects_sampled {0};
 struct EffectsLog {
 	enum class Kind : uint8_t { GpuWrite, HostWrite, RetiredSet };
 	struct Entry {
@@ -2106,6 +2145,12 @@ struct EffectsLog {
 		                  entries.push_back({kind, t_effect_source, address, size});
 		                  end.store(base + entries.size(), std::memory_order_release);
 	}
+	// The log's number, never another's (the slots name logs by it).
+	[[nodiscard]] static uint64_t NextId() noexcept {
+		static std::atomic<uint64_t> last {0};
+		return last.fetch_add(1, std::memory_order_relaxed) + 1;
+	}
+	const uint64_t id = NextId();
 	// The first write logged from `from` on over the range (null: none).
 	[[nodiscard]] const Entry* FirstWriteOver(uint64_t from, uint64_t address, uint64_t size) const {
 		if (const auto* indexed = IndexedWalk(from, address, size, false); indexed != reinterpret_cast<const Entry*>(1))
@@ -2296,6 +2341,54 @@ inline void NoteHostWrite(uint64_t address, uint64_t size) {
 	if (size == 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) == 0) return;
 	if (t_effects != nullptr) t_effects->Add(EffectsLog::Kind::HostWrite, address, size);
 	if (t_effects_async != nullptr) t_effects_async->Add(EffectsLog::Kind::HostWrite, address, size);
+}
+// Under KYTY_SPECULATE=4, ObtainBuffer's written note uses the slot of its write
+// memo's. The logs' one writer's, the GPU thread's: no other thread has t_effects set.
+inline constexpr size_t EffectsRepeatSlots = 4096;
+inline void NoteGpuWriteRepeat(size_t slot_at, bool memo_hit, uint64_t address, uint64_t size) {
+	if (size == 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return NoteGpuWrite(address, size);
+	// (The logs a note goes to: t_effects and t_effects_async, NoteGpuWrite's.)
+	static constexpr size_t Logs = 2;
+	struct Slot { // (64 bytes: P's range, its source and logs, `sampled` before its store, its position in each log)
+		uint64_t address = 0, size = 0, key = 0, sampled = 0;
+		std::array<uint64_t, Logs> at {};
+		uint64_t pad[2] {};
+	};
+	thread_local std::unique_ptr<Slot[]> slots;
+	static_assert(sizeof(Slot) == 64, "a slot a cache line");
+
+	std::array<EffectsLog*, Logs> logs {};
+	uint32_t                      count = 0;
+	uint64_t key      = static_cast<uint64_t>(t_effect_source) + 1;
+	bool     numbered = true;
+	const auto take = [&](EffectsLog* log) {
+		if (log == nullptr) return;
+		numbered = numbered && log->id < (uint64_t {1} << 20u);
+		key |= log->id << (4u + 20u * count);
+		logs[count++] = log;
+	};
+	take(t_effects);
+	take(t_effects_async);
+	if (count == 0 || !numbered) return NoteGpuWrite(address, size);
+	if (!slots) slots = std::make_unique<Slot[]>(EffectsRepeatSlots);
+
+	auto& slot = slots[slot_at & (EffectsRepeatSlots - 1)];
+	// (A memo hit alone is skipped; a miss's note becomes the slot's.)
+	const bool same   = memo_hit && slot.address == address && slot.size == size && slot.key == key;
+	bool       stands = same; // (P still in each log)
+	for (uint32_t i = 0; i < count && stands; ++i) stands = slot.at[i] >= logs[i]->base;
+	// (Before this write's end stores, should it become P.)
+	const uint64_t sampled = g_effects_sampled.load(std::memory_order_acquire);
+	std::array<uint64_t, Logs> at {};
+	for (uint32_t i = 0; i < count; ++i) at[i] = logs[i]->base + logs[i]->entries.size();
+	// (The last test, before any store of R: R's place in the order when it is skipped. An RMW, not a load:
+	// the argument's 2. The load before it only spares the locked one where it would refuse.)
+	const bool repeat = stands && g_effects_begun.load(std::memory_order_relaxed) == slot.sampled &&
+	                    g_effects_begun.fetch_add(0, std::memory_order_seq_cst) == slot.sampled;
+	if (!repeat) {
+		NoteGpuWrite(address, size);
+		slot.address = address, slot.size = size, slot.key = key, slot.sampled = sampled, slot.at = at;
+	}
 }
 // The parts of a host write that change memory, in 16-byte granules: found before the write, logged after it
 // (NoteHostWrite's order). A speculation that read only the rest reads the same bytes after the write: the game's

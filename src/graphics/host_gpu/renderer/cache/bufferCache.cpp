@@ -3566,7 +3566,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			TouchBuffer(*buffer);
 			InvalidateCopyFeedback(vaddr, size);
 			NoteGpuWrite(vaddr, size);
-			Spec::NoteGpuWrite(vaddr, size);
+			if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) [[unlikely]]
+				Spec::NoteGpuWriteRepeat(static_cast<size_t>(&memo - m_write_memo.data()), true, vaddr, size);
+			else
+				Spec::NoteGpuWrite(vaddr, size);
 			// (No change-ring mark for the weave: the range stayed GPU-written since the write below that made this memo
 			// and marked it, since every give-back moves m_gpu_coverage_epoch, so no worker's read of it could pass.)
 			LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
@@ -3591,7 +3594,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			m_gpu_modified_ranges.Add(vaddr, size);
 		}
 		NoteGpuWrite(vaddr, size);
-		Spec::NoteGpuWrite(vaddr, size);
+		static_assert(sizeof(m_write_memo) / sizeof(m_write_memo[0]) == Spec::EffectsRepeatSlots, "a slot a memo's");
+		if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) [[unlikely]]
+			Spec::NoteGpuWriteRepeat(static_cast<size_t>(&memo - m_write_memo.data()), false, vaddr, size);
+		else
+			Spec::NoteGpuWrite(vaddr, size);
 		// (While workers run: the scout's change ring marks the range GPU-written, which the weave's open tests a
 		// parcel's pages against; the tickets' test passes over the mark.)
 		if (Weave::Active() && Scout::Running()) Scout::NoteGpuMark(vaddr, size);

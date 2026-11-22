@@ -957,7 +957,11 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 		else
 			r.state.previous = nullptr;
 		// (Where its effects begin, as it becomes the translation going on: the log keeps what it may need.)
+		// Count around the end sample so the repeat test either sees this translation or precedes its sample.
+		const bool count_effects_sample = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+		if (count_effects_sample) Spec::g_effects_begun.fetch_add(1, std::memory_order_seq_cst);
 		r.effects_from     = m_log.End();
+		if (count_effects_sample) Spec::g_effects_sampled.fetch_add(1, std::memory_order_seq_cst);
 		r.state.log_end    = &m_log.end;
 		translator.current = &r;
 	}
