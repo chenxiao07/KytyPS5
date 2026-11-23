@@ -1493,6 +1493,11 @@ bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBackingToHost(vaddr, data, size);
 }
 
+bool TryReadBackingOnceToHost(uint64_t vaddr, void* data, uint64_t size) {
+	return (g_guest_address_space != nullptr && g_guest_address_space->TryCopyCachedBackingToHost(vaddr, data, size)) ||
+	       TryReadBackingToHost(vaddr, data, size);
+}
+
 // A speculative translation's CPU read of guest memory no GPU work wrote: not memory its own work or its guest
 // memory writes write (both wait for its commit), and noted (speculation-state.h: a hole that writes it stops the
 // commit before the reading segment).

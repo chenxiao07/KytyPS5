@@ -544,6 +544,30 @@ public:
 		return TryReadBacking(vaddr, data, size);
 	}
 
+	// Predict the slot's physical pages from this thread's last translation. A mapping
+	// writer drains every slot, whatever pages it holds. Check pending after the claim (Claim), then the region epoch:
+	// a remap either completed before that check or cannot move the mapping until the slot is dropped. The physical
+	// pages fence both kinds of writer as Narrow does, including a write through a different virtual alias.
+	bool TryCopyCachedBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
+		if (kyty_local_backing_read_mode.load(std::memory_order_relaxed) == 0) return false;
+		if (!IsAvailable()) return false;
+		if (data == nullptr || size == 0 || size > 0x10000 || UINT64_MAX - vaddr < size) return false;
+		const auto region = vaddr >> RegionEpochBits;
+		if (region >= RegionEpochCount || region != ((vaddr + size - 1) >> RegionEpochBits)) return false;
+		const auto& cached = HostReadTranslationOf(vaddr);
+		const auto& entry  = cached.entry;
+		if (!GuestFreeRangeContains(entry.vaddr, entry.size, vaddr, size)) return false;
+		const auto offset = entry.backing_offset + (vaddr - entry.vaddr);
+		if (!RangeOk(offset, size)) return false;
+
+		const auto pages = PackPages(offset, offset + size);
+		BackingReadTransaction read(*this, pages);
+		if (!read.Acquired() || cached.epoch != RegionEpoch(vaddr)) return false;
+		if (FindBackingWriter(pages) != BackingWriter::None) return false;
+		std::memcpy(data, m_backing_base + offset, size);
+		return true;
+	}
+
 	// The backing bytes of [vaddr, vaddr + size) when one mapping covers the range, else null.
 	// The backing view lives as long as the store; unmapping only detaches the guest range.
 	const uint8_t* BackingPointer(uint64_t vaddr, uint64_t size) {
@@ -1263,22 +1287,19 @@ private:
 		std::atomic<uint64_t>& m_published;
 	};
 
+	enum class BackingWriter { None, Data, Cpu };
+	[[gnu::always_inline]] BackingWriter FindBackingWriter(uint64_t pages) const {
+		if (PagesOverlap(m_data_write_pages.load(std::memory_order_seq_cst), pages)) return BackingWriter::Data;
+		if (PagesOverlap(m_cpu_write_pages.load(std::memory_order_seq_cst), pages)) return BackingWriter::Cpu;
+		return BackingWriter::None;
+	}
+
 	class BackingReadTransaction {
 	public:
 		KYTY_CLASS_NO_COPY(BackingReadTransaction);
-		explicit BackingReadTransaction(GuestBackingStore& store): m_store(store) {
-			// A reader per slot (this thread's first, then the next free one); it holds every page until Narrow
-			// names the ones it copies.
-			if (m_store.m_host_write_pending.load(std::memory_order_relaxed)) return;
-			thread_local const size_t first = std::hash<std::thread::id> {}(std::this_thread::get_id());
-			for (size_t i = 0; i < HostReadSlots && m_slot == nullptr; ++i) {
-				auto&    slot = m_store.m_host_read_slots[(first + i) % HostReadSlots].pages;
-				uint64_t idle = 0;
-				if (slot.load(std::memory_order_relaxed) == 0 &&
-				    slot.compare_exchange_strong(idle, AllPages, std::memory_order_seq_cst))
-					m_slot = &slot;
-			}
-			if (m_slot != nullptr && m_store.m_host_write_pending.load(std::memory_order_seq_cst)) Release();
+		explicit BackingReadTransaction(GuestBackingStore& store): m_store(store) { Claim(AllPages); }
+		[[gnu::always_inline]] BackingReadTransaction(GuestBackingStore& store, uint64_t pages): m_store(store) {
+			Claim(pages);
 		}
 		~BackingReadTransaction() { Release(); }
 		bool Acquired() const { return m_slot != nullptr; }
@@ -1287,8 +1308,7 @@ private:
 		bool Narrow(uint64_t begin, uint64_t end) {
 			const auto pages = PackPages(begin, end);
 			m_slot->store(pages, std::memory_order_seq_cst);
-			if (PagesOverlap(m_store.m_data_write_pages.load(std::memory_order_seq_cst), pages) ||
-			    PagesOverlap(m_store.m_cpu_write_pages.load(std::memory_order_seq_cst), pages)) {
+			if (m_store.FindBackingWriter(pages) != BackingWriter::None) {
 				Release();
 				return false;
 			}
@@ -1318,6 +1338,21 @@ private:
 			if (m_store.m_fence_sleepers.load(std::memory_order_seq_cst) != 0) m_store.WakeFenceSleepers();
 		}
 	private:
+		// A reader per slot (this thread's first, then the next free one). A normal read holds all pages until
+		// Narrow names the ones it copies. A cached prediction can name those pages in the claim itself.
+		[[gnu::always_inline]] void Claim(uint64_t pages) {
+			if (m_store.m_host_write_pending.load(std::memory_order_relaxed)) return;
+			thread_local const size_t first = std::hash<std::thread::id> {}(std::this_thread::get_id());
+			for (size_t i = 0; i < HostReadSlots && m_slot == nullptr; ++i) {
+				auto&    slot = m_store.m_host_read_slots[(first + i) % HostReadSlots].pages;
+				uint64_t idle = 0;
+				if (slot.load(std::memory_order_relaxed) == 0 &&
+				    slot.compare_exchange_strong(idle, pages, std::memory_order_seq_cst))
+					m_slot = &slot;
+			}
+			if (m_slot != nullptr && m_store.m_host_write_pending.load(std::memory_order_seq_cst)) Release();
+		}
+
 		// The small lock-free readers' release (and Narrow's refusal, and the constructor's): with the switch on, as a range
 		// reader's (a fence writer may sleep on any slot, SleepWhileOver); off (no writer sleeps), a release store as before.
 		void Release() {
@@ -2035,6 +2070,9 @@ public:
 	}
 	bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBackingToHost(vaddr, data, size);
+	}
+	bool TryCopyCachedBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
+		return m_backing->TryCopyCachedBackingToHost(vaddr, data, size);
 	}
 
 	const uint8_t* BackingPointer(uint64_t vaddr, uint64_t size) { return m_backing->BackingPointer(vaddr, size); }

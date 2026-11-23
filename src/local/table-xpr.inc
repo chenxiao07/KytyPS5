@@ -2832,6 +2832,14 @@ vk::DeviceAddress RenderExecutor::TableRingCopy(uint64_t address, uint64_t size,
 	return device;
 }
 
+// A fresh mode-4 ring copy tries one publication of its cached backing pages.
+[[gnu::noinline]] static std::optional<uint64_t> TableSpecBackingOnce(StreamBuffer& upload, uint64_t address, uint64_t size) {
+	const auto [mapped, offset] = upload.Map(size, 16, false);
+	if (mapped == nullptr || !Libs::LibKernel::Memory::TryReadBackingOnceToHost(address, mapped, size)) return std::nullopt;
+	upload.Commit();
+	return offset;
+}
+
 bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
                                  std::array<vk::DeviceAddress, 2>& blocks, bool* writes) {
 	return TableBlocks<Weave::Ordered>(pair, user_data, blocks, writes);
@@ -3228,11 +3236,17 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 							} else if (spec_shared != nullptr && spec_own()) {
 								device = spec_shared->copy.device;
 								spec->NoteCleanRead(address, size);
-							} else if (auto [mapped, offset] = upload.Map(size, 16, false);
-							           mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(address, mapped, size)) {
-								upload.Commit();
+							} else if (const auto offset = [&]() __attribute__((always_inline)) -> std::optional<uint64_t> {
+								if (spec_shared != nullptr) return TableSpecBackingOnce(upload, address, size);
+								if (auto [mapped, at] = upload.Map(size, 16, false);
+								    mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(address, mapped, size)) {
+									upload.Commit();
+									return at;
+								}
+								return std::nullopt;
+							}(); offset) {
 								if (spec != nullptr) spec->NoteCleanRead(address, size);
-								device = upload.BufferDeviceAddress() + offset;
+								device = upload.BufferDeviceAddress() + *offset;
 								LiveCounters::Add(LiveCounters::TableRingCopies);
 								LiveCounters::Add(LiveCounters::TableRingBytes, size);
 								if (spec_shared != nullptr) // (after its note)
