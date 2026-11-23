@@ -228,6 +228,8 @@ inline thread_local bool (*t_backing_copy)(void* out, uint64_t address, uint64_t
 #endif
 }
 
+inline constexpr size_t CommitImageScratchCapacity = 1024;
+
 // spec_commit_targets (under KYTY_SPECULATE=4 only): a target left to its commit's
 // acquisition (Speculation::Before).
 struct PendingTarget {
@@ -532,6 +534,20 @@ struct Segment {
 		bool     valid = false, any_pending = false;
 		uint64_t min_since = UINT64_MAX, begin = UINT64_MAX, end = 0;
 	} pending_summary;
+	// Sealed from worker-private notes in mode 4.
+	// Only the proposal range and its completion budget can move at commit.
+	struct CommitImageIndex {
+		std::vector<std::pair<const Image*, size_t>> uses;
+		std::vector<uint64_t>                         bound_sets;
+		size_t                                       proposal_first = SIZE_MAX, proposal_end = 0;
+		size_t                                       completion_first = 0, completion_end = 0; // pending-slot prefix counts
+
+		[[nodiscard]] size_t FindUse(const Image* image, size_t missing) const {
+			const auto it = std::ranges::lower_bound(uses, image, std::less<const Image*> {},
+			                                         [](const auto& use) { return use.first; });
+			return it != uses.end() && it->first == image ? it->second : missing;
+		}
+	} commit_image_index;
 };
 
 // KYTY_SPEC_DRAW_INDIRECT_VERIFY (live spec_draw_indirect_verify, N: every Nth DRAW_INDIRECT taken as a table draw, 0
@@ -755,6 +771,7 @@ struct State {
 		// data, metadata range or stencil plane (SegmentWritesRange: the completion's write test).)
 		std::function<bool()>                   resolve;
 		std::function<bool(uint64_t, uint64_t)> resolve_over;
+		size_t                                 pending_image_slots = 0; // at most one completed entry per pending slot
 	};
 	std::vector<ProposedSet> proposed_sets;
 	void SettleProposedSets(size_t committed_segment, bool all) {
@@ -1610,7 +1627,14 @@ struct State {
 	// the overlay.
 	void CloseSegment(size_t recorded_count) {
 		FlushCommandWords(); // (the segment's command words among its reads)
-		const size_t pending_from = closed.empty() ? 0 : closed.back().end.pending_buffers;
+		const auto*  previous_segment = closed.empty() ? nullptr : &closed.back();
+		const size_t pending_from     = previous_segment != nullptr ? previous_segment->end.pending_buffers : 0;
+		const bool   image_index      = ModeFour();
+		const auto*  previous_index   = image_index && previous_segment != nullptr ? &previous_segment->commit_image_index : nullptr;
+		const size_t sets_from        = previous_index != nullptr ? previous_segment->end.sets : 0;
+		const size_t targets_from     = previous_index != nullptr ? previous_segment->end.pending_targets : 0;
+		const size_t proposal_from    = previous_index != nullptr ? previous_index->proposal_end : 0;
+		const size_t completion_from  = previous_index != nullptr ? previous_index->completion_end : 0;
 		// Start the next segment with an empty touch filter.
 		TouchSeenReset();
 		auto& segment    = closed.emplace_back();
@@ -1638,6 +1662,29 @@ struct State {
 			                          entry.found_stencil_modified, entry.writes, false, entry.not_sampled, false,
 			                          entry.layer_lo, entry.layer_hi, entry.layer_other, entry.layer_nontarget});
 			entry.used = false;
+		}
+		if (image_index) {
+			auto& plan = segment.commit_image_index;
+			// Proposals append in open-segment order, including those left by a refused packet.
+			plan.proposal_first   = proposal_from;
+			plan.proposal_end     = proposed_sets.size();
+			plan.completion_first = completion_from;
+			plan.completion_end   = completion_from;
+			for (size_t i = proposal_from; i < plan.proposal_end; ++i)
+				plan.completion_end += proposed_sets[i].pending_image_slots;
+			if (pending_targets.size() > targets_from) {
+				plan.uses.reserve(segment.images.size());
+				for (size_t i = 0; i < segment.images.size(); ++i) plan.uses.emplace_back(segment.images[i].image, i);
+				std::ranges::sort(plan.uses, [](const auto& a, const auto& b) {
+					return a.first == b.first ? a.second < b.second : std::less<const Image*> {}(a.first, b.first);
+				});
+			}
+			// An earlier set can conflict only if an earlier proposal had pending slots.
+			if (completion_from != 0 && sets.size() > sets_from) {
+				plan.bound_sets.assign(sets.begin() + static_cast<ptrdiff_t>(sets_from), sets.end());
+				std::ranges::sort(plan.bound_sets);
+				plan.bound_sets.erase(std::unique(plan.bound_sets.begin(), plan.bound_sets.end()), plan.bound_sets.end());
+			}
 		}
 		used.clear();
 		bda_all = false;

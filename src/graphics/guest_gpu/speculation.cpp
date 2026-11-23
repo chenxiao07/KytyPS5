@@ -281,9 +281,12 @@ void Speculation::TakeShared() {
 	m_effects.Take(log);
 }
 
+static void PrepareCommitImageScratch();
+
 Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t base, uint32_t threads, bool pass_thread)
     : m_renderer(renderer), m_chain(std::make_unique<CommandProcessor>(renderer, interrupt_id)),
       m_state(std::make_unique<CommandProcessor>(renderer, interrupt_id)), m_interrupt_id(interrupt_id) {
+	if (Spec::ModeFour()) PrepareCommitImageScratch();
 	m_state->SetStateOnly(true);
 	if (threads == 0)
 		threads = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4
@@ -2372,6 +2375,15 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 					proposed.segment = index + 1;
 					if (proposed.on_hole) proposed.on_hole();
 				}
+			// The moved ordinals and their slots immediately precede the next segment's, including after consecutive redos.
+			auto& moved = result.state.closed[index].commit_image_index;
+			auto& next  = result.state.closed[index + 1].commit_image_index;
+			if (moved.proposal_first != SIZE_MAX && next.proposal_first != SIZE_MAX) {
+				next.proposal_first    = moved.proposal_first;
+				next.completion_first  = moved.completion_first;
+				moved.proposal_first   = moved.proposal_end;
+				moved.completion_first = moved.completion_end;
+			}
 			const auto run = RunHole(result, cp, index, false);
 			if (run == HoleRun::Blocked) return result.blocked = index, result.blocked_as_hole = true, Progress::Blocked;
 			if (run == HoleRun::Changed) return result.stop_past = true, Progress::Stopped;
@@ -2508,6 +2520,70 @@ struct ImageAtBeforeStart {
 	bool    registered = false;
 };
 
+using CompletedImage = Spec::State::ProposedSet::Completed;
+
+struct CompletedNow {
+	const Image*          image  = nullptr;
+	uint64_t              serial = 0;
+	vk::ImageLayout       layout = vk::ImageLayout::eUndefined;
+	const CompletedImage* entry  = nullptr;
+};
+
+static auto CompletionKey(const Image* image, uint64_t serial) {
+	return std::pair {reinterpret_cast<uintptr_t>(image), serial};
+}
+
+struct IndexedCompletion {
+	const CompletedImage* entry;
+	size_t                ordinal; // original order among this segment's completions
+
+	[[nodiscard]] auto Key() const { return CompletionKey(entry->image, entry->serial); }
+};
+
+struct CommitImageScratch {
+	bool                                          ready = false, borrowed = false;
+	std::vector<ImageAtBeforeStart>               at_start;
+	std::vector<std::pair<const Image*, uint32_t>> layers_drawn;
+	std::vector<IndexedCompletion>                completed;
+};
+
+static CommitImageScratch& CommitImageScratchStorage() {
+	static thread_local CommitImageScratch storage;
+	return storage;
+}
+
+static void PrepareCommitImageScratch() {
+	// Reserve the GPU thread's scratch before processing any mode-4 segments.
+	auto& storage = CommitImageScratchStorage();
+	if (storage.ready) return;
+	storage.at_start.reserve(Spec::CommitImageScratchCapacity);
+	storage.layers_drawn.reserve(Spec::CommitImageScratchCapacity);
+	storage.completed.reserve(Spec::CommitImageScratchCapacity);
+	storage.ready = true;
+}
+
+// A nested Before, if any, uses the linear fallback.
+struct CommitImageScratchLease {
+	CommitImageScratch* scratch = nullptr;
+
+	explicit CommitImageScratchLease(bool fits) {
+		if (!fits) return;
+		auto& storage = CommitImageScratchStorage();
+		if (!storage.ready || storage.borrowed) return;
+		storage.borrowed = true;
+		scratch          = &storage;
+	}
+	~CommitImageScratchLease() {
+		if (scratch == nullptr) return;
+		scratch->at_start.clear();
+		scratch->layers_drawn.clear();
+		scratch->completed.clear();
+		scratch->borrowed = false;
+	}
+	CommitImageScratchLease(const CommitImageScratchLease&)            = delete;
+	CommitImageScratchLease& operator=(const CommitImageScratchLease&) = delete;
+};
+
 // (Before: an image of the segment's entries gone: erased (before Before or in it: its slot's generation moved), its
 // slot another image's (the serial), or unregistered in this Before (ReclaimImageMemory takes registered images only:
 // a victim a speculation's packet still holds is erased by a later EraseRetired, whatever the GPU still has recorded).
@@ -2582,10 +2658,22 @@ void Speculation::Before(Result& result, size_t index) {
 		state.srt_failed = true;
 		return;
 	}
+	const auto& image_plan = segment.commit_image_index;
+	const bool  has_index  = image_plan.proposal_first != SIZE_MAX;
+	const auto  limit      = Spec::CommitImageScratchCapacity;
+	// Each pending target can add at most one layer entry, and each pending slot at most one completion.
+	const bool overflow = has_index && (segment.images.size() > limit || to.pending_targets - from.pending_targets > limit ||
+	                                    image_plan.completion_end - image_plan.completion_first > limit);
+	if (overflow) LiveCounters::Add(LiveCounters::SpecCommitImageIndexOverflowFallbacks);
+	const CommitImageScratchLease scratch_lease(has_index && !overflow);
+	auto* const image_scratch = scratch_lease.scratch;
+	const bool  indexed       = image_scratch != nullptr;
+
 	// Its images as they are before anything here can erase or unregister one (the last loop's ImageGoneInBefore).
-	const auto                      erase_epoch = textures.EraseEpoch();
-	std::vector<ImageAtBeforeStart> images_at_start;
-	images_at_start.reserve(segment.images.size());
+	const auto erase_epoch = textures.EraseEpoch();
+	std::optional<std::vector<ImageAtBeforeStart>> fallback_at_start;
+	auto& images_at_start = indexed ? image_scratch->at_start : fallback_at_start.emplace();
+	if (!indexed) images_at_start.reserve(segment.images.size());
 	for (const auto& use: segment.images) {
 		const auto id = textures.LiveImageId(*use.image);
 		images_at_start.push_back({id, id && use.image->registered});
@@ -2722,35 +2810,48 @@ void Speculation::Before(Result& result, size_t index) {
 	// nothing once a check before it failed, t_checks_failed.) Then what the proposals make at their commit (a capture's
 	// colour targets no image existed for: their images made, ProposedSet::resolve), only once every check passed, up to
 	// the first that cannot (the segment stops: nothing more made).
+	const std::span all_proposals(state.proposed_sets);
+	const auto proposals = indexed ? all_proposals.subspan(image_plan.proposal_first,
+	                                                       image_plan.proposal_end - image_plan.proposal_first)
+	                               : all_proposals;
 	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
 		Spec::t_check_segment = index;
-		for (const auto& proposed: state.proposed_sets)
+		for (const auto& proposed: proposals)
 			if (proposed.segment == index && proposed.check) {
 				Spec::t_checks_failed = state.images_failed;
 				if (!proposed.check()) state.images_failed = true;
 			}
 		Spec::t_checks_failed = false;
 		if (!state.images_failed && state.any_resolve)
-			for (const auto& proposed: state.proposed_sets)
+			for (const auto& proposed: proposals)
 				if (proposed.segment == index && proposed.resolve && !proposed.resolve()) {
 					state.images_failed = true;
 					break;
 				}
 	}
 	// (A set whose pending slots' memory the segment writes stopped it before this: the commit's checks before Before.)
-	for (auto& proposed: state.proposed_sets)
-		if (proposed.segment == index && proposed.complete) {
+	for (auto& proposed: proposals) {
+		if (proposed.segment != index) continue;
+		if (proposed.complete) {
 			if (!proposed.complete()) state.images_failed = true;
 			proposed.complete = nullptr;
 		}
+		// A failed set can still have completed some slots. Keep those actual entries as the old walk does.
+		if (indexed)
+			for (const auto& slot: proposed.completed)
+				image_scratch->completed.push_back({&slot, image_scratch->completed.size()});
+	}
 	// spec_commit_targets: the targets it left to its commit, acquired as the normal path does at the draw, before their
 	// states are restored to those its barriers start from (the acquisition's upload and clear stay: RestoreState
 	// transitions from them). A target found Undefined or per subresource, or not acquired, fails the segment (the
 	// caller stops it before the splice).
-	std::vector<std::pair<const Image*, uint32_t>> layers2_drawn; // (spec_depth_layers2: the (image, layer)s acted on)
+	std::optional<std::vector<std::pair<const Image*, uint32_t>>> fallback_layers2_drawn;
+	auto& layers2_drawn = indexed ? image_scratch->layers_drawn : fallback_layers2_drawn.emplace();
 	for (size_t i = from.pending_targets; i < to.pending_targets; ++i) {
 		const auto& pending = state.pending_targets[i];
-		const auto  use     = std::ranges::find(segment.images, pending.image, &Spec::ImageUse::image);
+		const auto  use     = indexed
+		                         ? segment.images.begin() + static_cast<ptrdiff_t>(image_plan.FindUse(pending.image, segment.images.size()))
+		                         : std::ranges::find(segment.images, pending.image, &Spec::ImageUse::image);
 		if (pending.depth_layers2) {
 			// spec_depth_layers2: this draw's acquisition and load, as the normal path makes them at the draw, in record
 			// order, ahead of the segment's replay: FindDepthTarget (the layers' upload, the metadata, the HTile entry), the
@@ -2883,40 +2984,66 @@ void Speculation::Before(Result& result, size_t index) {
 	// still where it differs (spec_completed_stop_differs_n), where two completions of the image in this segment left
 	// different snapshots, where two completions' layouts differ (the test above), and for a barrier-recorded use (the
 	// second form, unchanged).
-	struct CompletedNow {
-		const Image*                               image  = nullptr;
-		uint64_t                                   serial = 0;
-		vk::ImageLayout                            layout = vk::ImageLayout::eUndefined;
-		const Spec::State::ProposedSet::Completed* entry  = nullptr;
-	};
-	std::vector<CompletedNow> completed_now;
-	for (const auto& proposed: state.proposed_sets)
-		if (proposed.segment == index)
-			for (const auto& slot: proposed.completed) completed_now.push_back({slot.image, slot.serial, slot.layout, &slot});
+	std::optional<std::vector<CompletedNow>> fallback_completed;
+	std::span<const CompletedNow> completed_now;
+	if (!indexed) {
+		auto& entries = fallback_completed.emplace();
+		for (const auto& proposed: all_proposals)
+			if (proposed.segment == index)
+				for (const auto& slot: proposed.completed) entries.push_back({slot.image, slot.serial, slot.layout, &slot});
+		completed_now = entries;
+	}
+	std::span<const IndexedCompletion> completion_index;
+	if (indexed) {
+		// Group by identity and serial, keeping the original order within each group for snapshot comparisons.
+		std::ranges::sort(image_scratch->completed, [](const IndexedCompletion& a, const IndexedCompletion& b) {
+			return a.Key() == b.Key() ? a.ordinal < b.ordinal : a.Key() < b.Key();
+		});
+		completion_index = image_scratch->completed;
+	}
 	// Two completions of one image (the same object and serial) in different layouts: one barrier state cannot hold both
 	// (two sets of this segment completing it, a colour slot's ShaderReadOnly and a depth slot's DepthStencilReadOnly:
 	// TableCompletePendingImages transits it once for each, and the replay binds both descriptors with it in the last
 	// one's layout). Among this segment's completions, and those of an earlier segment's set this segment binds (its
 	// handle among the segment's sets: spec_set_cpu_dirty_stop off only). Whether or not the segment's images hold it (with
 	// no use of it the loop below never meets it): the segment stops before the splice (target_failed).
-	if (!completed_now.empty() && !state.target_failed && !state.images_failed) {
+	if ((!completed_now.empty() || !completion_index.empty()) && !state.target_failed && !state.images_failed) {
 		const auto bound_begin = state.sets.begin() + static_cast<ptrdiff_t>(from.sets);
 		const auto bound_end   = state.sets.begin() + static_cast<ptrdiff_t>(to.sets);
-		for (const auto& c: completed_now) {
-			const auto other_layout = [&](const auto& s) { return s.image == c.image && s.serial == c.serial && s.layout != c.layout; };
-			bool       conflict     = std::ranges::any_of(completed_now, other_layout);
-			for (const auto& proposed: state.proposed_sets) {
-				if (conflict) break;
-				if (proposed.segment >= index || proposed.completed.empty() ||
-				    std::find(bound_begin, bound_end, proposed.completed.front().set) == bound_end)
-					continue;
-				conflict = std::ranges::any_of(proposed.completed, other_layout);
+		const auto fallback_conflict = [&] {
+			for (const auto& c: completed_now) {
+				const auto other_layout = [&](const auto& s) { return s.image == c.image && s.serial == c.serial && s.layout != c.layout; };
+				bool       conflict     = std::ranges::any_of(completed_now, other_layout);
+				for (const auto& proposed: all_proposals) {
+					if (conflict) break;
+					if (proposed.segment >= index || proposed.completed.empty() ||
+					    std::find(bound_begin, bound_end, proposed.completed.front().set) == bound_end)
+						continue;
+					conflict = std::ranges::any_of(proposed.completed, other_layout);
+				}
+				if (conflict) return true;
 			}
-			if (conflict) {
-				TargetFailed(state, TargetLayouts);
-				break;
+			return false;
+		};
+		const auto indexed_conflict = [&] {
+			const auto different = [](const IndexedCompletion& a, const IndexedCompletion& b) {
+				return a.Key() == b.Key() && a.entry->layout != b.entry->layout;
+			};
+			if (std::ranges::adjacent_find(completion_index, different) != completion_index.end()) return true;
+			// Every current group has one layout now. Probe it once per earlier slot of a set bound here.
+			for (const auto& proposed: all_proposals.first(image_plan.proposal_first)) {
+				if (proposed.completed.empty()) continue;
+				if (!std::ranges::binary_search(image_plan.bound_sets, proposed.completed.front().set)) continue;
+				for (const auto& slot: proposed.completed) {
+					const auto key = CompletionKey(slot.image, slot.serial);
+					const auto it  = std::ranges::lower_bound(completion_index, key, {}, &IndexedCompletion::Key);
+					if (it != completion_index.end() && it->Key() == key && it->entry->layout != slot.layout) return true;
+				}
 			}
-		}
+			return false;
+		};
+		// Both walks expose only the boolean and this shared refusal reason.
+		if (indexed ? indexed_conflict() : fallback_conflict()) TargetFailed(state, TargetLayouts);
 	}
 	const bool erased = textures.EraseEpoch() != erase_epoch;
 	for (size_t i = 0; i < segment.images.size(); ++i) {
@@ -2956,7 +3083,19 @@ void Speculation::Before(Result& result, size_t index) {
 			}
 		}
 		const auto this_image = [&](const CompletedNow& c) { return c.image == use.image && c.serial == use.serial; };
-		if (!completed_now.empty() && std::ranges::any_of(completed_now, this_image)) {
+		std::span<const IndexedCompletion> matches;
+		if (!completion_index.empty()) {
+			const auto [first, last] = std::ranges::equal_range(completion_index, CompletionKey(use.image, use.serial), {},
+			                                                   &IndexedCompletion::Key);
+			matches = std::span(first, last);
+		}
+		const auto every_completion = [&](const auto& predicate) {
+			if (indexed) return std::ranges::find_if_not(matches, predicate, &IndexedCompletion::entry) == matches.end();
+			return std::ranges::all_of(completed_now, [&](const CompletedNow& c) {
+				return !this_image(c) || predicate(c.entry);
+			});
+		};
+		if (indexed ? !matches.empty() : !completed_now.empty() && std::ranges::any_of(completed_now, this_image)) {
 			if (use.sample_lo == UINT32_MAX && !use.sample_other) {
 				bool kept = false; // (still whole in the layout of every completion of it, with the completion's access; or
 				                   // spec_completed_snapshot: its state the completions' one snapshot)
@@ -2965,7 +3104,7 @@ void Speculation::Before(Result& result, size_t index) {
 					const auto&            now = use.image->backing.state;
 					kept = use.image->backing.subresource_states.empty() &&
 					       now.access_mask == vk::AccessFlags2 {vk::AccessFlagBits2::eShaderRead} &&
-					       std::ranges::all_of(completed_now, [&](const CompletedNow& c) { return !this_image(c) || c.layout == now.layout; });
+					       every_completion([&](const CompletedImage* c) { return c->layout == now.layout; });
 					if (kept) {
 						LiveCounters::Add(LiveCounters::SpecCompletedKeptWholeN);
 					} else if (Spec::CompletedSnapshotOn()) {
@@ -2978,21 +3117,13 @@ void Speculation::Before(Result& result, size_t index) {
 						                          const VulkanImageState& b, const std::vector<VulkanImageState>& b_sub) {
 							return same(a, b) && std::ranges::equal(a_sub, b_sub, same);
 						};
-						const Spec::State::ProposedSet::Completed* first = nullptr;
-						bool                                       equal = true;
-						for (const auto& c: completed_now) {
-							if (!this_image(c)) continue;
-							if (c.entry == nullptr || !c.entry->snapshot) {
-								equal = false;
-								break;
-							}
-							if (first == nullptr) {
-								first = c.entry;
-							} else if (!same_all(first->state, first->subresources, c.entry->state, c.entry->subresources)) {
-								equal = false;
-								break;
-							}
-						}
+						const CompletedImage* first = nullptr;
+						const bool equal = every_completion([&](const CompletedImage* c) {
+							if (c == nullptr || !c->snapshot) return false;
+							if (first != nullptr) return same_all(first->state, first->subresources, c->state, c->subresources);
+							first = c;
+							return true;
+						});
 						kept = equal && first != nullptr &&
 						       same_all(now, use.image->backing.subresource_states, first->state, first->subresources);
 						LiveCounters::Add(kept ? LiveCounters::SpecCompletedKeptSnapshotN : LiveCounters::SpecCompletedStopDiffersN);
@@ -3003,7 +3134,7 @@ void Speculation::Before(Result& result, size_t index) {
 				continue;
 			}
 			constexpr auto sro    = vk::ImageLayout::eShaderReadOnlyOptimal;
-			const bool     lc_sro = std::ranges::all_of(completed_now, [&](const CompletedNow& c) { return !this_image(c) || c.layout == sro; });
+			const bool     lc_sro = every_completion([&](const CompletedImage* c) { return c->layout == sro; });
 			const bool     found_sro = use.found_subresources.empty()
 			                               ? use.found.layout == sro
 			                               : std::ranges::all_of(use.found_subresources, [&](const auto& s) { return s.layout == sro; });

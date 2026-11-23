@@ -1459,6 +1459,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				return replaces || (*holder && !(*holder)->pending_images.empty());
 			};
 			if (!raw->pending_images.empty()) {
+				spec->proposed_sets.back().pending_image_slots = raw->pending_images.size();
 				// (The images it completes, each with its serial and the slot's layout, and the set's handle: for its segment's
 				// Before, and spec_set_cpu_dirty_stop off for the commits of later segments that bind it, CommitSegments'
 				// reuse test.)
