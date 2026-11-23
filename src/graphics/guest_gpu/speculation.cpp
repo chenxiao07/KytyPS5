@@ -394,6 +394,7 @@ void Speculation::ResyncStatePass() {
 	}
 }
 
+// The pass gives each chunk's start snapshot to its translation result.
 bool Speculation::StatePass(const Job& job, uint64_t which) {
 	if (job.reset) m_state->Reset();
 	if (job.kind != Job::Kind::Graphics) return job.kind == Job::Kind::Flip; // (a flip preparation leaves the state as it is)
@@ -404,11 +405,10 @@ bool Speculation::StatePass(const Job& job, uint64_t which) {
 	for (;;) {
 		// A chunk from here: where it starts, and its record, which reads through the one before while that is not done.
 		Chunk chunk;
-		chunk.start = std::make_unique<CommandProcessorState>();
-		m_state->SaveStateTo(*chunk.start);
 		chunk.at = execution;
 		{
 			std::lock_guard lock(m_mutex);
+			chunk.start = std::move(m_pass_snapshot);
 			chunk.record = TakeRecord();
 			if (const auto* entry = EntryOf(job.serial); entry != nullptr && !entry->chunks.empty())
 				chunk.record->previous = entry->chunks.back().record.get();
@@ -416,6 +416,9 @@ bool Speculation::StatePass(const Job& job, uint64_t which) {
 				chunk.record->previous = before->chunks.back().record.get();
 			m_pass_record = chunk.record.get();
 		}
+		if (!chunk.start) chunk.start = std::make_unique<CommandProcessorState>();
+		// (Only this pass touches m_state while m_state_busy; SaveStateTo overwrites every member.)
+		m_state->SaveStateTo(*chunk.start);
 		chunk.record->Inherit(); // (a copy's source the records before it write is not read: Spec::State::Resolve)
 		Spec::t_record       = chunk.record.get();
 		const auto processed = m_state->Process(execution, job.commands);
@@ -756,7 +759,8 @@ void Speculation::AheadRun(Translator& translator) {
 		const bool         blind  = previous == nullptr && record == nullptr && job.serial > m_done_serial + 1;
 		lock.unlock();
 		const auto began  = NowNs();
-		auto       result = Translate(translator, *start, job.commands, at, previous, record, stop ? &*stop : nullptr);
+		auto       result = Translate(translator, *start, job.commands, at, previous, record, stop ? &*stop : nullptr,
+		                              &start);
 		result->serial = job.serial;
 		result->chunk  = work_chunk;
 		result->pass   = which;
@@ -1009,7 +1013,8 @@ Speculation::Outcome Speculation::CommitAhead(CommandProcessor& cp, const Job& j
 std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translator, const CommandProcessorState& start,
                                                             std::span<const uint32_t> commands,
                                                             const Pm4Execution& execution, const Result* previous,
-                                                            const Spec::State* record, const Pm4Execution* stop) {
+                                                            const Spec::State* record, const Pm4Execution* stop,
+                                                            std::unique_ptr<CommandProcessorState>* chunk_start) {
 	auto&                                      scheduler = m_renderer.GetCommandScheduler();
 	std::unique_ptr<Result>                    result;
 	std::vector<std::pair<uint64_t, uint64_t>> resolved;
@@ -1069,11 +1074,11 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	    result && cap > 0 && result->hole_states.size() > static_cast<uint64_t>(cap))
 		result->hole_states.resize(static_cast<size_t>(cap));
 	if (!result) {
-		result              = std::make_unique<Result>();
-		result->owner       = &translator;
-		result->recorder    = scheduler.CreateRecorder();
-		result->start_state = std::make_unique<CommandProcessorState>();
-		result->end_state   = std::make_unique<CommandProcessorState>();
+		result           = std::make_unique<Result>();
+		result->owner    = &translator;
+		result->recorder = scheduler.CreateRecorder();
+		if (chunk_start == nullptr) result->start_state = std::make_unique<CommandProcessorState>();
+		result->end_state = std::make_unique<CommandProcessorState>();
 	}
 	auto& r = *result;
 	// (A speculation's thread records and ends its buffers; the GPU thread's go through its recording stream.)
@@ -1087,7 +1092,13 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	                      LocalVulkanRecording::HasPassiveProducer();
 	auto& processor          = *translator.cp;
 	processor.CopyStateFrom(start); // (no packet it takes uses the constant RAM)
-	*r.start_state = start;
+	// The chunk's pointer came out of the queue under m_mutex and only this worker owns it. The processor takes
+	// the same copy as before; the chunk snapshot itself stays with this result through commit or discard.
+	if (chunk_start != nullptr) {
+		r.start_state.swap(*chunk_start);
+	} else {
+		*r.start_state = start;
+	}
 	r.serial = 0;
 	r.pass   = 0;
 	r.blind  = false;
@@ -1101,6 +1112,9 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	{
 		// (Linked under the lock: one committed or dropped since it was chosen is not; Finish unlinks the others.)
 		std::lock_guard lock(m_mutex);
+		// (A displaced snapshot is from the reuse Horizon admitted above, never from an in-flight result. The one
+		// slot hands it back to the pass under this same lock; a full slot leaves it for the worker to free.)
+		if (chunk_start != nullptr && !m_pass_snapshot) m_pass_snapshot = std::move(*chunk_start);
 		r.retired = 0;
 		kyty_local_speculations_live.fetch_add(1, std::memory_order_seq_cst); // (Finish takes it back)
 		if (previous != nullptr && previous->retired == 0)
@@ -1125,6 +1139,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 		r.state.log_end    = &m_log.end;
 		translator.current = &r;
 	}
+	if (chunk_start != nullptr) chunk_start->reset();
 	r.state.Inherit();
 	r.holes.clear();
 	r.epochs = CurrentEpochs();

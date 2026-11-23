@@ -243,7 +243,8 @@ private:
 	[[nodiscard]] std::unique_ptr<Result> Translate(Translator& translator, const CommandProcessorState& start,
 	                                                std::span<const uint32_t> commands, const Pm4Execution& execution,
 	                                                const Result* previous = nullptr, const Spec::State* record = nullptr,
-	                                                const Pm4Execution* stop = nullptr);
+	                                                const Pm4Execution* stop = nullptr,
+	                                                std::unique_ptr<CommandProcessorState>* chunk_start = nullptr);
 	// The result committed (cp and execution as TranslateAndCommit leaves them), from where it is.
 	[[nodiscard]] Outcome Commit(std::unique_ptr<Result> result, CommandProcessor& cp, Pm4Execution& execution);
 	[[nodiscard]] Outcome Continue(std::unique_ptr<Result> result, CommandProcessor& cp, Pm4Execution& execution);
@@ -379,6 +380,8 @@ private:
 	std::unique_ptr<CommandProcessorState> m_done_state;
 	Spec::State*                           m_pass_record = nullptr; // the record the state pass fills
 	std::vector<std::pair<uint64_t, std::unique_ptr<Spec::State>>> m_retired_records; // (when: m_clock)
+	// Under m_mutex: a spare from a result admitted for reuse by Horizon.
+	std::unique_ptr<CommandProcessorState> m_pass_snapshot;
 	uint64_t                          m_waits_for_ahead = 0, m_ahead_misses = 0; // (the report's)
 	uint64_t                          m_blind = 0, m_stopped = 0, m_blind_stopped = 0; // (the report's)
 	// (The report's classes of the results: committed, full (to its chunk's or submission's end) or cut short (its
