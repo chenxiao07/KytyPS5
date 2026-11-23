@@ -8,7 +8,7 @@ if (!$compiler) { throw 'Visual Studio C# compiler not found.' }
 $out = Join-Path $root '_Build/launcher-mode4-tests'
 New-Item -ItemType Directory -Force $out | Out-Null
 $exe = Join-Path $out 'LauncherMode4Tests.exe'
-$sources = @('Mode4.cs', 'Settings.cs', 'Strings.cs', 'Commands.cs', 'Platform.cs', 'Game.cs', 'KeyboardPrompts.cs', 'KeyboardLayout.cs',
+$sources = @('Mode4.cs', 'Weave.cs', 'Settings.cs', 'Strings.cs', 'Commands.cs', 'Platform.cs', 'Game.cs', 'KeyboardPrompts.cs', 'KeyboardLayout.cs',
 	'PromptTexture.cs', 'PageMarks.cs') | ForEach-Object { Join-Path $root "launcher-windows/$_" }
 $arguments = @('/nologo', '/target:exe', '/r:System.Drawing.dll', '/r:System.Management.dll', '/r:System.Web.Extensions.dll', "/out:$exe") + $sources +
 	@((Join-Path $PSScriptRoot 'LauncherMode4Tests.cs'))

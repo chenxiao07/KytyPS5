@@ -60,6 +60,7 @@ can ask y/N and for the sudo password.
 | | Direct presentation | `KYTY_PRESENT_DIRECT=1` |
 | | AMD Anti-Lag | `KYTY_ANTI_LAG=1`, `KYTY_LOW_LATENCY=1` |
 | | Parallel translation (mode 4; offered where the emulator would not stand it down: 28 GB of RAM or more) | `KYTY_SPECULATE=4` (not cleared: one exported in the shell passes through) |
+| | Parallel translation (weave; offered where the emulator would not stand it down: 10 logical CPUs on the performance cores; one of the two at a time, mode 4 first) | `KYTY_WEAVE=1` (not cleared: one exported in the shell passes through) |
 
 The game is `KYTY_GAME`, the emulator `KYTY_BIN` (the `kyty_emulator` next to the launcher, or `KYTY_BIN` when the
 launcher was started with it). The variables above that a start does not set are unset, so what the shell exported

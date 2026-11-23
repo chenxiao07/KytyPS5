@@ -2,6 +2,7 @@
 #define KYTY_LAUNCHER_LINUX_COMMANDS_H
 
 #include "mode4.h"
+#include "weave.h"
 
 #include "game.h"
 #include "platform.h"
@@ -36,6 +37,12 @@ public:
 	[[nodiscard]] Mode4::Verdict Mode4Verdict() const;
 	// The Experimental page's parallel translation (KYTY_SPECULATE=4): on, and offered on this PC.
 	[[nodiscard]] bool Mode4On() const;
+	// The weave's gate (weave.h) on the same variables, mode 4's gate among them.
+	[[nodiscard]] Weave::Verdict WeaveVerdict() const;
+	// The Experimental page's weave (KYTY_WEAVE=1): on, offered on this PC, and no mode 4 set (the emulator runs one of
+	// the two, mode 4 first; the page keeps one on, and this keeps a settings file with both on to what the emulator
+	// would run).
+	[[nodiscard]] bool WeaveOn() const;
 	// FSR upscaling: FSR 3 (built into the emulator: any graphics card), or FSR 4 (which falls back to it).
 	[[nodiscard]] bool FsrUpscaler() const;
 	// FSR 4 chosen and ready to run (an AMD graphics card, libffx_vk_linux.so and AMD's DLLs: KYTY_FSR4=1).

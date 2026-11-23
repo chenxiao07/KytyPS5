@@ -27,7 +27,7 @@ sealed class Settings {
 		// (Experimental page.)
 		new object[] {"present_direct", false}, new object[] {"vrr_flips", false}, new object[] {"antilag", false},
 		new object[] {"keep_resident", false},
-		new object[] {"fps30", false}, new object[] {"mode4", false},
+		new object[] {"fps30", false}, new object[] {"mode4", false}, new object[] {"weave", false},
 		// (Advanced page.)
 		new object[] {"extra_args", ""}, new object[] {"gpu", ""}, new object[] {"reopen_launcher", false},
 		// (Graphics page: the DLSS model, a preset letter or the DLSS version's own choice; the file has seen the game output's

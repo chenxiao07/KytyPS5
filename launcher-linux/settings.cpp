@@ -41,6 +41,7 @@ const nlohmann::ordered_json& Defaults() {
 		d["keep_resident"]       = false;
 		d["fps30"]               = false;
 		d["mode4"]               = false; // (Experimental page: KYTY_SPECULATE=4 where it is offered)
+		d["weave"]               = false; // (Experimental page: KYTY_WEAVE=1 where it is offered and mode 4 is not set)
 		d["extra_args"]          = "";
 		d["gpu"]                 = "";
 		d["dlss_preset"]         = "";

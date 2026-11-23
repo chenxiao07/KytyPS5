@@ -70,8 +70,9 @@ partial class MainWindow : Window {
 	// The Sharpening row's value for each upscaler ("0" to "0.9"), and the upscaler whose value it shows.
 	string dlssSharpness = "0", fsrSharpness = "0.6", sharpnessShown = "";
 	CheckBox fullscreen, aspect, wideBars, hdr, fps120, vsync, lowLatency, fsr, cheats, redzone, safeGpu, ecores, presentDirect, vrrFlips,
-		antiLag, keepResident, fps30, mode4, padSpeaker, reopenLauncher, keyboardPrompts;
+		antiLag, keepResident, fps30, mode4, weave, padSpeaker, reopenLauncher, keyboardPrompts;
 	TextBlock mode4Desc; // (what it does, or why it is not offered: UpdateMode4)
+	TextBlock weaveDesc; // (the same for the weave: UpdateWeave)
 	TextBlock renderNote, outputNote, upscalerNote, frameGenNote, streamlineText, cheatState, bannerTitle, bannerLine, storeLine;
 	Image banner;
 	Border bannerFallback;
@@ -920,6 +921,14 @@ partial class MainWindow : Window {
 		var mode4Offered = mode4Verdict.Gate == Mode4.Gate.Available;
 		mode4 = Switch(S.Bool("mode4") && mode4Offered, mode4Offered);
 		mode4Desc = Desc(Mode4.Description(mode4Verdict));
+		// The weave beside it, gated the same way. The emulator runs one of the two, so turning one on turns the other off.
+		// (Its feedback: #358, the weave's own thread.)
+		var weaveVerdict = commands.WeaveVerdict;
+		var weaveOffered = weaveVerdict.Gate == Weave.Gate.Available;
+		weave = Switch(S.Bool("weave") && weaveOffered && !(S.Bool("mode4") && mode4Offered), weaveOffered);
+		weaveDesc = Desc(Weave.Description(weaveVerdict));
+		mode4.Checked += (s, e) => weave.IsChecked = false;
+		weave.Checked += (s, e) => mode4.IsChecked = false;
 		return Page("experimental.title",
 			Desc(T("experimental.intro")),
 			Section("experimental.framerate"),
@@ -938,7 +947,9 @@ partial class MainWindow : Window {
 			Row(null, Feedback(80)),
 			Section("experimental.translation"),
 			Row("mode4", mode4, mode4Desc),
-			Row(null, Feedback(335)));
+			Row(null, Feedback(335)),
+			Row("weave", weave, weaveDesc),
+			Row(null, Feedback(358)));
 	}
 
 	TextBlock Feedback(int issue) {
@@ -960,6 +971,7 @@ partial class MainWindow : Window {
 		if (building) return;
 		ReadForm();
 		UpdateMode4();
+		UpdateWeave();
 		UpdateSummary();
 	}
 
@@ -976,6 +988,20 @@ partial class MainWindow : Window {
 			building = false;
 		}
 		mode4Desc.Text = Mode4.Description(verdict);
+	}
+
+	// The weave's gate again after a change, as UpdateMode4 (mode 4 in the Command-line options can stand it down).
+	void UpdateWeave() {
+		if (weave == null || weaveDesc == null) return;
+		var verdict = commands.WeaveVerdict;
+		var offered = verdict.Gate == Weave.Gate.Available;
+		if (weave.IsEnabled != offered) {
+			building = true; // (no Changed from the switch set here)
+			weave.IsChecked = S.Bool("weave") && offered && !commands.Mode4On;
+			weave.IsEnabled = offered;
+			building = false;
+		}
+		weaveDesc.Text = Weave.Description(verdict);
 	}
 
 	// The Sharpening row's value back to the upscaler it shows (the other's stays as it was).
@@ -1032,6 +1058,7 @@ partial class MainWindow : Window {
 		S.Set("fps30", fps30.IsChecked == true);
 		// (Not offered here: the saved choice kept; Play gates it.)
 		if (mode4.IsEnabled) S.Set("mode4", mode4.IsChecked == true);
+		if (weave.IsEnabled) S.Set("weave", weave.IsChecked == true);
 		S.Save();
 	}
 
@@ -1068,6 +1095,7 @@ partial class MainWindow : Window {
 		if (S.Bool("antilag")) options.Add(T("summary.antilag"));
 		if (S.Bool("keep_resident")) options.Add(T("summary.keepResident"));
 		if (commands.Mode4On) options.Add(T("summary.mode4"));
+		if (commands.WeaveOn) options.Add(T("summary.weave"));
 		if (!S.Bool("pad_speaker")) options.Add(T("summary.padSpeakerOff"));
 		if (S.Str("extra_args").Length != 0) options.Add(T("summary.extra"));
 

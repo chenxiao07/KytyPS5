@@ -95,6 +95,7 @@ const Table& English() {
 	    {"summary.antilag", "Anti-Lag"},
 	    {"summary.fps30", "30 fps lock"},
 	    {"summary.mode4", "mode 4"},
+	    {"summary.weave", "weave"},
 	    {"summary.extra", "extra options"},
 	    {"summary.mangohud", "MangoHud"},
 	    {"summary.gamemode", "GameMode"},
@@ -428,6 +429,19 @@ const Table& English() {
 	    {"mode4.fewCores",
 	     "Needs {0} logical CPUs on the performance cores, and this PC has {1}: the emulator would not "
 	     "run it."},
+	    {"weave", "Parallel translation (weave)"},
+	    {"weave.desc",
+	     "Worker threads translate the game's draws ahead, and the render thread weaves their work back "
+	     "in order (KYTY_WEAVE=1): faster where the render thread limits the frame rate. It uses about "
+	     "{0} MB more memory than with it off and keeps a processor core for the render thread. If the "
+	     "game runs worse or shows something wrong, turn it off again."},
+	    {"weave.mode4",
+	     "The extra options turn on mode 4 (KYTY_SPECULATE=4), and the emulator runs one of the two at a "
+	     "time."},
+	    {"weave.fewCores",
+	     "Needs {0} logical CPUs on the performance cores, and this PC has {1}: the emulator would not "
+	     "run it."},
+	    {"weave.needs", "Needs {0}, which the extra options turn off: the emulator would not run it."},
 	    {"feedback", "Feedback: issue #{0}"},
 
 	    {"dialog.game", "The game folder (eboot.bin, sce_sys)"},
@@ -533,6 +547,7 @@ const Table& Chinese() {
 	    {"summary.antilag", "Anti-Lag"},
 	    {"summary.fps30", "锁定 30 帧"},
 	    {"summary.mode4", "模式 4"},
+	    {"summary.weave", "编织"},
 	    {"summary.extra", "附加参数"},
 	    {"summary.mangohud", "MangoHud"},
 	    {"summary.gamemode", "GameMode"},
@@ -801,6 +816,14 @@ const Table& Chinese() {
 	     "内存。如果游戏变慢或画面出错，请再关掉。"},
 	    {"mode4.lowRam", "需要 {0} GB 或更多内存：在这台电脑上模拟器不会启用它。"},
 	    {"mode4.fewCores", "需要性能核心上有 {0} 个逻辑处理器，这台电脑只有 {1} 个：模拟器不会启用它。"},
+	    {"weave", "并行转译（编织）"},
+	    {"weave.desc",
+	     "由工作线程提前转译游戏的绘制，渲染线程再按原顺序把结果织回去（KYTY_WEAVE=1）："
+	     "在帧率受渲染线程限制时更快。比关闭时多占用约 {0} MB 内存，并为渲染线程保留一个处理器核心。"
+	     "如果游戏变慢或画面出错，请再关掉。"},
+	    {"weave.mode4", "附加参数打开了模式 4（KYTY_SPECULATE=4），而模拟器一次只运行两者中的一个。"},
+	    {"weave.fewCores", "需要性能核心上有 {0} 个逻辑处理器，这台电脑只有 {1} 个：模拟器不会启用它。"},
+	    {"weave.needs", "需要 {0}，而附加参数把它关掉了：模拟器不会启用它。"},
 	    {"feedback", "反馈：issue #{0}"},
 
 	    {"dialog.game", "游戏文件夹（eboot.bin、sce_sys）"},
@@ -910,6 +933,7 @@ const Table& Portuguese() {
 	    {"summary.antilag", "Anti-Lag"},
 	    {"summary.fps30", "trava em 30 fps"},
 	    {"summary.mode4", "modo 4"},
+	    {"summary.weave", "trama"},
 	    {"summary.extra", "opções extras"},
 	    {"summary.mangohud", "MangoHud"},
 	    {"summary.gamemode", "GameMode"},
@@ -1238,6 +1262,19 @@ const Table& Portuguese() {
 	    {"mode4.fewCores",
 	     "Precisa de {0} CPUs lógicas nos núcleos de desempenho, e este PC tem {1}: o emulador não a "
 	     "usaria."},
+	    {"weave", "Tradução paralela (trama)"},
+	    {"weave.desc",
+	     "Threads de trabalho traduzem antes os desenhos do jogo, e a thread de renderização entrelaça o "
+	     "trabalho delas de volta na ordem (KYTY_WEAVE=1): mais rápido quando a thread de renderização "
+	     "limita a taxa de quadros. Usa cerca de {0} MB a mais de memória do que desligada e reserva um "
+	     "núcleo do processador para a thread de renderização. Se o jogo ficar pior ou mostrar algo "
+	     "errado, desligue de novo."},
+	    {"weave.mode4",
+	     "As opções extras ligam o modo 4 (KYTY_SPECULATE=4), e o emulador usa um dos dois de cada vez."},
+	    {"weave.fewCores",
+	     "Precisa de {0} CPUs lógicas nos núcleos de desempenho, e este PC tem {1}: o emulador não a "
+	     "usaria."},
+	    {"weave.needs", "Precisa de {0}, que as opções extras desligam: o emulador não a usaria."},
 	    {"feedback", "Comentários: issue #{0}"},
 
 	    {"dialog.game", "A pasta do jogo (eboot.bin, sce_sys)"},

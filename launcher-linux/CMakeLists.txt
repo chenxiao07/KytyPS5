@@ -90,4 +90,28 @@ if(BUILD_TESTING)
 	target_link_libraries(kyty_launcher_mode4_tests PRIVATE nlohmann_json::nlohmann_json Vulkan::Headers Threads::Threads
 		${CMAKE_DL_LIBS})
 	add_test(NAME launcher_mode4 COMMAND $<TARGET_FILE:kyty_launcher_mode4_tests>)
+
+	# The Experimental page's weave (tests/LauncherWeaveLinuxTests.cpp), the same way: its default, its gate beside mode
+	# 4's, its text and Play's variables.
+	#   cmake --build <build> --target kyty_launcher_weave_tests && ctest -R launcher_weave
+	add_executable(kyty_launcher_weave_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/LauncherWeaveLinuxTests.cpp"
+		commands.cpp
+		game.cpp
+		platform.cpp
+		settings.cpp
+		strings.cpp
+		bytes.cpp
+		keyboard_layout.cpp
+		keyboard_layout_settings.cpp
+		keyboard_prompts.cpp
+		page_marks.cpp
+		prompt_assets.cpp
+		prompt_texture.cpp
+	)
+	target_include_directories(kyty_launcher_weave_tests PRIVATE "${KYTY_THIRD_PARTY_DIR}/stb")
+	target_compile_options(kyty_launcher_weave_tests PRIVATE -fexceptions "-iquote${CMAKE_CURRENT_SOURCE_DIR}")
+	target_link_libraries(kyty_launcher_weave_tests PRIVATE nlohmann_json::nlohmann_json Vulkan::Headers Threads::Threads
+		${CMAKE_DL_LIBS})
+	add_test(NAME launcher_weave COMMAND $<TARGET_FILE:kyty_launcher_weave_tests>)
 endif()

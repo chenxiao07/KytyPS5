@@ -36,15 +36,26 @@ sealed class Commands {
 	// Mode 4's gate (Mode4.Check) on the variables as the game will see them: the Command-line options' -Set pair, else
 	// the launcher's own environment, which the game inherits.
 	public Mode4.Verdict Mode4Verdict {
-		get {
-			var sets = ExtraOptions().Where(option => IsSet(option.Key) && option.Value != null).Select(option => option.Value).ToList();
-			return Mode4.Check(context.RamBytes, (uint)Math.Max(0, context.PerformanceCpus),
-			                   name => Mode4.FromSetOptions(sets, name) ?? Environment.GetEnvironmentVariable(name));
-		}
+		get { return Mode4.Check(context.RamBytes, (uint)Math.Max(0, context.PerformanceCpus), GameVariables()); }
+	}
+	// The variables as the game will see them: the Command-line options' -Set pair, else the launcher's own environment.
+	Func<string, string> GameVariables() {
+		var sets = ExtraOptions().Where(option => IsSet(option.Key) && option.Value != null).Select(option => option.Value).ToList();
+		return name => Mode4.FromSetOptions(sets, name) ?? Environment.GetEnvironmentVariable(name);
 	}
 	// The Experimental page's parallel translation: on, and offered on this PC (gated here, at Play: the saved choice
 	// stays as it was where it is not offered).
 	public bool Mode4On { get { return Mode4.Set(S.Bool("mode4"), Mode4Verdict) != null; } }
+	// The weave's gate (Weave.Check) on the same variables, mode 4's gate among them.
+	public Weave.Verdict WeaveVerdict {
+		get {
+			return Weave.Check(Mode4Verdict, (uint)Math.Max(0, context.PerformanceCpus), (uint)Environment.ProcessorCount,
+			                   GameVariables());
+		}
+	}
+	// The Experimental page's weave: on, offered on this PC, and no mode 4 sent (the emulator runs one of the two, mode 4
+	// first; the page keeps one on, and this keeps a settings file with both on to what the emulator would run).
+	public bool WeaveOn { get { return Weave.Set(S.Bool("weave"), WeaveVerdict, Mode4On) != null; } }
 	// FSR 3 upscaling, built into the emulator: any graphics card.
 	public bool FsrUpscaler { get { return S.Str("upscaler") == "fsr"; } }
 
@@ -146,6 +157,8 @@ sealed class Commands {
 		if (S.Bool("keep_resident")) sets.AddRange(new[] { "KYTY_RESIDENT_MB=6144", "KYTY_WORKING_SET_TRIM=0" });
 		// The parallel translation (mode 4), where it is offered: nothing otherwise, so the emulator runs as without it.
 		if (Mode4On) sets.Add("KYTY_SPECULATE=4");
+		// The weave, where it is offered and mode 4 is not sent: nothing otherwise.
+		else if (WeaveOn) sets.Add("KYTY_WEAVE=1");
 		// The audio output the game is told (it mixes for it; a TV when none is set, issue #207).
 		var audioOutput = S.Str("audio_output");
 		if (audioOutput == "headphones" || audioOutput == "amplifier" || audioOutput == "soundbar") sets.Add("KYTY_AUDIO_OUTPUT=" + audioOutput);
