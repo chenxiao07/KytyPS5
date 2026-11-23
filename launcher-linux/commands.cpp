@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <system_error>
+#include <thread>
 #include <unistd.h>
 
 namespace {
@@ -122,21 +123,39 @@ bool Commands::Dlss() const {
 	return context_.DlssAvailable() && S().Str("upscaler") == "dlss";
 }
 
-Mode4::Verdict Commands::Mode4Verdict() const {
-	const auto extra = ParseExtra(S().Str("extra_args"));
-	return Mode4::Check(context_.ram, [&](const char* name) {
-		// (KEY= in the extra options: "0" for a variable the launcher does not set itself, as Play does.)
+namespace {
+
+// The variables as the game will see them: the extra options' pair, else the launcher's own environment, which the game
+// inherits. (KEY= in the extra options: "0" for a variable the launcher does not set itself, as Play does.)
+auto GameVariable(Commands::Extra extra) {
+	return [extra = std::move(extra)](const char* name) {
 		std::optional<std::string> value;
 		for (const auto& [key, text]: extra.set)
 			if (key == name) value = text.empty() ? std::string("0") : text;
 		if (value) return *value;
 		const char* own = std::getenv(name);
 		return std::string(own != nullptr ? own : "");
-	});
+	};
+}
+
+} // namespace
+
+Mode4::Verdict Commands::Mode4Verdict() const {
+	return Mode4::Check(context_.ram, GameVariable(ParseExtra(S().Str("extra_args"))));
 }
 
 bool Commands::Mode4On() const {
 	return Mode4::On(S().Bool("mode4"), Mode4Verdict());
+}
+
+Weave::Verdict Commands::WeaveVerdict() const {
+	const auto variable = GameVariable(ParseExtra(S().Str("extra_args")));
+	return Weave::Check(Mode4::Check(context_.ram, variable), context_.performance_cpus,
+	                    std::thread::hardware_concurrency(), variable);
+}
+
+bool Commands::WeaveOn() const {
+	return Weave::On(S().Bool("weave"), WeaveVerdict(), Mode4On());
 }
 
 bool Commands::FsrUpscaler() const {
@@ -330,6 +349,8 @@ Launch Commands::Play(const GameInfo& game, bool direct) const {
 	if (S().Bool("fps30")) Put(set, "KYTY_FLIP_RATE", "1");
 	// The parallel translation (mode 4), where it is offered: nothing otherwise, so the emulator runs as without it.
 	if (Mode4On()) Put(set, "KYTY_SPECULATE", "4");
+	// The weave, where it is offered and mode 4 is not set: nothing otherwise.
+	else if (WeaveOn()) Put(set, "KYTY_WEAVE", "1");
 	// The DLSS model (a preset letter; none: the DLSS version's own choice).
 	if (const auto preset = S().Str("dlss_preset");
 	    dlss && preset.size() == 1 && preset[0] >= 'A' && preset[0] <= 'O')

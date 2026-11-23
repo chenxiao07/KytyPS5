@@ -48,6 +48,9 @@ public:
 	int                  display_height = 0; // the primary display's, or 0 (set by the window)
 	std::string
 	    efficiency_cpus; // a hybrid CPU's efficiency cores as a taskset list ("16-23"), or empty
+	// The logical CPUs of the performance cores this process may run on, as the emulator counts them for the weave
+	// (local-platform.cpp's CoreCounts), or 0 where the topology is not known.
+	uint32_t performance_cpus = 0;
 	std::vector<Terminal> terminals; // the terminal programs found, preferred first
 
 	// libkyty_dlss.so where the emulator looks for it (KYTY_DLSS_DIR, next to it, its dlss folder),

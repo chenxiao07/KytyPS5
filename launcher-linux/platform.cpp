@@ -2,6 +2,8 @@
 
 #define VK_NO_PROTOTYPES
 #include <algorithm>
+#include <bit>
+#include <cstdio>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -324,6 +326,57 @@ bool HasWord(const std::string& text, const std::string& word) {
 	return false;
 }
 
+// A sysfs CPU list ("2-3", "0,8", "0-7,16-23") as a bit mask of CPUs 0..63; false where the file is missing
+// (local-platform.cpp's ReadSysfsCpuList).
+bool ReadCpuList(const char* path, uint64_t& mask) {
+	mask = 0;
+	std::ifstream file(path);
+	if (!file) return false;
+	std::string list;
+	std::getline(file, list);
+	for (size_t at = 0; at < list.size();) {
+		const size_t end   = std::min(list.find(',', at), list.size());
+		int          first = 0, last = 0;
+		const int    n     = std::sscanf(list.substr(at, end - at).c_str(), "%d-%d", &first, &last);
+		for (int c = first; n >= 1 && c >= 0 && c <= (n == 2 ? last : first) && c < 64; ++c)
+			mask |= uint64_t {1} << c;
+		at = end + 1;
+	}
+	return true;
+}
+
+// The logical CPUs of the performance class that this process may run on, as the emulator counts them for the weave
+// (local-platform.cpp's CoreCounts on MachineCores): each online CPU's core from its topology/thread_siblings_list, the
+// performance class from /sys/devices/cpu_core/cpus where there is one (an Intel hybrid part's P-cores), else every core
+// alike, and the process's affinity; 0 where the topology is not known.
+uint32_t PerformanceCpus() {
+	uint64_t performance = 0, seen = 0, allowed = 0;
+	(void)ReadCpuList("/sys/devices/cpu_core/cpus", performance);
+	std::vector<std::pair<uint64_t, bool>> cores; // (its CPUs, a performance core)
+	for (int cpu = 0; cpu < 64; ++cpu) {
+		if (((seen >> cpu) & 1u) != 0) continue;
+		char path[96];
+		std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+		uint64_t siblings = 0;
+		if (!ReadCpuList(path, siblings)) continue; // (offline, or no such CPU)
+		siblings |= uint64_t {1} << cpu;
+		seen |= siblings;
+		cores.emplace_back(siblings, (siblings & performance) != 0);
+	}
+	cpu_set_t process;
+	CPU_ZERO(&process);
+	if (sched_getaffinity(getpid(), sizeof(process), &process) == 0)
+		for (int c = 0; c < 64; ++c)
+			if (CPU_ISSET(c, &process)) allowed |= uint64_t {1} << c;
+	bool fastest = false; // (the highest class among the cores the process may run on)
+	for (const auto& [cpus, fast]: cores)
+		if ((cpus & allowed) != 0 && fast) fastest = true;
+	uint32_t count = 0;
+	for (const auto& [cpus, fast]: cores)
+		if ((cpus & allowed) != 0 && fast == fastest) count += static_cast<uint32_t>(std::popcount(cpus & allowed));
+	return count;
+}
+
 // Intel's hybrid processors list their efficiency cores as the cpu_atom PMU's CPUs ("16-23");
 // others have one kind.
 std::string EfficiencyCpus() {
@@ -476,6 +529,7 @@ LauncherContext::LauncherContext() {
 	struct sysinfo info {};
 	if (sysinfo(&info) == 0) ram = static_cast<uint64_t>(info.totalram) * info.mem_unit;
 	efficiency_cpus = EfficiencyCpus();
+	performance_cpus = PerformanceCpus();
 	terminals       = FindTerminals();
 	mangohud_       = Platform::HasProgram("mangohud");
 	gamemode_       = Platform::HasProgram("gamemoderun");

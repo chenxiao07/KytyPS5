@@ -49,7 +49,7 @@ $safeGpuTip = "Prevents the crashes and blue screens that come from the graphics
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true; cheats = $false;
 	ecores = $false; fps120 = $false; render = 1440; ratio = '16:9'; quality = 'standard'; vsync = $false; hdr = $false; framegen = 0
 	hud = 0; streamline = ''; safegpu = $false; upscaler = ''; render_dlss = 1080; fsr = $false; output = 'auto'
-	lowlatency = $false; present_direct = $false; vrr_flips = $false; antilag = $false; keep_resident = $false; fps30 = $false; mode4 = $false; pad_speaker = $true
+	lowlatency = $false; present_direct = $false; vrr_flips = $false; antilag = $false; keep_resident = $false; fps30 = $false; mode4 = $false; weave = $false; pad_speaker = $true
 	extra_args = ''; dlss_preset = ''; dlss_sharpness = ''; fsr_sharpness = ''; gpu = ''; output_auto = $true; audio_output = '' }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
@@ -425,8 +425,11 @@ function Get-PlayCommand {
 	if ($settings.antilag) { $sets += 'KYTY_ANTI_LAG=1' }
 	if ($settings.fps30) { $sets += 'KYTY_FLIP_RATE=1' }
 	if ($settings.keep_resident) { $sets += @('KYTY_RESIDENT_MB=6144', 'KYTY_WORKING_SET_TRIM=0') }
-	# KytyLauncher.exe's parallel translation (mode 4), only where the emulator would not stand it down (Test-Mode4Offered).
+	# KytyLauncher.exe's parallel translation (mode 4), only where the emulator would not stand it down (Test-Mode4Offered);
+	# else its weave, only where the emulator would not stand it down (Test-WeaveOffered): the emulator runs one of the two,
+	# mode 4 first.
 	if ($settings.mode4 -and (Test-Mode4Offered (Get-ExtraOptions))) { $sets += 'KYTY_SPECULATE=4' }
+	elseif ($settings.weave -and (Test-WeaveOffered (Get-ExtraOptions))) { $sets += 'KYTY_WEAVE=1' }
 	# The DualSense's speaker silent, over USB or Bluetooth: the pad's own volume 0 (the haptics stay).
 	if (-not $settings.pad_speaker) { $sets += 'KYTY_DUALSENSE_SPEAKER_VOLUME=0' }
 	# KytyLauncher.exe's DLSS model (a preset letter; none: the DLSS version's own choice).
@@ -554,6 +557,31 @@ function Test-Mode4Offered($extra) {
 	else { $cpus = [uint64](Get-PerformanceCpus) }
 	return !($cpus -ne 0 -and $cpus -lt 3 + $workers + 2)
 }
+# KytyLauncher.exe's weave gate (Weave.cs): the emulator's, as it applies it at its start (weave.cpp ApplyStartGates), on
+# the same variables. Mode 4 in effect (KYTY_SPECULATE=4 where Test-Mode4Offered) stands it down; then the performance
+# cores' logical CPUs (every logical CPU where the classes are not known; no KYTY_SIMULATE_PCORES) under 10, unless
+# KYTY_WEAVE_WORKERS is 1 to 8; then KYTY_SCOUT, KYTY_VULKAN_RECORDING, KYTY_TABLE_XPR or KYTY_NATIVE_XPR at 0.
+# (A switch's value as the emulator reads it: whole digits, else not taken.)
+function Get-WeaveSwitch([string]$name, $extra) {
+	$text = Get-Mode4Variable $name $extra
+	if (!$text) { return $null }
+	$number = ConvertFrom-CNumber $text ([uint64][uint32]::MaxValue)
+	if ($number[1]) { return $number[0] }
+	return $null
+}
+function Test-WeaveOffered($extra, [uint64]$performance = (Get-PerformanceCpus), [uint64]$logical = [Environment]::ProcessorCount) {
+	if ((Get-WeaveSwitch 'KYTY_SPECULATE' $extra) -eq 4 -and (Test-Mode4Offered $extra)) { return $false }
+	$workers = Get-WeaveSwitch 'KYTY_WEAVE_WORKERS' $extra
+	if ($null -eq $workers -or $workers -eq 0) {
+		$cpus = $(if ($performance -ne 0) { $performance } else { $logical })
+		if ($cpus -lt 10) { return $false }
+	}
+	foreach ($name in @('KYTY_SCOUT', 'KYTY_VULKAN_RECORDING', 'KYTY_TABLE_XPR', 'KYTY_NATIVE_XPR')) {
+		$value = Get-WeaveSwitch $name $extra
+		if ($null -ne $value -and $value -eq 0) { return $false }
+	}
+	return $true
+}
 # KytyLauncher.exe's graphics card (Advanced page, a PC with more than one), by its name, for the game and the precompile
 # alike (issue #132); one holding a character cmd would act on is left out.
 function Get-GpuArguments {
@@ -576,6 +604,7 @@ if ($DryRun) {
 	"hints:      cmd /s /c `"$(Get-PrecompileCommand '-ExportHints')`""
 	"efficiency cores: 0x{0:X}" -f $efficiencyMask
 	"mode 4 offered: $(Test-Mode4Offered (Get-ExtraOptions))"
+	"weave offered: $(Test-WeaveOffered (Get-ExtraOptions))"
 	"display: $displayHeight lines"
 	"frame generation: $(if ($frameGenAvailable) { "NVIDIA's Streamline runtime in $streamline" } elseif (!$rtxGpu) { 'no NVIDIA RTX graphics card (DLSS off)' } else { "no NVIDIA-signed Streamline runtime (settings: '$($settings.streamline)')" })"
 	return
