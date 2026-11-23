@@ -1971,9 +1971,40 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 						       m_log.FirstGpuWriteOver(result.effects_from, begin, size) != nullptr;
 					return !effects.gpu_writes.Empty() && effects.gpu_writes.Intersects(begin, size);
 				};
+				// copy_gpu_dirty_src (live, default 0; the flyby GPU drain): a copy is also "written" when its source or
+				// destination is now on a GPU-modified page (the tracker's 4 KiB grain: a neighbour's GPU write since the
+				// translation; it covers GPU-written bytes not read back, HasGpuDirtyBytes, which is not asked: that range
+				// set's query cost ~4.5% of this thread over ~1100 ranges a frame), shares a page with the segment's own
+				// GPU writes (Before marks it
+				// GPU-modified, before After's copy), or has an image over its source: in order CopyBuffer takes its GPU
+				// path for each. Made in After as the GPU copy, with the refusals below; else After's processor copy
+				// would read the read-watched page (CopyGuestMemory's fault: a full GPU drain on this thread).
+				static auto& copy_gpu_dirty = LiveSwitch::Find("copy_gpu_dirty_src", 0);
+				const auto   gpu_dirty_mode = copy_gpu_dirty.load(std::memory_order_relaxed);
+				const bool   gpu_dirty_fix  = gpu_dirty_mode != 0;
+				const bool   gpu_dirty_chain = gpu_dirty_mode >= 2;
+				auto&        fix_buffers    = m_renderer.GetBufferCache();
+				auto&        fix_textures   = m_renderer.GetTextureCache();
+				constexpr uint64_t FixPage  = 4096; // (TRACKER_PAGE_SIZE)
+				const auto   segment_writes_page = [&](uint64_t begin, uint64_t size) {
+					const uint64_t p0 = begin & ~(FixPage - 1), p1 = (begin + size + FixPage - 1) & ~(FixPage - 1);
+					for (size_t k = from.written; k < to.written; ++k)
+						if (state.written[k].begin < p1 && p0 < state.written[k].end) return true;
+					for (size_t k = from.pending_buffers; k < to.pending_buffers; ++k) {
+						const auto& pb = state.pending_buffers[k];
+						if (pb.written && pb.address < p1 && p0 < pb.address + pb.size) return true;
+					}
+					return false;
+				};
+				const auto copy_dirty = [&](uint64_t begin, uint64_t size) {
+					return copy_written(begin, size) ||
+					       (gpu_dirty_fix && (fix_buffers.IsRegionGpuModified(begin, size) || segment_writes_page(begin, size)));
+				};
+				// (An image over a copy's source made since its translation is not looked for: a lookup a copy, and
+				// none seen. Such a copy stays the processor copy, as before.)
 				bool copies_written = false;
 				for (size_t i = from.cpu_copies; i < to.cpu_copies && !copies_written; ++i)
-					copies_written = copy_written(state.cpu_copies[i].begin, state.cpu_copies[i].end - state.cpu_copies[i].begin);
+					copies_written = copy_dirty(state.cpu_copies[i].begin, state.cpu_copies[i].end - state.cpu_copies[i].begin);
 				if (copies_written) {
 					// Under KYTY_SPECULATE=4 each such copy is made in After as the in-order path makes it now
 					// (BufferCache::CopyBuffer on the GPU thread, in the journal's place: WriteLabels), instead of the stop.
@@ -2009,8 +2040,21 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 					// (A journaled copy GPU work wrote: its source or destination written since. Every cpu_copies range is a
 					// journaled copy's source or destination, noted with it.)
 					const auto noted = [&](const Spec::MemoryWrite& write) {
-						return write.copy && (copy_written(write.address, write.size) || copy_written(write.value, write.size));
+						return write.copy && (copy_dirty(write.address, write.size) || copy_dirty(write.value, write.size) ||
+						                      (gpu_dirty_fix && fix_textures.FindImageFromRange(write.value, write.size)));
 					};
+					// (copy_gpu_dirty_src: a word the segment's translation took through this copy (Resolve: read from its
+					// source then): the GPU copy leaves the destination's guest bytes as they were until the copy feedback,
+					// which the journal check would read. Refused, the stop.)
+					const auto journal_read_through = [&](size_t entry) {
+						if (!gpu_dirty_fix) return false;
+						for (size_t k = from.journal_reads; k < to.journal_reads; ++k)
+							if (state.journal_reads[k].entry == entry) return true;
+						return false;
+					};
+					// (copy_gpu_dirty_src: the pages of the GPU copies' destinations, which CopyBuffer marks GPU-modified
+					// in After before the copies after them: a later copy on such a page is made on the GPU too.)
+					std::vector<std::pair<uint64_t, uint64_t>> touched_dst_pages;
 					auto&                                      textures = m_renderer.GetTextureCache();
 					std::vector<std::pair<uint64_t, uint64_t>> touched; // (the GPU copies' sources and destinations, [begin, end))
 					std::vector<size_t>                        marked;
@@ -2026,18 +2070,33 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 							if (follows) return "commit: GPU work wrote what it copies";
 							continue;
 						}
-						if (!follows && !noted(write)) continue;
+						const auto on_pages = [&](uint64_t begin, uint64_t size) {
+							for (const auto& [b, e]: touched_dst_pages)
+								if (b < begin + size && begin < e) return true;
+							return false;
+						};
+						const bool page_follows =
+						    gpu_dirty_fix && (on_pages(write.address, write.size) || on_pages(write.value, write.size));
+						if (!follows && !page_follows && !noted(write)) continue;
 						if (own(write.address, write.address + write.size) || own(write.value, write.value + write.size) ||
-						    textures.HasTrackedDataOverlap(write.address, write.size))
+						    textures.HasTrackedDataOverlap(write.address, write.size) || journal_read_through(i))
 							return "commit: GPU work wrote what it copies";
 						marked.push_back(i);
 						touched.emplace_back(write.address, write.address + write.size);
 						touched.emplace_back(write.value, write.value + write.size);
+						if (gpu_dirty_fix)
+							touched_dst_pages.emplace_back(write.address & ~(FixPage - 1),
+							                               (write.address + write.size + FixPage - 1) & ~(FixPage - 1));
 					}
 					for (const auto i: marked) result.state.writes[i].gpu = true;
 				}
 				for (size_t i = from.chain_reads; i < to.chain_reads; ++i) {
 					const auto& read = state.chain_reads[i];
+					// (copy_gpu_dirty_src=2: a word on a GPU-modified page (read watched): read here it faults into a full
+					// GPU drain on this thread; a GPU copy made at an earlier commit leaves such destinations. A lookup a
+					// word: ~0.4 ms a frame of this thread at 1, so only at 2.)
+					if (gpu_dirty_chain && fix_buffers.IsRegionGpuModified(read.address, 4u))
+						return "commit: a command buffer before wrote otherwise";
 					// (KYTY_WRITE_GUARD_SPEC: a page a pending guest write guards, through the backing view: wg2's census had this
 					// read fault ~1 a frame.)
 					const void* word = reinterpret_cast<const void*>(read.address);
