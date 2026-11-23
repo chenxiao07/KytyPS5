@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
+#include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h" // (spec_depth_layers2: htile_load_decision)
@@ -1918,6 +1919,23 @@ struct ChangedRules {
 // (The GPU thread, from a segment's Before to its patch step: every one of its entries obtained.)
 static thread_local bool t_pending_obtained_all = false;
 
+static bool AfterCopyOverlapsJournalRead(const Spec::MemoryWrite& write, const Spec::State& state,
+                                         const Spec::Counts& from, const Spec::Counts& to) noexcept {
+	if (write.size == 0) {
+		return false;
+	}
+	for (size_t k = from.journal_reads; k < to.journal_reads; ++k) {
+		const auto& read = state.journal_reads[k];
+		const auto overlaps = [&](uint64_t address) {
+			return read.address < address + write.size && address < read.address + read.bytes;
+		};
+		if (read.bytes != 0 && (overlaps(write.address) || overlaps(write.value))) {
+			return true;
+		}
+	}
+	return false;
+}
+
 Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcessor& cp) {
 	m_renderer.GetBufferCache().ServeAhead(); // (spec_buffer_ahead: the ranges speculations found no buffer over)
 	auto&       scheduler = m_renderer.GetCommandScheduler();
@@ -2177,7 +2195,8 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 					// - its place: recorded after the segment's work (WriteLabels flushes it first), in the journal's order.
 					//   Refused (the stop as before) when the segment's own work reads or writes the source or destination
 					//   (its current, written, buffer, table or texel ranges: that work would then run before the copy
-					//   instead of after it), or the destination is image memory (HasTrackedDataOverlap);
+					//   instead of after it), the destination is image memory (HasTrackedDataOverlap), or a journal read
+					//   recorded in the segment overlaps either operand;
 					// - in the journal's order, a later copy over a GPU copy's source or destination is made as the GPU copy
 					//   too (in order CopyBuffer would see the range GPU-modified), and a processor write (a label) over one
 					//   stops the segment (it would land before the GPU copy's execution, not after it);
@@ -2220,7 +2239,8 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 						}
 						if (!follows && !noted(write)) continue;
 						if (own(write.address, write.address + write.size) || own(write.value, write.value + write.size) ||
-						    textures.HasTrackedDataOverlap(write.address, write.size))
+						    textures.HasTrackedDataOverlap(write.address, write.size) ||
+						    AfterCopyOverlapsJournalRead(write, state, from, to))
 							return "commit: GPU work wrote what it copies";
 						marked.push_back(i);
 						touched.emplace_back(write.address, write.address + write.size);
@@ -3044,6 +3064,64 @@ static bool GuardedCopy(BufferCache& buffers, uint64_t dst, uint64_t src, uint64
 	return true;
 }
 
+// After: a journaled copy the processor copy would make over pages the tracker holds GPU-modified now (its
+// destination's or its source's) made as the GPU copy instead, as the in-order CopyBuffer makes a copy over GPU-modified
+// pages: no processor copy, so no compare read of a GPU-owned page, no fault, no synchronous download on the GPU thread
+// (1.5-3 ms each, ~440 a walk at the crossing's new area). The pages were mostly made GPU-modified by the segment's own
+// Before: it obtains the segment's written ranges as written, so the tracker marks their whole 4 KiB pages, and a copy a
+// few bytes away from an own write found its page GPU-modified though the translation found it clean. Exact (the
+// processor copy's result, without its read back):
+// - the bytes: no own written range of the segment lies over either range (own writes before the copy in guest order:
+//   the order test), and no pending written entry, so the GPU copy and the processor copy leave the same bytes; the
+//   segment's work is recorded before it either way;
+// - the journal: no later entry of the segment touches either range (a label over them would land on the CPU before the
+//   GPU copy runs; a later copy reading the destination on the CPU would read it before the GPU copy wrote it).
+//   A journal read recorded in this segment over either range also keeps the processor copy;
+// - source and destination not overlapping (a no-op on the processor path; CopyBuffer's GPU path exits on overlapping
+//   resolved ranges), and each the only mapping of its memory (IsUniqueGuestBackingRangeAcrossMappings, as the linear
+//   copy's shader path: the tracker and the buffers are per address);
+// - no image over the source or at the destination: kept on the processor copy;
+// - publication: before After's next entry (a label, or a copy made on the processor, can let a guest thread read the
+//   destination) and before After's end, the destination's pending no access is applied (FlushDeferredProtection) and
+//   After waits through the copy's upload sequence: a guest that reads the destination faults into the readback path,
+//   which waits for the recorded copy. The same protection covers mode 4's GPU copies of ranges GPU work wrote since the
+//   translation (write.gpu), whose destinations had the same window.
+static bool AfterGpuCopyNow(BufferCache& buffers, TextureCache& textures, const Spec::State& state, const Spec::Counts& from,
+                            const Spec::Counts& to, size_t i) {
+	const auto& write = state.writes[i];
+	if (!buffers.IsRegionGpuModified(write.address, write.size) && !buffers.IsRegionGpuModified(write.value, write.size))
+		return false; // (clean: the processor copy, no fault)
+	if (textures.FindImageFromRange(write.value, write.size) || textures.HasTrackedDataOverlap(write.address, write.size))
+		return false;
+	const auto meets = [](uint64_t begin, uint64_t size, uint64_t address, uint64_t bytes) {
+		return size != 0 && bytes != 0 && begin < address + bytes && address < begin + size;
+	};
+	if (meets(write.address, write.size, write.value, write.size)) return false;
+	if (!Libs::LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(write.address, write.size) ||
+	    !Libs::LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(write.value, write.size))
+		return false;
+	for (size_t k = from.written; k < to.written; ++k) {
+		const auto& range = state.written[k];
+		if (meets(range.begin, range.end - range.begin, write.address, write.size) ||
+		    meets(range.begin, range.end - range.begin, write.value, write.size))
+			return false;
+	}
+	for (size_t k = from.pending_buffers; k < to.pending_buffers; ++k) {
+		const auto& entry = state.pending_buffers[k];
+		if (entry.written && (meets(entry.address, entry.size, write.address, write.size) ||
+		                      meets(entry.address, entry.size, write.value, write.size)))
+			return false;
+	}
+	for (size_t k = i + 1; k < to.writes; ++k) {
+		const auto& later = state.writes[k];
+		if (meets(later.address, later.size, write.address, write.size) || meets(later.address, later.size, write.value, write.size) ||
+		    (later.copy && (meets(later.value, later.size, write.address, write.size) ||
+		                    meets(later.value, later.size, write.value, write.size))))
+			return false;
+	}
+	return !AfterCopyOverlapsJournalRead(write, state, from, to);
+}
+
 void Speculation::After(Result& result, size_t index) {
 	const Spec::EffectSourceScope source(Spec::EffectSource::Commit);
 	auto&       buffers  = m_renderer.GetBufferCache();
@@ -3128,8 +3206,20 @@ void Speculation::After(Result& result, size_t index) {
 	// after_guard_batch (under KYTY_SPECULATE=4 only): a run of labels on one guard page, guarded once for the page
 	// (graphicsRun.cpp).
 	const int64_t batch = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 1 : 0;
+	bool       copy_protection_pending = false;
+	uint64_t   copy_upload = 0;
+	const auto protect     = [&] {
+		PageManager::FlushDeferredProtection();
+		copy_protection_pending = false;
+	};
 	for (size_t i = from.writes; i < to.writes; ++i) {
 		const auto& write = state.writes[i];
+		if (copy_protection_pending) [[unlikely]] {
+			protect();
+			AsyncUpload::Wait(copy_upload);
+			// (A fallback label write still drains any uploads queued after the copy.)
+			drained = AsyncUpload::SubmitSequence() == copy_upload;
+		}
 		if (batch != 0 && guard && !write.copy) {
 			const uint64_t page = write.address >> 12u;
 			size_t         end  = i;
@@ -3169,6 +3259,14 @@ void Speculation::After(Result& result, size_t index) {
 		    (buffers.IsRegionGpuModified(write.address, write.size) || buffers.IsRegionGpuModified(write.value, write.size) ||
 		     textures.FindImageFromRange(write.value, write.size))) {
 			buffers.CopyBuffer(write.address, write.value, write.size, false, false);
+			copy_protection_pending = true;
+			copy_upload = AsyncUpload::SubmitSequence();
+			continue;
+		}
+		if (write.copy && AfterGpuCopyNow(buffers, textures, state, from, to, i)) [[unlikely]] {
+			buffers.CopyBuffer(write.address, write.value, write.size, false, false);
+			copy_protection_pending = true;
+			copy_upload = AsyncUpload::SubmitSequence();
 			continue;
 		}
 		if (write.copy) {
@@ -3192,6 +3290,7 @@ void Speculation::After(Result& result, size_t index) {
 			Spec::NoteLabel(write.address);
 		}
 	}
+	if (copy_protection_pending) protect();
 	if (from.feedbacks != to.feedbacks) {
 		RenderLockGuard lock(m_renderer.GetMutex());
 		for (size_t i = from.feedbacks; i < to.feedbacks; ++i)

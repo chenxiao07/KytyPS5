@@ -450,7 +450,7 @@ static_assert(__builtin_strcmp(Names[SpecTablePatchRegisteredKept], "spec_table_
               "spec_table_patch counters out of step with Names");
 static_assert(__builtin_strcmp(Names[FrontRetestFallbacks], "front_retest_fallbacks") == 0,
               "front_retest_fallbacks out of step with Names");
-static_assert(__builtin_strcmp(Names[Count - 1], "reg_quiet_fallbacks") == 0, "quiet inserts counter out of step with Names");
+static_assert(__builtin_strcmp(Names[RegQuietFallbacks], "reg_quiet_fallbacks") == 0, "quiet inserts counter out of step with Names");
 inline std::atomic<uint64_t> g_values[Count];
 // The render thread's counts: it is their only writer, so an increment needs no locked
 // instruction (a locked add also drains the store buffer). Readers add both (Value).
