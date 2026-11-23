@@ -4121,6 +4121,13 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size) || (spec != nullptr && spec->WrittenIntersects(vaddr, size));
 }
 
+bool BufferCache::SpecTableCpuWritten(const Spec::State& spec, uint64_t vaddr, uint64_t size) {
+	const auto dirty = m_memory_tracker.ReadRegionDirtyForSpeculation(vaddr, size);
+	// As IsRegionGpuModified, this translation's own GPU writes count too. A journaled write only
+	// bars the ring copy; cpu_written still decides whether the fallthrough needs EnsureBufferContents.
+	return dirty.cpu && !dirty.gpu && !spec.WrittenIntersects(vaddr, size);
+}
+
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	// (Another thread's question, a speculation's: under the lock the GPU thread changes them under.)
 	if (!GuestGpu::IsGpuThread()) {

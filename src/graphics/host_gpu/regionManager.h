@@ -357,6 +357,18 @@ public:
 		return bits.AnyInRange(start, end);
 	}
 
+	struct DirtyBits {
+		bool cpu;
+		bool gpu; // (queried only when cpu is true, as in TableBlocks)
+	};
+
+	// The two queries share the page range and the caller's sequence check.
+	[[nodiscard]] DirtyBits QueryDirty(uint64_t offset, uint64_t size) const {
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		const bool cpu         = m_cpu_dirty.AnyInRange(start, end);
+		return {cpu, cpu && m_gpu_dirty.AnyInRange(start, end)};
+	}
+
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);

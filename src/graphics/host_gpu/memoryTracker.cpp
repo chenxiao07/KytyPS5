@@ -108,6 +108,27 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+RegionManager::DirtyBits MemoryTracker::ReadRegionDirtyForSpeculation(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	ValidateRange(vaddr, size);
+	const auto index  = vaddr / TRACKER_REGION_SIZE;
+	const auto offset = vaddr % TRACKER_REGION_SIZE;
+	const bool single = size <= TRACKER_REGION_SIZE - offset;
+	auto* const manager = single ? m_regions[index].load(std::memory_order_acquire) : nullptr;
+
+	RegionManager::DirtyBits dirty {};
+	const bool stable = manager != nullptr && manager->lock.TryReadShared([&] {
+		return manager->QueryDirty(offset, size);
+	}, dirty);
+	// Missing managers still go through the CPU query that creates them. ReadShared in the old queries
+	// also handles a busy region, as it did before.
+	if (!stable) {
+		const bool cpu = IsRegionCpuModified(vaddr, size);
+		dirty = {cpu, cpu && IsRegionGpuModified(vaddr, size)};
+	}
+	return dirty;
+}
+
 bool MemoryTracker::IsRegionFullyCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	// (Missing regions were never tracked: all CPU-dirty.)

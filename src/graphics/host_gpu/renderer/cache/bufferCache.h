@@ -219,6 +219,7 @@ public:
 	enum class RelocUpload : uint8_t { Uploaded, Refused, StillDirty };
 	[[nodiscard]] RelocUpload UploadRelocated(BufferId id, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	[[gnu::noinline]] [[nodiscard]] bool SpecTableCpuWritten(const Spec::State& spec, uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	struct SyncRegionRequest {

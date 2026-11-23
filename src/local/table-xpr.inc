@@ -3161,9 +3161,15 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 					if (address % 4 != 0 || (formatted && image_starts(address))) return false;
 					// (A speculation's: the guest's writes, not those its commit makes current; with none of its own
 					// guest memory writes pending over the range, read as no GPU work wrote it.)
-					auto* const spec        = Spec::Current();
-					const bool  cpu_written = buffer_cache.IsRegionCpuDirty(address, size) &&
-					                         !buffer_cache.IsRegionGpuModified(address, size);
+					auto* const spec = Spec::Current();
+					const bool cpu_written = [&] {
+						if constexpr (!P::worker) {
+							if (spec != nullptr) [[unlikely]]
+								return buffer_cache.SpecTableCpuWritten(*spec, address, size);
+						}
+						return buffer_cache.IsRegionCpuDirty(address, size) &&
+						       !buffer_cache.IsRegionGpuModified(address, size);
+					}();
 					if (cpu_written && size <= BufferCache::CACHING_PAGESIZE &&
 					    (spec == nullptr || !spec->JournalIntersects(address, size))) {
 						// As ObtainBuffer: a small range the guest wrote is read from a copy in the ring (nothing held: the
