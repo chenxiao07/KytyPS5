@@ -18,12 +18,13 @@ sealed class KeyboardControlsWindow : Window {
 	string capturing;
 	// First input of a combo being captured; bound by itself if it is released alone.
 	string held;
-	static string T(string en, string zh) { return Strings.Language == UiLanguage.Chinese ? zh : en; }
+	static string T(string en, string zh, string ru) { return Strings.Language == UiLanguage.Russian ? ru : Strings.Language == UiLanguage.Chinese ? zh : en; }
 	static readonly string[] ChineseActions = { "互动 / 确认", "翻滚 / 返回", "使用道具", "双持武器", "防御 / 左手攻击", "招架 / 左手重击", "左摇杆按下", "攻击", "重击", "锁定", "菜单", "切换法术", "切换道具", "切换左手武器", "切换右手武器", "触摸板 / 左侧", "触摸板右侧", "向前移动", "向后移动", "向左移动", "向右移动" };
+	static readonly string[] RussianActions = { "Взаимодействие / подтверждение", "Перекат / назад", "Использовать предмет", "Двуручный хват", "Блок / атака слева", "Парирование / сильная атака слева", "Нажатие левого стика", "Атака", "Сильная атака", "Захват цели", "Меню", "Смена заклинания", "Смена предмета", "Смена оружия слева", "Смена оружия справа", "Тачпад / левая часть", "Тачпад / правая часть", "Движение вперёд", "Движение назад", "Движение влево", "Движение вправо" };
 	public KeyboardControlsWindow(Settings settings) {
 		this.settings = settings;
 		layout = KeyboardLayout.Read(settings, false);
-		Title = T("Keyboard and mouse controls", "键盘和鼠标控制");
+		Title = T("Keyboard and mouse controls", "键盘和鼠标控制", "Управление с клавиатуры и мыши");
 		Width = 820;
 		Height = 760;
 		MinWidth = 700;
@@ -35,25 +36,25 @@ sealed class KeyboardControlsWindow : Window {
 		FontSize = 14;
 		var dock = new DockPanel { Margin = new Thickness(24) };
 		Content = dock;
-		var intro = new TextBlock { Text = T("Click an action, then press a key or mouse button. Assigning a single input that another action already uses swaps the two; a clash involving a combo is refused. F7 captures/releases the mouse in-game; F7, F8, F11 and Pause cannot be rebound. Hold one input and press another to bind both at once, such as Left Alt + Mouse:Left.", "点击动作后按键或鼠标按钮。若单个输入已用于其他动作，则交换两个动作的键位；涉及组合键的冲突会被拒绝。游戏内按 F7 捕获/释放鼠标；F7、F8、F11 和 Pause 不可重新绑定。按住一个输入再按下另一个，即可将两者一起绑定，例如 Left Alt + Mouse:Left。"), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 12) };
+		var intro = new TextBlock { Text = T("Click an action, then press a key or mouse button. Assigning a single input that another action already uses swaps the two; a clash involving a combo is refused. F7 captures/releases the mouse in-game; F7, F8, F11 and Pause cannot be rebound. Hold one input and press another to bind both at once, such as Left Alt + Mouse:Left.", "点击动作后按键或鼠标按钮。若单个输入已用于其他动作，则交换两个动作的键位；涉及组合键的冲突会被拒绝。游戏内按 F7 捕获/释放鼠标；F7、F8、F11 和 Pause 不可重新绑定。按住一个输入再按下另一个，即可将两者一起绑定，例如 Left Alt + Mouse:Left。", "Нажмите на действие, затем нажмите клавишу или кнопку мыши. Если назначить ввод, который уже занят другим действием, они поменяются местами; конфликт с комбинацией отклоняется. F7 захватывает/отпускает мышь в игре; F7, F8, F11 и Pause переназначить нельзя. Удерживайте один ввод и нажмите другой, чтобы привязать оба сразу, например Left Alt + Mouse:Left."), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 12) };
 		DockPanel.SetDock(intro, Dock.Top);
 		dock.Children.Add(intro);
 		var footer = new StackPanel();
 		DockPanel.SetDock(footer, Dock.Bottom);
 		dock.Children.Add(footer);
-		status = new TextBlock { Text = T("Changes apply with matching prompts on the next Play when the prompt option is enabled.", "启用按键提示选项后，下次游玩时应用键位和对应图标。"), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 8) };
+		status = new TextBlock { Text = T("Changes apply with matching prompts on the next Play when the prompt option is enabled.", "启用按键提示选项后，下次游玩时应用键位和对应图标。", "Изменения применятся при следующем запуске (Play): если включена опция подсказок, значки клавиш обновятся под новое управление."), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 8) };
 		footer.Children.Add(status);
 		var sens = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 4, 0, 10) };
-		sens.Children.Add(new TextBlock { Text = T("Mouse sensitivity (0.1–5; blank keeps existing): ", "鼠标灵敏度（0.1–5；留空沿用现有设置）："), VerticalAlignment = VerticalAlignment.Center });
+		sens.Children.Add(new TextBlock { Text = T("Mouse sensitivity (0.1–5; blank keeps existing): ", "鼠标灵敏度（0.1–5；留空沿用现有设置）：", "Чувствительность мыши (0.1–5; пусто — оставить текущую): "), VerticalAlignment = VerticalAlignment.Center });
 		sensitivity = new TextBox { Text = layout.Sensitivity, Width = 75, Padding = new Thickness(5) };
 		sens.Children.Add(sensitivity);
 		footer.Children.Add(sens);
 		var actions = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
 		footer.Children.Add(actions);
-		actions.Children.Add(ActionButton(T("Stop capture", "停止捕获"), () => { capturing = null; held = null; ReleaseMouseCapture(); Refresh(); }));
-		actions.Children.Add(ActionButton(T("Reset defaults", "恢复默认"), () => { capturing = null; layout = new KeyboardLayout(); sensitivity.Text = ""; Refresh(); status.Text = T("Default layout restored in the editor. Save to keep it.", "已在编辑器中恢复默认键位，保存后生效。"); }));
-		actions.Children.Add(ActionButton(T("Cancel", "取消"), () => Close()));
-		actions.Children.Add(ActionButton(T("Save", "保存"), Save));
+		actions.Children.Add(ActionButton(T("Stop capture", "停止捕获", "Остановить ввод"), () => { capturing = null; held = null; ReleaseMouseCapture(); Refresh(); }));
+		actions.Children.Add(ActionButton(T("Reset defaults", "恢复默认", "Сбросить раскладку"), () => { capturing = null; layout = new KeyboardLayout(); sensitivity.Text = ""; Refresh(); status.Text = T("Default layout restored in the editor. Save to keep it.", "已在编辑器中恢复默认键位，保存后生效。", "В редакторе восстановлена раскладка по умолчанию. Сохраните, чтобы применить."); }));
+		actions.Children.Add(ActionButton(T("Cancel", "取消", "Отмена"), () => Close()));
+		actions.Children.Add(ActionButton(T("Save", "保存", "Сохранить"), Save));
 		var rows = new StackPanel();
 		dock.Children.Add(new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Content = rows });
 		for (int i = 0; i < KeyboardLayout.Controls.Length; i++) {
@@ -62,9 +63,9 @@ sealed class KeyboardControlsWindow : Window {
 			row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 			row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(190) });
 			row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(88) });
-			row.Children.Add(new TextBlock { Text = (Strings.Language == UiLanguage.Chinese ? ChineseActions[i] : KeyboardLayout.Actions[i]) + " (" + control + ")", VerticalAlignment = VerticalAlignment.Center });
+			row.Children.Add(new TextBlock { Text = (Strings.Language == UiLanguage.Russian ? RussianActions[i] : Strings.Language == UiLanguage.Chinese ? ChineseActions[i] : KeyboardLayout.Actions[i]) + " (" + control + ")", VerticalAlignment = VerticalAlignment.Center });
 			var button = new Button { Style = (Style)Application.Current.FindResource("FlatButton"), MinHeight = 34, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(4), Content = layout.Bindings[control] };
-			button.Click += (s, e) => { capturing = control; held = null; Refresh(); status.Text = T("Press a key, mouse button or scroll wheel. Use Stop capture to cancel.", "请按键、鼠标按钮或滚轮；点击停止捕获取消。"); };
+			button.Click += (s, e) => { capturing = control; held = null; Refresh(); status.Text = T("Press a key, mouse button or scroll wheel. Use Stop capture to cancel.", "请按键、鼠标按钮或滚轮；点击停止捕获取消。", "Нажмите клавишу, кнопку или колесо мыши. Для отмены — «Остановить ввод»."); };
 			buttons.Add(control, button);
 			Grid.SetColumn(button, 1);
 			row.Children.Add(button);
@@ -82,7 +83,7 @@ sealed class KeyboardControlsWindow : Window {
 		Deactivated += (s, e) => { if (capturing != null) { capturing = null; held = null; ReleaseMouseCapture(); Refresh(); } };
 		Refresh();
 		try { layout.Validate(); }
-		catch (IOException error) { status.Text = error.Message + T(" You can repair it here or reset defaults.", "可在此修复或恢复默认设置。"); }
+		catch (IOException error) { status.Text = error.Message + T(" You can repair it here or reset defaults.", "可在此修复或恢复默认设置。", " Можно исправить здесь вручную или вернуть раскладку по умолчанию."); }
 	}
 	Button ActionButton(string text, Action action) {
 		var b = new Button { Style = (Style)Application.Current.FindResource("FlatButton"), Content = text, Tag = "editor-command", Margin = new Thickness(4), Padding = new Thickness(10, 6, 10, 6) };
@@ -91,7 +92,7 @@ sealed class KeyboardControlsWindow : Window {
 	}
 	void Refresh() {
 		foreach (var pair in buttons) {
-			pair.Value.Content = capturing == pair.Key ? (held == null ? T("Press an input…", "请按键…") : held + " + …") : layout.Bindings[pair.Key];
+			pair.Value.Content = capturing == pair.Key ? (held == null ? T("Press an input…", "请按键…", "Нажмите ввод…") : held + " + …") : layout.Bindings[pair.Key];
 			using (var bitmap = PromptTexture.Draw(KeyboardLayout.Label(layout.Bindings[pair.Key])))
 			using (var stream = new MemoryStream()) {
 				bitmap.Save(stream, System.Drawing.Imaging.ImageFormat.Png);
@@ -113,7 +114,7 @@ sealed class KeyboardControlsWindow : Window {
 			var other = layout.Assign(capturing, input);
 			capturing = null;
 			Refresh();
-			status.Text = other == null ? T("Binding updated. Save to keep it.", "键位已更新，保存后生效。") : T("Swapped with ", "已交换键位：") + other;
+			status.Text = other == null ? T("Binding updated. Save to keep it.", "键位已更新，保存后生效。", "Управление обновлено. Сохраните, чтобы применить.") : T("Swapped with ", "已交换键位：", "Поменяно местами с ") + other;
 		}
 		catch (IOException error) { Refresh(); status.Text = error.Message; }
 	}
@@ -125,7 +126,7 @@ sealed class KeyboardControlsWindow : Window {
 		if (held == null) {
 			held = input;
 			Refresh();
-			status.Text = string.Format(T("Holding {0}: press another with it for a combo, or release it to bind {0} alone.", "正在按住 {0}：同时按下另一个输入可设为组合键，松开则单独绑定 {0}。"), input);
+			status.Text = string.Format(T("Holding {0}: press another with it for a combo, or release it to bind {0} alone.", "正在按住 {0}：同时按下另一个输入可设为组合键，松开则单独绑定 {0}。", "Удерживается {0}: нажмите другую клавишу для комбинации или отпустите, чтобы назначить {0} отдельно."), input);
 		} else if (input != held)
 			Assign(held + "+" + input);
 	}
