@@ -64,7 +64,7 @@ static constexpr uint8_t  WATCH_ZAPPED     = 0x10;
 static constexpr uint8_t  WATCH_REGISTERED = 0x40;
 static constexpr uint8_t  WATCH_WP         = 0x80;
 
-// KYTY_UFFD_MINOR=1 (with KYTY_UFFD_WP; on by default in the Steam Deck build): the GPU thread's deferred read
+// KYTY_UFFD_MINOR=1 or 2 (with KYTY_UFFD_WP; 1 by default in the Steam Deck build): the GPU thread's deferred read
 // protections (no access: PageManager's flush, SysVirtualZapNoAccess) of runs of up to MINOR_RUN_PAGES pages of a
 // registered view drop the pages' PTEs (MADV_DONTNEED) under userfaultfd minor mode instead of an mprotect: the next
 // access faults (SIGBUS, as a write protection's), and lifting it maps the page cache page again (UFFDIO_CONTINUE, its
@@ -83,6 +83,14 @@ static constexpr uint8_t  WATCH_WP         = 0x80;
 // boot alternating: stand 34.0/34.1/34.2 -> 35.9/35.8/35.8 fps (render 23.1 -> 21.9 ms), walk legs 33.8 -> 35.4 fps
 // (p99 37.5 -> 35.8 ms).
 static bool              g_minor_on      = false;
+// KYTY_UFFD_MINOR=2: runs longer than MINOR_RUN_PAGES too, cut at the minor blocks' boundaries (each piece one
+// block's at most, zapped as a short run is, or left to mprotect alone when not resident or at the cap), and a zapped
+// run mapped again block by block. Under =1 the GPU thread's no-access protections and lifts of runs of 89-607 pages
+// stayed mprotects; with the weave and the watch on, its rare stalls were those calls queued on the memory-map lock
+// for writing, 1-15 ms each, beside the game threads' calls. Inner Ward, standing, one exe alternating =1/=2/=2/=1:
+// frames over 25 ms in 105 s 5/4 -> 0/0, the worst 51.0/47.5 -> 22.1/22.9 ms, the per-second SD 1.63/1.07 ->
+// 0.85/0.68, fps level (63.8/65.7 -> 64.3/64.7).
+static bool              g_minor_long    = false;
 static thread_local bool g_zap_no_access = false;
 static std::mutex        g_minor_mutex;
 static std::map<uint64_t, uint64_t>* g_minor_blocks = nullptr; // (first page -> end page; under g_minor_mutex)
@@ -138,7 +146,7 @@ static void WriteWatchInit() {
 #endif
 	if (value == nullptr || value[0] != '1') return;
 	constexpr uint64_t features = UFFD_FEATURE_SIGBUS | UFFD_FEATURE_WP_HUGETLBFS_SHMEM | UFFD_FEATURE_WP_UNPOPULATED;
-	const bool         want_minor = minor != nullptr && minor[0] == '1';
+	const bool         want_minor = minor != nullptr && (minor[0] == '1' || minor[0] == '2');
 	int                fd         = want_minor ? OpenUffd(features | UFFD_FEATURE_MINOR_SHMEM) : -1;
 	const bool         has_minor  = fd >= 0;
 	if (fd < 0) fd = OpenUffd(features);
@@ -156,10 +164,12 @@ static void WriteWatchInit() {
 	std::printf("KYTY_UFFD_WP: write watch by userfaultfd write protection%s\n",
 	            by_weave ? " (the weave's default; KYTY_UFFD_WP=0 keeps mprotect)" : "");
 	if (!want_minor) return;
-	g_minor_on = has_minor;
+	g_minor_on   = has_minor;
+	g_minor_long = has_minor && minor[0] == '2';
 	if (g_minor_on) g_minor_blocks = new std::map<uint64_t, uint64_t>;
-	std::printf("KYTY_UFFD_MINOR: %s\n", g_minor_on ? "the GPU's read protections of short runs by userfaultfd minor mode"
-	                                                : "userfaultfd minor mode unavailable, mprotect kept");
+	std::printf("KYTY_UFFD_MINOR: %s\n", !g_minor_on   ? "userfaultfd minor mode unavailable, mprotect kept"
+	                                    : g_minor_long ? "the GPU's read protections of short and long runs by userfaultfd minor mode"
+	                                                   : "the GPU's read protections of short runs by userfaultfd minor mode");
 }
 
 static bool WatchRange(uint64_t address, uint64_t size) {
@@ -864,10 +874,15 @@ bool SysVirtualProtectWriteWatch(uint64_t address, uint64_t size, VirtualMemory:
 	const int  protect  = get_protection_flag(mode);
 	const bool watch    = protect == PROT_READ;
 	const bool writable = (protect & PROT_WRITE) != 0;
+	// (KYTY_UFFD_MINOR=2: a run to zap, or a zapped run to lift, ends at its minor block's end.)
+	const bool cut_zap = g_minor_long && g_zap_no_access && protect == PROT_NONE;
 	for (auto first = begin >> 12u, last = end >> 12u; first < last;) {
-		auto state = WatchPage(first);
-		auto next  = first + 1;
-		while (next < last && WatchPage(next) == state) next++;
+		auto       state = WatchPage(first);
+		auto       next  = first + 1;
+		const bool cut   = g_minor_long && (state & WATCH_REGISTERED) != 0 &&
+		                 ((cut_zap && (state & WATCH_ZAPPED) == 0) || (protect != PROT_NONE && (state & WATCH_ZAPPED) != 0));
+		const auto stop = cut ? std::min(last, (first / MINOR_BLOCK_PAGES + 1) * MINOR_BLOCK_PAGES) : last;
+		while (next < stop && WatchPage(next) == state) next++;
 		const auto run_address = first << 12u;
 		const auto run_size    = (next - first) << 12u;
 		first                  = next;
