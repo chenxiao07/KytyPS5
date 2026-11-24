@@ -1125,7 +1125,17 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 
 	// (More layers, texels or bytes than the format allows is no image at all: the driver may not even refuse it. Images
 	// that must exist try anyway, as before.)
+	uint32_t max_dim = create.extent.width;
+	if (create.extent.height > max_dim) max_dim = create.extent.height;
+	if (create.extent.depth > max_dim) max_dim = create.extent.depth;
+	uint32_t max_mips_for_extent = 0;
+	for (uint32_t d = max_dim; d > 0; d >>= 1u) {
+		++max_mips_for_extent;
+	}
 	const bool within_limits = create.arrayLayers <= properties.maxArrayLayers &&
+	                           create.mipLevels > 0 &&
+	                           create.mipLevels <= properties.maxMipLevels &&
+	                           create.mipLevels <= max_mips_for_extent &&
 	                           create.extent.width <= properties.maxExtent.width &&
 	                           create.extent.height <= properties.maxExtent.height &&
 	                           create.extent.depth <= properties.maxExtent.depth &&
