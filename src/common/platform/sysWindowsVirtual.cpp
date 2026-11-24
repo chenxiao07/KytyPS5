@@ -350,6 +350,10 @@ void SysVirtualWriteWatchMapped(uint64_t /*address*/, uint64_t /*size*/, Virtual
 
 void SysVirtualWriteWatchUnmapped(uint64_t /*address*/, uint64_t /*size*/) {}
 
+bool SysVirtualWriteWatchByUffd() {
+	return false;
+}
+
 void SysVirtualZapNoAccess(bool /*on*/) {}
 
 bool SysVirtualResolveMinorFault(uint64_t /*address*/, bool /*present*/, bool /*write*/) {
