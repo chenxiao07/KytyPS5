@@ -125,6 +125,7 @@ static void WriteWatchInit() {
 	const char* value   = std::getenv("KYTY_UFFD_WP");
 	const char* minor   = std::getenv("KYTY_UFFD_MINOR");
 	bool        by_weave = false;
+	bool        minor_by_weave = false;
 #if defined(KYTY_STEAM_DECK)
 	// On by default in the Steam Deck build (KYTY_UFFD_WP=0: mprotect): there the upload worker's re-arms took 4.4 ms a
 	// frame as mprotect calls, 2.3 ms as write protections; 1-1 at 360p, same boots alternating: stand 29.0/29.3 ->
@@ -142,6 +143,15 @@ static void WriteWatchInit() {
 	if ((value == nullptr || value[0] == '\0') && WeaveAsked()) {
 		value    = "1";
 		by_weave = true;
+	}
+	// With the weave, also the GPU's read protections by minor mode, long runs too (KYTY_UFFD_MINOR=2; 0: mprotect, 1:
+	// short runs only). Under the watch those no-access protections and their lifts are the remaining mprotects, the GPU
+	// thread's, and its rare long frames standing were them queued on the memory-map lock. Inner Ward, one exe each,
+	// alternating: unset/1/1/unset, walking 67.2/70.5/71.3/65.5 fps, standing level; 1/2/2/1, frames over 25 ms in 105 s
+	// standing 5/0/0/4, the worst 51.0/22.1/22.9/47.5 ms, the per-second SD 1.63/0.85/0.68/1.07, standing fps level.
+	if ((minor == nullptr || minor[0] == '\0') && WeaveAsked()) {
+		minor          = "2";
+		minor_by_weave = true;
 	}
 #endif
 	if (value == nullptr || value[0] != '1') return;
@@ -167,9 +177,11 @@ static void WriteWatchInit() {
 	g_minor_on   = has_minor;
 	g_minor_long = has_minor && minor[0] == '2';
 	if (g_minor_on) g_minor_blocks = new std::map<uint64_t, uint64_t>;
-	std::printf("KYTY_UFFD_MINOR: %s\n", !g_minor_on   ? "userfaultfd minor mode unavailable, mprotect kept"
-	                                    : g_minor_long ? "the GPU's read protections of short and long runs by userfaultfd minor mode"
-	                                                   : "the GPU's read protections of short runs by userfaultfd minor mode");
+	std::printf("KYTY_UFFD_MINOR: %s%s\n",
+	            !g_minor_on    ? "userfaultfd minor mode unavailable, mprotect kept"
+	            : g_minor_long ? "the GPU's read protections of short and long runs by userfaultfd minor mode"
+	                           : "the GPU's read protections of short runs by userfaultfd minor mode",
+	            minor_by_weave ? " (the weave's default; KYTY_UFFD_MINOR=0 keeps mprotect)" : "");
 }
 
 static bool WatchRange(uint64_t address, uint64_t size) {
