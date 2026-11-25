@@ -330,7 +330,9 @@ private:
 	std::condition_variable& PassWake() noexcept;
 	std::condition_variable& GpuWake() noexcept;
 	void WakePass() noexcept;
-	void WakeGpu() noexcept;
+	void WakeGpu(uint64_t serial, std::optional<uint32_t> chunk = std::nullopt) noexcept;
+	[[nodiscard]] bool TranslatingChunk(uint64_t serial, uint32_t chunk) const noexcept;
+	[[nodiscard]] bool ReadingSpan(uint64_t serial) const noexcept;
 	[[nodiscard]] bool StampPoolsShort() const;
 	void WakeStampRefill();
 	void WakeAll() noexcept;
@@ -378,7 +380,7 @@ private:
 	std::vector<std::unique_ptr<Translator>> m_translators;
 	bool                                     m_pass_thread = false; // (KYTY_SPEC_PASS_THREAD: the last of m_translators)
 	std::deque<std::unique_ptr<Result>>      m_ahead;     // translated ahead (under m_mutex in mode 4)
-	// (Mode 4) moved by every worker's push into m_ahead (written under m_mutex: no locked add): CommitReady's spin.
+	// CommitReady's spin generation. Advances under m_mutex on q0's awaited completion, or on each publish elsewhere.
 	std::atomic<uint64_t>                    m_ahead_gen {0};
 	std::unique_ptr<Result>                  m_blocked;   // a commit waiting at a wait hole
 	std::unique_ptr<CommandProcessor>        m_chain;     // mode 3: the state the next one ahead starts from
@@ -428,10 +430,25 @@ private:
 	// thread took the normal way and the last it did, with its state after it.
 	// Shared by all roles by default. With role wakes, this is the translator channel.
 	std::condition_variable           m_ahead_wake;
+	struct GpuWait {
+		uint64_t serial;
+		std::optional<uint32_t> chunk; // An empty chunk means drain every reader of the serial.
+	};
 	struct RoleWakes {
 		std::condition_variable pass, gpu;
+		std::optional<GpuWait> gpu_wait; // Under m_mutex. Only the GPU thread enrolls, before it unlocks.
 	};
 	std::optional<RoleWakes>           m_role_wakes; // q0 mode 4, set before workers start
+	class ScopedGpuWait {
+	public:
+		ScopedGpuWait(Speculation& instance, uint64_t serial, std::optional<uint32_t> chunk = std::nullopt) noexcept;
+		~ScopedGpuWait();
+		ScopedGpuWait(const ScopedGpuWait&) = delete;
+		ScopedGpuWait& operator=(const ScopedGpuWait&) = delete;
+
+	private:
+		std::optional<GpuWait>* const m_wait;
+	};
 	bool                              m_log_placement = false;
 	std::optional<Pm4Execution>        m_pass_resume;
 	std::deque<Entry>                 m_jobs;

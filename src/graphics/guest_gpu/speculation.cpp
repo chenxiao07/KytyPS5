@@ -1143,12 +1143,53 @@ void Speculation::WakePass() noexcept {
 	}
 }
 
-void Speculation::WakeGpu() noexcept {
-	if (m_role_wakes) {
-		m_role_wakes->gpu.notify_one();
-	} else {
-		m_ahead_wake.notify_all();
+Speculation::ScopedGpuWait::ScopedGpuWait(Speculation& instance, uint64_t serial, std::optional<uint32_t> chunk) noexcept
+    : m_wait(instance.m_role_wakes ? &instance.m_role_wakes->gpu_wait : nullptr) {
+	if (m_wait != nullptr) {
+		m_wait->emplace(GpuWait {serial, chunk});
 	}
+}
+
+Speculation::ScopedGpuWait::~ScopedGpuWait() {
+	if (m_wait != nullptr) {
+		m_wait->reset();
+	}
+}
+
+bool Speculation::TranslatingChunk(uint64_t serial, uint32_t chunk) const noexcept {
+	return std::ranges::any_of(m_translators, [serial, chunk](const auto& translator) {
+		return translator->translating == serial && translator->translating_chunk == chunk;
+	});
+}
+
+bool Speculation::ReadingSpan(uint64_t serial) const noexcept {
+	return m_pass_active_serial == serial ||
+	       std::ranges::any_of(m_translators, [serial](const auto& worker) { return worker->translating == serial; });
+}
+
+// Called after publishing and clearing a reader, with m_mutex held throughout.
+void Speculation::WakeGpu(uint64_t serial, std::optional<uint32_t> chunk) noexcept {
+	if (!m_role_wakes) {
+		if (chunk) {
+			m_ahead_gen.store(m_ahead_gen.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+		}
+		m_ahead_wake.notify_all();
+		return;
+	}
+	const auto& waiting = m_role_wakes->gpu_wait;
+	if (!waiting || waiting->serial != serial) {
+		return;
+	}
+	if (const auto awaited = waiting->chunk) {
+		if (awaited != chunk || TranslatingChunk(serial, *awaited)) {
+			return;
+		}
+		// CommitReady's bounded cancellation spin observes the same completion as the CV.
+		m_ahead_gen.store(m_ahead_gen.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+	} else if (ReadingSpan(serial)) {
+		return;
+	}
+	m_role_wakes->gpu.notify_one();
 }
 
 bool Speculation::StampPoolsShort() const {
@@ -1875,7 +1916,7 @@ bool Speculation::AheadTurn(Translator& translator, std::unique_lock<std::mutex>
 		if (which == m_pass && !m_pass_resume) {
 			m_state_serial = job.serial;
 		}
-		WakeGpu(); // The pass may have released a reader of the claimed span.
+		WakeGpu(job.serial); // The pass may have released the last reader of the claimed span.
 		if (!m_pass_thread) {
 			WakeStampRefill(); // Another translator can refill if this one takes the next pass.
 		}
@@ -1964,8 +2005,7 @@ bool Speculation::AheadTurn(Translator& translator, std::unique_lock<std::mutex>
 		}
 	}
 	m_ahead.push_back(std::move(result));
-	m_ahead_gen.store(m_ahead_gen.load(std::memory_order_relaxed) + 1, std::memory_order_release); // (under m_mutex)
-	WakeGpu();
+	WakeGpu(job.serial, work_chunk);
 	WakeStampRefill();
 	if (wake_reclaim) {
 		// Enqueue takes the queue mutex before m_mutex.
@@ -2005,10 +2045,7 @@ void Speculation::ClaimBlockingRemainder(uint64_t serial, std::unique_lock<std::
 			worker->cancel.store(true, std::memory_order_relaxed);
 		}
 	}
-	const auto reading = [&] {
-		return m_pass_active_serial == serial ||
-		       std::ranges::any_of(m_translators, [serial](const auto& worker) { return worker->translating == serial; });
-	};
+	const auto reading = [&] { return ReadingSpan(serial); };
 	if (!reading()) {
 		return;
 	}
@@ -2025,10 +2062,13 @@ void Speculation::ClaimBlockingRemainder(uint64_t serial, std::unique_lock<std::
 				GuestGpu::ServePendingCommands();
 				lock.lock();
 			} else {
+				// Command arrivals signal the GPU's queue, so service them on the existing timed poll.
+				const ScopedGpuWait waiting(*this, serial);
 				GpuWake().wait_for(lock, std::chrono::microseconds(50));
 			}
 		}
-	} else {
+	} else if (reading()) {
+		const ScopedGpuWait waiting(*this, serial);
 		GpuWake().wait(lock, [&] { return !reading(); });
 	}
 }
@@ -2073,11 +2113,7 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 			// Being translated: its result (the normal translation would write what tells the guest the command
 			// buffer is done, which it may then reuse under the speculation's thread). Not begun: this thread translates
 			// it the normal way, the speculation's threads do not begin it.
-			const auto translating = [&] {
-				return std::ranges::any_of(m_translators, [&](const auto& translator) {
-					return translator->translating == job.serial && translator->translating_chunk == chunk;
-				});
-			};
+			const auto translating = [&] { return TranslatingChunk(job.serial, chunk); };
 			if (translating()) {
 				// Mode 4, the graphics instance: before the cancel, another queue's compute front that is runnable and ready
 				// (the async speculation's front has its chunk translated, or an unspeculated one: in-order work this thread
@@ -2154,14 +2190,11 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 					}
 				}
 #endif
-				// (CancelSpinOn: the cancelled worker's stop waited for by a spin on the pushes' generation before the
-				// sleep: while it has not seen the flag, CancelSpinUnseen pauses (its packet's poll not reached: a long
-				// packet sleeps as before); once it has (its tail: the refusal, the segment's close, the end state, the
-				// push), up to CancelSpinTail. Guest commands queued for this thread (KYTY_SERVE_IN_WAITS 4) end it too:
-				// the wait below serves them. Exact: it changes only how this thread waits; the lock is taken again and
-				// translating() decides, as the wait below does. A push of another worker ends the spin as well, and the
-				// predicate then sends it to the wait.)
+				// Spin on the result generation before sleeping. Allow CancelSpinUnseen pauses for the worker to
+				// see the cancellation and up to CancelSpinTail for it to finish. Pending GPU commands can also end
+				// the spin. Once the lock is held again, translating() determines whether to wait.
 				if (spinning != nullptr && CancelSpinOn() && translating()) {
+					const ScopedGpuWait waiting(*this, job.serial, chunk);
 					const auto gen   = m_ahead_gen.load(std::memory_order_acquire);
 					const bool serve = (GuestGpu::ServeInWaits() & 4u) != 0;
 					lock.unlock();
@@ -2182,9 +2215,12 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 							lock.lock();
 							continue;
 						}
+						// Keep polling for commands queued to the GPU thread while the worker is busy.
+						const ScopedGpuWait waiting(*this, job.serial, chunk);
 						GpuWake().wait_for(lock, std::chrono::microseconds(50));
 					}
-				} else {
+				} else if (translating()) {
+					const ScopedGpuWait waiting(*this, job.serial, chunk);
 					GpuWake().wait(lock, [&] { return !translating(); });
 				}
 				m_wait_ns += NowNs() - waited;
