@@ -2233,6 +2233,11 @@ struct EffectsLog {
 	};
 	EntryList             entries;
 	bool                  graphics_writer = false; // set by the GPU thread for the current submission
+	// KYTY_SPEC_COMMIT_WALKS (live spec_commit_walks), sampled once per mode-4 submission slice.
+	uint8_t               commit_walks_mode = 0;
+	void SetCommitWalksMode(int64_t mode) noexcept {
+		commit_walks_mode = mode == 1;
+	}
 	uint64_t              base = 0;  // the index of entries.front() since the log began
 	std::atomic<uint64_t> end {0};   // entries since the log began (read where a speculation begins)
 	[[nodiscard]] uint64_t End() const noexcept { return end.load(std::memory_order_acquire); }
@@ -2247,9 +2252,9 @@ struct EffectsLog {
 	static constexpr uint64_t IndexGranuleBits = 22, IndexWideGranules = 256;
 	std::unordered_map<uint64_t, std::vector<uint64_t>> index;
 	// KYTY_SPEC_LOG_FLAT (empty without it): by granule below AddressLimit, the list `index` holds for it, or null until
-	// AddFlat first wants it. The map keeps the lists (its nodes never move; a granule above the table asks the map) and
-	// the readers read the map: a slot is nulled where its list leaves it (the prune, the switch to mode 0), never the
-	// table cleared. A table, not the last granule alone: a dispatch's written buffers alternate granules. 2 MiB a log,
+	// AddFlat first wants it. The map keeps the lists (its nodes never move; a granule above the table asks the map).
+	// A slot is nulled when its list leaves the map (pruning or switching out of indexing), with the rest of the
+	// table left intact. The pointers cover all granules because a dispatch's writes alternate granules. 2 MiB a log,
 	// made with it (as each stamp set's 6 MiB of granules).
 	std::vector<std::vector<uint64_t>*> index_lists = std::vector<std::vector<uint64_t>*>(
 	    entries.flat ? WriteStamps<8>::AddressLimit >> IndexGranuleBits : 0);
@@ -2326,19 +2331,20 @@ struct EffectsLog {
 	const uint64_t id = NextId();
 	// The first write logged from `from` on over the range (null: none).
 	[[nodiscard]] const Entry* FirstWriteOver(uint64_t from, uint64_t address, uint64_t size) const {
-		if (const auto* indexed = IndexedWalk(from, address, size, false); indexed != reinterpret_cast<const Entry*>(1))
-			return indexed;
-		for (auto i = std::max(from, base); i < base + entries.size(); ++i) {
-			const auto& entry = entries[i - base];
-			if (entry.kind != Kind::RetiredSet && entry.address < address + size && address < entry.address + entry.size)
-				return &entry;
+		return WalkWriteOver<false>(from, address, size);
+	}
+	[[nodiscard]] const std::vector<uint64_t>* FindIndexList(uint64_t granule) const {
+		if (granule < index_lists.size()) {
+			return index_lists[granule];
 		}
-		return nullptr;
+		const auto found = index.find(granule);
+		return found == index.end() ? nullptr : &found->second;
 	}
 	// spec_log_index: the first entry from `from` on over the range (`gpu_only`: a GPU write), through the granules'
 	// indices: in each granule the range touches, the first index >= max(from, base) over it, the smallest of those (the
 	// linear walk's answer). (const Entry*)1 when the index cannot answer (off, entries from `from` on not all indexed, or a
 	// range over more than 256 granules).
+	template <bool UseTable>
 	[[nodiscard]] const Entry* IndexedWalk(uint64_t from, uint64_t address, uint64_t size, bool gpu_only) const {
 		const auto on = IndexSwitch();
 		if (on == 0 || index_from == UINT64_MAX || from < index_from || size == 0) return reinterpret_cast<const Entry*>(1);
@@ -2359,8 +2365,15 @@ struct EffectsLog {
 				}
 			}
 		};
-		for (uint64_t g = g0; g <= g1; ++g)
-			if (const auto found = index.find(g); found != index.end()) scan(found->second);
+		for (uint64_t g = g0; g <= g1; ++g) {
+			if constexpr (UseTable) {
+				if (const auto* list = FindIndexList(g)) {
+					scan(*list);
+				}
+			} else if (const auto found = index.find(g); found != index.end()) {
+				scan(found->second);
+			}
+		}
 		scan(index_wide);
 		return best == UINT64_MAX ? nullptr : &entries[best - base];
 	}
@@ -2383,19 +2396,118 @@ struct EffectsLog {
 	}
 	// The first GPU write logged from `from` on over the range (null: none).
 	[[nodiscard]] const Entry* FirstGpuWriteOver(uint64_t from, uint64_t address, uint64_t size) const {
-		if (const auto* indexed = IndexedWalk(from, address, size, true); indexed != reinterpret_cast<const Entry*>(1))
+		return WalkWriteOver<true>(from, address, size);
+	}
+	template <bool GpuOnly, bool UseTable = false>
+	[[nodiscard]] const Entry* ExactWriteOver(uint64_t from, uint64_t address, uint64_t size) const {
+		if (const auto* indexed = IndexedWalk<UseTable>(from, address, size, GpuOnly);
+		    indexed != reinterpret_cast<const Entry*>(1)) {
 			return indexed;
+		}
 		for (auto i = std::max(from, base); i < base + entries.size(); ++i) {
 			const auto& entry = entries[i - base];
-			if (entry.kind == Kind::GpuWrite && entry.address < address + size && address < entry.address + entry.size)
+			if ((GpuOnly ? entry.kind == Kind::GpuWrite : entry.kind != Kind::RetiredSet) &&
+			    entry.address < address + size && address < entry.address + entry.size) {
 				return &entry;
+			}
 		}
 		return nullptr;
+	}
+	template <bool GpuOnly>
+	[[nodiscard]] const Entry* WalkWriteOver(uint64_t from, uint64_t address, uint64_t size) const {
+		if (commit_walks_mode == 0) [[likely]] {
+			return ExactWriteOver<GpuOnly>(from, address, size);
+		}
+		return ExactWriteOver<GpuOnly, true>(from, address, size);
+	}
+	struct HostWriteHit {
+		uint64_t address, size;
+	};
+	template <typename F>
+	bool EmitHostWrite(uint64_t at, uint64_t address, uint64_t read_end, const F& emit) const {
+		const auto& entry = entries[at - base];
+		if (entry.kind != Kind::HostWrite || entry.address >= read_end || address >= entry.address + entry.size) {
+			return false;
+		}
+		const auto begin = std::max(address, entry.address), end = std::min(read_end, entry.address + entry.size);
+		emit(HostWriteHit {begin, end - begin});
+		return true;
+	}
+	// Follow the live end as callbacks append. A callback that advances base can also retire IDs.
+	template <typename F>
+	void WalkHostWritesScan(uint64_t next, uint64_t address, uint64_t read_end, const F& emit) const {
+		while (next < base + entries.size()) {
+			if (EmitHostWrite(next++, address, read_end, emit)) {
+				next = std::max(next, base);
+			}
+		}
+	}
+	template <typename F>
+	void WalkHostIndex(uint64_t& next, uint64_t last, uint64_t address, uint64_t read_end, uint64_t first_granule,
+	                       uint64_t last_granule, const F& emit) const {
+		struct Cursor {
+			const std::vector<uint64_t>* list;
+			size_t offset;
+		};
+		std::array<Cursor, IndexWideGranules + 1> heap;
+		auto* tail = heap.data();
+		const auto later = [](const Cursor& a, const Cursor& b) { return (*a.list)[a.offset] > (*b.list)[b.offset]; };
+		const auto open = [&](const std::vector<uint64_t>& list) {
+			const auto it = std::lower_bound(list.begin(), list.end(), next);
+			if (it == list.end() || *it >= last) {
+				return;
+			}
+			*tail++ = {&list, static_cast<size_t>(it - list.begin())};
+			std::push_heap(heap.data(), tail, later);
+		};
+		for (auto granule = first_granule; granule <= last_granule; ++granule) {
+			if (const auto* list = FindIndexList(granule)) {
+				open(*list);
+			}
+		}
+		open(index_wide);
+
+		const auto indexed_base = base, indexed_from = index_from;
+		while (tail != heap.data()) {
+			std::pop_heap(heap.data(), tail, later);
+			auto& cursor = *--tail;
+			const auto at = (*cursor.list)[cursor.offset++];
+			if (at >= next) { // A write can occur in several lists.
+				next = at + 1;
+				if (EmitHostWrite(at, address, read_end, emit) &&
+				    (base + entries.size() != last || base != indexed_base || index_from != indexed_from)) {
+					return;
+				}
+			}
+			if (cursor.offset < cursor.list->size() && (*cursor.list)[cursor.offset] < last) {
+				std::push_heap(heap.data(), ++tail, later);
+			}
+		}
+		next = last;
+	}
+	template <typename F>
+	void CommitWalkHostWrites(uint64_t next, uint64_t address, uint64_t read_end, const F& emit) const {
+		const auto first_granule = address >> IndexGranuleBits, last_granule = (read_end - 1) >> IndexGranuleBits;
+		for (auto last = base + entries.size(); next < last; last = base + entries.size()) {
+			// NoteHostWrite skips empty writes, so every host write in the covered suffix is in the index.
+			if (next < index_from || read_end <= address || last_granule - first_granule >= IndexWideGranules) {
+				WalkHostWritesScan(next, address, read_end, emit);
+				return;
+			}
+			WalkHostIndex(next, last, address, read_end, first_granule, last_granule, emit);
+			// Callbacks can grow or trim the log. Reopen from the next surviving ID.
+			next = std::max(next, base);
+		}
 	}
 	// Each host write logged from `from` on over the range, clipped to it.
 	template <typename F>
 	void ForEachHostWriteOver(uint64_t from, uint64_t address, uint64_t size, F&& f) const {
 		if (!host_stamps.MaybeSince(address, size, from)) {
+			return;
+		}
+		if (commit_walks_mode != 0) [[unlikely]] {
+			CommitWalkHostWrites(std::max(from, base), address, address + size,
+			                     [&](const HostWriteHit& hit) { f(hit.address, hit.size); });
 			return;
 		}
 		const auto read_end   = address + size;

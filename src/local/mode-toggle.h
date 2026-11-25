@@ -45,6 +45,7 @@ inline constexpr Row Table[] = {
     {"spec_format_ahead", 1, 0}, // (a table pair born with its recorded pair's vertex format mask: local/format-ahead.h)
     {"spec_compute", 3, 0}, // (mode 4 startup: 0 off, 1 legacy async, 3 both claim and cancel)
     {"spec_log_flat", 1, 0}, // (the effects log's Add cheaper, the same contents; read at the first log: speculation-state.h)
+    {"spec_commit_walks", 1, 0}, // (read the effects log indexes during commit, sampled per submission slice)
 };
 // KYTY_TABLE_TARGET_READ (not a live switch: read where image sets are made): on under mode 4.
 inline constexpr uint32_t TableTargetRead4 = 1, TableTargetRead0 = 0;

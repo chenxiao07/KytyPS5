@@ -155,7 +155,8 @@ static bool GraphicsRunDebugDumpEnabled() {
 	return g_graphics_run_debug_dump;
 }
 
-GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
+GuestGpu::GuestGpu(RenderContext& renderer)
+    : m_renderer(renderer), m_commit_walks_switch(LiveSwitch::Find("spec_commit_walks", ModeToggle::Default("spec_commit_walks"))) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	g_graphics_run_debug_dump =
 	    Config::GraphicsDebugDumpEnabled() && Config::GetPrintfDirection() != Config::OutputDirection::Silent;
@@ -2227,7 +2228,8 @@ bool GuestGpu::Process(Submission& submission) {
 	struct EffectsScope {
 		Spec::EffectsLog* copy_log = nullptr;
 		bool previous_graphics_writer = false;
-		EffectsScope(Speculation* speculation, Speculation* async, uint32_t queue) {
+		EffectsScope(Speculation* speculation, Speculation* async, uint32_t queue,
+		             const std::atomic<int64_t>& commit_walks_switch) {
 			Spec::t_effects       = speculation != nullptr ? &speculation->Log() : nullptr;
 			Spec::t_effects_async = async != nullptr ? &async->Log() : nullptr;
 			// (In mode 4 every instance's Log() is the shared log, written once.)
@@ -2235,6 +2237,7 @@ bool GuestGpu::Process(Submission& submission) {
 			if (any != nullptr && any->SharesEffectsLog()) [[unlikely]] {
 				Spec::t_effects       = &any->Log();
 				Spec::t_effects_async = nullptr;
+				Spec::t_effects->SetCommitWalksMode(commit_walks_switch.load(std::memory_order_relaxed));
 				if (Spec::CopyForwardActive()) {
 					copy_log = Spec::t_effects;
 					previous_graphics_writer = copy_log->graphics_writer;
@@ -2257,7 +2260,7 @@ bool GuestGpu::Process(Submission& submission) {
 		if (m_spec_start_failed[0] && compute_effects == nullptr) {
 			compute_effects = m_speculation_q1 ? m_speculation_q1.get() : m_speculation_async.get();
 		}
-		effects_scope.emplace(m_speculation.get(), compute_effects, submission.queue_id);
+		effects_scope.emplace(m_speculation.get(), compute_effects, submission.queue_id, m_commit_walks_switch);
 	}
 	auto* const compute_lane = mode == 4 ? ComputeLane(submission.queue_id) : nullptr;
 

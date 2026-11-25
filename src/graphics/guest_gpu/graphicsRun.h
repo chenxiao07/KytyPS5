@@ -147,6 +147,7 @@ private:
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 
 	RenderContext&                                 m_renderer;
+	const std::atomic<int64_t>&                     m_commit_walks_switch;
 	Common::Mutex                                  m_submission_mutex;
 	Common::Mutex                                  m_queue_mutex;
 	std::mutex                                     m_shutdown_mutex;

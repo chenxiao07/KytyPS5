@@ -68,6 +68,7 @@ switch acts only in mode 4. A verify switch N checks every Nth use against the p
 | spec_touch_batch | a committed segment's image LRU touches under one texture-cache lock | - | 1 | |
 | spec_draw_indirect | DRAW_INDIRECT as a table draw, not a hole | - | 1 | spec_draw_indirect_verify N |
 | spec_read_one_set | a worker's clear read costs one search of one journal set | - | 1 | spec_read_one_set_verify N |
+| spec_commit_walks (KYTY_SPEC_COMMIT_WALKS) | 0 uses the existing walks. 1 merges the effects log's existing 4 MiB lists and wide list for ordered host-write callbacks and uses the flat pointer table for exact overlap queries. Sampled at the next mode-4 submission slice. | 0 | 1 | |
 | spec_walk_from_stamp | the clean-read check's log walk tries the read's latest stamp first | 1 | 1 | spec_commit_verify N |
 | spec_worker_packets | a worker's draws recorded as Vulkan packets on its own thread and spliced into the render thread's command buffer at commit | - | 1 | |
 | speculate_cancel_us | how long the render thread waits on a worker's chunk before taking the rest itself | - | 1000000 (always) | |
