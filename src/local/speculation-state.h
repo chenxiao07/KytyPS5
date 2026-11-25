@@ -2530,7 +2530,7 @@ inline thread_local EffectsLog* t_effects = nullptr;
 // t_packet_slot), 0 between translations. A buffer or image the thread that commits releases (unregistered: no later
 // lookup finds it) is destroyed after the packets it may have been looked up in: PacketNow when it is released,
 // WaitPacketPassed before it is destroyed.
-inline constexpr size_t                                MaxPacketSlots = 12; // (the graphics queue's threads, then the compute lanes')
+inline constexpr size_t                                MaxPacketSlots = 13; // (the graphics queue's threads, then the compute lanes')
 // (Each slot on its own cache line: every worker packet stores to its slot.)
 struct alignas(64) PacketSlot {
 	std::atomic<uint64_t> value {0};

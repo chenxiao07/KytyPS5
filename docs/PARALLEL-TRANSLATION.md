@@ -38,7 +38,7 @@ where single black frames start (README).
 
 Mode 4 also stands down at boot on a CPU whose performance cores (the highest efficiency class the process may run on)
 have fewer logical CPUs than its threads: the GPU, recording and upload threads, KYTY_SPECULATE_THREADS workers and the
-async queue's 2, 9 by default (src/local/performance-switches.h). On 3 performance cores (6 logical CPUs) beside
+async queue's 2, with nine logical CPUs required to enable automatic sizing (src/local/performance-switches.h). On 3 performance cores (6 logical CPUs) beside
 efficiency cores, the default placement put the workers on the render threads' CPUs and mode 4 read 6 % under mode 0;
 with the workers on the efficiency cores, half. The workers never go to the efficiency cores by default; naming their
 CPUs with KYTY_SPECULATE_CPUS lifts the check. KYTY_SIMULATE_PCORES=<n> stands in for the count (a test). Linux: no
@@ -54,9 +54,9 @@ switch acts only in mode 4. A verify switch N checks every Nth use against the p
 | **Speculation** | | | | |
 | KYTY_SPECULATE (0 or 4) | 4: graphics command buffers translated ahead on worker threads and committed in order | 0 | 4 | |
 | live `mode 0\|4` (live-control.h) | KYTY_SPECULATE's mode changed while the game runs, between submissions; every mode-defaulted switch from one table (local/mode-toggle.h), a variable set wins | - | - | |
-| KYTY_SPECULATE_THREADS (1..12) | the worker threads | - | 4 | |
+| KYTY_SPECULATE_THREADS (1..12) | Unset, q0 counts two translators per spare SMT core and one per spare single-threaded core in its existing CPU list, up to eight. The budget reserves GPU, Record, upload, state pass and today's copy workers. If the render masks cannot keep their three cores or the copy budget is zero, q0 keeps four. Automatic 10- and 14-core alike SMT shapes match their six-P-core peers' copy counts. | - | CPU shape, or four on Linux or unknown topology | |
 | KYTY_SPECULATE_RAM_GB (GiB, 0 = no gate) | KYTY_SPECULATE=4 stands down at boot on a PC with less physical memory; the run stays in mode 0 and the log names the memory and the threshold | - | 28 | |
-| KYTY_SPECULATE_CPUS (a CPU list) | the workers' CPUs; unset: the upper half of the performance cores, and KYTY_SPECULATE=4 stands down at boot where they have fewer logical CPUs than its threads (9 by default; the log names both counts) | - | unset | |
+| KYTY_SPECULATE_CPUS (a CPU list) | the workers' CPUs, including efficiency CPUs if explicitly named. Unset uses the upper half of the eligible performance cores. The GPU thread moves off those cores at a flip when at least two other performance cores are available in its mask. Record and upload retain their affinity masks and can share q0's cores. Naming the list lifts the mode-4 CPU stand-down check | - | unset | |
 | KYTY_SPEC_COMPUTE | sampled when mode 4 starts. 0 disables compute speculation. 1 uses round 4's blocking async path and its queue selector. 3 enables fixed queues 1 and 49 with claim-and-cancel. | 0 | 3 | |
 | KYTY_SPECULATE_ASYNC | applies only at KYTY_SPEC_COMPUTE=1. Unset selects queue 49. 0 disables the lane. A positive queue ID selects that queue. | - | 49 | |
 | KYTY_SPECULATE_ASYNC_THREADS | workers per enabled compute lane, subject to the translator slot budget. At value 1, the fallback is 2 if the queue selector is unset and 4 if it is set. The fixed lanes default to 2 each and reserve a slot for each queue, with queue 1 taking available slots first. | - | 2 or 4 | |

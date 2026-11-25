@@ -484,7 +484,7 @@ public:
 	// At the start of a translation: what this executor kept of the catalog from its last one, dropped when the owner
 	// changed it since (TableXpr::epoch; table-xpr.inc).
 	void ForgetStaleCatalog();
-	static constexpr uint32_t Roles = 13; // (the GPU thread, Spec::MaxPacketSlots speculation threads)
+	static constexpr uint32_t Roles = 14; // (the GPU thread, Spec::MaxPacketSlots speculation threads)
 	// (Mode 4, the GPU thread) A segment's commit settles each proposal's catalog part under its owner's catalog write
 	// taken with a try-lock (SettleOrQueue; `owner`: the proposal's catalog owner, Spec::State::ProposedSet::catalog_owner,
 	// null: run at once, its own writes taken); held by a worker's read, or a part already waiting, the part waits in a list

@@ -1651,7 +1651,7 @@ void GuestGpu::ThreadRun(void* data) {
 	gpu->m_renderer.GetMutex().BecomeOwner();
 	BdaDirtyRegions::g_translating = true;
 	LiveTrace::g_mark_thread = true;
-	InitializePerformanceSwitches();
+	const auto cpu_plan = InitializePerformanceSwitches();
 #if defined(__linux__)
 	static const auto check_write_guard_uffd = [] { // (static: apply_mode calls it too)
 	// KYTY_WRITE_GUARD with the userfaultfd write watch (KYTY_UFFD_WP=1, the Steam Deck build's default unless 0;
@@ -1686,7 +1686,7 @@ void GuestGpu::ThreadRun(void* data) {
 	};
 	// (Mode 4's machinery: at the start, and again on a live `mode 4` (mode-toggle.h, below).)
 	using FailedLanes = std::array<std::unique_ptr<Speculation>, QueueCount>;
-	const auto start_speculation = [gpu](FailedLanes& failed) {
+	const auto start_speculation = [gpu, &cpu_plan](bool boot, FailedLanes& failed) {
 		const auto start_workers = [gpu, &failed](std::unique_ptr<Speculation>& lane, uint32_t id) {
 			if (lane->StartWorkers(id)) {
 				return true;
@@ -1705,18 +1705,18 @@ void GuestGpu::ThreadRun(void* data) {
 		// KYTY_SPEC_PASS_THREAD (unset: on, mode 4 only as all of this; 0 off): the state pass on its own thread
 		// (Speculation::AheadRun), its packet slot after the workers'.
 		const char* pass_env         = std::getenv("KYTY_SPEC_PASS_THREAD");
-		const auto  graphics_workers = kyty_local_speculate_threads.load(std::memory_order_relaxed);
-		const bool  pass_thread      = (pass_env == nullptr || std::atoi(pass_env) > 0) &&
-		                               graphics_workers + 1 < Spec::MaxPacketSlots;
-		static_assert(AsyncUpload::SpecPacketSlots == Spec::MaxPacketSlots); // (the upload pipe's count repeats this test)
+		const auto graphics_workers = cpu_plan.derived_workers ? cpu_plan.workers
+		                                                        : kyty_local_speculate_threads.load(std::memory_order_relaxed);
+		const bool  pass_thread      = CpuShape::HasPass(graphics_workers, pass_env == nullptr || std::atoi(pass_env) > 0);
+		static_assert(CpuShape::PacketSlots == Spec::MaxPacketSlots);
 		const auto compute = LiveSwitch::Find("spec_compute", ModeToggle::Default("spec_compute"))
 		                         .load(std::memory_order_relaxed);
 		const bool both_lanes = compute == 3;
 		// Reserve one worker slot per lane. The graphics pass keeps its own slot if enabled.
-		const auto graphics_limit = static_cast<uint32_t>(Spec::MaxPacketSlots) - (pass_thread ? 1u : 0u) - 2u;
+		const auto q0_workers = both_lanes ? CpuShape::FixedGraphicsWorkers(graphics_workers, pass_thread)
+		                                   : graphics_workers;
 		if (!gpu->m_spec_start_failed[0]) {
-			gpu->m_speculation = std::make_unique<Speculation>(
-			    gpu->m_renderer, 0, 0, both_lanes ? std::min(graphics_workers, graphics_limit) : 0u, pass_thread);
+			gpu->m_speculation = std::make_unique<Speculation>(gpu->m_renderer, 0, 0, q0_workers, pass_thread);
 			if (both_lanes) {
 				gpu->m_speculation->EnablePlacementLogging();
 			}
@@ -1735,13 +1735,14 @@ void GuestGpu::ThreadRun(void* data) {
 			const char* async_value = std::getenv("KYTY_SPECULATE_ASYNC");
 			const int   async       = async_value != nullptr ? std::atoi(async_value) : 49;
 			if (async > 0 && static_cast<uint32_t>(async) < QueueCount && !gpu->m_spec_start_failed[async] &&
-			    base < Spec::MaxPacketSlots) {
-				const auto  queue   = static_cast<uint32_t>(async);
-				const char* threads = std::getenv("KYTY_SPECULATE_ASYNC_THREADS");
+			    base < CpuShape::BaselinePacketSlots) {
+				const auto  queue     = static_cast<uint32_t>(async);
+				const char* threads   = std::getenv("KYTY_SPECULATE_ASYNC_THREADS");
+				const int   requested = threads != nullptr ? std::atoi(threads) : 0;
+				const auto  workers   = requested > 0 ? static_cast<uint32_t>(requested) : async_value != nullptr ? 4u : 2u;
+				const auto  slots     = CpuShape::LegacyAsyncSlots(base, workers);
 				gpu->m_speculation_async = std::make_unique<Speculation>(
-				    gpu->m_renderer, static_cast<int>(ComputeQueueBase + queue - 1), base,
-				    threads != nullptr && std::atoi(threads) > 0 ? static_cast<uint32_t>(std::atoi(threads))
-				                                                 : async_value != nullptr ? 4u : 2u);
+				    gpu->m_renderer, static_cast<int>(ComputeQueueBase + queue - 1), slots.base, slots.workers);
 				if (start_workers(gpu->m_speculation_async, queue)) {
 					gpu->m_async_queue = queue;
 					for (auto& submission: gpu->m_queues[queue]) {
@@ -1758,14 +1759,14 @@ void GuestGpu::ThreadRun(void* data) {
 			const char* threads    = std::getenv("KYTY_SPECULATE_ASYNC_THREADS");
 			const int   requested  = threads != nullptr ? std::atoi(threads) : 0;
 			const auto  workers    = requested > 0 ? static_cast<uint32_t>(requested) : 2u;
-			const auto  q1_workers = std::min(workers, static_cast<uint32_t>(Spec::MaxPacketSlots) - base - 1u);
+			const auto [q1_range, q49_range] = CpuShape::FixedLanes(base, pass_started, workers);
 			if (!gpu->m_spec_start_failed[ComputeQueue1]) {
 				gpu->m_speculation_q1 = std::make_unique<Speculation>(
-				    gpu->m_renderer, ComputeQueueBase + ComputeQueue1 - 1, base, q1_workers, false, gpu);
+				    gpu->m_renderer, ComputeQueueBase + ComputeQueue1 - 1, q1_range.base, q1_range.workers, false, gpu);
 			}
 			if (!gpu->m_spec_start_failed[ComputeQueue49]) {
 				gpu->m_speculation_q49 = std::make_unique<Speculation>(
-				    gpu->m_renderer, ComputeQueueBase + ComputeQueue49 - 1, base + q1_workers, workers, false, gpu);
+				    gpu->m_renderer, ComputeQueueBase + ComputeQueue49 - 1, q49_range.base, q49_range.workers, false, gpu);
 			}
 			for (auto* lane: {gpu->m_speculation_q1.get(), gpu->m_speculation_q49.get()}) {
 				if (lane != nullptr) {
@@ -1807,6 +1808,32 @@ void GuestGpu::ThreadRun(void* data) {
 			}
 			gpu->m_ahead.store(gpu->m_speculation.get(), std::memory_order_release);
 		}
+		if (boot) {
+			const auto slots = [](const std::unique_ptr<Speculation>& lane) -> uint32_t {
+				return lane ? lane->TranslatorCount() : 0u;
+			};
+			const auto q0 = base - (pass_started ? 1u : 0u);
+			const auto q1 = slots(gpu->m_speculation_q1);
+			const auto q49 = slots(gpu->m_speculation_q49);
+			const auto dedicated = q1 + q49 + slots(gpu->m_speculation_async);
+			const auto copies = cpu_plan.copies;
+			const auto gpu_cpus = CpuShape::CpuList(cpu_plan.gpu_cpus);
+			const auto record_cpus = CpuShape::CpuList(cpu_plan.record_cpus);
+			const char* count = std::getenv("KYTY_SPECULATE_THREADS");
+			const char* named = std::getenv("KYTY_SPECULATE_CPUS");
+			const char* why = count != nullptr && *count != '\0' ? "KYTY_SPECULATE_THREADS set"
+			                  : named != nullptr && *named != '\0' ? "KYTY_SPECULATE_CPUS set, default count"
+			                  : cpu_plan.reason;
+			std::printf("Speculation: %u translators (CPU shape: %u P-cores / %u logical, %u E-cores; "
+			            "GPU CPUs %s; Record/upload CPUs %s; %s); %u compute workers (q1 %u, q49 %u), "
+			            "%u pass, %u copy threads; %u threads including GPU/Record/upload vs %u cores\n",
+			            q0, cpu_plan.performance_cores, cpu_plan.performance_logical,
+			            cpu_plan.performance_cores != 0 ? cpu_plan.cores - cpu_plan.performance_cores : 0u,
+			            gpu_cpus.empty() ? "scheduler" : gpu_cpus.c_str(),
+			            record_cpus.empty() ? "scheduler" : record_cpus.c_str(), why, dedicated, q1, q49,
+			            static_cast<unsigned>(pass_started), copies,
+			            q0 + dedicated + pass_started + copies + CpuShape::RenderThreads, cpu_plan.cores);
+		}
 	};
 	// (A KYTY_SPECULATE=4 boot: the mode table's values set before the first packet, as a live `mode 4` sets them; the
 	// switches whose Find keeps main's default, the four levers, take mode 4's here.)
@@ -1821,7 +1848,7 @@ void GuestGpu::ThreadRun(void* data) {
 		gpu->m_renderer.GetPipelineCache().ApplyFormatAhead();
 		FailedLanes failed;
 		Common::LockGuard lock(gpu->m_queue_mutex);
-		start_speculation(failed);
+		start_speculation(true, failed);
 	}
 	// (Tooling: the live mode toggle (mode-toggle.h), applied between submissions when no speculated queue has one started
 	// and not done: a speculation's results and blocked commits belong to the submission they began. Under m_queue_mutex,
@@ -1867,7 +1894,7 @@ void GuestGpu::ThreadRun(void* data) {
 #if defined(__linux__)
 				check_write_guard_uffd(); // (the guard turns on with mode 4: #289's check, as at boot)
 #endif
-				start_speculation(failed);
+				start_speculation(false, failed);
 			}
 		}
 		// (To 0: the threads joined and the unfinished results finished as lost ones (Speculation::Stop: a destroyed

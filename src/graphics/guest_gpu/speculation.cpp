@@ -72,6 +72,8 @@ static bool RestoreCancelPriority(int priority) noexcept {
 }
 #endif
 
+static_assert(RenderExecutor::Roles == Spec::MaxPacketSlots + 1);
+
 bool CommitGuardedWrite(void* dst, const void* src, uint32_t size); // (graphicsRun.cpp: KYTY_WRITE_GUARD_SPEC)
 bool CommitGuardedCopyWrite(void* dst, const void* src, uint32_t size); // (graphicsRun.cpp: GuardedCopy)
 // (after_guard_batch)

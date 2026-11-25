@@ -3,6 +3,7 @@
 // define them with); an environment variable sets one for an A/B or a workaround (0 turns a path off). The GPU
 // thread applies them once, before it consumes commands. Values outside a switch's range abort.
 
+#include "cpu-shape.h"
 #include "native-buffer-residency.h"
 #include "local-platform.h"
 #include "mode-toggle.h"
@@ -81,7 +82,8 @@ extern volatile std::atomic_uint32_t kyty_local_weave_workers;
 extern volatile std::atomic_uint32_t kyty_local_weave_calls;
 }
 
-inline void InitializePerformanceSwitches() {
+inline CpuShape::Plan InitializePerformanceSwitches() {
+	CpuShape::Plan cpu_plan;
 	struct Switch {
 		const char*                     environment;
 		volatile std::atomic_uint32_t* value;
@@ -237,22 +239,21 @@ inline void InitializePerformanceSwitches() {
 		            SpeculationRamGate::ThresholdGib());
 		enabled += std::string(enabled.empty() ? "" : " ") + "(KYTY_SPECULATE=4 stood down: memory)";
 	}
-	// KYTY_SPECULATE=4 on a CPU whose performance cores can't hold its threads: the GPU, recording and upload threads, the
-	// workers (KYTY_SPECULATE_THREADS) and the async queue's 2. With 3 performance cores (6 logical CPUs) the default
-	// placement put 4 workers on CPUs the render threads used, and mode 4 lost 6 % at Latria; on the efficiency cores it
-	// lost half (Chenxiao, 9 Nov). Mode 4 stands down and the run stays in mode 0. KYTY_SPECULATE_CPUS (the workers' CPUs
-	// named) lifts the check; the efficiency cores are never taken by default. Not known (Linux): no check.
-	if (const char* named = std::getenv("KYTY_SPECULATE_CPUS");
-	    kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && (named == nullptr || *named == '\0')) {
-		const uint32_t cpus    = LocalPlatform::PerformanceLogicalCpus();
+	// Keep the old CPU stand-down threshold for the requested count (four when unset).
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+		const char* threads = std::getenv("KYTY_SPECULATE_THREADS");
+		const char* pass = std::getenv("KYTY_SPEC_PASS_THREAD");
 		const uint32_t workers = kyty_local_speculate_threads.load(std::memory_order_relaxed);
-		const uint32_t need    = 3u + workers + 2u;
-		if (cpus != 0 && cpus < need) {
+		const bool pipe = LiveSwitch::Find("spec_upload_pipe", ModeToggle::Default("spec_upload_pipe"))
+		                      .load(std::memory_order_relaxed) != 0;
+		cpu_plan = CpuShape::BootPlan(threads != nullptr && *threads != '\0' ? workers : 0,
+		                              pass == nullptr || std::atoi(pass) > 0, pipe);
+		if (cpu_plan.stands_down) {
 			kyty_local_speculate_mode.store(0, std::memory_order_relaxed);
 			std::printf("Speculation: KYTY_SPECULATE=4 stands down: %u logical CPUs on the performance cores, under the %u its "
 			            "threads need (3 render threads, %u workers, 2 async; KYTY_SPECULATE_CPUS lifts the check). This run "
 			            "stays in mode 0.\n",
-			            cpus, need, workers);
+			            cpu_plan.performance_logical, CpuShape::RenderThreads + workers + 2, workers);
 			enabled += std::string(enabled.empty() ? "" : " ") + "(KYTY_SPECULATE=4 stood down: CPU)";
 		}
 	}
@@ -289,4 +290,5 @@ inline void InitializePerformanceSwitches() {
 		std::printf("Performance switches: %s\n", enabled.c_str());
 		std::fflush(stdout);
 	}
+	return cpu_plan;
 }

@@ -1,5 +1,8 @@
 #include "local-platform.h"
 
+#include "cpu-shape.h"
+#include "live-switch.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -3302,3 +3305,88 @@ void StartHeapTrimmer() {
 }
 
 } // namespace LocalPlatform
+
+namespace CpuShape {
+
+std::string CpuList(uint64_t mask) {
+	std::string list;
+	for (uint32_t cpu = 0; cpu < 64;) {
+		if ((mask & (uint64_t {1} << cpu)) == 0) {
+			++cpu;
+			continue;
+		}
+		const auto first = cpu++;
+		while (cpu < 64 && (mask & (uint64_t {1} << cpu)) != 0) {
+			++cpu;
+		}
+		list += (list.empty() ? "" : ",") + std::to_string(first);
+		if (cpu > first + 1) {
+			list += "-" + std::to_string(cpu - 1);
+		}
+	}
+	return list;
+}
+
+Plan BootPlan(uint32_t requested_workers, bool pass_enabled, bool pipe_enabled) {
+	uint64_t allowed = LocalPlatform::ProcessAffinityMask(), render_core = 0;
+	std::vector<Core> cores;
+
+#if defined(_WIN32)
+	for (const auto& core: LocalPlatform::MachineCores(allowed)) {
+		cores.push_back({core.cpus, core.efficiency});
+	}
+	uint64_t core_allowed = 0;
+	bool by_fallback = false;
+	if (LocalPlatform::RenderCoreChoice(nullptr, render_core, core_allowed, by_fallback) < 0) {
+		render_core = 0;
+	}
+#endif
+	const char* workers = std::getenv("KYTY_SPECULATE_CPUS");
+	const bool named = workers != nullptr && *workers != '\0';
+	const auto live = static_cast<uint64_t>(LiveSwitch::Find("speculate_cpu_mask", 0).load(std::memory_order_relaxed));
+	const auto list = named ? std::string(workers) : LocalPlatform::SpeculationCpuList();
+	const auto worker_mask = live != 0 ? live : LocalPlatform::CpuListMask(list.c_str());
+	const auto render = LocalPlatform::CpuListMask(std::getenv("KYTY_RENDER_CPUS"));
+	const auto record = LocalPlatform::CpuListMask(std::getenv("KYTY_RECORDING_CPUS"));
+	const auto copy_override = pipe_enabled ? PipeOverride() : std::optional<uint32_t> {0};
+	const bool gpu_apart = LiveSwitch::Find("spec_gpu_affinity", 1).load(std::memory_order_relaxed) != 0;
+	auto plan = Choose(cores, allowed, requested_workers, named, worker_mask, live != 0, render, record, render_core,
+	                   pass_enabled, true, copy_override, gpu_apart);
+	if (!plan.stands_down && plan.cores == 0) {
+		plan.cores = LocalPlatform::CoresIn(~uint64_t {0});
+		plan.copies = copy_override.value_or(CopyBudget(plan.cores, plan.workers, LocalPlatform::CoresIn(worker_mask),
+		                                               plan.pass));
+	}
+	return plan;
+}
+
+uint32_t PipeCopyBudget(uint32_t workers, uint64_t mask, bool pass, bool automatic) {
+	const auto count = LocalPlatform::CoresIn(~uint64_t {0});
+	bool match_hybrid = false;
+#if defined(_WIN32)
+	if (automatic && HasSixPCorePeer(count)) {
+		uint64_t allowed = 0;
+		std::vector<Core> cores;
+		for (const auto& core: LocalPlatform::MachineCores(allowed)) {
+			cores.push_back({core.cpus, core.efficiency});
+		}
+		match_hybrid = AllCoresHaveSmt2(cores, allowed);
+	}
+#else
+	(void)automatic;
+#endif
+	return CopyBudget(count, workers, LocalPlatform::CoresIn(mask), pass, match_hybrid);
+}
+
+std::optional<uint32_t> PipeOverride() {
+	const char* value = std::getenv("KYTY_SPEC_UPLOAD_PIPE_THREADS");
+	if (value == nullptr || *value == '\0') {
+		return {};
+	}
+	if (std::strlen(value) > 9 || std::strspn(value, "0123456789") != std::strlen(value)) {
+		return {};
+	}
+	return static_cast<uint32_t>(std::min(std::strtoul(value, nullptr, 10), 16ul));
+}
+
+} // namespace CpuShape
