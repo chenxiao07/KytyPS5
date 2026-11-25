@@ -867,6 +867,7 @@ struct State {
 		std::function<bool()>                   resolve;
 		std::function<bool(uint64_t, uint64_t)> resolve_over;
 		size_t                                 pending_image_slots = 0; // at most one completed entry per pending slot
+		uint64_t                               premut_deferred_set = 0; // exact descriptor handle, set at commit
 	};
 	std::vector<ProposedSet> proposed_sets;
 	void SettleProposedSets(size_t committed_segment, bool all) {

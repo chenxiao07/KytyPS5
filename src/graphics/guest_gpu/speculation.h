@@ -198,6 +198,7 @@ private:
 		bool         blind  = false; // translated without the one before it while that was not done (mode 4)
 		size_t       submitted = 0, next = 0; // recorded command buffers submitted, segments committed
 		size_t       first_unsettled_proposal = 0;
+		bool         premut_fullwalk = false; // proposal ownership changed on the GPU thread
 		uint64_t     last_tick = 0;           // the last of them's tick (0: none; batched / spliced: not yet submitted)
 		size_t       blocked   = SIZE_MAX;    // the wait hole the commit waits at
 		bool         blocked_as_hole = false; // (... after its segment ran as a hole: `cp` holds the hole's state)

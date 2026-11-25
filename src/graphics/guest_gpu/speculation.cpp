@@ -3682,19 +3682,65 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 			// slots' memory the segment writes (the whole segment: SegmentWritesRange) stops it here, before anything of
 			// its Before ran: run as a hole under KYTY_SPECULATE=4, as the other stops here. (Under the render lock, as
 			// Before reads the sets and images.)
-			if (std::ranges::any_of(state.proposed_sets, [&](const auto& proposed) {
-				    return proposed.segment == index && proposed.complete && proposed.pending_written;
+			auto& proposals = result.state.proposed_sets;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+			constexpr auto attachment_conflict_reason = "commit: a pending image would conflict with an attachment";
+			const auto bound_in = [&](size_t segment, uint64_t handle) {
+				const auto first = segment == 0 ? 0u : state.closed[segment - 1].end.sets;
+				const auto bound = std::span(state.sets).subspan(first, state.closed[segment].end.sets - first);
+				return std::ranges::find(bound, handle) != bound.end();
+			};
+			// Even after its first binder ran in order, the worker's descriptor is still incomplete for later users.
+			if (result.premut_fullwalk && std::ranges::any_of(proposals, [&](const auto& proposed) {
+				    return proposed.premut_deferred_set != 0 && bound_in(index, proposed.premut_deferred_set);
 			    })) {
+				return attachment_conflict_reason;
+			}
+#endif
+			const auto completes_here = [&](const auto& proposed) {
+				return proposed.segment == index && proposed.complete && proposed.pending_written;
+			};
+			const auto first_completion = std::ranges::find_if(proposals, completes_here);
+			if (first_completion != proposals.end()) {
 				const RenderLockGuard lock(m_renderer.GetMutex());
 				const auto            from           = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
 				const auto&           to             = state.closed[index].end;
 				const auto            segment_writes = [&](uint64_t address, uint64_t size) {
 					return SegmentWritesRange(state, index, from, to, address, size);
 				};
-				for (const auto& proposed: state.proposed_sets)
-					if (proposed.segment == index && proposed.complete && proposed.pending_written &&
-					    proposed.pending_written(segment_writes))
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+				if (state.journal_reads_on && Spec::ModeFour()) {
+					auto& textures = m_renderer.GetTextureCache();
+					for (auto candidate = first_completion; candidate != proposals.end(); ++candidate) {
+						if (!completes_here(*candidate)) {
+							continue;
+						}
+						const auto& set = *static_cast<const RenderExecutor::TableImageSet*>(candidate->set);
+						const auto handle = RenderExecutor::TablePredictPendingConflict(set, textures);
+						if (handle == 0) {
+							continue;
+						}
+						if (bound_in(index, handle)) {
+							return attachment_conflict_reason;
+						}
+						auto binder = index + 1;
+						for (; binder < segments; ++binder) {
+							if (bound_in(binder, handle)) {
+								break;
+							}
+						}
+						// Changing ownership postpones all callbacks. With no recorded binder, Finish retires it unpublished.
+						candidate->segment = binder;
+						candidate->premut_deferred_set = handle;
+						result.premut_fullwalk = true;
+					}
+				}
+#endif
+				for (const auto& proposed: proposals) {
+					if (completes_here(proposed) && proposed.pending_written(segment_writes)) {
 						return "commit: a pending image's memory written by its segment";
+					}
+				}
 			}
 			return nullptr;
 		};
@@ -3763,12 +3809,17 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 			// one's replay, as they would have been this one's. A later segment may bind any of them, through the reuse of
 			// its own or the role's last / previous / memo set, so all move; one only the dropped replay bound may then
 			// stop that segment's commit for nothing: the price of the rule.)
-			for (auto& proposed: result.state.proposed_sets)
+			for (auto& proposed: result.state.proposed_sets) {
 				if (proposed.segment == index) {
-					proposed.segment = index + 1;
-					if (proposed.on_hole) proposed.on_hole();
+					// A deferred set stays unpublished after its binder runs in order. Its handle still guards later users.
+					proposed.segment = proposed.premut_deferred_set != 0 ? segments : index + 1;
+					if (proposed.on_hole) {
+						proposed.on_hole();
+					}
 				}
+			}
 			// The moved ordinals and their slots immediately precede the next segment's, including after consecutive redos.
+			// After deferral Before sizes completion scratch by current proposal ownership.
 			auto& moved = result.state.closed[index].commit_image_index;
 			auto& next  = result.state.closed[index + 1].commit_image_index;
 			if (moved.proposal_first != SIZE_MAX && next.proposal_first != SIZE_MAX) {
@@ -4054,10 +4105,22 @@ void Speculation::Before(Result& result, size_t index) {
 	const auto& image_plan = segment.commit_image_index;
 	const bool  has_index  = image_plan.proposal_first != SIZE_MAX;
 	const auto  limit      = Spec::CommitImageScratchCapacity;
+	size_t completion_slots = image_plan.completion_end - image_plan.completion_first;
+	if (has_index && result.premut_fullwalk) {
+		// Deferral changes ownership without changing the recorded ranges. Count the slots Before can complete.
+		completion_slots = 0;
+		for (const auto& proposed: state.proposed_sets) {
+			if (proposed.segment == index) {
+				completion_slots += proposed.pending_image_slots;
+			}
+		}
+	}
 	// Each pending target can add at most one layer entry, and each pending slot at most one completion.
 	const bool overflow = has_index && (segment.images.size() > limit || to.pending_targets - from.pending_targets > limit ||
-	                                    image_plan.completion_end - image_plan.completion_first > limit);
-	if (overflow) LiveCounters::Add(LiveCounters::SpecCommitImageIndexOverflowFallbacks);
+	                                    completion_slots > limit);
+	if (overflow) {
+		LiveCounters::Add(LiveCounters::SpecCommitImageIndexOverflowFallbacks);
+	}
 	const CommitImageScratchLease scratch_lease(has_index && !overflow);
 	auto* const image_scratch = scratch_lease.scratch;
 	const bool  indexed       = image_scratch != nullptr;
@@ -4204,9 +4267,11 @@ void Speculation::Before(Result& result, size_t index) {
 	// colour targets no image existed for: their images made, ProposedSet::resolve), only once every check passed, up to
 	// the first that cannot (the segment stops: nothing more made).
 	const std::span all_proposals(state.proposed_sets);
-	const auto proposals = indexed ? all_proposals.subspan(image_plan.proposal_first,
-	                                                       image_plan.proposal_end - image_plan.proposal_first)
-	                               : all_proposals;
+	// Deferral changes proposal ownership. The image lookup and the scratch lease still apply.
+	const bool indexed_proposals = indexed && !result.premut_fullwalk;
+	const auto proposals = indexed_proposals ? all_proposals.subspan(image_plan.proposal_first,
+	                                                                 image_plan.proposal_end - image_plan.proposal_first)
+	                                         : all_proposals;
 	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
 		Spec::t_check_segment = index;
 		for (const auto& proposed: proposals)
@@ -4424,8 +4489,11 @@ void Speculation::Before(Result& result, size_t index) {
 			};
 			if (std::ranges::adjacent_find(completion_index, different) != completion_index.end()) return true;
 			// Every current group has one layout now. Probe it once per earlier slot of a set bound here.
-			for (const auto& proposed: all_proposals.first(image_plan.proposal_first)) {
-				if (proposed.completed.empty()) continue;
+			const auto earlier = indexed_proposals ? all_proposals.first(image_plan.proposal_first) : all_proposals;
+			for (const auto& proposed: earlier) {
+				if ((!indexed_proposals && proposed.segment >= index) || proposed.completed.empty()) {
+					continue;
+				}
 				if (!std::ranges::binary_search(image_plan.bound_sets, proposed.completed.front().set)) continue;
 				for (const auto& slot: proposed.completed) {
 					const auto key = CompletionKey(slot.image, slot.serial);
@@ -4679,6 +4747,11 @@ void Speculation::After(Result& result, size_t index) {
 		// The end ordinal includes proposals through this segment, including those left by a redo.
 		while (result.first_unsettled_proposal < segment.commit_image_index.proposal_end) {
 			auto& proposed = state.proposed_sets[result.first_unsettled_proposal];
+			if (proposed.premut_deferred_set != 0) {
+				// Its recorded users ran in order. Finish retires the unpublished set.
+				++result.first_unsettled_proposal;
+				continue;
+			}
 			proposed.settled = true;
 			if (proposed.settle_now) {
 				proposed.settle_now();
@@ -5094,6 +5167,7 @@ void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {
 	auto& r         = *result;
 	r.state.forwarded_reads.clear();
 	r.state.forwarded_bytes.clear();
+	r.premut_fullwalk = false;
 	r.state.ReleaseConsumePending(); // (its holes' clears are consumed now, or never: spec_predict_dcc=3)
 	// (spec_worker_sets: its proposed sets no commit settled, settled here on the GPU thread while it still counts as live,
 	// not at its Result's reuse on a worker: the catalog's pair sweeps wait for no speculation live, so the pairs those

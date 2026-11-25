@@ -49,6 +49,7 @@ struct DrawIndexBufferSource;
 struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
+class TextureCache;
 struct RenderExecutorTestAccess;
 
 enum class CommandBufferDebugOp : uint32_t {
@@ -614,6 +615,7 @@ private:
 	[[nodiscard]] vk::DeviceAddress TableRingCopy(uint64_t address, uint64_t size);
 	// spec_worker_images: a worker's set's pending slots completed by the GPU thread at its commit (Speculation::Before).
 	[[nodiscard]] bool TableCompletePendingImages(TableImageSet& set);
+	[[nodiscard]] static uint64_t TablePredictPendingConflict(const TableImageSet& set, TextureCache& textures) noexcept;
 	// (Mode 4; table-xpr.inc) A speculation makes the table entry a draw lacks (a new pair, a new draw state from a
 	// sibling's capture, a variant), draws with it, and its commit publishes it (nullopt: not made, refused as before).
 	[[nodiscard]] std::optional<TableResult> TableWorkerEntry(CommandBuffer& buffer, TablePair* existing, uint64_t pair_hash,
@@ -801,6 +803,7 @@ private:
 	std::unordered_set<uint64_t> m_depth_tiled_reports;
 
 	friend class CommandProcessor;
+	friend class Speculation;
 	friend struct RenderExecutorTestAccess;
 };
 

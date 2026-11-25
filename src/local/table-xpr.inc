@@ -1288,6 +1288,35 @@ static void TableAsideDrain(uint64_t frame) {
 	for (auto& item: due) aside.retiring.emplace_back(marks, std::move(item.holder));
 }
 
+// Read-only prediction under the caller's render lock.
+uint64_t RenderExecutor::TablePredictPendingConflict(const TableImageSet& proposed_set, TextureCache& textures) noexcept {
+	if (proposed_set.pending_images.empty() || proposed_set.pending_targets.empty()) {
+		return 0;
+	}
+	// Other cache users can run under the cache lock alone. Skip the prediction if a read would wait.
+	std::shared_lock shared(textures.m_lock, std::defer_lock);
+	std::unique_lock exclusive(textures.m_lock, std::defer_lock);
+	if (!(textures.m_lock.SharedMode() ? shared.try_lock() : exclusive.try_lock())) {
+		return 0;
+	}
+	const TextureCache& cache = textures;
+	const auto handle = reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(proposed_set.set));
+	for (const auto target: proposed_set.pending_targets) {
+		const auto* image = cache.m_slot_images.try_get(target);
+		if (image == nullptr || image->info.data.size == 0) {
+			continue;
+		}
+		const auto& data = image->info.data;
+		for (const auto& pending: proposed_set.pending_images) {
+			const auto& range = pending.desc.info.data;
+			if (range.size != 0 && range.address < data.End() && data.address < range.End()) {
+				return handle;
+			}
+		}
+	}
+	return 0;
+}
+
 // spec_worker_images: the GPU thread, at the commit of the segment that built `set` (Speculation::Before, before the replay
 // binds it): each pending slot's image as its own TableResolveSet would find it now (FindImage: made if needed;
 // FindTexture: uploaded, its view), transited to the sampled layout in the open buffer, its view written into the slot,
