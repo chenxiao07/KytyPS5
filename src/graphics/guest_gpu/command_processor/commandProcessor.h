@@ -106,6 +106,7 @@ public:
 	// index and indirect bases, instances, counters, predication, context pushes), translating and executing nothing:
 	// the state a command buffer leaves, before it is translated.
 	void SetStateOnly(bool state_only) noexcept { m_state_only = state_only; }
+	void SetGuardedDispatchArgs() noexcept { m_guarded_dispatch_args = true; }
 	// Chunks of a command buffer (KYTY_SPECULATE=4): a state pass suspends before every `every`-th draw or dispatch that
 	// does not continue a run of indirect draws (TakeBoundary: it did); Process suspends before the packet at `at` (the
 	// next chunk's start; null: none; TakeStopReached: it did). Positions are compared by the packets they are at.
@@ -239,6 +240,9 @@ public:
 	void        WeaveModeChanged();
 
 private:
+	template <bool GuardedArgs>
+	void DispatchIndirectAddressImpl(uint64_t args_addr, uint32_t mode);
+	bool                m_guarded_dispatch_args = false;
 	uint32_t            m_draw_run_skip = 0;
 	bool                m_state_only    = false;
 	uint32_t            m_chunk_every = 0, m_chunk_work = 0, m_chunk_last_opcode = 0;

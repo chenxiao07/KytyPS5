@@ -1316,6 +1316,26 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	                        dst_gds, src_gds);
 }
 
+Speculation* GuestGpu::ComputeLane(uint32_t queue_id) const noexcept {
+	if (auto* ahead = m_ahead_async.load(std::memory_order_acquire); ahead != nullptr && queue_id == m_async_queue) {
+		return ahead;
+	}
+	if (queue_id == ComputeQueue49) {
+		return m_ahead_q49.load(std::memory_order_acquire);
+	}
+	if (queue_id == ComputeQueue1) {
+		return m_ahead_q1.load(std::memory_order_acquire);
+	}
+	return nullptr;
+}
+
+void GuestGpu::PushCompute(Speculation& speculation, const Submission& submission) {
+	speculation.Push({submission.serial, submission.commands, submission.reset_processor,
+	                  submission.type == SubmissionType::Compute && submission.constant_commands.empty()
+	                      ? Speculation::Job::Kind::Graphics
+	                      : Speculation::Job::Kind::Other});
+}
+
 void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
@@ -1347,13 +1367,11 @@ void GuestGpu::Enqueue(Submission submission) {
 		             : submission.type == SubmissionType::Graphics && submission.constant_commands.empty()
 		                 ? Speculation::Job::Kind::Graphics
 		                 : Speculation::Job::Kind::Other});
-	// (KYTY_SPECULATE_ASYNC: that queue's command buffers, passed and translated as the graphics queue's are.)
-	if (auto* ahead = m_ahead_async.load(std::memory_order_acquire);
-	    ahead != nullptr && submission.queue_id == m_async_queue && submission.queue_id != 0)
-		ahead->Push({submission.serial, submission.commands, submission.reset_processor,
-		             submission.type == SubmissionType::Compute && submission.constant_commands.empty()
-		                 ? Speculation::Job::Kind::Graphics
-		                 : Speculation::Job::Kind::Other});
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) [[unlikely]] {
+		if (auto* ahead = ComputeLane(submission.queue_id); ahead != nullptr) {
+			PushCompute(*ahead, submission);
+		}
+	}
 	LiveTrace::Event(LiveTrace::Submit, submission.queue_id | static_cast<uint32_t>(submission.type) << 8u,
 	                 submission.commands.size());
 	m_queues[submission.queue_id].push_back(std::move(submission));
@@ -1490,39 +1508,60 @@ uint32_t GuestGpu::RetestBlockedFronts(RetestAt at) {
 	return unblocked;
 }
 
-// Under the queue mutex the runnable fronts of the other queues are looked at (the async speculation's: its serial and
-// chunk taken); the async speculation's own lock is taken after the queue mutex is released (FrontReady), so no two
-// locks are held at once. A front gone meanwhile only costs a wasted yield: the selector takes what is runnable. None
-// runnable: the blocked fronts' stored waits re-tested; one that passes is unblocked, and the fronts looked at again.
+// Under the queue mutex, capture the serial and chunk of each runnable fixed lane and look for in-order compute.
+// FrontReady takes each lane's lock after releasing the queue mutex. If nothing is ready, re-test the blocked fronts'
+// stored waits and check again if a front unblocks.
 int GuestGpu::ReadyFrontElsewhere() noexcept {
 	auto* gpu = g_gpu_state;
-	if (gpu == nullptr || !IsGpuThread()) return 0;
-	const auto look = [gpu] {
-		bool     async_front = false, compute_front = false;
-		uint64_t async_serial = 0;
-		uint32_t async_chunk  = 0;
+	if (gpu == nullptr || !IsGpuThread()) {
+		return 0;
+	}
+	const bool fixed = gpu->m_speculation_q1 != nullptr;
+	const auto look = [gpu, fixed] {
+		struct Front {
+			uint64_t serial = 0;
+			uint32_t chunk  = 0;
+		};
+		Front async, q1, q49;
+		bool compute_front = false;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			for (uint32_t id = 1; id < QueueCount; ++id) {
 				const auto& queue = gpu->m_queues[id];
-				if (queue.empty()) continue;
+				if (queue.empty()) {
+					continue;
+				}
 				const auto& front = queue.front();
-				if (front.blocked || front.type != SubmissionType::Compute || !gpu->CanProcessSubmission(front)) continue;
-				if (gpu->m_speculation_async && id == gpu->m_async_queue && front.constant_commands.empty()) {
-					if (!async_front) async_front = true, async_serial = front.serial, async_chunk = front.spec_chunk;
+				if (front.blocked || front.type != SubmissionType::Compute || !gpu->CanProcessSubmission(front)) {
+					continue;
+				}
+				const bool spec_front = front.constant_commands.empty() && (!fixed || !front.spec_normal);
+				if (gpu->m_speculation_async && id == gpu->m_async_queue && spec_front) {
+					async = {front.serial, front.spec_chunk};
+				} else if (id == ComputeQueue1 && gpu->m_speculation_q1 && spec_front) {
+					q1 = {front.serial, front.spec_chunk};
+				} else if (id == ComputeQueue49 && gpu->m_speculation_q49 && spec_front) {
+					q49 = {front.serial, front.spec_chunk};
 				} else {
 					compute_front = true;
 				}
 			}
 		}
-		if (async_front && gpu->m_speculation_async && gpu->m_speculation_async->FrontReady(async_serial, async_chunk))
+		if ((async.serial != 0 && gpu->m_speculation_async->FrontReady(async.serial, async.chunk)) ||
+		    (q1.serial != 0 && gpu->m_speculation_q1->FrontReady(q1.serial, q1.chunk)) ||
+		    (q49.serial != 0 && gpu->m_speculation_q49->FrontReady(q49.serial, q49.chunk))) {
 			return 1;
+		}
 		return compute_front ? 2 : 0;
 	};
-	if (const int target = look(); target != 0) return target;
+	if (const int target = look(); target != 0) {
+		return target;
+	}
 	{
 		Common::LockGuard lock(gpu->m_queue_mutex);
-		if (gpu->m_failed_waits_n == 0 || gpu->RetestBlockedFronts() == 0) return 0;
+		if (gpu->m_failed_waits_n == 0 || gpu->RetestBlockedFronts() == 0) {
+			return 0;
+		}
 	}
 	return look();
 }
@@ -1585,7 +1624,7 @@ void GuestGpu::ThreadRun(void* data) {
 		return true;
 	};
 	// (Mode 4's machinery: at the start, and again on a live `mode 4` (mode-toggle.h, below).)
-	const auto start_speculation = [gpu] {
+	const auto start_speculation = [gpu](bool boot) {
 		// (spec_exact_reg_stop / spec_regional_pending: the buffer cache's granule epochs complete from here on, the mode
 		// reading 4 already: BufferCache::MarkExactEpochsFromNow. Before the speculations below exist, not before every
 		// thread that reads the mode: on a live `mode 4` the weave's workers run on until the loop top pauses them, so
@@ -1593,29 +1632,69 @@ void GuestGpu::ThreadRun(void* data) {
 		gpu->m_renderer.GetBufferCache().MarkExactEpochsFromNow();
 		// KYTY_SPEC_PASS_THREAD (unset: on, mode 4 only as all of this; 0 off): the state pass on its own thread
 		// (Speculation::AheadRun), its packet slot after the workers'.
-		const char* pass_env    = std::getenv("KYTY_SPEC_PASS_THREAD");
-		const bool  pass_thread = (pass_env == nullptr || std::atoi(pass_env) > 0) &&
-		                          kyty_local_speculate_threads.load(std::memory_order_relaxed) + 1 < Spec::MaxPacketSlots;
+		const char* pass_env         = std::getenv("KYTY_SPEC_PASS_THREAD");
+		const auto  graphics_workers = kyty_local_speculate_threads.load(std::memory_order_relaxed);
+		const bool  pass_thread      = (pass_env == nullptr || std::atoi(pass_env) > 0) &&
+		                               graphics_workers + 1 < Spec::MaxPacketSlots;
 		static_assert(AsyncUpload::SpecPacketSlots == Spec::MaxPacketSlots); // (the upload pipe's count repeats this test)
 		AsyncUpload::g_spec_pass_made.store(pass_thread ? 1 : 0, std::memory_order_relaxed);
-		gpu->m_speculation = std::make_unique<Speculation>(gpu->m_renderer, 0, 0, 0, pass_thread);
+		const auto compute = LiveSwitch::Find("spec_compute", ModeToggle::Default("spec_compute"))
+		                         .load(std::memory_order_relaxed);
+		const bool both_lanes = compute == 2;
+		std::optional<Common::LockGuard> boot_queue_lock;
+		if (boot && both_lanes) {
+			boot_queue_lock.emplace(gpu->m_queue_mutex);
+		}
+		// Reserve one worker slot per lane. The graphics pass keeps its own slot if enabled.
+		const auto graphics_limit = static_cast<uint32_t>(Spec::MaxPacketSlots) - (pass_thread ? 1u : 0u) - 2u;
+		gpu->m_speculation = std::make_unique<Speculation>(
+		    gpu->m_renderer, 0, 0, both_lanes ? std::min(graphics_workers, graphics_limit) : 0u, pass_thread);
 		gpu->m_ahead.store(gpu->m_speculation.get(), std::memory_order_release);
-		// (The async queue's threads take the packet slots after the graphics queue's: none left, no async speculation.)
-		// KYTY_SPECULATE_ASYNC unset: the compute queue 49 (Demon's Souls' async compute; a queue a game does not use
-		// costs nothing) with 2 threads unless KYTY_SPECULATE_ASYNC_THREADS says otherwise; 0 none.
-		const char* async_value = std::getenv("KYTY_SPECULATE_ASYNC");
-		const int   async       = async_value != nullptr ? std::atoi(async_value) : 49;
-		if (async > 0 && static_cast<uint32_t>(async) < QueueCount &&
-		    gpu->m_speculation->TranslatorCount() < Spec::MaxPacketSlots) {
-			const auto  queue   = static_cast<uint32_t>(async);
-			const char* threads = std::getenv("KYTY_SPECULATE_ASYNC_THREADS");
-			const auto  base    = gpu->m_speculation->TranslatorCount(); // (its translators, the workers and the pass thread)
-			gpu->m_speculation_async = std::make_unique<Speculation>(
-			    gpu->m_renderer, static_cast<int>(ComputeQueueBase + queue - 1), base,
-			    threads != nullptr && std::atoi(threads) > 0 ? static_cast<uint32_t>(std::atoi(threads))
-			                                                 : async_value != nullptr ? 4u : 2u);
-			gpu->m_async_queue = queue;
-			gpu->m_ahead_async.store(gpu->m_speculation_async.get(), std::memory_order_release);
+
+		if (compute == 1) {
+			// Round 4's async selection and slot policy. An explicit selector gives a four-worker fallback.
+			const char* async_value = std::getenv("KYTY_SPECULATE_ASYNC");
+			const int   async       = async_value != nullptr ? std::atoi(async_value) : 49;
+			if (async > 0 && static_cast<uint32_t>(async) < QueueCount &&
+			    gpu->m_speculation->TranslatorCount() < Spec::MaxPacketSlots) {
+				const auto  queue   = static_cast<uint32_t>(async);
+				const char* threads = std::getenv("KYTY_SPECULATE_ASYNC_THREADS");
+				const auto  base    = gpu->m_speculation->TranslatorCount();
+				gpu->m_speculation_async = std::make_unique<Speculation>(
+				    gpu->m_renderer, static_cast<int>(ComputeQueueBase + queue - 1), base,
+				    threads != nullptr && std::atoi(threads) > 0 ? static_cast<uint32_t>(std::atoi(threads))
+				                                                 : async_value != nullptr ? 4u : 2u);
+				gpu->m_async_queue = queue;
+				gpu->m_ahead_async.store(gpu->m_speculation_async.get(), std::memory_order_release);
+			}
+		} else if (both_lanes) {
+			const auto  base       = gpu->m_speculation->TranslatorCount();
+			const char* threads    = std::getenv("KYTY_SPECULATE_ASYNC_THREADS");
+			const int   requested  = threads != nullptr ? std::atoi(threads) : 0;
+			const auto  workers    = requested > 0 ? static_cast<uint32_t>(requested) : 2u;
+			const auto  q1_workers = std::min(workers, static_cast<uint32_t>(Spec::MaxPacketSlots) - base - 1u);
+			gpu->m_speculation_q1 = std::make_unique<Speculation>(
+			    gpu->m_renderer, ComputeQueueBase + ComputeQueue1 - 1, base, q1_workers, false, true);
+			gpu->m_speculation_q49 = std::make_unique<Speculation>(
+			    gpu->m_renderer, ComputeQueueBase + ComputeQueue49 - 1, base + q1_workers, workers, false, true);
+			const auto start_lane = [gpu](Speculation& lane, uint32_t id) {
+				auto& queue = gpu->m_queues[id];
+				const auto completed = queue.empty() ? gpu->m_serials[id] : queue.front().serial - 1;
+				// A front already started in order supplies its full state at Done.
+				const auto* cp = queue.empty() || !queue.front().started ? gpu->m_compute_cp[id - 1].get() : nullptr;
+				lane.SeedCompute(completed, cp);
+				for (auto& submission: queue) {
+					if (submission.started) {
+						submission.spec_normal = true;
+					} else {
+						PushCompute(lane, submission);
+					}
+				}
+			};
+			start_lane(*gpu->m_speculation_q1, ComputeQueue1);
+			start_lane(*gpu->m_speculation_q49, ComputeQueue49);
+			gpu->m_ahead_q1.store(gpu->m_speculation_q1.get(), std::memory_order_release);
+			gpu->m_ahead_q49.store(gpu->m_speculation_q49.get(), std::memory_order_release);
 		}
 	};
 	// (A KYTY_SPECULATE=4 boot: the mode table's values set before the first packet, as a live `mode 4` sets them; the
@@ -1629,7 +1708,7 @@ void GuestGpu::ThreadRun(void* data) {
 		ModeToggle::ApplyTable(4);
 		// (spec_format_ahead: after the table sets the switch; before the threads that birth pairs exist.)
 		gpu->m_renderer.GetPipelineCache().ApplyFormatAhead();
-		start_speculation();
+		start_speculation(true);
 	}
 	// (Tooling: the live mode toggle (mode-toggle.h), applied between submissions when no speculated queue has one started
 	// and not done: a speculation's results and blocked commits belong to the submission they began. Under m_queue_mutex,
@@ -1642,21 +1721,29 @@ void GuestGpu::ThreadRun(void* data) {
 		// take it shared. Turned on even if the switch to mode 4 below waits for a later call: until then mode 0's takes
 		// only find no readers to drain.)
 		if (want == 4) gpu->m_renderer.GetTextureCache().ApplySharedMode(true);
-		std::unique_ptr<Speculation> old, old_async;
+		std::unique_ptr<Speculation> old, old_async, old_q49, old_q1;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			const auto started = [&](uint32_t id) {
 				return id < QueueCount && !gpu->m_queues[id].empty() && gpu->m_queues[id].front().started;
 			};
-			if (started(0) || (gpu->m_speculation_async && started(gpu->m_async_queue))) return;
+			if (started(0) || (gpu->m_speculation_async && started(gpu->m_async_queue)) ||
+			    (gpu->m_speculation_q49 && started(ComputeQueue49)) ||
+			    (gpu->m_speculation_q1 && started(ComputeQueue1))) {
+				return;
+			}
 			ModeToggle::g_request.store(-1, std::memory_order_release);
 			if (static_cast<int>(mode) == want) return;
 			ModeToggle::ApplyTable(want);
 			if (want == 0) {
 				gpu->m_ahead.store(nullptr, std::memory_order_release);
 				gpu->m_ahead_async.store(nullptr, std::memory_order_release);
+				gpu->m_ahead_q49.store(nullptr, std::memory_order_release);
+				gpu->m_ahead_q1.store(nullptr, std::memory_order_release);
 				old       = std::move(gpu->m_speculation);
 				old_async = std::move(gpu->m_speculation_async);
+				old_q49 = std::move(gpu->m_speculation_q49);
+				old_q1  = std::move(gpu->m_speculation_q1);
 			} else {
 				// (spec_format_ahead: as at a mode-4 boot; before the mode reads 4. No hints and the warmup not done with the
 				// recording: the one fold is here, under m_queue_mutex. With hints to read: one stat and a thread.)
@@ -1666,7 +1753,7 @@ void GuestGpu::ThreadRun(void* data) {
 #if defined(__linux__)
 				check_write_guard_uffd(); // (the guard turns on with mode 4: #289's check, as at boot)
 #endif
-				start_speculation();
+				start_speculation(false);
 				// (The command buffers queued already, handed over as Enqueue hands them.)
 				for (const auto& s: gpu->m_queues[0])
 					gpu->m_speculation->Push(
@@ -1674,20 +1761,31 @@ void GuestGpu::ThreadRun(void* data) {
 					     s.type == SubmissionType::FlipPreparation || s.type == SubmissionType::FrameBoundary ? Speculation::Job::Kind::Flip
 					     : s.type == SubmissionType::Graphics && s.constant_commands.empty()               ? Speculation::Job::Kind::Graphics
 					                                                                                         : Speculation::Job::Kind::Other});
-				if (gpu->m_speculation_async && gpu->m_async_queue != 0)
-					for (const auto& s: gpu->m_queues[gpu->m_async_queue])
-						gpu->m_speculation_async->Push({s.serial, s.commands, s.reset_processor,
-						                                s.type == SubmissionType::Compute && s.constant_commands.empty()
-						                                    ? Speculation::Job::Kind::Graphics
-						                                    : Speculation::Job::Kind::Other});
+				if (gpu->m_speculation_async && gpu->m_async_queue != 0) {
+					for (const auto& submission: gpu->m_queues[gpu->m_async_queue]) {
+						PushCompute(*gpu->m_speculation_async, submission);
+					}
+				}
 			}
 		}
 		// (To 0: the threads joined and the unfinished results finished as lost ones (Speculation::Stop: a destroyed
 		// result's recorder waited for ticks never submitted, a hang at the 5th flip), outside the lock.)
-		if (old) old->Stop();
-		if (old_async) old_async->Stop();
+		if (old) {
+			old->Stop();
+		}
+		if (old_async) {
+			old_async->Stop();
+		}
+		if (old_q49) {
+			old_q49->Stop();
+		}
+		if (old_q1) {
+			old_q1->Stop();
+		}
 		old.reset();
 		old_async.reset();
+		old_q49.reset();
+		old_q1.reset();
 		// (Mode 0 once no speculation thread is left: Spec::Current(), the recorder and executor accessors read the global
 		// first, so a thread still translating would otherwise take the normal path. No packet runs in between: this is
 		// the GPU thread between submissions.)
@@ -1960,8 +2058,9 @@ bool GuestGpu::Process(Submission& submission) {
 	}
 
 	// The graphics queue's command buffers, speculation on: speculatively first (speculation.h).
+	const auto mode = kyty_local_speculate_mode.load(std::memory_order_relaxed);
 	const bool speculate = submission.type == SubmissionType::Graphics && submission.queue_id == 0 &&
-	                       kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0;
+	                       mode != 0;
 	if (speculate && !m_speculation) m_speculation = std::make_unique<Speculation>(m_renderer);
 	// (What the translation does a speculation not committed yet must see.)
 	struct EffectsScope {
@@ -1980,7 +2079,8 @@ bool GuestGpu::Process(Submission& submission) {
 			Spec::t_effects_async = nullptr;
 		}
 		KYTY_CLASS_NO_COPY(EffectsScope);
-	} effects_scope {m_speculation.get(), m_speculation_async.get()};
+	} effects_scope {m_speculation.get(), m_speculation_q49.get()};
+	auto* const compute_lane = mode == 4 ? ComputeLane(submission.queue_id) : nullptr;
 
 	cp.BufferInit();
 	bool complete = true;
@@ -1998,8 +2098,7 @@ bool GuestGpu::Process(Submission& submission) {
 			} queue_time {speculate ? m_speculation.get() : nullptr};
 			// KYTY_SPECULATE=4: chunk by chunk, each committed as the speculation's threads translated it, or translated
 			// the normal way up to where the next begins (Speculation::CommitReady).
-			if (speculate && submission.constant_commands.empty() &&
-			    kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+			if (speculate && submission.constant_commands.empty() && mode == 4) {
 				const Speculation::Job job {submission.serial, submission.commands};
 				for (;;) {
 					if (!submission.spec_normal) {
@@ -2060,7 +2159,6 @@ bool GuestGpu::Process(Submission& submission) {
 				}
 			} else if (speculate && submission.constant_commands.empty() &&
 			           (first_slice || CommandProcessor::AtWait(submission.command_execution))) {
-				const auto mode = kyty_local_speculate_mode.load(std::memory_order_relaxed);
 				// KYTY_SPECULATE=3: from its start, translated ahead with the graphics queue's command buffers after it.
 				if (first_slice && mode == 3) {
 					std::vector<Speculation::Job> queued;
@@ -2135,9 +2233,9 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		}
 		case SubmissionType::Compute: {
-			// KYTY_SPECULATE_ASYNC: that async queue's command buffers chunk by chunk, as the graphics queue's (above).
-			if (m_speculation_async && submission.queue_id == m_async_queue && submission.constant_commands.empty()) {
-				auto&                   speculation = *m_speculation_async;
+			// The fixed and legacy lanes use the blocking take.
+			if (compute_lane != nullptr && submission.constant_commands.empty()) {
+				auto&                   speculation = *compute_lane;
 				bool                    progressed  = false;
 				const Speculation::Job  job {submission.serial, submission.commands};
 				struct QueueTime {
@@ -2221,9 +2319,9 @@ bool GuestGpu::Process(Submission& submission) {
 	// (KYTY_SPECULATE=4: the state after the graphics queue's submission, for a chain that could not follow it.)
 	if (complete && submission.queue_id == 0 && m_ahead.load(std::memory_order_relaxed) != nullptr)
 		m_speculation->Done(submission.serial, cp);
-	if (complete && submission.queue_id == m_async_queue && submission.queue_id != 0 &&
-	    m_ahead_async.load(std::memory_order_relaxed) != nullptr)
-		m_speculation_async->Done(submission.serial, cp);
+	if (complete && compute_lane != nullptr) {
+		compute_lane->Done(submission.serial, cp);
+	}
 
 	return complete;
 }
@@ -4078,7 +4176,17 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 	DispatchIndirectAddress(m_dispatch_indirect_args_base_addr + data_offset, mode);
 }
 
+static std::atomic<uint32_t> g_dispatch_sync_fallback_logs {0};
+
 void CommandProcessor::DispatchIndirectAddress(uint64_t args_addr, uint32_t mode) {
+	if (m_guarded_dispatch_args) {
+		return DispatchIndirectAddressImpl<true>(args_addr, mode);
+	}
+	DispatchIndirectAddressImpl<false>(args_addr, mode);
+}
+
+template <bool GuardedArgs>
+void CommandProcessor::DispatchIndirectAddressImpl(uint64_t args_addr, uint32_t mode) {
 	// (A state pass: its state only.)
 	if (m_state_only) return m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	struct DispatchIndirectArgs {
@@ -4095,16 +4203,28 @@ void CommandProcessor::DispatchIndirectAddress(uint64_t args_addr, uint32_t mode
 		DispatchDirect(1, 1, 1, mode, args_addr);
 		return;
 	}
-	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(args_addr, sizeof(DispatchIndirectArgs))) {
-		static std::atomic<uint32_t> sync_fallback_logs {0};
-		if (sync_fallback_logs.load(std::memory_order_relaxed) < 16 && sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+	const bool synced = Libs::LibKernel::Memory::SyncGpuCleanBacking(args_addr, sizeof(DispatchIndirectArgs));
+	if (!synced) {
+		if (g_dispatch_sync_fallback_logs.load(std::memory_order_relaxed) < 16 && g_dispatch_sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
 			LOGF("DispatchIndirect: failed to synchronise indirect arguments at 0x%016" PRIx64
 			     " (image-owned range, reading guest memory)\n",
 			     args_addr);
 		}
 	}
 	DispatchIndirectArgs args {};
-	std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
+	const auto* source = reinterpret_cast<const void*>(args_addr);
+	if constexpr (GuardedArgs) {
+		// Speculative sync may refuse the arguments while returning true.
+		if (const auto* spec = Spec::Current(); spec != nullptr && spec->refused != nullptr) {
+			return;
+		}
+		if (!synced || Spec::WorkerCopy(&args, source, sizeof(args), false) != 0) {
+			Spec::Refuse("unreadable indirect dispatch arguments");
+			return;
+		}
+	} else {
+		std::memcpy(&args, source, sizeof(args));
+	}
 
 	DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode, args_addr);
 }

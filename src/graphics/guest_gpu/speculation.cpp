@@ -283,9 +283,11 @@ void Speculation::TakeShared() {
 
 static void PrepareCommitImageScratch();
 
-Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t base, uint32_t threads, bool pass_thread)
+Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t base, uint32_t threads, bool pass_thread,
+                         bool guarded_dispatch_args)
     : m_renderer(renderer), m_chain(std::make_unique<CommandProcessor>(renderer, interrupt_id)),
-      m_state(std::make_unique<CommandProcessor>(renderer, interrupt_id)), m_interrupt_id(interrupt_id) {
+      m_interrupt_id(interrupt_id),
+      m_state(std::make_unique<CommandProcessor>(renderer, interrupt_id)) {
 	if (Spec::ModeFour()) PrepareCommitImageScratch();
 	m_state->SetStateOnly(true);
 	if (threads == 0)
@@ -294,7 +296,12 @@ Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t bas
 		              : 1u;
 	// (Packet slots and executor roles: Spec::MaxPacketSlots, RenderExecutor::Roles less the GPU thread's.)
 	threads = std::clamp<uint32_t>(threads, 1u, static_cast<uint32_t>(Spec::MaxPacketSlots) - std::min<uint32_t>(base, Spec::MaxPacketSlots - 1));
-	for (uint32_t i = 0; i < threads; ++i) m_translators.push_back(std::make_unique<Translator>(renderer, base + i, interrupt_id));
+	for (uint32_t i = 0; i < threads; ++i) {
+		m_translators.push_back(std::make_unique<Translator>(renderer, base + i, interrupt_id));
+		if (guarded_dispatch_args) {
+			m_translators.back()->cp->SetGuardedDispatchArgs();
+		}
+	}
 	// KYTY_SPEC_PASS_THREAD: the state pass's own translator, last (the caller left it a packet slot).
 	if (pass_thread && base + threads < Spec::MaxPacketSlots) {
 		m_translators.push_back(std::make_unique<Translator>(renderer, base + threads, interrupt_id));
@@ -356,6 +363,19 @@ Speculation::Outcome Speculation::TranslateAndCommit(CommandProcessor& cp, uint6
 
 Speculation::Outcome Speculation::Resume(CommandProcessor& cp, Pm4Execution& execution) {
 	return Continue(std::move(m_blocked), cp, execution);
+}
+
+void Speculation::SeedCompute(uint64_t completed, const CommandProcessor* cp) {
+	// The lane is still private and no worker has begun its state pass.
+	if (cp != nullptr) {
+		if (!m_done_state) {
+			m_done_state = std::make_unique<CommandProcessorState>();
+		}
+		cp->SaveStateTo(*m_done_state);
+		m_state->CopyStateFrom(*m_done_state);
+	}
+	m_done_serial = m_state_serial = m_taken = completed;
+	m_taken_chunk = UINT32_MAX;
 }
 
 void Speculation::Push(const Job& job) {

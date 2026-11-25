@@ -2346,7 +2346,7 @@ inline thread_local EffectsLog* t_effects = nullptr;
 // t_packet_slot), 0 between translations. A buffer or image the thread that commits releases (unregistered: no later
 // lookup finds it) is destroyed after the packets it may have been looked up in: PacketNow when it is released,
 // WaitPacketPassed before it is destroyed.
-inline constexpr size_t                                MaxPacketSlots = 12; // (the graphics queue's threads, then the async queue's)
+inline constexpr size_t                                MaxPacketSlots = 12; // (the graphics queue's threads, then the compute lanes')
 // (Each slot on its own cache line: every worker packet stores to its slot.)
 struct alignas(64) PacketSlot {
 	std::atomic<uint64_t> value {0};
@@ -2372,7 +2372,7 @@ using PacketMarks = std::array<uint64_t, MaxPacketSlots>;
 	return true;
 }
 
-// (KYTY_SPECULATE_ASYNC: the async queue's speculation logs them too.)
+// (Mode 4's compute lanes share the graphics instance's log.)
 inline thread_local EffectsLog* t_effects_async = nullptr;
 // (KYTY_SPECULATE unset: no effects log on any thread, and the hot callers (ObtainBuffer's writes, the host writes)
 // read a plain global instead of two thread-locals.)

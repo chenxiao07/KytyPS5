@@ -84,6 +84,8 @@ private:
 	static constexpr uint32_t ComputeQueueCount    = ComputePipeCount * QueuesPerComputePipe;
 	static constexpr uint32_t ComputeQueueBase     = 0x20;
 	static constexpr uint32_t QueueCount           = 1 + ComputeQueueCount;
+	static constexpr uint32_t ComputeQueue1        = 1;
+	static constexpr uint32_t ComputeQueue49       = 49;
 
 	enum class SubmissionType { Graphics, Compute, FlipPreparation, FrameBoundary };
 
@@ -114,13 +116,14 @@ private:
 	};
 
 	void              Enqueue(Submission submission);
+	static void       PushCompute(Speculation& speculation, const Submission& submission);
+	[[nodiscard]] Speculation* ComputeLane(uint32_t queue_id) const noexcept;
 	void              WaitForIdle();
 	bool              CanProcessSubmission(const Submission& submission) const;
 
 public:
 	// KYTY_SPECULATE=4, on the GPU thread (Speculation::CommitReady, holding no speculation's lock): another queue's
-	// compute front runnable now: 1 the async speculation's front with its chunk translated, 2 another (unspeculated)
-	// one; 0 none.
+	// compute front runnable now: 1 a fixed lane's front with its chunk translated, 2 an unspeculated front; 0 none.
 	[[nodiscard]] static int ReadyFrontElsewhere() noexcept;
 
 private:
@@ -178,11 +181,15 @@ private:
 	// KYTY_SPECULATE (speculation.h): made at the first graphics command buffer it translates.
 	std::unique_ptr<Speculation>                                     m_speculation;
 	std::atomic<Speculation*>                                        m_ahead {nullptr}; // KYTY_SPECULATE=4's
-	// KYTY_SPECULATE_ASYNC=<queue id> (mode 4): that async compute queue's command buffers speculated too, by
-	// KYTY_SPECULATE_ASYNC_THREADS threads of their own (the culling chain's, 3.7 ms a frame on the GPU thread, 10-31).
+	// KYTY_SPEC_COMPUTE=1 retains round 4's single configurable async queue.
 	std::unique_ptr<Speculation>                                     m_speculation_async;
 	std::atomic<Speculation*>                                        m_ahead_async {nullptr};
-	uint32_t                                                         m_async_queue = 0; // (0: none)
+	uint32_t                                                         m_async_queue = 0;
+	// Each fixed compute lane has its own results, state pass and workers.
+	std::unique_ptr<Speculation>                                     m_speculation_q49;
+	std::unique_ptr<Speculation>                                     m_speculation_q1;
+	std::atomic<Speculation*>                                        m_ahead_q49 {nullptr};
+	std::atomic<Speculation*>                                        m_ahead_q1 {nullptr};
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
 	uint64_t        m_submit_id = 0;

@@ -57,8 +57,9 @@ switch acts only in mode 4. A verify switch N checks every Nth use against the p
 | KYTY_SPECULATE_THREADS (1..12) | the worker threads | - | 4 | |
 | KYTY_SPECULATE_RAM_GB (GiB, 0 = no gate) | KYTY_SPECULATE=4 stands down at boot on a PC with less physical memory; the run stays in mode 0 and the log names the memory and the threshold | - | 28 | |
 | KYTY_SPECULATE_CPUS (a CPU list) | the workers' CPUs; unset: the upper half of the performance cores, and KYTY_SPECULATE=4 stands down at boot where they have fewer logical CPUs than its threads (9 by default; the log names both counts) | - | unset | |
-| KYTY_SPECULATE_ASYNC | the compute queue speculated beside the graphics queue (0: none) | - | 49 | |
-| KYTY_SPECULATE_ASYNC_THREADS | that queue's threads | - | 2 | |
+| KYTY_SPEC_COMPUTE | sampled when mode 4 starts. 0 disables compute speculation. 1 uses round 4's blocking async path and its queue selector. 2 enables fixed queues 1 and 49 on the blocking path. | 0 | 2 | |
+| KYTY_SPECULATE_ASYNC | applies only at KYTY_SPEC_COMPUTE=1. Unset selects queue 49. 0 disables the lane. A positive queue ID selects that queue. | - | 49 | |
+| KYTY_SPECULATE_ASYNC_THREADS | workers per enabled compute lane, subject to the translator slot budget. At value 1, the fallback is 2 if the queue selector is unset and 4 if it is set. The fixed lanes default to 2 each and reserve a slot for each queue, with queue 1 taking available slots first. | - | 2 or 4 | |
 | KYTY_MIMALLOC (Windows) | the emulator's operator new/delete from mimalloc; fixed at process start from the environment (a boot in mode 0 switched live to 4 keeps the CRT heap, so a heap A/B is two boots) | 0 | 1 | |
 | KYTY_RENDER_CPUS | CPUs the workers avoid (the render thread's) | - | unset | |
 | spec_late_reads | a read of memory a pending write of an unlinked chain covered is checked at commit | - | 1 | |

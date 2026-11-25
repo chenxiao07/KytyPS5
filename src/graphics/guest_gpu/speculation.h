@@ -49,11 +49,12 @@ void VerifyDrawIndirect(RenderContext& renderer, const Spec::DrawIndirectVerify&
 // (RenderExecutor::ReadCatalogOf); its holes and the rest of the command buffer are translated by those.
 class Speculation {
 public:
-	// `interrupt_id`: the queue's processor's (0: the graphics queue; an async compute queue's: KYTY_SPECULATE_ASYNC);
+	// `interrupt_id`: the queue's processor's (0: the graphics queue; a compute queue's: KYTY_SPEC_COMPUTE);
 	// `base`: the first speculation thread's packet slot and executor role less one (after another speculation's).
 	// `pass_thread`: KYTY_SPEC_PASS_THREAD, one translator after the `threads` that takes only the state pass.
 	explicit Speculation(RenderContext& renderer, int interrupt_id = 0, uint32_t base = 0, uint32_t threads = 0,
-	                     bool pass_thread = false);
+	                     bool pass_thread = false, bool guarded_dispatch_args = false);
+	void SeedCompute(uint64_t completed, const CommandProcessor* cp);
 	// Its translators (the workers and the pass thread): the next instance's packet slots and roles start after them.
 	[[nodiscard]] uint32_t TranslatorCount() const { return static_cast<uint32_t>(m_translators.size()); }
 	~Speculation();
