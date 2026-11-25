@@ -121,6 +121,7 @@ public:
 	KYTY_CLASS_NO_COPY(Image);
 
 	[[nodiscard]] bool CreateFailed() const noexcept { return m_create_failed; }
+	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
 
 	// `find_only` (spec_worker_sets): an existing view or null, none made (the caller holds the texture cache's lock).
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info, bool find_only = false);
@@ -143,6 +144,8 @@ public:
 	// A speculative translation's work uses the image as it is now (its commit puts it there first: a use without a
 	// transition needs this too); null outside one.
 	Spec::ImageEntry* SpeculativeEntry();
+	// The caller holds the renderer lock and has validated a whole-image replay source.
+	void RecordWholeReplayRestore(const VulkanImageState& state, vk::CommandBuffer command_buffer) const;
 	// The barrier state set to `state` (each subresource's: `subresources`, unless empty), with the barriers there
 	// from the image's (a speculative translation's work is committed where it found the image).
 	void RestoreState(const VulkanImageState& state, const std::vector<VulkanImageState>& subresources,
@@ -474,7 +477,6 @@ public:
 private:
 	friend struct ImageTestAccess;
 
-	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
 	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,
 	                                                   uint64_t capacity) noexcept;
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>

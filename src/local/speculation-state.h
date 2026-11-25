@@ -37,6 +37,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <set>
 #include <span>
 #include <unordered_map>
@@ -297,6 +298,8 @@ inline thread_local bool (*t_backing_copy)(void* out, uint64_t address, uint64_t
 }
 
 inline constexpr size_t CommitImageScratchCapacity = 1024;
+// Mode 4 storage for one result's pending-use notes and one segment's staged slots.
+inline constexpr size_t RestoreGeneralScratchBytes = 64 * 1024;
 
 // spec_commit_targets (under KYTY_SPECULATE=4 only): a target left to its commit's
 // acquisition (Speculation::Before).
@@ -483,6 +486,17 @@ inline int64_t CommitVerifyEvery() {
 	return value > 0 || (value < 0 && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4);
 }
 
+// Per-image worker requests, including transits that emit no barrier.
+enum GeneralReadUse : uint8_t {
+	GeneralRead = 1,
+	GeneralOther = 2,
+	GeneralAttachment = 4,
+	GeneralStorage = 8,
+	GeneralPartial = 16,
+	SroRead = 32,
+};
+struct PendingImagePlan;
+
 // An image's barrier state as a segment found it (the commit transitions the image there first if other work moved
 // it since) and as it left it.
 struct ImageUse {
@@ -518,6 +532,9 @@ struct ImageUse {
 	uint32_t                      layer_lo = UINT32_MAX, layer_hi = 0;
 	bool                          layer_other = false;
 	uint8_t                       layer_nontarget = 0;
+	uint8_t                       general_read_use = 0;
+	uint64_t                      first_general_to_sro = 0;
+	bool                          restore_general = false; // approved in Before, issued at splice
 	// (spec_pool_layers' refusal counters: this use counted already, at most once per use whatever the calls.)
 	mutable bool                  pool_counted = false;
 	enum LayerNontarget : uint8_t {
@@ -616,6 +633,9 @@ struct Segment {
 			return it != uses.end() && it->first == image ? it->second : missing;
 		}
 	} commit_image_index;
+	size_t pending_set_uses_end = 0;
+	bool pending_set_use_overflow = false;
+	uint32_t restore_general_count = 0; // (Before approved these images, counted once the packets splice)
 };
 
 // KYTY_SPEC_DRAW_INDIRECT_VERIFY (live spec_draw_indirect_verify, N: every Nth DRAW_INDIRECT taken as a table draw, 0
@@ -666,6 +686,9 @@ struct ImageEntry {
 	uint32_t                      layer_lo = UINT32_MAX, layer_hi = 0;
 	bool                          layer_other = false;
 	uint8_t                       layer_nontarget = 0; // (ImageUse::layer_nontarget: the first such access's kind)
+	uint8_t                       general_read_use = 0;
+	uint64_t                      first_general_to_sro = 0;
+	uint64_t*                     restore_general_order = nullptr; // the owning translation's open segment
 };
 
 // (spec_predict_dcc=3.) The fast clears speculations' holes will consume, by surface and slice, until that speculation
@@ -733,6 +756,14 @@ struct State {
 	}
 	// - the descriptor sets it binds (a hole that retires one stops the commit before it: it may be reused under it);
 	std::vector<uint64_t> sets;
+	struct PendingSetUse {
+		uint64_t set;
+		uint64_t order;
+	};
+	std::unique_ptr<PendingSetUse[]> pending_set_uses;
+	size_t pending_set_use_count = 0;
+	bool pending_set_use_overflow = false;
+	uint64_t image_access_order = 0; // orders barriers and pending set uses in the open segment
 	// - words it read from a previous speculation's pending writes, and the waits it found satisfied (ChainRead);
 	std::vector<ChainRead> chain_reads;
 	std::vector<WaitCheck> waits;
@@ -796,6 +827,7 @@ struct State {
 	const char*                target_failed_why = nullptr; // (its first site's stop reason: Speculation's TargetFailed)
 	bool                       images_failed = false; // (spec_worker_images: a set's pending slot not completed)
 	bool                       any_resolve   = false; // (mode 4: a proposed set has a resolve, Before's pass for it)
+	bool                       any_general_restore = false;
 	// (Mode 4) The raw SRT words a translation read from the stale clean backing where GPU work had written them into a
 	// buffer (the in-order read is that buffer's readback), and the specialization words whose read failed as the in-order
 	// one fails (`expect_fail`: GPU-written, no clean read on any thread; the lookup went on unspecialized): each checked at
@@ -818,16 +850,16 @@ struct State {
 	// spec_worker_sets: the image sets this speculation built itself (RenderExecutor::TableResolveSet,
 	// read only), by the catalog's pair and the words' hash; `segment`: the open segment then (or, when that one was
 	// re-run as a hole, the segment after: Speculation::CommitSegments). Published into the
-	// catalog when a segment from it on is committed (Speculation::After: settle(true)); else kept aside, never freed (a
-	// draw that holds one may still be recorded): settle(false) when the record is cleared.
+	// catalog when its segment commits. An unfinished proposal is discarded or kept aside until no draw can use it.
 	struct ProposedSet {
+		enum class Settlement { Discard, Publish, RetireRestored };
 		const void*               pair = nullptr;
 		uint64_t                  hash = 0;
 		void*                     set  = nullptr;
 		size_t                    segment = 0;
 		bool                      settled = false;
-		std::function<void(bool)> settle;
-		std::function<bool()>     complete; // (spec_worker_images: its pending slots, at its segment's commit; empty: none)
+		std::function<void(Settlement)> settle;
+		std::function<bool(PendingImagePlan*)> complete; // (spec_worker_images: its pending slots, at its segment's commit)
 		// (With `complete`, read only, at its segment's commit before it: whether `written` holds any of the memory its
 		// completion uploads from: each pending slot's own desc range (data, metadata range, stencil plane) and every
 		// image over the slot's bytes as FindImage would meet them (TextureCache::ImagesOverWritten).)
@@ -851,6 +883,7 @@ struct State {
 			std::vector<VulkanImageState> subresources;
 		};
 		std::vector<Completed> completed;
+		bool restored_general = false; // its recorded pending uses were proved only in its completing segment
 		std::function<bool()>     check; // (spec_proposed_check: still current at its segment's commit)
 		std::function<void()>     on_hole; // (its segment re-run as a hole, the GPU thread: what must not move to the next one)
 		// (Its commit's settle, Speculation::After: what must run at once, in order (settle_now: an entry's records, pipeline
@@ -862,19 +895,23 @@ struct State {
 		std::function<bool()>     settle_must_now;
 		// (Mode 4, a worker's capture of colour targets no image existed for: what its commit makes once every check of the
 		// segment passed, before the pending images are completed; false stops the segment. Empty: nothing. With it, read
-		// only before its segment's Before: whether a target `resolve` makes meets [address, address + size), by its desc's
-		// data, metadata range or stencil plane (SegmentWritesRange: the completion's write test).)
+		// whether a target meets [address, address + size) by its data, metadata range or stencil plane.
+		// SegmentWritesRange checks only virtual targets. Restore-general also checks them after resolution.)
 		std::function<bool()>                   resolve;
-		std::function<bool(uint64_t, uint64_t)> resolve_over;
+		std::function<bool(uint64_t, uint64_t, bool include_resolved)> resolve_over;
 		size_t                                 pending_image_slots = 0; // at most one completed entry per pending slot
 		uint64_t                               premut_deferred_set = 0; // exact descriptor handle, set at commit
+
+		[[nodiscard]] Settlement CommitSettlement() const noexcept {
+			return restored_general ? Settlement::RetireRestored : Settlement::Publish;
+		}
 	};
 	std::vector<ProposedSet> proposed_sets;
 	void SettleProposedSets(size_t committed_segment, bool all) {
 		for (auto& p: proposed_sets)
 			if (!p.settled && (all || p.segment <= committed_segment)) {
 				p.settled = true;
-				p.settle(!all);
+				p.settle(all ? ProposedSet::Settlement::Discard : p.CommitSettlement());
 			}
 		if (all) proposed_sets.clear();
 	}
@@ -969,7 +1006,8 @@ struct State {
 	std::unordered_set<NoteSeenKey, NoteSeenHash> note_seen;
 	uint32_t one_set_verify_n = 0, one_set_verified = 0; // (KYTY_SPEC_READ_ONE_SET_VERIFY; added 64 at a time)
 	// The notes as the packet being translated found them (Mark): a refused packet leaves none (Rollback). (Its image
-	// transitions stay: they are recorded, the overlay holds where they leave the images.)
+	// transitions stay: they are recorded, the overlay holds where they leave the images. A refused packet with
+	// emitted work fails the translation, so image_access_order needs no rewind.)
 	Counts   checkpoint;
 	bool     checkpoint_bda_all = false;
 	uint64_t checkpoint_work    = 0; // LocalVulkanRecording::RecordedWrites()
@@ -1253,6 +1291,25 @@ struct State {
 	}
 	void NoteSet(uint64_t set) {
 		if (sets.size() == Sealed().sets || sets.back() != set) sets.push_back(set);
+	}
+	void NotePendingSetUse() {
+		if (pending_set_use_overflow) return;
+		// The emitted draw or dispatch follows NoteSet, even when the descriptor bind was elided.
+		const size_t sealed = closed.empty() ? 0 : closed.back().pending_set_uses_end;
+		const uint64_t set = sets.back();
+		if (pending_set_use_count > sealed && pending_set_uses[pending_set_use_count - 1].set == set) return;
+		if (pending_set_use_count == CommitImageScratchCapacity) {
+			pending_set_use_overflow = true;
+			return;
+		}
+		if (!pending_set_uses) {
+			pending_set_uses.reset(new (std::nothrow) PendingSetUse[CommitImageScratchCapacity]);
+			if (!pending_set_uses) {
+				pending_set_use_overflow = true;
+				return;
+			}
+		}
+		pending_set_uses[pending_set_use_count++] = {set, ++image_access_order};
 	}
 	// What it holds of surface metadata clears (TextureCache::IsMetaCleared), by slice (all: UINT32_MAX), from a segment
 	// on: found not cleared (the commit checks it before the segments that relied on it, first..last); consumed by a
@@ -1672,6 +1729,10 @@ struct State {
 		feedbacks.clear();
 		buffer_ranges.clear();
 		sets.clear();
+		pending_set_uses.reset();
+		pending_set_use_count = 0;
+		pending_set_use_overflow = false;
+		image_access_order = 0;
 		chain_reads.clear();
 		waits.clear();
 		journal_reads.clear();
@@ -1696,6 +1757,7 @@ struct State {
 		target_failed_why = nullptr;
 		images_failed     = false;
 		any_resolve       = false;
+		any_general_restore = false;
 		srt_verify.clear();
 		srt_failed = false;
 		draw_verifies.clear();
@@ -1780,7 +1842,8 @@ struct State {
 			                          entry.group, entry.found_buffer_modified, entry.sample_lo, entry.sample_hi,
 			                          entry.sample_other, entry.found_cpu_dirty, entry.found_validity,
 			                          entry.found_stencil_modified, entry.writes, false, entry.not_sampled, false,
-			                          entry.layer_lo, entry.layer_hi, entry.layer_other, entry.layer_nontarget});
+			                          entry.layer_lo, entry.layer_hi, entry.layer_other, entry.layer_nontarget,
+			                          entry.general_read_use, entry.first_general_to_sro});
 			entry.used = false;
 		}
 		if (image_index) {
@@ -1807,6 +1870,9 @@ struct State {
 			}
 		}
 		used.clear();
+		segment.pending_set_uses_end = pending_set_use_count;
+		segment.pending_set_use_overflow = std::exchange(pending_set_use_overflow, false);
+		image_access_order = 0;
 		bda_all = false;
 		note_seen.clear(); // (before_merge: the next segment's own)
 		open_journal_set.Clear();

@@ -1325,66 +1325,89 @@ uint64_t RenderExecutor::TablePredictPendingConflict(const TableImageSet& propos
 // spec_worker_images: the GPU thread, at the commit of the segment that built `set` (Speculation::Before, before the replay
 // binds it): each pending slot's image as its own TableResolveSet would find it now (FindImage: made if needed;
 // FindTexture: uploaded, its view), transited to the sampled layout in the open buffer, its view written into the slot,
-// and the image added to the set's (its later draws validate and transit it as any). All of them, or false (the
-// segment stops; the set is never published).
-bool RenderExecutor::TableCompletePendingImages(TableImageSet& set) {
-	auto&                                textures = m_context.GetTextureCache();
-	std::vector<vk::DescriptorImageInfo> infos(set.pending_images.size());
-	std::vector<vk::WriteDescriptorSet>  writes;
-	size_t                               done = 0;
-	for (size_t i = 0; i < set.pending_images.size(); ++i) {
-		auto&      pending = set.pending_images[i];
-		auto       desc    = pending.desc;
-		const auto id      = textures.FindImage(desc, false, true); // (may fail: no memory for it, a refusal)
-		if (!id) continue;
-		// An image a draw that bound the set renders to: the slot would hold it read-only as a texture (the dep below, not
-		// a target) while that draw's attachment holds it, where the owner's build lays it out as the target
-		// (TableResolveSet). The segment stops: in order, the owner's build. (The rest of the set's slots are left: it is
-		// retired unpublished.)
-		if (std::ranges::find(set.pending_targets, id) != set.pending_targets.end()) break;
-		// (Its view with metadata: FindTexture's metadata step still a no-op here, the in-order point before the work,
-		// else the slot fails and the segment stops.)
-		if (pending.metadata && !textures.MetadataBindNoop(id, desc)) continue;
-		const auto view = textures.FindTexture(id, desc);
-		if (!view) continue;
-		auto& image = textures.GetImage(id);
-		image.usage.texture = true;
-		const ImageSubresourceRange range {desc.view_info.base_level, desc.view_info.level_count, desc.view_info.base_layer,
-		                                   desc.view_info.layer_count};
-		// (The open buffer read at each slot: a slot's FindImage / FindTexture that reclaims memory (a failed creation:
-		// ReclaimImageMemory waits for the current tick) submitted the one open before and began the next.)
-		image.Transit(pending.layout, vk::AccessFlagBits2::eShaderRead, range,
-		              m_context.GetCommandScheduler().Current().Handle());
-		infos[i] = vk::DescriptorImageInfo {nullptr, view, pending.layout};
-		vk::WriteDescriptorSet write;
-		write.dstSet          = set.set;
-		write.dstBinding      = pending.binding;
-		write.dstArrayElement = pending.element;
-		write.descriptorCount = 1;
-		write.descriptorType  = pending.type;
-		write.pImageInfo      = &infos[i];
-		writes.push_back(write);
-		auto& dep  = set.images.emplace_back();
-		dep.id     = id;
-		dep.serial = image.serial;
-		dep.layout = pending.layout;
-		dep.range  = range;
-		dep.desc   = desc;
-		set.image_ids.push_back(id);
-		// (Its view's metadata noted as the owner's build notes a dep's, KYTY_TABLE_SERIALS.)
-		if (pending.metadata) textures.NoteMetaUse(desc.info.metadata.range.address, id.index);
-		++done;
-	}
-	if (!writes.empty())
-		m_context.GetGraphics().device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr
+// and the image added to the set's dependencies. With a plan, acquire all slots before placing any, so their
+// images and views can be checked together. Both paths place each slot in its original descriptor layout.
+bool RenderExecutor::TableCompletePendingImages(TableImageSet& set, Spec::PendingImagePlan* plan) {
+	enum class Completion { Normal, Acquire, Apply };
+	const auto complete = [&]<Completion Pass>() {
+		auto& textures = m_context.GetTextureCache();
+		std::vector<vk::DescriptorImageInfo> infos(Pass == Completion::Acquire ? 0 : set.pending_images.size());
+		std::vector<vk::WriteDescriptorSet> writes;
+		size_t     done  = 0;
+		const auto place = [&](size_t i, Image& image, ImageId id, const TextureCache::ImageDesc& desc,
+		                       vk::ImageView view) {
+			const auto& pending = set.pending_images[i];
+			const ImageSubresourceRange range {desc.view_info.base_level, desc.view_info.level_count, desc.view_info.base_layer,
+			                                   desc.view_info.layer_count};
+			// Acquisition can submit and reopen the scheduler on memory pressure. Use the current buffer.
+			image.Transit(pending.layout, vk::AccessFlagBits2::eShaderRead, range, m_context.GetCommandScheduler().Current().Handle());
+			infos[i] = vk::DescriptorImageInfo {nullptr, view, pending.layout};
+			vk::WriteDescriptorSet write;
+			write.dstSet          = set.set;
+			write.dstBinding      = pending.binding;
+			write.dstArrayElement = pending.element;
+			write.descriptorCount = 1;
+			write.descriptorType  = pending.type;
+			write.pImageInfo      = &infos[i];
+			writes.push_back(write);
+			auto& dep  = set.images.emplace_back();
+			dep.id     = id;
+			dep.serial = image.serial;
+			dep.layout = pending.layout;
+			dep.range  = range;
+			dep.desc   = desc;
+			set.image_ids.push_back(id);
+		};
+		if constexpr (Pass == Completion::Apply) {
+			if (set.pending_images.size() > plan->size - plan->next_slot) return false;
+		}
+		for (size_t i = 0; i < set.pending_images.size(); ++i) {
+			const auto& pending = set.pending_images[i];
+			if constexpr (Pass == Completion::Apply) {
+				const auto& slot = plan->slots[plan->next_slot++];
+				place(i, *slot.image, slot.id, slot.desc, slot.view);
+				++done;
+				continue;
+			}
+			auto       desc = pending.desc;
+			const auto id   = textures.FindImage(desc, false, true);
+			if (!id) continue;
+			// (A pending slot resolving to a target of a draw that binds this set stops the segment, as before.)
+			if (std::ranges::find(set.pending_targets, id) != set.pending_targets.end()) {
+				break;
+			}
+			// (Its view's metadata step must still be a no-op at this in-order point.)
+			if (pending.metadata && !textures.MetadataBindNoop(id, desc)) continue;
+			const auto view = textures.FindTexture(id, desc);
+			if (!view) continue;
+			auto& image = textures.GetImage(id);
+			image.usage.texture = true;
+			if constexpr (Pass == Completion::Acquire) {
+				if (plan->size == plan->capacity) return false;
+				const auto handle = reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(set.set));
+				plan->slots[plan->size++] = {&image, handle, id, image.serial, view, image.registrations, pending.type,
+				                            pending.layout, desc};
+			} else {
+				place(i, image, id, desc, view);
+			}
+			if (pending.metadata) textures.NoteMetaUse(desc.info.metadata.range.address, id.index);
+			++done;
+		}
+		const bool ok = done == set.pending_images.size();
+		if constexpr (Pass == Completion::Acquire) return ok;
+		if (!writes.empty())
+			m_context.GetGraphics().device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
-		                                                    , LocalVulkanRecording::DirectDispatch()
+			                                                    , LocalVulkanRecording::DirectDispatch()
 #endif
-		);
-	bool ok = done == set.pending_images.size();
-	set.span_begin = set.span_end = 0; // (its span grew: found again at its next proof)
-	if (ok) set.pending_images.clear(), std::vector<ImageId>().swap(set.pending_targets);
-	return ok;
+			);
+		set.span_begin = set.span_end = 0; // (its span grew: found again at its next proof)
+		if (ok) set.pending_images.clear(), std::vector<ImageId>().swap(set.pending_targets);
+		return ok;
+	};
+	if (plan == nullptr) return complete.template operator()<Completion::Normal>();
+	if (plan->applying) return complete.template operator()<Completion::Apply>();
+	return complete.template operator()<Completion::Acquire>();
 }
 
 RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& buffer, TablePair& pair,
@@ -1436,16 +1459,23 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			const auto  since    = CatalogTable()->epoch;
 			const bool  replaces = t_table_revalidating; // (spec_worker_revalidate: built for a set found no longer valid)
 			auto        holder   = std::make_shared<std::unique_ptr<TableImageSet>>(std::move(set));
+			using Settlement = Spec::State::ProposedSet::Settlement;
 			spec->proposed_sets.push_back({&pair, words_hash, raw, spec->closed.size(), false,
-			                               [owner, target, words_hash, since, holder, replaces](bool commit) {
+			                               [owner, target, words_hash, since, holder, replaces](Settlement action) {
+				                               const bool commit = action == Settlement::Publish;
+				                               const bool restored = action == Settlement::RetireRestored;
 				                               if (commit && TableAsideReleaseOn()) TableAsideDrain(owner->m_context.FrameNumber());
-				                               // (spec_worker_images: never completed, never published or kept; the roles' pointers to it
-				                               // dropped first, under the write lock their reads exclude; its descriptor set retired as the
-				                               // owner retires one. No other translation binds it (an unpublished proposal is foreign to
-				                               // them, TableSet), and its own segment's commit stopped before any replay that binds it ran.)
-				                               if (*holder && !(*holder)->pending_images.empty()) {
+				                               // An incomplete or restored set stays unpublished. Foreign translations cannot bind it.
+				                               if (*holder && (restored || !(*holder)->pending_images.empty())) {
 					                               const auto write = owner->CatalogWrite();
 					                               target->ForgetSet(holder->get());
+					                               if (restored && owner->m_table_xpr) {
+						                               auto& table = *owner->m_table_xpr;
+						                               if (table.last_set == holder->get()) table.last_set = nullptr;
+						                               if (table.memo_set == holder->get()) table.memo_set = nullptr;
+						                               ++table.epoch; // workers drop cached references on their next lookup
+					                               }
+					                               // Retire at or after the splice's tick. The proposal keeps the wrapper.
 					                               owner->NativeXprRetireSet((*holder)->pool, (*holder)->set);
 					                               return;
 				                               }
@@ -1497,9 +1527,11 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				// (The images it completes, each with its serial and the slot's layout, and the set's handle: for its segment's
 				// Before, and spec_set_cpu_dirty_stop off for the commits of later segments that bind it, CommitSegments'
 				// reuse test.)
-				spec->proposed_sets.back().complete = [owner, raw, spec, index = spec->proposed_sets.size() - 1] {
+				spec->proposed_sets.back().complete = [owner, raw, spec, index = spec->proposed_sets.size() - 1]
+				    (Spec::PendingImagePlan* plan) {
 					const auto first = raw->images.size();
-					const bool ok    = owner->TableCompletePendingImages(*raw);
+					const bool ok    = owner->TableCompletePendingImages(*raw, plan);
+					if (plan != nullptr && !plan->applying) return ok;
 					auto&      textures  = owner->m_context.GetTextureCache();
 					auto&      completed = spec->proposed_sets[index].completed;
 					const auto handle    = reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(raw->set));
@@ -4630,6 +4662,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (!same_index && !(reloc && TableRelocRecord(vk_buffer, *spec_state, Spec::RelocIndex, indices, index_base, index_bytes,
 	                                               0, static_cast<uint32_t>(static_cast<VkIndexType>(index_type)), 0)))
 		vk_buffer.bindIndexBuffer(indices.first->Handle(), indices.second, index_type);
+	if (spec_state != nullptr && spec_state->reloc_on && !set->pending_images.empty() &&
+	    (groups != 0 || (direct != nullptr && !vertex_arguments)))
+		spec_state->NotePendingSetUse();
 	if (direct != nullptr && !vertex_arguments) {
 		// This draw's offsets, as the normal path's ResolveVertexOffset/ResolveInstanceOffset give them: the index
 		// offset register, else (a vertex program that fetches) the user data its fetch adds.
@@ -5277,6 +5312,8 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	const bool continues_chain = chain && buffer.ComputeChainPending();
 	if (storage_writes && !continues_chain) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, BindPipelineHandle(pipeline));
+	if (retry_spec != nullptr && retry_spec->reloc_on && !set->pending_images.empty())
+		retry_spec->NotePendingSetUse();
 	if (indirect_args != 0) {
 		vk::BufferMemoryBarrier args_barrier {};
 		args_barrier.srcAccessMask       = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite |
@@ -6068,8 +6105,11 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(Comm
 	}
 	auto* const owner = &Catalog();
 	auto* const raw   = holder.get();
+	using Settlement = Spec::State::ProposedSet::Settlement;
 	spec->proposed_sets.push_back({nullptr, mix, raw, spec->closed.size(), false,
-	                               [owner, holder](bool commit) { owner->TableEntrySettle(holder, commit); }});
+	                               [owner, holder](Settlement action) {
+		                               owner->TableEntrySettle(holder, action == Settlement::Publish);
+	                               }});
 	spec->proposed_sets.back().check = [owner, raw] { return owner->TableEntryCheck(*raw); };
 	// (Its segment re-run as a hole drew the draw in order, maybe through the table without a normal lookup: what its commit
 	// would do for the draw is not done at a later segment's (records, private pipeline dropped here).)
@@ -6080,18 +6120,20 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(Comm
 	if (raw->state != nullptr && raw->state->virtual_targets != nullptr) {
 		auto& proposed        = spec->proposed_sets.back();
 		proposed.resolve      = [owner, raw, spec] { return owner->TableEntryResolveVirtual(*raw, spec); };
-		proposed.resolve_over = [raw](uint64_t address, uint64_t size) {
+		proposed.resolve_over = [raw](uint64_t address, uint64_t size, bool include_resolved) {
 			const auto* state = raw->state.get();
-			if (state == nullptr || state->virtual_targets == nullptr || raw->virtual_hole) return false;
+			if (state == nullptr || raw->virtual_hole) return false;
 			const auto meets = [&](uint64_t begin, uint64_t bytes) { return bytes != 0 && begin < address + size && address < begin + bytes; };
-			for (const auto& made: state->virtual_targets->targets) {
-				const auto& info = made.desc.info;
-				if (meets(info.data.address, info.data.size) ||
-				    (info.HasMetadata() && meets(info.metadata.range.address, info.metadata.range.size)) ||
-				    (info.HasStencil() && meets(info.stencil.address, info.stencil.size)))
-					return true;
-			}
-			return false;
+			const auto overlaps = [&](const ImageInfo& info) {
+				return meets(info.data.address, info.data.size) ||
+				       (info.HasMetadata() && meets(info.metadata.range.address, info.metadata.range.size)) ||
+				       (info.HasStencil() && meets(info.stencil.address, info.stencil.size));
+			};
+			// The layout plan also checks after resolution has filled the real targets and cleared virtual_targets.
+			if (state->virtual_targets == nullptr)
+				return include_resolved &&
+				       std::ranges::any_of(state->targets, [&](const auto& target) { return overlaps(target.requested); });
+			return std::ranges::any_of(state->virtual_targets->targets, [&](const auto& made) { return overlaps(made.desc.info); });
 		};
 		spec->any_resolve = true;
 		proposed.on_hole  = [raw, before = std::move(proposed.on_hole)] {
@@ -6491,7 +6533,8 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableEntryOverlay(Com
 		for (const auto& p: spec->proposed_sets)
 			if (p.pair == nullptr && p.hash == 0 && p.set == raw && p.segment == segment) return;
 		auto* const owner = &Catalog();
-		spec->proposed_sets.push_back({nullptr, 0, raw, segment, false, [held = std::move(held)](bool) { (void)held; }});
+		spec->proposed_sets.push_back({nullptr, 0, raw, segment, false,
+		                               [held = std::move(held)](Spec::State::ProposedSet::Settlement) { (void)held; }});
 		spec->proposed_sets.back().check = [owner, raw] { return owner->TableEntryOverlayCheck(*raw); };
 	};
 	// (Its own translation's entry for a new pair, the catalog's pair for the key made since: proposed with the mix

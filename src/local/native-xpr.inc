@@ -3407,7 +3407,8 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 		};
 		bool left2 = false; // (spec_depth_layers2: the commit owns this target's acquisition and clear)
 		// spec_commit_targets: a target the commit can acquire (one whole-image state, defined; its metadata the draw's; no
-		// depth link) is left to it, recorded once a segment.
+		// depth link) is left to it, recorded once a segment. A speculative table draw holds the graphics catalog read
+		// here; the restore-general splice takes that catalog's write before changing the published backing state.
 		const auto acquirable = [&] {
 			return spec != nullptr && Spec::CommitTargetsOn() && !image->depth_id &&
 			       image->backing.subresource_states.empty() && image->backing.state.layout != vk::ImageLayout::eUndefined &&

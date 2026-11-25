@@ -7,9 +7,10 @@
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
-#include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h" // (spec_depth_layers2: htile_load_decision)
+#include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h" // (mode 4: ReadSrtWordInOrder, ReadSpecializationWordInOrder)
+#include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h" // (GuardedCopy: IsUniqueGuestBackingRangeAcrossMappings)
 #include "async-upload.h"
 #include "draw-state-observer.h"
@@ -32,6 +33,8 @@
 #include <exception>
 #include <immintrin.h> // (_mm_pause: CommitReady's spin)
 #include <map>
+#include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -2529,7 +2532,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	if (Spec::CopyForwardReader(m_interrupt_id) && m_shared) {
 		r.state.forward_owner = this;
 	}
-	// (Relocatable buffer references: the mode once a translation, so a live change cannot split a segment's notes.)
+	// Sample mode 4 once for relocations and for the restore-GENERAL access proof.
 	r.state.reloc_on      = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 	r.state.table_upload  = translator.table_upload.get();
 	r.state.shader_upload = translator.shader_upload.get();
@@ -3376,6 +3379,28 @@ struct ChangedRules {
 // (The GPU thread, from a segment's Before to its patch step: every one of its entries obtained.)
 static thread_local bool t_pending_obtained_all = false;
 
+static bool PendingSlotLive(TextureCache& textures, const Spec::PendingImagePlan::Slot& slot) {
+	const auto* live = textures.TryGetImage(slot.id);
+	return live != nullptr && live == slot.image && live->serial == slot.serial && live->registered &&
+	       live->registrations == slot.registrations && live->backing.image != nullptr &&
+	       std::ranges::find(live->views, slot.view, &CachedImageView::view) != live->views.end();
+}
+
+// The final refresh can change the layout. A whole SRO source gives one restore barrier and preserves contents.
+static bool CheckLiveGeneralRestore(const Image& image) {
+	const Image::StateLock lock(image);
+	const auto& backing = image.backing;
+	return backing.subresource_states.empty() && backing.state.layout == vk::ImageLayout::eShaderReadOnlyOptimal;
+}
+
+// The caller holds the image's StateLock.
+static void PublishImageUse(Spec::ImageUse& use) {
+	use.image->backing.state              = use.left;
+	use.image->backing.subresource_states = std::move(use.left_subresources);
+	use.image->transit_group              = use.left_group;
+	MoveImageStateEpoch(use.image);
+}
+
 static bool AfterCopyOverlapsJournalRead(const Spec::MemoryWrite& write, const Spec::State& state,
                                          const Spec::Counts& from, const Spec::Counts& to) noexcept {
 	if (write.size == 0) {
@@ -3622,6 +3647,15 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 							return wrote_what_it_read(m_log.FirstWriteOver(result.effects_from, read.begin, read.end - read.begin), read);
 						}
 					}
+				}
+				// Only the completing segment proved the pending set's hidden image accesses.
+				if (state.any_general_restore && to.sets > from.sets) {
+					const auto bound = std::span(state.sets).subspan(from.sets, to.sets - from.sets);
+					for (const auto& proposed: state.proposed_sets)
+						if (proposed.segment < index && proposed.restored_general && !proposed.completed.empty() &&
+						    std::ranges::find(bound, proposed.completed.front().set) != bound.end()) {
+							return "commit: an earlier segment's restore-general pending set used again";
+						}
 				}
 				// The descriptor sets it binds: none retired since (one may be reused under it).
 				for (const auto retired: effects.retired_sets)
@@ -3927,7 +3961,8 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 			continue;
 		}
 		const auto prepared = CurrentEpochs();
-		Before(result, index);
+		Spec::PendingImagePlan pending_images;
+		Before(result, index, pending_images);
 		// (Its preparation registers what the work did not find registered (BDA ranges): a buffer merged away under
 		// the recorded work leaves it reading a destroyed one. The work after it is translated in order.)
 		// Changed's stamps (mode 4): when the first call passed with no relocation, it proved no change over the
@@ -4026,9 +4061,45 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		// KYTY_SPEC_DRAW_INDIRECT_VERIFY: its sampled DRAW_INDIRECT table draws, here where their arguments are current.
 		for (const auto& entry: state.draw_verifies)
 			if (entry.segment == index) VerifyDrawIndirect(m_renderer, entry);
-		const auto& segment = state.closed[index];
-		if (const auto tick = scheduler.SubmitRecorded(*result.recorder, segment.recorded - result.submitted); tick != 0)
-			result.last_tick = tick;
+		auto& segment = result.state.closed[index];
+		const auto splice_recorded = [&] {
+			if (const auto tick = scheduler.SubmitRecorded(*result.recorder, segment.recorded - result.submitted); tick != 0)
+				result.last_tick = tick;
+		};
+		if (segment.restore_general_count != 0) {
+			const RenderLockGuard restore_lock(m_renderer.GetMutex());
+			auto& textures = m_renderer.GetTextureCache();
+			if (!std::ranges::all_of(pending_images.Slots(), [&](const auto& slot) { return PendingSlotLive(textures, slot); })) {
+				return ++m_stop_reasons[TargetCompletedUse], Progress::Stopped;
+			}
+			// Check every source before recording any restore. Keep the renderer locked through the splice.
+			for (const auto& use: segment.images) {
+				if (!use.restore_general) continue;
+				if (!CheckLiveGeneralRestore(*use.image)) {
+					return ++m_stop_reasons[TargetCompletedUse], Progress::Stopped;
+				}
+			}
+			// TableTry and TableContinue hold the graphics catalog read across NativeXprEmitTargets' acquisition check.
+			// Try the write before emitting anything so the GPU thread never waits on those readers here.
+			const std::unique_lock catalog_write(m_renderer.DefaultRenderExecutor().m_catalog_mutex, std::try_to_lock);
+			if (!catalog_write.owns_lock()) {
+				LiveCounters::Add(LiveCounters::SpecRestoreGeneralCatalogBusy);
+				return ++m_stop_reasons[TargetCompletedUse], Progress::Stopped;
+			}
+			for (const auto& use: segment.images)
+				if (use.restore_general)
+					use.image->RecordWholeReplayRestore(use.found, scheduler.Current().Handle());
+			splice_recorded();
+			// Only the queued commands see GENERAL. Publish their final SRO state after enqueue.
+			for (auto& use: segment.images)
+				if (use.restore_general) {
+					const Image::StateLock lock(*use.image);
+					PublishImageUse(use);
+				}
+			LiveCounters::Add(LiveCounters::SpecRestoreGeneralTaken, segment.restore_general_count);
+		} else {
+			splice_recorded();
+		}
 		result.submitted = segment.recorded;
 		RelocCellsRelease(result.state, index); // (its chunks spliced)
 		// (Worker packets: spliced into the open buffer, which goes on: the draw state this thread knew of it is not
@@ -4162,7 +4233,7 @@ static bool SegmentWritesRange(const Spec::State& state, size_t index, const Spe
 			return true;
 	if (state.any_resolve)
 		for (const auto& proposed: state.proposed_sets)
-			if (proposed.segment == index && proposed.resolve && proposed.resolve_over && proposed.resolve_over(address, size))
+			if (proposed.segment == index && proposed.resolve && proposed.resolve_over && proposed.resolve_over(address, size, false))
 				return true;
 	for (size_t k = from.pending_targets; k < std::min(to.pending_targets, state.pending_targets.size()); ++k) {
 		const auto& target = state.pending_targets[k];
@@ -4173,7 +4244,80 @@ static bool SegmentWritesRange(const Spec::State& state, size_t index, const Spe
 	return false;
 }
 
-void Speculation::Before(Result& result, size_t index) {
+static bool VirtualTargetOver(const Spec::State& state, size_t index, const ImageInfo& info) {
+	if (!state.any_resolve) return false;
+	for (const auto& proposed: state.proposed_sets) {
+		if (proposed.segment != index || !proposed.resolve_over) continue;
+		const auto& over = proposed.resolve_over;
+		if (over(info.data.address, info.data.size, true) ||
+		    (info.HasMetadata() && over(info.metadata.range.address, info.metadata.range.size, true)) ||
+		    (info.HasStencil() && over(info.stencil.address, info.stencil.size, true)))
+			return true;
+	}
+	return false;
+}
+
+static bool CheckPendingGeneralRestore(const Spec::State& state, size_t index, const Spec::Counts& from,
+                                       std::span<const Spec::PendingImagePlan::Slot> slots, const Spec::ImageUse& use) {
+	const auto& image = *use.image;
+	const auto& to    = state.closed[index].end;
+	const auto same_image = [&](const auto& entry) { return entry.image == &image && entry.serial == use.serial; };
+	if (image.info.data.Empty() || !std::ranges::any_of(slots, same_image)) return false;
+
+	constexpr auto color = vk::ImageAspectFlagBits::eColor;
+	constexpr auto sro   = vk::ImageLayout::eShaderReadOnlyOptimal;
+	if (Image::FullAspectMask(image.backing.format) != color || image.info.IsDepth() || image.depth_id)
+		return false;
+
+	const auto targets = std::span(state.pending_targets).subspan(from.pending_targets, to.pending_targets - from.pending_targets);
+	if ((use.general_read_use & Spec::GeneralAttachment) || std::ranges::any_of(targets, same_image) ||
+	    VirtualTargetOver(state, index, image.info))
+		return false;
+	if (!(use.general_read_use & Spec::SroRead) ||
+	    (use.general_read_use & (Spec::GeneralStorage | Spec::GeneralRead | Spec::GeneralOther | Spec::GeneralPartial)))
+		return false;
+
+	if (!use.found_subresources.empty() || !use.left_subresources.empty()) return false;
+	if (use.found.layout != vk::ImageLayout::eGeneral || use.left.layout != sro) return false;
+	// Resolved bindings transit the image before drawing or dispatching. An elided transit repeats a placement already
+	// made in this segment. With only whole SRO reads from found GENERAL, the first such transit emits this barrier.
+	if (use.first_general_to_sro == 0) return false;
+
+	const auto bound = std::span(state.sets).subspan(from.sets, to.sets - from.sets);
+	for (const auto& proposed: state.proposed_sets) {
+		if (proposed.segment >= index || proposed.completed.empty() ||
+		    std::ranges::find(bound, proposed.completed.front().set) == bound.end())
+			continue;
+		// A completion from an earlier segment can also hide an access to this image.
+		if (std::ranges::any_of(proposed.completed, same_image)) return false;
+	}
+	const size_t notes_from = index == 0 ? 0 : state.closed[index - 1].pending_set_uses_end;
+	const std::span<const Spec::State::PendingSetUse> recorded_notes(state.pending_set_uses.get(), state.pending_set_use_count);
+	const auto notes = recorded_notes.subspan(notes_from, state.closed[index].pending_set_uses_end - notes_from);
+	for (const auto& slot: slots) {
+		if (!same_image(slot)) continue;
+		const auto& view = slot.desc.view_info;
+		if (view.aspect != color || slot.desc.info.IsDepth()) return false;
+		if (slot.type != vk::DescriptorType::eSampledImage || slot.desc.type != TextureCache::BindingType::Texture ||
+		    (view.usage & vk::ImageUsageFlagBits::eStorage))
+			return false;
+		if (slot.layout != sro) return false;
+		if (view.base_level != 0 || view.level_count != image.backing.mip_levels ||
+		    view.level_count != image.info.resources.levels || view.base_layer != 0 ||
+		    view.layer_count != image.backing.layers || view.layer_count != image.info.resources.layers ||
+		    (image.info.IsVolume() && view.type != vk::ImageViewType::e3D))
+			return false;
+		if (VirtualTargetOver(state, index, slot.desc.info)) return false;
+
+		// A pending slot had no real image at record time, so its first use may precede the tracked transit.
+		const auto first = std::ranges::find(notes, slot.set, &Spec::State::PendingSetUse::set);
+		if (first == notes.end() || first->order <= use.first_general_to_sro)
+			return false;
+	}
+	return CheckLiveGeneralRestore(image);
+}
+
+void Speculation::Before(Result& result, size_t index, Spec::PendingImagePlan& plan) {
 	t_pending_obtained_all = false; // (spec_pending_summary: first, so no return below leaves an earlier segment's true)
 	const Spec::EffectSourceScope source(Spec::EffectSource::Commit);
 	auto&       resources = m_renderer.GetGpuResources();
@@ -4181,9 +4325,10 @@ void Speculation::Before(Result& result, size_t index) {
 	auto&       textures  = m_renderer.GetTextureCache();
 	auto&       scheduler = m_renderer.GetCommandScheduler();
 	auto&       state     = result.state;
-	const auto& segment   = state.closed[index];
+	auto&       segment   = state.closed[index];
 	const auto  from      = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
 	const auto& to        = segment.end;
+	segment.restore_general_count = 0;
 	BdaDirtyRegions::Publish();
 	// In the scheduler's command buffer (submitted before the segment's): the ranges it writes obtained written
 	// (their CPU-dirty pages uploaded, then GPU-owned), those it reads made current, its BDA reads prepared, and each
@@ -4349,8 +4494,8 @@ void Speculation::Before(Result& result, size_t index) {
 		const auto& range = state.invalidated[i];
 		textures.InvalidateMemoryFromGPU(range.begin, range.end - range.begin, "speculation");
 	}
-	// spec_worker_images: the sets its worker built with pending slots, completed by the owner now (the set is bound by
-	// the replay after this; their images are not among the segment's, which RestoreState below restores).
+	// spec_worker_images: the sets its worker built with pending slots, completed by the owner now for replay.
+	// A completed image may also be among the segment's recorded uses, checked at the restore loop below.
 	// spec_proposed_check (under KYTY_SPECULATE=4, the only mode with worker sets):
 	// the sets its worker proposed in this segment, or handed on by one re-run as a hole (bound by the replay after this)
 	// still current: the BDA page table's
@@ -4365,7 +4510,8 @@ void Speculation::Before(Result& result, size_t index) {
 	const auto proposals = indexed_proposals ? all_proposals.subspan(image_plan.proposal_first,
 	                                                                 image_plan.proposal_end - image_plan.proposal_first)
 	                                         : all_proposals;
-	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+	const bool mode4 = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+	if (mode4) {
 		Spec::t_check_segment = index;
 		for (const auto& proposed: proposals)
 			if (proposed.segment == index && proposed.check) {
@@ -4381,10 +4527,58 @@ void Speculation::Before(Result& result, size_t index) {
 				}
 	}
 	// (A set whose pending slots' memory the segment writes stopped it before this: the commit's checks before Before.)
+	Spec::PendingImagePlan* completion_plan = nullptr;
+	const auto completes_here = [index](const auto& proposed) { return proposed.segment == index && proposed.complete; };
+	bool restore_general = mode4 && state.reloc_on && !state.images_failed && !segment.images.empty() &&
+	                       std::ranges::any_of(proposals, completes_here);
+	bool packet_replay = false;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	if (restore_general) {
+		const size_t recorded = segment.recorded - result.submitted;
+		packet_replay = result.recorder->packets && recorded != 0 && recorded <= result.recorder->recorded.size() &&
+		                std::ranges::all_of(std::span(result.recorder->recorded).first(recorded),
+		                                    [](const auto& entry) { return entry.packets && !entry.chunks.failed; });
+		if (packet_replay &&
+		    std::ranges::any_of(segment.images, [](const auto& use) { return (use.general_read_use & Spec::SroRead) != 0; })) {
+			constexpr size_t proof_bytes = Spec::CommitImageScratchCapacity * sizeof(Spec::State::PendingSetUse);
+			static_assert(proof_bytes + sizeof(Spec::PendingImagePlan::Slot) <= Spec::RestoreGeneralScratchBytes);
+			constexpr size_t slot_limit =
+			    (Spec::RestoreGeneralScratchBytes - proof_bytes) / sizeof(Spec::PendingImagePlan::Slot);
+			static_assert(slot_limit <= Spec::CommitImageScratchCapacity);
+			if (!segment.pending_set_use_overflow) {
+				for (const auto& proposed: proposals) {
+					if (!completes_here(proposed)) continue;
+					if (proposed.pending_image_slots > slot_limit - plan.capacity) {
+						plan.capacity = 0;
+						break;
+					}
+					plan.capacity += proposed.pending_image_slots;
+				}
+				if (plan.capacity != 0)
+					plan.slots.reset(new (std::nothrow) Spec::PendingImagePlan::Slot[plan.capacity]);
+			}
+			if (plan.slots) {
+				completion_plan = &plan;
+				for (auto& proposed: proposals)
+					if (completes_here(proposed) && !proposed.complete(completion_plan)) state.images_failed = true;
+				// An acquisition can reclaim an earlier image or view. Validate all slots before any descriptor update.
+				if (!state.images_failed && !std::ranges::all_of(plan.Slots(), [&](const auto& slot) { return PendingSlotLive(textures, slot); })) {
+					state.images_failed = true;
+				}
+				plan.applying = !state.images_failed;
+			} else {
+				// Keep ordinary completion when either proof or staging storage ran out.
+				LiveCounters::Add(LiveCounters::SpecRestoreGeneralBudget);
+				restore_general = false;
+			}
+		}
+	}
+#endif
 	for (auto& proposed: proposals) {
 		if (proposed.segment != index) continue;
 		if (proposed.complete) {
-			if (!proposed.complete()) state.images_failed = true;
+			if ((completion_plan == nullptr || plan.applying) && !proposed.complete(completion_plan))
+				state.images_failed = true;
 			proposed.complete = nullptr;
 		}
 		// A failed set can still have completed some slots. Keep those actual entries as the old walk does.
@@ -4485,6 +4679,9 @@ void Speculation::Before(Result& result, size_t index) {
 	// in the states the segment's barriers start from. One not refreshed fails the segment.)
 	for (const auto& use: segment.images)
 		if (use.refresh && !textures.RefreshAtCommit(*use.image, use.serial)) TargetFailed(state, TargetRefresh);
+	if (plan.applying && !std::ranges::all_of(plan.Slots(), [&](const auto& slot) { return PendingSlotLive(textures, slot); })) {
+		TargetFailed(state, TargetGone);
+	}
 	// The images back in the states the segment's barriers start from. This Before may have released one: a creation it
 	// made failed for memory (ReclaimImageMemory unregisters its victims, among them maybe the segment's own, and erases
 	// them after a wait), and any EraseRetired here (that one, a deferred RetireImage a Finish ran) erases retired images
@@ -4522,8 +4719,9 @@ void Speculation::Before(Result& result, size_t index) {
 	//   order the set's build puts it in Lc. Restored (no stop) only when the image is in Lc at every point of the replay
 	//   whatever the order: every completion of it in this segment in the shader-read-only layout (a sampled colour slot,
 	//   not a depth one's), `found` in that layout (whole, or at every found subresource; RestoreState makes it `found`
-	//   whatever the state now) and every access of the segment a shader read in it (not_sampled clear); else the segment
-	//   stops before the splice (target_failed), its restore not made.
+	//   whatever the state now) and every access of the segment a shader read in it (not_sampled clear). Mode 4 can
+	//   also restore whole GENERAL for a packet splice when the recorded GENERAL -> SRO barrier precedes every use of
+	//   the image. That restore is issued at the splice. A failed proof stops the segment.
 	// KYTY_SPEC_COMPLETED_SNAPSHOT (spec_completed_snapshot, mode 4): the first form's test is instead the image's state
 	// now equal to the snapshot its completion took (ProposedSet::Completed::state and subresources: layout, access,
 	// stages and guest, the whole state and every subresource), so a completion that transited only the slot's
@@ -4597,18 +4795,21 @@ void Speculation::Before(Result& result, size_t index) {
 			return false;
 		};
 		// Both walks expose only the boolean and this shared refusal reason.
-		if (indexed ? indexed_conflict() : fallback_conflict()) TargetFailed(state, TargetLayouts);
+		if (indexed ? indexed_conflict() : fallback_conflict()) {
+			TargetFailed(state, TargetLayouts);
+		}
 	}
 	const bool erased = textures.EraseEpoch() != erase_epoch;
 	for (size_t i = 0; i < segment.images.size(); ++i) {
-		auto& use      = state.closed[index].images[i];
+		auto& use      = segment.images[i];
 		use.keep_state = false;
 		if (ImageGoneInBefore(textures, *use.image, use.serial, images_at_start[i], erased)) {
 			TargetFailed(state, TargetGone);
 			LiveCounters::Add(LiveCounters::SpecImageGoneInBeforeN);
 			continue;
 		}
-		const auto undefined   = [](const VulkanImageState& s) { return s.layout == vk::ImageLayout::eUndefined; };
+		const auto this_image = [&](const CompletedNow& c) { return c.image == use.image && c.serial == use.serial; };
+		const auto undefined  = [](const VulkanImageState& s) { return s.layout == vk::ImageLayout::eUndefined; };
 		const bool whole_undef = use.found_subresources.empty() && undefined(use.found);
 		if (whole_undef || std::ranges::any_of(use.found_subresources, undefined)) {
 			if (use.sample_lo == UINT32_MAX && !use.sample_other && whole_undef) {
@@ -4636,7 +4837,6 @@ void Speculation::Before(Result& result, size_t index) {
 				continue;
 			}
 		}
-		const auto this_image = [&](const CompletedNow& c) { return c.image == use.image && c.serial == use.serial; };
 		std::span<const IndexedCompletion> matches;
 		if (!completion_index.empty()) {
 			const auto [first, last] = std::ranges::equal_range(completion_index, CompletionKey(use.image, use.serial), {},
@@ -4693,6 +4893,19 @@ void Speculation::Before(Result& result, size_t index) {
 			                               ? use.found.layout == sro
 			                               : std::ranges::all_of(use.found_subresources, [&](const auto& s) { return s.layout == sro; });
 			if (!lc_sro || use.not_sampled || !found_sro) {
+				if (restore_general && !state.target_failed && !state.images_failed && packet_replay && lc_sro &&
+				    plan.applying && CheckPendingGeneralRestore(state, index, from, plan.Slots(), use)) {
+					use.restore_general = true;
+					++segment.restore_general_count;
+					for (auto& proposed: state.proposed_sets)
+						if (proposed.segment == index &&
+						    std::ranges::any_of(proposed.completed, [&](const auto& slot) {
+							    return slot.image == use.image && slot.serial == use.serial;
+						    }))
+							proposed.restored_general = true;
+					state.any_general_restore = true;
+					continue;
+				}
 				TargetFailed(state, TargetCompletedUse);
 				continue;
 			}
@@ -4849,8 +5062,10 @@ void Speculation::After(Result& result, size_t index) {
 			if (proposed.settle_now) {
 				proposed.settle_now();
 			}
-			const bool must_now = proposed.settle_must_now && proposed.settle_must_now();
-			RenderExecutor::SettleOrQueue(proposed.catalog_owner, [settle = proposed.settle] { settle(true); });
+			// A restored set must leave service at this commit, without ever entering the catalog.
+			const auto action = proposed.CommitSettlement();
+			const bool must_now = proposed.restored_general || (proposed.settle_must_now && proposed.settle_must_now());
+			RenderExecutor::SettleOrQueue(proposed.catalog_owner, [settle = proposed.settle, action] { settle(action); });
 			if (must_now && RenderExecutor::s_settle_pending_n.load(std::memory_order_relaxed) != 0) {
 				RenderExecutor::SettleDrain(true);
 			}
@@ -4875,17 +5090,24 @@ void Speculation::After(Result& result, size_t index) {
 		const auto& range = state.written[i];
 		buffers.NoteSpeculativeWrite(range.begin, range.end - range.begin);
 	}
-	for (auto& use: state.closed[index].images) {
-		const Image::StateLock lock(*use.image);
-		// (A use Before did not restore keeps the state it has, its in-order state: see Before's restore loop.)
-		if (use.keep_state) {
-			MoveImageStateEpoch(use.image);
-			continue;
+	const auto publish_images = [&]<bool RestoredGeneral>() {
+		for (auto& use: state.closed[index].images) {
+			if constexpr (RestoredGeneral) {
+				if (use.restore_general) continue; // already published under the renderer lock at the splice
+			}
+			const Image::StateLock lock(*use.image);
+			// A use Before did not restore keeps its in-order state.
+			if (use.keep_state) {
+				MoveImageStateEpoch(use.image);
+				continue;
+			}
+			PublishImageUse(use);
 		}
-		use.image->backing.state              = use.left;
-		use.image->backing.subresource_states = std::move(use.left_subresources);
-		use.image->transit_group              = use.left_group;
-		MoveImageStateEpoch(use.image); // (KYTY_TABLE_SERIALS: the image's serial moves, and the epoch)
+	};
+	if (state.closed[index].restore_general_count != 0) {
+		publish_images.template operator()<true>();
+	} else {
+		publish_images.template operator()<false>();
 	}
 	// KYTY_SPEC_TOUCH_BATCH (live spec_touch_batch, default on): one lock for the segment's images (~0.4 ms a frame of
 	// LRU touches at 1-1 were taken image by image); 0: one by one, as before.
@@ -5260,6 +5482,7 @@ void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {
 	auto& r         = *result;
 	r.state.forwarded_reads.clear();
 	r.state.forwarded_bytes.clear();
+	r.state.pending_set_uses.reset(); // Commit is the only reader; pooled results need no proof storage.
 	r.premut_fullwalk = false;
 	r.state.ReleaseConsumePending(); // (its holes' clears are consumed now, or never: spec_predict_dcc=3)
 	// (spec_worker_sets: its proposed sets no commit settled, settled here on the GPU thread while it still counts as live,

@@ -309,7 +309,7 @@ private:
 	[[nodiscard]] bool     ReadValuesHold(const Result& result, size_t index, const Spec::Range& read) const;
 	[[nodiscard]] Progress CommitSegments(Result& result, CommandProcessor& cp);
 	// The segment before its work and after it.
-	void Before(Result& result, size_t index);
+	void Before(Result& result, size_t index, Spec::PendingImagePlan& plan);
 	void After(Result& result, size_t index);
 	// The hole translated the normal way: changed what the work after it assumed, or a wait not satisfied yet.
 	// `copy_state` false: `cp` is already at the hole in the state it runs from (a segment run as a hole, its state checked).
