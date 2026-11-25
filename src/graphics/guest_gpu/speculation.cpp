@@ -27,6 +27,7 @@
 #include <bitset>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <immintrin.h> // (_mm_pause: CommitReady's spin)
@@ -36,6 +37,10 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 extern "C" {
 volatile std::atomic_uint32_t kyty_local_speculate_mode {0};
@@ -54,6 +59,18 @@ namespace Spec {
 thread_local CopyOutcome* t_copy_outcome = nullptr;
 std::atomic_bool g_copy_forward_active {false};
 } // namespace Spec
+
+#if defined(_WIN32)
+static bool RestoreCancelPriority(int priority) noexcept {
+	constexpr uint32_t attempts = 3;
+	for (uint32_t attempt = 0; attempt < attempts; ++attempt) {
+		if (SetThreadPriority(GetCurrentThread(), priority) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+#endif
 
 bool CommitGuardedWrite(void* dst, const void* src, uint32_t size); // (graphicsRun.cpp: KYTY_WRITE_GUARD_SPEC)
 bool CommitGuardedCopyWrite(void* dst, const void* src, uint32_t size); // (graphicsRun.cpp: GuardedCopy)
@@ -1068,7 +1085,14 @@ Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t bas
     : m_renderer(renderer), m_chain(std::make_unique<CommandProcessor>(renderer, interrupt_id)),
       m_interrupt_id(interrupt_id), m_waitless_gpu(waitless_gpu),
       m_state(std::make_unique<CommandProcessor>(renderer, interrupt_id)) {
-	if (Spec::ModeFour()) PrepareCommitImageScratch();
+	if (Spec::ModeFour()) {
+		PrepareCommitImageScratch();
+#if defined(_WIN32)
+		if (m_interrupt_id == 0) {
+			m_cancel_restore_wake.emplace();
+		}
+#endif
+	}
 	m_state->SetStateOnly(true);
 	if (threads == 0)
 		threads = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4
@@ -1116,6 +1140,11 @@ void Speculation::RequestStop() {
 		}
 	}
 	m_ahead_wake.notify_all();
+#if defined(_WIN32)
+	if (m_cancel_restore_wake) {
+		m_cancel_restore_wake->notify_all();
+	}
+#endif
 }
 
 void Speculation::Stop() {
@@ -1173,6 +1202,11 @@ Speculation::~Speculation() {
 		m_quit = true;
 	}
 	m_ahead_wake.notify_all();
+#if defined(_WIN32)
+	if (m_cancel_restore_wake) {
+		m_cancel_restore_wake->notify_all();
+	}
+#endif
 	for (auto& translator: m_translators)
 		if (translator->thread.joinable()) translator->thread.join();
 	DropCopyCandidates();
@@ -1672,9 +1706,17 @@ void Speculation::AheadRun(Translator& translator) {
 	GuestGpu::SetSpeculationThread(true);
 	Spec::t_packet_slot = translator.index;
 	std::unique_lock lock(m_mutex);
+#if defined(_WIN32)
+	if (m_cancel_restore_wake && !translator.pass_only) {
+		translator.cancel_base_priority = LocalPlatform::CurrentThreadPriority();
+		if (translator.cancel_base_priority != THREAD_PRIORITY_ERROR_RETURN) {
+			translator.cancel_thread = OpenThread(THREAD_SET_INFORMATION, FALSE, GetCurrentThreadId());
+		}
+	}
+#endif
 	for (;;) {
 		if (m_quit) {
-			return;
+			break;
 		}
 		if (AheadTurn(translator, lock, live_cpus)) {
 			continue;
@@ -1690,6 +1732,11 @@ void Speculation::AheadRun(Translator& translator) {
 		}
 		m_ahead_wake.wait(lock);
 	}
+#if defined(_WIN32)
+	if (translator.cancel_thread != nullptr) {
+		CloseHandle(std::exchange(translator.cancel_thread, nullptr));
+	}
+#endif
 }
 
 bool Speculation::AheadTurn(Translator& translator, std::unique_lock<std::mutex>& lock,
@@ -1784,6 +1831,11 @@ bool Speculation::AheadTurn(Translator& translator, std::unique_lock<std::mutex>
 	translator.translating       = work->job.serial;
 	translator.translating_chunk = work_chunk;
 	translator.since             = ++m_clock; // (before `previous` can be retired: it is not reused meanwhile)
+#if defined(_WIN32)
+	if (m_cancel_restore_wake) {
+		translator.translation_turn = translator.since;
+	}
+#endif
 	translator.began_ns          = NowNs();
 	translator.cancel.store(false, std::memory_order_relaxed);
 	translator.cancel_seen.store(false, std::memory_order_relaxed);
@@ -1834,6 +1886,18 @@ bool Speculation::AheadTurn(Translator& translator, std::unique_lock<std::mutex>
 		++m_durations[ms < 0.5 ? 0 : ms < 1 ? 1 : ms < 2 ? 2 : ms < 4 ? 3 : ms < 8 ? 4 : 5];
 		m_longest_ns = std::max(m_longest_ns, took);
 	}
+#if defined(_WIN32)
+	// Give back the loan before acknowledging, even if the translation finished naturally.
+	if (translator.cancel_boosted) {
+		translator.cancel_boosted = !RestoreCancelPriority(translator.cancel_base_priority);
+		if (translator.cancel_boosted) {
+			for (const auto& [pending, tick]: translator.resolved) {
+				ResolvePending(translator, pending, tick);
+			}
+			translator.resolved.clear();
+		}
+	}
+#endif
 	translator.translating = 0;
 	bool wake_reclaim = false;
 	if (Waitless()) {
@@ -1852,6 +1916,14 @@ bool Speculation::AheadTurn(Translator& translator, std::unique_lock<std::mutex>
 		m_waitless_gpu->WakeForComputeReclaim();
 		lock.lock();
 	}
+#if defined(_WIN32)
+	// If the immediate restores failed, let the GPU thread take the result. Retry while idle
+	// with the mutex released between attempts. The worker cannot start another turn with the loan.
+	while (translator.cancel_boosted && !m_quit) {
+		m_cancel_restore_wake->wait_for(lock, std::chrono::milliseconds(1), [this] { return m_quit; });
+		translator.cancel_boosted = SetThreadPriority(GetCurrentThread(), translator.cancel_base_priority) == 0;
+	}
+#endif
 	return true;
 }
 
@@ -1907,7 +1979,6 @@ void Speculation::ClaimBlockingRemainder(uint64_t serial, std::unique_lock<std::
 Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& job, uint32_t chunk, Pm4Execution& execution,
                                               std::optional<Pm4Execution>& end) {
 	std::unique_ptr<Result> result;
-	Translator*             spin_translator = nullptr; // (CancelSpinOn: the worker this call cancelled)
 	{
 		std::unique_lock lock(m_mutex);
 		// Where the chunk ends (the rest of it the normal way, up to there, when there is none for it or its commit
@@ -1977,13 +2048,31 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 				// KYTY_SPECULATE_CANCEL_US (live speculate_cancel_us, 0: never): a translation begun less than that long ago
 				// has more left than this thread takes for the whole chunk (a speculation's thread is several times slower
 				// per draw): it stops at its next packet, what it did is committed, the rest is translated here.
+				Translator* spinning = nullptr;
+#if defined(_WIN32)
+				struct CancelledTurn {
+					Translator* worker;
+					uint64_t turn;
+				};
+				std::array<CancelledTurn, Spec::MaxPacketSlots> cancelled;
+				size_t cancel_count = 0;
+#endif
 				static auto& cancel_us = LiveSwitch::Find("speculate_cancel_us", 1000000); // (default 1 s: always)
-				if (const auto us = cancel_us.load(std::memory_order_relaxed); us > 0)
-					for (auto& translator: m_translators)
+				if (const auto us = cancel_us.load(std::memory_order_relaxed); us > 0) {
+					for (auto& translator: m_translators) {
 						if (translator->translating == job.serial && translator->translating_chunk == chunk &&
 						    NowNs() - translator->began_ns < static_cast<uint64_t>(us) * 1000u &&
-						    !translator->cancel.exchange(true, std::memory_order_relaxed))
-							++m_cancelled, spin_translator = translator.get();
+						    !translator->cancel.exchange(true, std::memory_order_relaxed)) {
+							++m_cancelled;
+							spinning = translator.get();
+#if defined(_WIN32)
+							if (m_cancel_restore_wake) {
+								cancelled[cancel_count++] = {spinning, spinning->translation_turn};
+							}
+#endif
+						}
+					}
+				}
 				++m_waits_for_ahead;
 				const auto waited = NowNs();
 				// (KYTY_SPECULATE_FLUSH_EVERY: the commits held go before waiting on a speculation's thread.)
@@ -1992,15 +2081,30 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 					m_renderer.GetCommandScheduler().FlushRecorded();
 					lock.lock();
 				}
+#if defined(_WIN32)
+				if (cancel_count != 0) {
+					// The flush unlocked m_mutex. The serial and chunk can recur on a new turn after resync.
+					const int priority = LocalPlatform::CurrentThreadPriority();
+					spinning = nullptr;
+					for (const auto& [worker, turn]: std::span(cancelled).first(cancel_count)) {
+						if (worker->translating != 0 && worker->translation_turn == turn) {
+							spinning = worker;
+							if (!worker->cancel_boosted && worker->cancel_thread != nullptr &&
+							    priority != THREAD_PRIORITY_ERROR_RETURN && priority > worker->cancel_base_priority) {
+								worker->cancel_boosted = SetThreadPriority(worker->cancel_thread, priority) != 0;
+							}
+						}
+					}
+				}
+#endif
 				// (CancelSpinOn: the cancelled worker's stop waited for by a spin on the pushes' generation before the
 				// sleep: while it has not seen the flag, CancelSpinUnseen pauses (its packet's poll not reached: a long
 				// packet sleeps as before); once it has (its tail: the refusal, the segment's close, the end state, the
 				// push), up to CancelSpinTail. Guest commands queued for this thread (KYTY_SERVE_IN_WAITS 4) end it too:
 				// the wait below serves them. Exact: it changes only how this thread waits; the lock is taken again and
 				// translating() decides, as the wait below does. A push of another worker ends the spin as well, and the
-				// predicate then sends it to the wait. The worker is taken whatever the switch: never spun on stale.)
-				if (auto* const spinning = std::exchange(spin_translator, nullptr);
-				    spinning != nullptr && CancelSpinOn() && translating()) {
+				// predicate then sends it to the wait.)
+				if (spinning != nullptr && CancelSpinOn() && translating()) {
 					const auto gen   = m_ahead_gen.load(std::memory_order_acquire);
 					const bool serve = (GuestGpu::ServeInWaits() & 4u) != 0;
 					lock.unlock();
@@ -5013,8 +5117,17 @@ void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {
 	    r.serial != 0 && r.pass != 0) {
 		DropCopyCandidates(r.serial, r.chunk, r.pass);
 	}
-	// (A speculation thread's: released when it begins its next translation.)
-	if (r.recorder->own_thread) owner.resolved.emplace_back(pending, tick);
+	if (r.recorder->own_thread) {
+#if defined(_WIN32)
+		if (owner.cancel_boosted && owner.translating == 0) {
+			// The worker is parked retrying its restore. Resolve this tick while it cannot use its rings.
+			ResolvePending(owner, pending, tick);
+		} else
+#endif
+		{
+			owner.resolved.emplace_back(pending, tick); // released at the owner's next translation
+		}
+	}
 	// (Its pending writes are made or dropped: what was translated after it reads through its command buffer's record
 	// while that is not done, else memory.)
 	Unlink(&r.state, RecordOf(r.serial, r.chunk));

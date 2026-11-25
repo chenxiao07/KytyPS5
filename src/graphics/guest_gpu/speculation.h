@@ -244,6 +244,13 @@ private:
 		// (Mode 4: set when its translation saw `cancel`, Spec::State::cancel_seen; CommitReady's spin goes on through the
 		// tail then.)
 		std::atomic<bool>                          cancel_seen {false};
+#if defined(_WIN32)
+		// Cancel priority loan, registered by the worker and changed under m_mutex.
+		uint64_t                                   translation_turn = 0; // m_clock at the claim, kept through acknowledgement
+		void*                                      cancel_thread = nullptr;
+		int                                        cancel_base_priority = 0;
+		bool                                       cancel_boosted = false;
+#endif
 		uint64_t                                   began_ns = 0;
 		uint64_t                                   since       = 0;
 		bool                                       abandoned   = false; // under m_mutex
@@ -390,6 +397,10 @@ private:
 	std::vector<std::pair<const Result*, uint64_t>> m_live;
 	std::atomic<uint64_t>                           m_oldest_live {LiveNone};
 	int                                  m_interrupt_id = 0; // its queue's processor's
+#if defined(_WIN32)
+	// Present for Windows mode-4 queue 0. Only shutdown signals this wait.
+	std::optional<std::condition_variable> m_cancel_restore_wake;
+#endif
 	Spec::Effects                        m_effects;
 	// Outcomes since the last report: command buffers committed whole, partly, not at all; segments and holes
 	// committed; why packets became holes, why speculations or commits stopped.
