@@ -600,13 +600,19 @@ private:
 	template <typename P>
 	[[nodiscard]] bool TableEvaluate(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
 	template <typename P>
+	void TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data, bool versioned);
+	template <typename P, bool Versioned>
 	void TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
 	template <typename P>
 	[[nodiscard]] TableImageSet* TableSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
 	                                      const NativeXprDrawState* draw_state);
 	template <typename P>
 	[[nodiscard]] bool TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
-	                               std::array<vk::DeviceAddress, 2>& blocks, bool* writes);
+	                               std::array<vk::DeviceAddress, 2>& blocks, bool* writes, bool versioned);
+	template <typename P, bool Versioned>
+	[[nodiscard]] bool TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
+	                               std::array<vk::DeviceAddress, 2>& blocks, bool* writes,
+	                               TableXpr& table);
 	// A copy in the table upload ring of a small range the guest wrote, as TableBlocks makes one (0: none;
 	// table-xpr.inc).
 	template <typename P>
@@ -654,11 +660,8 @@ private:
 	void                         TableRuns(TablePair& pair);
 	void                         TableReset(TablePair& pair);
 	[[nodiscard]] bool           TableEvaluate(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
-	void                         TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
 	[[nodiscard]] TableImageSet* TableSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
 	                                      const NativeXprDrawState* draw_state);
-	[[nodiscard]] bool           TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
-	                                         std::array<vk::DeviceAddress, 2>& blocks, bool* writes);
 	void                         TablePrepareBda(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
 	                                            bool flat);
 	[[nodiscard]] bool           TableTransit(const TableImageSet& set, vk::CommandBuffer vk_buffer,

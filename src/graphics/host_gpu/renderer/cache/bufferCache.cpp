@@ -79,6 +79,7 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fmt/format.h>
@@ -791,6 +792,54 @@ void BufferCache::DrainGuestReadback(uint64_t address, uint64_t size, bool gpu_r
 	}
 }
 
+void BufferCache::StartWriteVersions() {
+	// Mode 0 can subtract GPU coverage without updating the per-buffer versions.
+	m_write_memo.fill({});
+	m_write_versions.store(true, std::memory_order_relaxed);
+}
+
+// A live, in-bounds buffer still owns the range. Every removal of GPU-written bytes stamps
+// the registered buffers the subtraction overlaps. An unchanged version proves the memo's
+// bytes are still GPU-written, so SynchronizeBuffer's coverage check would return and Add
+// would leave the range set unchanged. ObtainBuffer drains pending readbacks before testing.
+void BufferCache::NoteCoverageSubtracted(uint64_t address, uint64_t size) {
+	if (size == 0) {
+		return;
+	}
+	const auto end = address + size;
+	auto it = m_buffers.upper_bound(address);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		auto& buffer = m_slot_buffers[it->second];
+		if (buffer.CpuAddress() + buffer.Size() > address) {
+			buffer.coverage_subtracted = m_gpu_coverage_epoch;
+		}
+	}
+}
+
+bool BufferCache::WriteVersionHit(WriteMemo& memo, uint64_t address, uint64_t size) {
+	if (!WriteVersionsConfigured() || kyty_local_buffer_residency_mode.load(std::memory_order_relaxed) == 0 ||
+	    native_buffer_download_depth != 0) {
+		return false;
+	}
+	const auto* buffer = GetBufferIfLive(memo.id);
+	if (buffer == nullptr || !buffer->IsInBounds(address, size) || buffer->coverage_subtracted > memo.coverage) {
+		return false;
+	}
+	memo.registration = RegistrationEpoch();
+	memo.coverage = m_gpu_coverage_epoch;
+	return true;
+}
+
+bool BufferCache::WrittenOwnerHolds(const Buffer& owner, uint64_t address, uint64_t size, uint64_t registered) {
+	if (RegistrationEpoch() != registered || owner.is_deleted || !owner.IsInBounds(address, size)) {
+		return false;
+	}
+	return true;
+}
+
 void BufferCache::FinishGuestReadback(size_t slot, bool detach) {
 	auto request = m_guest_readbacks[slot];
 	if (!request) return;
@@ -821,6 +870,7 @@ void BufferCache::FinishGuestReadback(size_t slot, bool detach) {
 		m_gpu_modified_ranges.SubtractSorted(request->parts);
 		++m_gpu_coverage_epoch;
 	}
+	NoteRangesSubtracted(request->parts);
 	// The renderer may have dirtied other pages in the widened window since handoff.
 	for (const auto& page: request->pages)
 		m_memory_tracker.UnmarkRegionAsGpuModified(page.address, page.size);
@@ -1131,6 +1181,7 @@ bool BufferCache::VerifyEagerFeedback(const EagerFeedback& entry) {
 		m_gpu_modified_ranges.SubtractSorted(copies);
 		++m_gpu_coverage_epoch;
 	}
+	NoteRangesSubtracted(copies);
 	m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
 	LiveCounters::Add(LiveCounters::EagerVerified);
 	if (mismatched != 0) {
@@ -1232,6 +1283,7 @@ bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t s
 		m_gpu_modified_ranges.SubtractSorted(copies);
 		++m_gpu_coverage_epoch;
 	}
+	NoteRangesSubtracted(copies);
 	// Only complete dirty-page coverage allows dropping protection. CPU-clean bytes
 	// are never published from the snapshot. Any later upload/GPU write invalidates it.
 	m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
@@ -1380,6 +1432,15 @@ void BufferCache::ChangeRegister(BufferId id) {
 		// table as there.)
 		quiet = false;
 		LiveCounters::Add(LiveCounters::RegQuietFallbacks);
+		// Replacing a page owner can leave the old buffer live and its write version unchanged.
+		// Drop memos over this page range before publishing the new registration epoch.
+		const auto begin = uint64_t {pages.first} << PageTable::kPageBits;
+		const auto end   = uint64_t {pages.last_exclusive} << PageTable::kPageBits;
+		for (auto& memo: m_write_memo) {
+			if (memo.size != 0 && memo.vaddr < end && begin < memo.vaddr + memo.size) {
+				memo = {};
+			}
+		}
 	}
 	const auto epoch = ++m_change_counter;
 	// spec_exact_reg_stop: the granules' epochs, for RegisteredSinceExact (KYTY_SPECULATE=4 only; not a quiet insert's).
@@ -1626,6 +1687,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 		m_gpu_modified_ranges.SubtractSorted(copies);
 		++m_gpu_coverage_epoch;
 	}
+	NoteRangesSubtracted(copies);
 }
 
 bool BufferCache::TryReportLodStatsOnGpu(uint64_t address, bool reset) {
@@ -1995,6 +2057,9 @@ void BufferCache::DiscardGpuWrites(uint64_t vaddr, uint64_t size) {
 		m_gpu_modified_ranges.ForEachIntersection(first, last - first, [&](RangeSet::Range range) { dropped += range.size; });
 		m_gpu_modified_ranges.Subtract(first, last - first);
 		++m_gpu_coverage_epoch;
+	}
+	if (Spec::ModeFour() && WriteVersionsConfigured()) {
+		NoteCoverageSubtracted(first, last - first);
 	}
 	LiveCounters::Add(LiveCounters::DiscardedGpuBytes, dropped);
 	InvalidateCopyFeedback(first, last - first);
@@ -2506,6 +2571,7 @@ bool BufferCache::ServiceFreedReadback(FreeBlocksQuery free_blocks, FreeBlockSpl
 			m_gpu_modified_ranges.SubtractSorted(written);
 			++m_gpu_coverage_epoch;
 		}
+		NoteRangesSubtracted(written);
 		// The pages with no GPU-written byte left are the CPU's again.
 		for (const auto& range: written) {
 			const auto page_begin = range.address & ~(TRACKER_PAGE_SIZE - 1);
@@ -3569,7 +3635,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	// standing 9.11 -> 8.91 ms render in the same process.)
 	auto& memo = m_write_memo[((vaddr >> 4u) ^ (size * 0x9e3779b97f4a7c15ull >> 40u)) % m_write_memo.size()];
 	if (is_written && memo.vaddr == vaddr && memo.size == size && memo.texel == is_texel_buffer &&
-	    memo.registration == RegistrationEpoch() && memo.coverage == m_gpu_coverage_epoch) {
+	    ((memo.registration == RegistrationEpoch() && memo.coverage == m_gpu_coverage_epoch) ||
+	     (Spec::ModeFour() && WriteVersionHit(memo, vaddr, size)))) {
 		if (auto* buffer = m_slot_buffers.try_get(memo.id); buffer != nullptr && !buffer->is_deleted && buffer->IsInBounds(vaddr, size)) {
 			TouchBuffer(*buffer);
 			InvalidateCopyFeedback(vaddr, size);
@@ -3579,7 +3646,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			else
 				Spec::NoteGpuWrite(vaddr, size);
 			// (No change-ring mark for the weave: the range stayed GPU-written since the write below that made this memo
-			// and marked it, since every give-back moves m_gpu_coverage_epoch, so no worker's read of it could pass.)
+			// and marked it. Both memo paths rule out a give-back over those bytes.)
 			LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
 			LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
 			return {buffer, buffer->Offset(vaddr)};

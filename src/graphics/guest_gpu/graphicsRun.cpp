@@ -1701,6 +1701,7 @@ void GuestGpu::ThreadRun(void* data) {
 		// thread that reads the mode: on a live `mode 4` the weave's workers run on until the loop top pauses them, so
 		// they ask nothing this floor guards: BufferCache::RegionResolutionEpoch.)
 		gpu->m_renderer.GetBufferCache().MarkExactEpochsFromNow();
+		gpu->m_renderer.GetBufferCache().StartWriteVersions();
 		// KYTY_SPEC_PASS_THREAD (unset: on, mode 4 only as all of this; 0 off): the state pass on its own thread
 		// (Speculation::AheadRun), its packet slot after the workers'.
 		const char* pass_env         = std::getenv("KYTY_SPEC_PASS_THREAD");

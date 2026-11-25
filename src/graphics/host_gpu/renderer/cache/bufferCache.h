@@ -71,6 +71,13 @@ public:
 		auto* buffer = m_slot_buffers.try_get(id);
 		return buffer != nullptr && !buffer->is_deleted ? buffer : nullptr;
 	}
+	// Start tracking write versions on entry to mode 4.
+	void StartWriteVersions();
+	[[nodiscard]] bool WriteVersionsConfigured() const {
+		return m_write_versions.load(std::memory_order_relaxed);
+	}
+	// The in-order written ObtainBuffer returned this owner. The registration epoch is sampled before the call.
+	[[nodiscard]] bool WrittenOwnerHolds(const Buffer& owner, uint64_t address, uint64_t size, uint64_t registered);
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	// FindBuffer's speculative-translation form, out of line (bufferCache.cpp).
 	[[gnu::noinline]] [[nodiscard]] BufferId FindBufferSpec(uint64_t vaddr, uint64_t size);
@@ -632,6 +639,17 @@ private:
 		bool     texel = false;
 	};
 	std::array<WriteMemo, 4096> m_write_memo {};
+	std::atomic<bool> m_write_versions {false};
+	[[nodiscard]] bool WriteVersionHit(WriteMemo& memo, uint64_t address, uint64_t size);
+	void NoteCoverageSubtracted(uint64_t address, uint64_t size);
+	template <typename Ranges>
+	void NoteRangesSubtracted(const Ranges& ranges) {
+		if (Spec::ModeFour() && WriteVersionsConfigured()) {
+			for (const auto& range: ranges) {
+				NoteCoverageSubtracted(range.address, range.size);
+			}
+		}
+	}
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	// ObtainBufferForImage (KYTY_ASYNC_UPLOAD=2): the backing pieces of an image upload.

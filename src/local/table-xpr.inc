@@ -464,6 +464,7 @@ struct RenderExecutor::TableXpr {
 	};
 	static constexpr size_t                WrittenEntries = 1024;
 	std::array<WrittenRange, WrittenEntries> written;
+	std::optional<std::array<uint32_t, 128>> buffer_format_classes;
 	// The draw's blocks (per stage): its slots (IR::TablePlan::BlockDwords), then its buffers.
 	std::array<std::vector<uint32_t>, 2> blocks;
 	// An indirect image's candidates for the draw or dispatch being made (per stage), in the order its set binds them
@@ -484,6 +485,10 @@ struct RenderExecutor::TableXpr {
 	// program with several dense roots has their candidates one after another there. Written for a stage with an indirect
 	// image only (TableEvaluate, TableScoutApply), the one TableResolveSet reads it for.)
 	std::array<std::vector<uint32_t>, 2> indirect_counts;
+	// Indexed by the low bits of the hash TableGather already computed.
+	static constexpr size_t WrittenWideEntries = 4096;
+	static_assert(ResolvedEntries % WrittenWideEntries == 0, "the proof index uses the gathered hash's low bits");
+	std::vector<WrittenRange> written_wide;
 };
 // KYTY_TABLE_MEMO: a descriptor set left service (NativeXprRetireSet): a memo entry may hold it.
 void RenderExecutor::TableMemoRetired() {
@@ -2739,16 +2744,25 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 // writes). False: a buffer the shaders cannot take.
 // The V#s' words and their resolved entries (TableXpr::entries), as soon as TableEvaluate made the slots they are read
 // from: the entries' lines (a 4 MiB direct-mapped table: TLB misses too) load while the image set is found (TableSet).
-void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data) {
-	TableGather<Weave::Ordered>(pair, user_data);
+// Use the proof path selected by the draw or dispatch before gathering any buffers.
+template <typename P>
+void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
+                                 bool versioned) {
+	if constexpr (!P::worker) {
+		if (versioned) [[unlikely]] {
+			TableGather<P, true>(pair, user_data);
+			return;
+		}
+	}
+	TableGather<P, false>(pair, user_data);
 }
 
-// (Under Weave::Worker: the worker's own entries.)
-template <typename P>
+template <typename P, bool Versioned>
 void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data) {
-	using Kind        = ShaderRecompiler::IR::TablePlan::Operand::Kind;
-	auto&      table  = TableOf<P>();
-	const auto stages = pair.programs[1] != nullptr ? 2u : 1u;
+	using Kind         = ShaderRecompiler::IR::TablePlan::Operand::Kind;
+	auto&       table  = TableOf<P>();
+	const auto* proofs = Versioned && !table.written_wide.empty() ? table.written_wide.data() : nullptr;
+	const auto  stages = pair.programs[1] != nullptr ? 2u : 1u;
 	for (uint32_t st = 0; st < stages; ++st) {
 		const auto& program = *pair.programs[st];
 		const auto& plan    = program.table_plan;
@@ -2787,6 +2801,13 @@ void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<con
 			} else {
 				words4 = fresh;
 				entry  = &table.resolved[XXH3_64bits(words4.data(), sizeof(words4)) & (TableXpr::ResolvedEntries - 1)];
+			}
+			if constexpr (Versioned) {
+				if (proofs != nullptr && (program.info.buffers[i].written || program.info.buffers[i].atomic)) {
+					const auto index = static_cast<size_t>(entry - table.resolved.get()) & (TableXpr::WrittenWideEntries - 1);
+					__builtin_prefetch(proofs + index);
+					continue;
+				}
 			}
 			__builtin_prefetch(entry);
 		}
@@ -2877,9 +2898,16 @@ vk::DeviceAddress RenderExecutor::TableRingCopy(uint64_t address, uint64_t size,
 	return offset;
 }
 
+template <typename P>
 bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
-                                 std::array<vk::DeviceAddress, 2>& blocks, bool* writes) {
-	return TableBlocks<Weave::Ordered>(pair, user_data, blocks, writes);
+                                 std::array<vk::DeviceAddress, 2>& blocks, bool* writes, bool versioned) {
+	auto& table = TableOf<P>();
+	if constexpr (!P::worker) {
+		if (versioned) [[unlikely]] {
+			return TableBlocks<P, true>(pair, user_data, blocks, writes, table);
+		}
+	}
+	return TableBlocks<P, false>(pair, user_data, blocks, writes, table);
 }
 
 // Under Weave::Worker: the worker's own entries, ring copies and special generation; its blocks and ring copies in the
@@ -2889,11 +2917,27 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 // else, a buffer the shaders write, or a format the pair isn't compiled for (a respecialization), is a hole. Every V#
 // taken from a game buffer is noted with its range's CPU epoch (a held use, its five block words kept for the turn's
 // recopy), every ring copy with its range.
-template <typename P>
+template <typename P, bool Versioned>
 bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
-                                 std::array<vk::DeviceAddress, 2>& blocks, bool* writes) {
-	using Kind         = ShaderRecompiler::IR::TablePlan::Operand::Kind;
-	auto&      table        = TableOf<P>();
+                                 std::array<vk::DeviceAddress, 2>& blocks, bool* writes,
+                                 TableXpr& table) {
+	using Kind = ShaderRecompiler::IR::TablePlan::Operand::Kind;
+	const auto make_format_classes = [] {
+		std::array<uint32_t, 128> classes {};
+		for (uint32_t format = 0; format < classes.size(); ++format) {
+			classes[format] = ShaderRecompiler::IR::BufferFormatClass(static_cast<Prospero::BufferFormat>(format));
+		}
+		return classes;
+	};
+	const auto& format_classes = [&]() -> const std::array<uint32_t, 128>& {
+		if constexpr (Versioned) {
+			if (!table.buffer_format_classes) table.buffer_format_classes.emplace(make_format_classes());
+			return *table.buffer_format_classes;
+		} else {
+			static const auto classes = make_format_classes();
+			return classes;
+		}
+	}();
 	auto&      buffer_cache = m_context.GetBufferCache();
 	auto&      textures     = m_context.GetTextureCache();
 	auto&      upload       = buffer_cache.GetTableUploadBuffer();
@@ -2944,15 +2988,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 	// A null buffer's device address: valid memory (the shaders' loads of a buffer are not branched around its bounds:
 	// out of bounds they load its first dword).
 	const vk::DeviceAddress null_device = upload.BufferDeviceAddress();
-	// A V#'s buffer word (IR::BufferWord, as IR::BufferDescriptorWord makes it) and stride. (Each format's class
-	// once: the V#s of every draw's buffers asked for it.)
-	static const auto format_classes = [] {
-		std::array<uint32_t, 128> classes {};
-		for (uint32_t format = 0; format < classes.size(); ++format)
-			classes[format] = ShaderRecompiler::IR::BufferFormatClass(static_cast<Prospero::BufferFormat>(format));
-		return classes;
-	}();
-	const auto word_of = [](const std::array<uint32_t, 4>& words4) -> std::pair<uint32_t, uint32_t> {
+	const auto word_of = [&format_classes](const std::array<uint32_t, 4>& words4) -> std::pair<uint32_t, uint32_t> {
 		ShaderBufferResource descriptor;
 		std::copy_n(words4.begin(), 4, descriptor.fields);
 		if (descriptor.Type() != 0) return {0, 0};
@@ -2992,8 +3028,15 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 		       (!resource.formatted || resource.descriptor_format == Prospero::BufferFormat::kInvalid ||
 		        (descriptor.Format() == resource.descriptor_format && descriptor.DstSelXYZW() == resource.descriptor_swizzle));
 	};
-	if (table.gathered != &pair) TableGather<P>(pair, user_data);
+	if (table.gathered != &pair) {
+		TableGather<P, Versioned>(pair, user_data);
+	}
 	table.gathered = nullptr; // (taken: a later draw or dispatch gathers its own)
+	if constexpr (Versioned) {
+		if (table.written_wide.empty()) [[unlikely]] {
+			table.written_wide.resize(TableXpr::WrittenWideEntries);
+		}
+	}
 	// (A weave worker's notes: a V# taken from a game buffer, its five block words placed once the stage's block is
 	// made; a ring copy; a buffer whose last use the turn stamps.)
 	const auto note_held = [&](uint32_t st, size_t i, uint64_t address, uint64_t size, uint64_t epoch) {
@@ -3064,7 +3107,14 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				if (writes != nullptr && resource.written && (uint64_t {words4[0]} | (words4[1] & 0xffffu)) != 0 &&
 				    words4[2] != 0)
 					*writes = true;
-				auto& proof = table.written[XXH3_64bits(words4.data(), sizeof(words4)) & (TableXpr::WrittenEntries - 1)];
+				auto& proof = [&]() -> TableXpr::WrittenRange& {
+					if constexpr (Versioned) {
+						const auto index = static_cast<size_t>(entries[i].second - table.resolved.get());
+						return table.written_wide[index & (TableXpr::WrittenWideEntries - 1)];
+					} else {
+						return table.written[XXH3_64bits(words4.data(), sizeof(words4)) & (TableXpr::WrittenEntries - 1)];
+					}
+				}();
 				if (proof.special != table.special_generation || proof.words != words4) {
 					const auto [clamped_address, clamped_size] = range_of(words4);
 					proof = {.words = words4, .special = table.special_generation, .address = clamped_address, .size = clamped_size};
@@ -3086,6 +3136,8 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						no_range.emplace(reloc);
 						Spec::t_pending_ok  = pending_ok;
 						Spec::t_pending_hit = false;
+					} else if constexpr (Versioned) {
+						written_since = buffer_cache.RegistrationEpoch();
 					}
 					const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, true, formatted);
 					if (spec_here) Spec::t_pending_ok = false;
@@ -3102,8 +3154,11 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						block[plan.BufferDword(i) + 4] = stride;
 						continue;
 					}
-					if (owner == nullptr || buffer_cache.GetBufferIfLive(buffer_cache.FindBuffer(address, size)) != owner)
+					if (owner == nullptr ||
+					    (!(Versioned && !spec_here && buffer_cache.WrittenOwnerHolds(*owner, address, size, written_since)) &&
+					     buffer_cache.GetBufferIfLive(buffer_cache.FindBuffer(address, size)) != owner)) {
 						return false;
+					}
 					if (formatted) textures.InvalidateMemoryFromGPU(address, size, "storage-buffer");
 					device = owner->BufferDeviceAddress() + offset;
 					// (spec_reloc_refs: proven at the epoch read before its lookup.)
@@ -4219,6 +4274,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	// reads in the draw. The mode kept for the set's target test below.)
 	const auto         speculate_mode = ::kyty_local_speculate_mode.load(std::memory_order_relaxed);
 	Spec::State* const spec_state     = speculate_mode != 0 ? Spec::Current() : nullptr;
+	const bool         versioned      = !P::worker && speculate_mode == 4 && m_context.GetBufferCache().WriteVersionsConfigured();
 	// (A speculation's relocatable index buffer and draw arguments, TableRelocRecord: nothing of it runs without one.)
 	const bool reloc = spec_state != nullptr && spec_state->reloc_on;
 	const auto& sh     = buffer.GetShaders();
@@ -4243,7 +4299,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		TableScoutApply(table, pair, *scout, stages);
 	} else {
 		const bool evaluated = TableEvaluate<P>(pair, user_data);
-		if (evaluated) TableGather<P>(pair, user_data);
+		if (evaluated) TableGather<P>(pair, user_data, versioned);
 		if (scout != nullptr) TableScoutVerify(table, pair, *scout, stages, evaluated);
 		if (!evaluated)
 			return TableAdd<P>(LiveCounters::TableDrawNative), Spec::Refuse("table: evaluation"), TableResult::Native;
@@ -4376,7 +4432,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	// replaces an earlier one) leaves an earlier address stale, where the normal path binds after all its lookups
 	// (RebindBuffers). Such a draw takes the normal path; the next use finds the buffers registered.
 	const auto registration = buffer_cache.RegistrationEpoch();
-	if (!TableBlocks<P>(pair, user_data, blocks, &writes))
+	if (!TableBlocks<P>(pair, user_data, blocks, &writes, versioned))
 		return TableAdd<P>(LiveCounters::TableDrawNative), Spec::Refuse("table: blocks"), TableResult::Native;
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 9);
@@ -5121,7 +5177,9 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 		return m_dispatch_declined = "table: indirect off", false;
 	if (!TableEvaluate(pair, user_data)) return m_dispatch_declined = "table: tables unmapped", false;
 	const bool mode_four = Spec::ModeFour();
-	TableGather(pair, user_data);
+	auto&      cache     = m_context.GetBufferCache();
+	const bool versioned = mode_four && cache.WriteVersionsConfigured();
+	TableGather<Weave::Ordered>(pair, user_data, versioned);
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 2);
 	auto* set = TableSet(buffer, pair, nullptr, nullptr);
@@ -5131,7 +5189,6 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 3);
 	std::array<vk::DeviceAddress, 2> blocks {};
 	bool                             storage_writes  = false;
-	auto&                            cache           = m_context.GetBufferCache();
 	vk::Buffer                       indirect_buffer = nullptr;
 	uint64_t                         indirect_offset = 0;
 	// (Mode 4) A speculation's dispatch whose lookups saw the buffer registration epoch move under them takes back its
@@ -5151,7 +5208,8 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	for (uint32_t attempt = 0;; ++attempt) {
 		TablePrepareBda(pair, user_data, mode_four); // (as TableDraw's: before the blocks)
 		const auto registration = cache.RegistrationEpoch(); // (as TableDraw's)
-		if (!TableBlocks(pair, user_data, blocks, &storage_writes)) return m_dispatch_declined = "table: blocks", false;
+		if (!TableBlocks<Weave::Ordered>(pair, user_data, blocks, &storage_writes, versioned))
+			return m_dispatch_declined = "table: blocks", false;
 		if (indirect_args != 0) {
 			// As DispatchDirect's: the arguments' owner, made current.
 			cache.EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
