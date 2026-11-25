@@ -327,6 +327,13 @@ private:
 	// cannot follow or is behind (under m_mutex).
 	void AheadRun(Translator& translator);
 	bool AheadTurn(Translator& translator, std::unique_lock<std::mutex>& lock, const std::atomic<int64_t>& live_cpus);
+	std::condition_variable& PassWake() noexcept;
+	std::condition_variable& GpuWake() noexcept;
+	void WakePass() noexcept;
+	void WakeGpu() noexcept;
+	[[nodiscard]] bool StampPoolsShort() const;
+	void WakeStampRefill();
+	void WakeAll() noexcept;
 	void LogWorker(const Translator& translator) const;
 	// The state pass of a submission (its chunks given to its entry as it passes them, while the pass is `which`):
 	// false: it could not follow it.
@@ -419,7 +426,12 @@ private:
 	// last submission it passed, which pass (a pass that went wrong starts another: what began from it is dropped),
 	// whether a thread runs it and whether it cannot follow the submission broken_at; the last submission the GPU
 	// thread took the normal way and the last it did, with its state after it.
+	// Shared by all roles by default. With role wakes, this is the translator channel.
 	std::condition_variable           m_ahead_wake;
+	struct RoleWakes {
+		std::condition_variable pass, gpu;
+	};
+	std::optional<RoleWakes>           m_role_wakes; // q0 mode 4, set before workers start
 	bool                              m_log_placement = false;
 	std::optional<Pm4Execution>        m_pass_resume;
 	std::deque<Entry>                 m_jobs;

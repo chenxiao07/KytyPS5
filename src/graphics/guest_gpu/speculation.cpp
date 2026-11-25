@@ -1127,6 +1127,56 @@ Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t bas
 	}
 }
 
+std::condition_variable& Speculation::PassWake() noexcept {
+	return m_role_wakes && m_pass_thread ? m_role_wakes->pass : m_ahead_wake;
+}
+
+std::condition_variable& Speculation::GpuWake() noexcept {
+	return m_role_wakes ? m_role_wakes->gpu : m_ahead_wake;
+}
+
+void Speculation::WakePass() noexcept {
+	if (m_role_wakes) {
+		PassWake().notify_one(); // A new job or Done can make the next state pass runnable.
+	} else {
+		m_ahead_wake.notify_all();
+	}
+}
+
+void Speculation::WakeGpu() noexcept {
+	if (m_role_wakes) {
+		m_role_wakes->gpu.notify_one();
+	} else {
+		m_ahead_wake.notify_all();
+	}
+}
+
+bool Speculation::StampPoolsShort() const {
+	return m_log.stamps.PoolShort() || m_log.host_stamps.PoolShort();
+}
+
+// Under m_mutex. A worker rechecks the shortage before trying to refill outside the lock.
+void Speculation::WakeStampRefill() {
+	if (m_role_wakes && StampPoolsShort()) {
+		// A busy dedicated pass cannot refill until it finishes its current turn.
+		auto& wake = m_pass_thread && m_state_busy ? m_ahead_wake : PassWake();
+		wake.notify_one();
+	}
+}
+
+void Speculation::WakeAll() noexcept {
+	m_ahead_wake.notify_all();
+	if (m_role_wakes) {
+		m_role_wakes->pass.notify_all();
+		m_role_wakes->gpu.notify_all();
+	}
+#if defined(_WIN32)
+	if (m_cancel_restore_wake) {
+		m_cancel_restore_wake->notify_all();
+	}
+#endif
+}
+
 void Speculation::RequestStop() {
 	{
 		std::lock_guard lock(m_mutex);
@@ -1141,12 +1191,7 @@ void Speculation::RequestStop() {
 			}
 		}
 	}
-	m_ahead_wake.notify_all();
-#if defined(_WIN32)
-	if (m_cancel_restore_wake) {
-		m_cancel_restore_wake->notify_all();
-	}
-#endif
+	WakeAll();
 }
 
 void Speculation::Stop() {
@@ -1203,12 +1248,7 @@ Speculation::~Speculation() {
 		std::lock_guard lock(m_mutex);
 		m_quit = true;
 	}
-	m_ahead_wake.notify_all();
-#if defined(_WIN32)
-	if (m_cancel_restore_wake) {
-		m_cancel_restore_wake->notify_all();
-	}
-#endif
+	WakeAll();
 	for (auto& translator: m_translators)
 		if (translator->thread.joinable()) translator->thread.join();
 	DropCopyCandidates();
@@ -1239,6 +1279,9 @@ Speculation::Outcome Speculation::Resume(CommandProcessor& cp, Pm4Execution& exe
 
 bool Speculation::StartWorkers(uint32_t queue_id) noexcept {
 	try {
+		if (m_interrupt_id == 0 && Spec::ModeFour()) {
+			m_role_wakes.emplace();
+		}
 		for (auto& translator: m_translators) {
 			translator->thread = std::thread([this, worker = translator.get()] { AheadRun(*worker); });
 		}
@@ -1316,7 +1359,7 @@ void Speculation::Push(const Job& job) {
 			m_jobs.back().pushed_ns = NowNs();
 		}
 	}
-	m_ahead_wake.notify_all();
+	WakePass();
 }
 
 void Speculation::RetireFront() {
@@ -1359,8 +1402,11 @@ void Speculation::Done(uint64_t serial, const CommandProcessor& cp) {
 		if (Waitless()) {
 			m_reclaim.store(true, std::memory_order_release);
 		}
+		if (m_pass_thread && m_state_busy) {
+			WakeStampRefill(); // Ready commits can drain the pool while translators sleep.
+		}
 	}
-	m_ahead_wake.notify_all();
+	WakePass();
 }
 
 void Speculation::ResyncStatePass() {
@@ -1465,7 +1511,11 @@ bool Speculation::StatePass(const Job& job, uint64_t which, bool one_cut) {
 				}
 			}
 			entry->chunks.push_back(std::move(chunk));
-			m_ahead_wake.notify_all();
+			if (m_role_wakes) {
+				m_ahead_wake.notify_one(); // One more chunk is available to any translator.
+			} else {
+				m_ahead_wake.notify_all();
+			}
 		} else {
 			Unlink(chunk.record.get(), nullptr);
 			Retire(std::move(chunk.record));
@@ -1724,7 +1774,7 @@ void Speculation::AheadRun(Translator& translator) {
 			continue;
 		}
 		// With nothing to take, make a stamp leaf ready for the thread that commits first.
-		if (m_log.stamps.PoolShort() || m_log.host_stamps.PoolShort()) {
+		if (StampPoolsShort()) {
 			lock.unlock();
 			if (!m_log.stamps.Refill()) {
 				(void)m_log.host_stamps.Refill();
@@ -1732,7 +1782,8 @@ void Speculation::AheadRun(Translator& translator) {
 			lock.lock();
 			continue;
 		}
-		m_ahead_wake.wait(lock);
+		auto& wake = translator.pass_only ? PassWake() : m_ahead_wake;
+		wake.wait(lock);
 	}
 #if defined(_WIN32)
 	if (translator.cancel_thread != nullptr) {
@@ -1824,7 +1875,10 @@ bool Speculation::AheadTurn(Translator& translator, std::unique_lock<std::mutex>
 		if (which == m_pass && !m_pass_resume) {
 			m_state_serial = job.serial;
 		}
-		m_ahead_wake.notify_all();
+		WakeGpu(); // The pass may have released a reader of the claimed span.
+		if (!m_pass_thread) {
+			WakeStampRefill(); // Another translator can refill if this one takes the next pass.
+		}
 		return true;
 	}
 	// A translation, from the state the pass gave it (with the pending writes of the one before when it is done).
@@ -1911,7 +1965,8 @@ bool Speculation::AheadTurn(Translator& translator, std::unique_lock<std::mutex>
 	}
 	m_ahead.push_back(std::move(result));
 	m_ahead_gen.store(m_ahead_gen.load(std::memory_order_relaxed) + 1, std::memory_order_release); // (under m_mutex)
-	m_ahead_wake.notify_all();
+	WakeGpu();
+	WakeStampRefill();
 	if (wake_reclaim) {
 		// Enqueue takes the queue mutex before m_mutex.
 		lock.unlock();
@@ -1970,11 +2025,11 @@ void Speculation::ClaimBlockingRemainder(uint64_t serial, std::unique_lock<std::
 				GuestGpu::ServePendingCommands();
 				lock.lock();
 			} else {
-				m_ahead_wake.wait_for(lock, std::chrono::microseconds(50));
+				GpuWake().wait_for(lock, std::chrono::microseconds(50));
 			}
 		}
 	} else {
-		m_ahead_wake.wait(lock, [&] { return !reading(); });
+		GpuWake().wait(lock, [&] { return !reading(); });
 	}
 }
 
@@ -2127,10 +2182,10 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 							lock.lock();
 							continue;
 						}
-						m_ahead_wake.wait_for(lock, std::chrono::microseconds(50));
+						GpuWake().wait_for(lock, std::chrono::microseconds(50));
 					}
 				} else {
-					m_ahead_wake.wait(lock, [&] { return !translating(); });
+					GpuWake().wait(lock, [&] { return !translating(); });
 				}
 				m_wait_ns += NowNs() - waited;
 				continue;
