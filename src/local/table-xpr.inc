@@ -2833,10 +2833,17 @@ vk::DeviceAddress RenderExecutor::TableRingCopy(uint64_t address, uint64_t size,
 	return device;
 }
 
-// A fresh mode-4 ring copy tries one publication of its cached backing pages.
-[[gnu::noinline]] static std::optional<uint64_t> TableSpecBackingOnce(StreamBuffer& upload, uint64_t address, uint64_t size) {
+// If forwarding misses, reuse the existing ring copy or read through one publication of the cached backing pages.
+[[gnu::noinline]] static std::optional<uint64_t> TableSpecBackingOnce(StreamBuffer& upload, uint64_t address, uint64_t size,
+                                                                    Spec::State* forward, bool& forwarded, bool reuse) {
 	const auto [mapped, offset] = upload.Map(size, 16, false);
-	if (mapped == nullptr || !Libs::LibKernel::Memory::TryReadBackingOnceToHost(address, mapped, size)) return std::nullopt;
+	if (mapped == nullptr) {
+		return std::nullopt;
+	}
+	forwarded = forward != nullptr && forward->ReadForwarded(address, mapped, size);
+	if (!forwarded && (reuse || !Libs::LibKernel::Memory::TryReadBackingOnceToHost(address, mapped, size))) {
+		return std::nullopt;
+	}
 	upload.Commit();
 	return offset;
 }
@@ -3222,7 +3229,10 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 							// same range: the commit's checks see the same lists); the shader reads the copy's bytes at its
 							// address, in the same ring, fenced for the same commit.)
 							TableXpr::SpecRingCopy* spec_shared = nullptr;
-							if (spec != nullptr && cpu != 0 && ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+							const bool forward_enabled = spec != nullptr && spec->ForwardReadsEnabled();
+							const bool try_forward = forward_enabled && spec->MightReadForwarded(address, size);
+							bool forwarded = false;
+							if (spec != nullptr && cpu != 0 && Spec::ModeFour()) {
 								if (!table.spec_ring_copies)
 									table.spec_ring_copies = std::make_unique<TableXpr::SpecRingCopy[]>(TableXpr::RingCopies);
 								spec_shared = &table.spec_ring_copies[((address ^ (size << 40u)) * 0x9e3779b97f4a7c15ull) >> 52u];
@@ -3235,28 +3245,37 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 								       spec_shared->segment == spec->closed.size() && spec_shared->rollbacks == spec->rollbacks &&
 								       spec_shared->waits == spec_waits();
 							};
+							const bool reuse_spec_copy = spec_shared != nullptr && spec_own();
 							if (shared != nullptr && cpu != 0 && shared->address == address && shared->size == size &&
 							    shared->observation == observation && shared->tick == tick && shared->cpu_epoch == cpu) {
 								device = shared->device;
 								LiveCounters::Add(LiveCounters::TableRingShared);
 								LiveCounters::Add(LiveCounters::TableRingSharedBytes, size);
-							} else if (spec_shared != nullptr && spec_own()) {
-								device = spec_shared->copy.device;
-								spec->NoteCleanRead(address, size);
 							} else if (const auto offset = [&]() __attribute__((always_inline)) -> std::optional<uint64_t> {
-								if (spec_shared != nullptr) return TableSpecBackingOnce(upload, address, size);
-								if (auto [mapped, at] = upload.Map(size, 16, false);
-								    mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(address, mapped, size)) {
-									upload.Commit();
-									return at;
+								if (reuse_spec_copy && !try_forward) {
+									return std::nullopt;
 								}
-								return std::nullopt;
+								std::optional<uint64_t> copied_offset;
+								if (spec_shared != nullptr) {
+									auto* const forward = try_forward ? spec : nullptr;
+									copied_offset = TableSpecBackingOnce(upload, address, size, forward, forwarded, reuse_spec_copy);
+								} else if (const auto [mapped, at] = upload.Map(size, 16, false); mapped != nullptr) {
+									forwarded = try_forward && spec->ReadForwarded(address, mapped, size);
+									if (forwarded || Libs::LibKernel::Memory::TryReadBackingToHost(address, mapped, size)) {
+										upload.Commit();
+										copied_offset = at;
+									}
+								}
+								return copied_offset;
 							}(); offset) {
-								if (spec != nullptr) spec->NoteCleanRead(address, size);
+								if (spec != nullptr && !forwarded) {
+									spec->NoteCleanRead(address, size);
+								}
 								device = upload.BufferDeviceAddress() + *offset;
 								LiveCounters::Add(LiveCounters::TableRingCopies);
 								LiveCounters::Add(LiveCounters::TableRingBytes, size);
-								if (spec_shared != nullptr) // (after its note)
+								// A forwarded upload is tied to this segment's validation.
+								if (spec_shared != nullptr && !forwarded) { // (after its note)
 									*spec_shared = {.copy      = {.address     = address,
 									                              .size        = size,
 									                              .observation = observation,
@@ -3267,6 +3286,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 									                .rollbacks = spec->rollbacks,
 									                .waits     = spec_waits(),
 									                .segment   = spec->closed.size()};
+								}
 								if (shared != nullptr && cpu != 0)
 									*shared = {.address     = address,
 									           .size        = size,
@@ -3274,6 +3294,9 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 									           .tick        = tick,
 									           .cpu_epoch   = cpu,
 									           .device      = device};
+							} else if (reuse_spec_copy) {
+								device = spec_shared->copy.device;
+								spec->NoteCleanRead(address, size);
 							}
 							// (The V#'s later uses take it from its held entry.)
 							if (device != 0 && shared != nullptr && cpu != 0)

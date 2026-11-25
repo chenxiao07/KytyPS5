@@ -157,6 +157,7 @@ private:
 	std::atomic_uint32_t                           m_pending_commands {0};
 	uint32_t                                       m_next_queue        = 0;
 	std::array<uint64_t, QueueCount>               m_serials {};
+	std::atomic<uint64_t>                           m_copy_enqueue_serial {0};
 	uint32_t                                       m_submission_count  = 0;
 	// Producer epoch is owned by m_submission_mutex; consumed epoch by m_queue_mutex.
 	uint64_t                                       m_submitted_frame   = 0;

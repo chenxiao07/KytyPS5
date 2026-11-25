@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <bitset>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -32,6 +33,7 @@
 #include <map>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -47,6 +49,11 @@ volatile std::atomic_uint32_t kyty_local_pipelines_evicting {0};
 }
 
 namespace Libs::Graphics {
+
+namespace Spec {
+thread_local CopyOutcome* t_copy_outcome = nullptr;
+std::atomic_bool g_copy_forward_active {false};
+} // namespace Spec
 
 bool CommitGuardedWrite(void* dst, const void* src, uint32_t size); // (graphicsRun.cpp: KYTY_WRITE_GUARD_SPEC)
 bool CommitGuardedCopyWrite(void* dst, const void* src, uint32_t size); // (graphicsRun.cpp: GuardedCopy)
@@ -104,6 +111,7 @@ static bool IsHole(uint32_t header) {
 
 // A chunk's translation stopped where the next chunk begins (Result::stop).
 static constexpr char ChunkEnd[] = "chunk end";
+static constexpr char ForwardedReadChanged[] = "commit: a forwarded copy read changed";
 // A result that ends before a packet whose command words lie on a page a read watcher guards (ProcessPm4Spec).
 static constexpr char CommandWordsWatched[] = "command words watched";
 
@@ -182,6 +190,506 @@ Speculation::Translator::Translator(RenderContext& renderer, uint32_t number, in
 // ahead on a queue gone quiet) holds it exactly as it holds its own log today, once in place of beside the others.
 //
 struct Speculation::SharedEffects {
+	~SharedEffects() {
+		// Shutdown may destroy the last owner without a live mode exit.
+		if (copy_pages) {
+			Spec::g_copy_forward_active.store(false, std::memory_order_relaxed);
+		}
+	}
+	enum class CopyStatus { Predicted, Confirmed, Gpu };
+	struct CopyCandidate {
+		uint32_t chunk;
+		uint64_t serial, pass;
+		Spec::CopyDispatch dispatch;
+		const Spec::State* record = nullptr; // retired from the index before the pass record can be reused
+		Spec::CopyCompletion completion;
+		CopyStatus status;
+	};
+	struct CopyProgress {
+		uint64_t serial = 0;
+		std::array<uint32_t, Spec::CopyCursor::MaxDepth> offsets {};
+		bool inclusive = false; // the latest direct packet finished, or the next packet not yet executed
+		bool Past(uint64_t submission, const auto& at) const {
+			return std::tie(submission, at) < std::tie(serial, offsets) ||
+			       (inclusive && submission == serial && at == offsets);
+		}
+	};
+	// The GPU thread is the sole progress writer. Readers snapshot its full indirect-buffer cursor.
+	struct CopyProgressSlot {
+		CopyProgress position;
+		std::atomic<uint64_t> version {0}, serial {0};
+		std::array<std::atomic<uint32_t>, Spec::CopyCursor::MaxDepth> offsets {};
+		std::atomic<bool> inclusive {false};
+
+		void Advance(const CopyProgress& reached) {
+			if (position.Past(reached.serial, reached.offsets) ||
+			    (position.serial == reached.serial && position.offsets == reached.offsets && !reached.inclusive)) {
+				return;
+			}
+			const auto next = version.load(std::memory_order_relaxed) + 1;
+			version.store(next, std::memory_order_relaxed);
+			std::atomic_thread_fence(std::memory_order_release);
+			if (position.serial != reached.serial) {
+				serial.store(reached.serial, std::memory_order_relaxed);
+			}
+			for (size_t i = 0; i < offsets.size(); ++i)
+				if (position.offsets[i] != reached.offsets[i]) {
+					offsets[i].store(reached.offsets[i], std::memory_order_relaxed);
+				}
+			if (position.inclusive != reached.inclusive) {
+				inclusive.store(reached.inclusive, std::memory_order_relaxed);
+			}
+			position = reached;
+			// Ordered with packet presence publication. Either the GPU thread sees the candidate,
+			// or the state pass sees the progress and removes it before releasing copy_mutex.
+			version.store(next + 1, std::memory_order_seq_cst);
+		}
+
+		[[nodiscard]] CopyProgress Read() const {
+			for (;;) {
+				const auto begin = version.load(std::memory_order_seq_cst);
+				if (begin & 1u) {
+					_mm_pause();
+					continue;
+				}
+				CopyProgress snapshot;
+				snapshot.serial = serial.load(std::memory_order_relaxed);
+				for (size_t i = 0; i < offsets.size(); ++i)
+					snapshot.offsets[i] = offsets[i].load(std::memory_order_relaxed);
+				snapshot.inclusive = inclusive.load(std::memory_order_relaxed);
+				std::atomic_thread_fence(std::memory_order_acquire);
+				if (version.load(std::memory_order_relaxed) == begin) {
+					return snapshot;
+				}
+			}
+		}
+	};
+	static constexpr size_t CopyLimit = 1024, LinksPerCopy = 8, PageBuckets = 4096;
+	static constexpr size_t PagesPerWord = 32, PacketBuckets = 1024;
+	static constexpr size_t WordsPerLeaf = TRACKER_REGION_PAGES / PagesPerWord;
+	static constexpr size_t CopyPageLeafCount = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	static constexpr size_t MaxCopyPageLeaves = 4096; // at most 16 GiB of tracked guest address space
+	static constexpr uint64_t OmittedBits = UINT64_C(0x5555555555555555), PendingBits = ~OmittedBits;
+	static_assert(CopyLimit * LinksPerCopy < UINT16_MAX);
+	struct PageLink { uint16_t prev = 0, next = 0; };
+	std::mutex copy_mutex;
+	std::array<CopyCandidate, CopyLimit> copies {};
+	std::array<uint16_t, PageBuckets> page_heads {};
+	std::array<PageLink, CopyLimit * LinksPerCopy + 1> links {};
+	std::vector<uint16_t> active, wide; // reserved once, under copy_mutex
+	size_t next_copy = 0;
+	CopyProgressSlot copy_progress;
+	std::atomic<uint64_t> first_pending_serial {0};
+	std::array<uint16_t, PacketBuckets> packet_refs {};
+	std::array<std::atomic<uint64_t>, PacketBuckets / 64> pending_packets {};
+	// Two flags per exact 4 KiB guest page: known omitted (even) and pending (odd).
+	// A leaf covers 4 MiB. Published leaves stay at fixed addresses until all mode-4 workers have quiesced.
+	struct CopyPageLeaf {
+		std::array<std::atomic<uint64_t>, WordsPerLeaf> words {};
+		// Under copy_mutex. Omission-only leaves never need reference counts.
+		std::unique_ptr<std::array<uint16_t, TRACKER_REGION_PAGES>> pending_refs;
+	};
+	std::unique_ptr<std::atomic<CopyPageLeaf*>[]> copy_pages;
+	std::vector<std::unique_ptr<CopyPageLeaf>> copy_page_leaves;
+	CopyPageLeaf capped_copy_leaf; // immutable, empty probe words for regions without a leaf
+	uint64_t capped_copy_leaf_count = 0; // under copy_mutex, until mode exit
+	struct InterestPage {
+		uint64_t page;
+		uint64_t after_serial; // first eligible for a submission with a strictly newer serial
+	};
+	static constexpr size_t InterestLimit = 4096;
+	std::array<InterestPage, InterestLimit> interested_pages;
+	size_t interest_count = 0;
+	const std::atomic<uint64_t>* enqueue_serial = nullptr; // queue 0's latest enqueue, stable across worker turns
+	uint64_t overflow_serial = 0;
+
+	// The following leaf accessors run under copy_mutex. Only the state pass creates leaves.
+	[[nodiscard]] CopyPageLeaf* FindCopyPageLeaf(size_t word) const {
+		auto* leaf = copy_pages[word / WordsPerLeaf].load(std::memory_order_relaxed);
+		return leaf == &capped_copy_leaf ? nullptr : leaf;
+	}
+	CopyPageLeaf* GetCopyPageLeafForPublish(size_t word) {
+		auto& slot = copy_pages[word / WordsPerLeaf];
+		auto* leaf = slot.load(std::memory_order_relaxed);
+		if (leaf == nullptr) {
+			if (copy_page_leaves.size() == MaxCopyPageLeaves) {
+				// Keep the marker until mode exit, including when the copy that set it retires.
+				leaf = &capped_copy_leaf;
+				++capped_copy_leaf_count;
+			} else {
+				copy_page_leaves.push_back(std::make_unique<CopyPageLeaf>());
+				leaf = copy_page_leaves.back().get();
+			}
+			slot.store(leaf, std::memory_order_release);
+		}
+		return leaf == &capped_copy_leaf ? nullptr : leaf;
+	}
+	[[nodiscard]] bool TouchesCappedCopyRegion(GuestRange range) const {
+		if (capped_copy_leaf_count == 0 || !range.Valid()) {
+			return false;
+		}
+		const auto last = (range.End() - 1) / TRACKER_REGION_SIZE;
+		for (auto index = range.address / TRACKER_REGION_SIZE; index <= last; ++index)
+			if (copy_pages[index].load(std::memory_order_relaxed) == &capped_copy_leaf) {
+				return true;
+			}
+		return false;
+	}
+
+	static uint64_t PageWordMask(size_t word, uint64_t first, uint64_t end) {
+		const uint64_t base = uint64_t {word} * PagesPerWord;
+		const auto lo = std::max(base, first), hi = std::min<uint64_t>(base + PagesPerWord, end);
+		if (lo >= hi) {
+			return 0;
+		}
+		const auto count = hi - lo;
+		const auto mask = count == PagesPerWord ? UINT64_MAX : (uint64_t {1} << (2 * count)) - 1;
+		return (mask << (2 * (lo - base))) & OmittedBits;
+	}
+	template <typename Visit>
+	static bool CopyPageWords(uint64_t address, uint64_t size, Visit&& visit) {
+		const auto first = address / TRACKER_PAGE_SIZE, last = (address + size - 1) / TRACKER_PAGE_SIZE;
+		if (first / PagesPerWord == last / PagesPerWord) {
+			const auto word = first / PagesPerWord;
+			return visit(word, PageWordMask(word, first, last + 1));
+		}
+		for (auto word = first / PagesPerWord; word <= last / PagesPerWord; ++word)
+			if (visit(word, PageWordMask(word, first, last + 1))) {
+				return true;
+			}
+		return false;
+	}
+	[[nodiscard]] const InterestPage* FirstInterest(uint64_t page) const {
+		const auto* first = interested_pages.data();
+		return std::lower_bound(first, first + interest_count, page,
+		                        [](const InterestPage& entry, uint64_t at) { return entry.page < at; });
+	}
+	void EnrollInterest(uint64_t page, const InterestPage* where) {
+		auto* const pages = interested_pages.data();
+		auto* const at = pages + (where - pages);
+		auto* const end = pages + interest_count;
+		std::move_backward(at, end, end + 1);
+		// Order learning against queue 0's enqueue, including jobs waiting for their first state pass.
+		*at = {page, enqueue_serial->load(std::memory_order_seq_cst)};
+		++interest_count;
+		const auto word = page / PagesPerWord;
+		if (auto* leaf = FindCopyPageLeaf(word); leaf != nullptr) {
+			const auto bit = uint64_t {1} << (2 * (page % PagesPerWord));
+			leaf->words[word % WordsPerLeaf].fetch_and(~bit, std::memory_order_relaxed);
+		}
+	}
+	void LearnInterest(uint64_t address, uint64_t size) {
+		if (!GuestRange{address, size}.Valid()) {
+			return;
+		}
+		const auto last = (address + size - 1) / TRACKER_PAGE_SIZE;
+		for (auto page = address / TRACKER_PAGE_SIZE; page <= last; ++page) {
+			const auto* at = FirstInterest(page);
+			if (at != interested_pages.data() + interest_count && at->page == page) {
+				continue;
+			}
+			if (interest_count == InterestLimit) {
+				return;
+			}
+			EnrollInterest(page, at);
+		}
+	}
+	bool LearnOmitted(uint64_t address, uint64_t size) {
+		bool omitted = false;
+		CopyPageWords(address, size, [&](size_t word, uint64_t mask) {
+			const auto* leaf = FindCopyPageLeaf(word);
+			if (leaf == nullptr) {
+				return false;
+			}
+			auto bits = leaf->words[word % WordsPerLeaf].load(std::memory_order_relaxed) & mask;
+			omitted |= bits != 0;
+			// In this lock, an omitted bit implies the page is still unenrolled.
+			for (; bits != 0 && interest_count < InterestLimit; bits &= bits - 1) {
+				const auto page = word * PagesPerWord + std::countr_zero(bits) / 2u;
+				EnrollInterest(page, FirstInterest(page));
+			}
+			return false;
+		});
+		return omitted;
+	}
+	[[nodiscard]] bool MightRead(uint64_t address, uint64_t size) {
+		const auto first = address / TRACKER_PAGE_SIZE, last = (address + size - 1) / TRACKER_PAGE_SIZE;
+		uint64_t found = 0;
+		for (auto index = first / TRACKER_REGION_PAGES; index <= last / TRACKER_REGION_PAGES; ++index) {
+			const auto* leaf = copy_pages[index].load(std::memory_order_acquire);
+			if (leaf == nullptr) {
+				continue;
+			}
+			const auto base = index * WordsPerLeaf;
+			const auto first_word = std::max<uint64_t>(first / PagesPerWord, base);
+			const auto last_word = std::min<uint64_t>(last / PagesPerWord, base + WordsPerLeaf - 1);
+			for (auto word = first_word; word <= last_word; ++word) {
+				const auto mask = PageWordMask(word, first, last + 1);
+				found |= leaf->words[word - base].load(std::memory_order_acquire) & (mask | (mask << 1u));
+				if ((found & PendingBits) != 0) {
+					return true;
+				}
+			}
+		}
+		if (found != 0) {
+			// Misses learn only on exact pages that a state pass skipped. Don't wait for publication.
+			std::unique_lock lock(copy_mutex, std::try_to_lock);
+			if (lock) {
+				(void)LearnOmitted(address, size);
+			}
+		}
+		return false;
+	}
+	[[nodiscard]] bool Interested(uint64_t address, uint64_t size, uint64_t serial) const {
+		const auto last = (address + size - 1) / TRACKER_PAGE_SIZE;
+		const auto* const end = interested_pages.data() + interest_count;
+		for (auto* it = FirstInterest(address / TRACKER_PAGE_SIZE); it != end && it->page <= last; ++it)
+			if (it->after_serial < serial) {
+				return true;
+			}
+		return false;
+	}
+	[[nodiscard]] bool AllInterested(uint64_t address, uint64_t size, uint64_t serial) const {
+		const auto first = address / TRACKER_PAGE_SIZE, last = (address + size - 1) / TRACKER_PAGE_SIZE;
+		const auto* const end = interested_pages.data() + interest_count;
+		auto* it = FirstInterest(first);
+		for (auto page = first; page <= last; ++page, ++it)
+			if (it == end || it->page != page || it->after_serial >= serial) {
+				return false;
+			}
+		return true;
+	}
+	void NoteOmitted(uint64_t address, uint64_t size) {
+		auto* interest = FirstInterest(address / TRACKER_PAGE_SIZE);
+		const auto* const end = interested_pages.data() + interest_count;
+		CopyPageWords(address, size, [&](size_t word, uint64_t mask) {
+			const auto base = word * PagesPerWord;
+			for (; interest != end && interest->page < base + PagesPerWord; ++interest)
+				mask &= ~(uint64_t {1} << (2 * (interest->page - base)));
+			if (mask == 0) {
+				return false;
+			}
+			if (auto* leaf = GetCopyPageLeafForPublish(word); leaf != nullptr) {
+				auto& bits = leaf->words[word % WordsPerLeaf];
+				if ((bits.load(std::memory_order_relaxed) & mask) != mask) {
+					bits.fetch_or(mask, std::memory_order_release);
+				}
+			}
+			return false;
+		});
+	}
+	[[nodiscard]] bool OmittedOver(uint64_t address, uint64_t size, uint64_t live_serial) {
+		if (!GuestRange{address, size}.Valid()) {
+			return true;
+		}
+		// Keep older omissions blocking reads until all submissions that began before enrollment are past.
+		if (LearnOmitted(address, size)) {
+			return true;
+		}
+		if (overflow_serial != 0 && overflow_serial >= live_serial) {
+			return true;
+		}
+		const auto last = (address + size - 1) / TRACKER_PAGE_SIZE;
+		const auto* const end = interested_pages.data() + interest_count;
+		for (auto* it = FirstInterest(address / TRACKER_PAGE_SIZE); it != end && it->page <= last; ++it)
+			if (it->after_serial != 0 && it->after_serial >= live_serial) {
+				return true;
+			}
+		return false;
+	}
+	static size_t PacketBucket(uint64_t serial, const Spec::CopyCursor& cursor) {
+		uint64_t key = serial;
+		for (const auto offset: cursor.offsets) {
+			if (offset == 0) {
+				break;
+			}
+			key = std::rotl(key, 11) ^ offset;
+		}
+		return (key * UINT64_C(0x9e3779b97f4a7c15)) >> 54u;
+	}
+	[[nodiscard]] bool MightHavePacket(uint64_t serial, const Spec::CopyCursor& cursor) const {
+		const auto bucket = PacketBucket(serial, cursor);
+		return (pending_packets[bucket / 64].load(std::memory_order_seq_cst) & (uint64_t {1} << (bucket % 64))) != 0;
+	}
+	[[nodiscard]] uint64_t FirstPendingSerial() const {
+		return first_pending_serial.load(std::memory_order_seq_cst);
+	}
+	void UpdateFirstPendingSerial() {
+		const auto before = first_pending_serial.load(std::memory_order_relaxed);
+		auto serial = UINT64_MAX;
+		for (const auto slot: active) {
+			const auto& entry = copies[slot];
+			if (entry.serial == before) {
+				return;
+			}
+			serial = std::min(serial, entry.serial);
+		}
+		first_pending_serial.store(serial == UINT64_MAX ? 0 : serial, std::memory_order_seq_cst);
+	}
+	static size_t PageBucket(uint64_t page) {
+		return (page * UINT64_C(0x9e3779b97f4a7c15)) >> 52u;
+	}
+	void IndexCopy(uint16_t slot, bool insert) {
+		const auto& copy = copies[slot].dispatch.copy;
+		const auto first = copy.dst / TRACKER_PAGE_SIZE, last = (copy.dst + copy.bytes - 1) / TRACKER_PAGE_SIZE;
+		if (last - first >= LinksPerCopy) {
+			if (insert) {
+				wide.push_back(slot);
+			} else {
+				std::erase(wide, slot);
+			}
+		} else {
+			for (auto page = first; page <= last; ++page) {
+				auto& head = page_heads[PageBucket(page)];
+				const auto id = static_cast<uint16_t>(1 + slot * LinksPerCopy + (page - first));
+				auto& link = links[id];
+				if (insert) {
+					link = {0, head};
+					if (head != 0) {
+						links[head].prev = id;
+					}
+					head = id;
+				} else {
+					(link.prev == 0 ? head : links[link.prev].next) = link.next;
+					if (link.next != 0) {
+						links[link.next].prev = link.prev;
+					}
+				}
+			}
+		}
+		CopyPageWords(copy.dst, copy.bytes, [&](size_t word, uint64_t mask) {
+			// A capped region has no bitmap references to add or retire.
+			auto* leaf = insert ? GetCopyPageLeafForPublish(word) : FindCopyPageLeaf(word);
+			if (leaf == nullptr) {
+				return false;
+			}
+			if (insert && !leaf->pending_refs) {
+				leaf->pending_refs = std::make_unique<std::array<uint16_t, TRACKER_REGION_PAGES>>();
+			}
+			const auto local_word = word % WordsPerLeaf;
+			uint64_t changed = 0;
+			for (; mask != 0; mask &= mask - 1) {
+				const auto lane = static_cast<size_t>(std::countr_zero(mask)) / 2u;
+				auto& refs = (*leaf->pending_refs)[local_word * PagesPerWord + lane];
+				if (insert ? refs++ == 0 : --refs == 0) {
+					changed |= uint64_t {2} << (2 * lane);
+				}
+			}
+			if (changed != 0) {
+				if (insert) {
+					leaf->words[local_word].fetch_or(changed, std::memory_order_release);
+				} else {
+					leaf->words[local_word].fetch_and(~changed, std::memory_order_release);
+				}
+			}
+			return false;
+		});
+
+		const auto& entry = copies[slot];
+		const auto packet = PacketBucket(entry.serial, entry.dispatch.cursor);
+		auto& packet_count = packet_refs[packet];
+		if (insert ? packet_count++ == 0 : --packet_count == 0) {
+			const auto bit = uint64_t {1} << (packet % 64);
+			if (insert) {
+				pending_packets[packet / 64].fetch_or(bit, std::memory_order_seq_cst);
+			} else {
+				pending_packets[packet / 64].fetch_and(~bit, std::memory_order_seq_cst);
+			}
+		}
+	}
+	bool PublishCopy(uint32_t chunk, uint64_t serial, uint64_t pass, const Spec::CopyDispatch& dispatch,
+	                 const Spec::State& record) {
+		for (size_t n = 0; n < CopyLimit; ++n) {
+			const auto slot = static_cast<uint16_t>(next_copy++ % CopyLimit);
+			auto& entry = copies[slot];
+			if (entry.record != nullptr || entry.completion.readers.load(std::memory_order_acquire) != 0) {
+				continue;
+			}
+			entry.chunk = chunk;
+			entry.serial = serial;
+			entry.pass = pass;
+			entry.dispatch = dispatch;
+			entry.record = &record;
+			entry.status = dispatch.copy.gpu ? CopyStatus::Gpu : CopyStatus::Predicted;
+			entry.completion.effects_end.store(Spec::CopyCompletion::Pending, std::memory_order_relaxed);
+			active.push_back(slot);
+			IndexCopy(slot, true);
+			const auto first = first_pending_serial.load(std::memory_order_relaxed);
+			const bool new_first = first == 0 || serial < first;
+			if (new_first) {
+				first_pending_serial.store(serial, std::memory_order_seq_cst);
+			}
+			if (copy_progress.Read().Past(serial, dispatch.cursor.offsets)) {
+				// A packet can finish while the pass has copy_mutex. No reader can have acquired a token yet.
+				IndexCopy(slot, false);
+				active.pop_back();
+				entry.record = nullptr;
+				if (new_first) {
+					first_pending_serial.store(first, std::memory_order_seq_cst);
+				}
+				return true; // A finished packet consumes no capacity.
+			}
+			return true;
+		}
+		return false;
+	}
+	template <typename Match>
+	CopyCandidate* FindCopy(Match&& match) {
+		const auto it = std::ranges::find_if(active, [&](uint16_t slot) { return match(copies[slot]); });
+		return it == active.end() ? nullptr : &copies[*it];
+	}
+	template <typename Match, typename Complete>
+	void RetireCopiesWith(Match&& match, Complete&& complete) {
+		bool update_first = false;
+		const auto first = first_pending_serial.load(std::memory_order_relaxed);
+		std::erase_if(active, [&](uint16_t slot) {
+			auto& entry = copies[slot];
+			if (!match(entry)) {
+				return false;
+			}
+			update_first |= entry.serial == first;
+			entry.completion.effects_end.store(complete(entry), std::memory_order_release);
+			IndexCopy(slot, false);
+			entry.record = nullptr;
+			return true;
+		});
+		if (update_first) {
+			UpdateFirstPendingSerial();
+		}
+	}
+	template <typename Match>
+	void RetireCopies(Match&& match) {
+		RetireCopiesWith(match, [](const auto&) { return Spec::CopyCompletion::Invalid; });
+	}
+	template <typename Visit>
+	bool VisitCopies(uint64_t at, uint64_t end, Visit&& visit) {
+		const auto first = at / TRACKER_PAGE_SIZE, last = (end - 1) / TRACKER_PAGE_SIZE;
+		if (last - first >= 32) {
+			for (const auto slot: active)
+				if (!visit(copies[slot])) {
+					return false;
+				}
+		} else {
+			std::bitset<CopyLimit> seen;
+			for (auto page = first; page <= last; ++page)
+				for (auto id = page_heads[PageBucket(page)]; id != 0; id = links[id].next) {
+					const auto slot = (id - 1) / LinksPerCopy;
+					if (seen.test(slot)) {
+						continue;
+					}
+					seen.set(slot);
+					if (!visit(copies[slot])) {
+						return false;
+					}
+				}
+			for (const auto slot: wide)
+				if (!visit(copies[slot])) {
+					return false;
+				}
+		}
+		return true;
+	}
+
 	Spec::EffectsLog          log;
 	std::vector<Speculation*> instances; // (the GPU thread's: made and dropped there)
 	uint64_t below = 0, not_live = 0;
@@ -202,6 +710,277 @@ struct Speculation::SharedEffects {
 		}
 	}
 };
+
+bool Speculation::FinishCopyPacket(uint64_t serial, uint64_t pass, const Spec::CopyCursor& cursor,
+                                   const Spec::CopyOutcome& copy, bool replay) {
+	if (!m_shared) {
+		return false;
+	}
+	auto& shared = *m_shared;
+	if (pass == 0) {
+		shared.copy_progress.Advance({serial, cursor.offsets, true});
+	}
+	if (!shared.MightHavePacket(serial, cursor)) {
+		return false;
+	}
+	std::lock_guard lock(shared.copy_mutex);
+	const auto same_packet = [&](const auto& entry) {
+		return entry.serial == serial && entry.dispatch.cursor == cursor;
+	};
+	const auto same_copy = [&](const auto& entry) {
+		const auto& predicted = entry.dispatch.copy;
+		return predicted.dst == copy.dst && predicted.src == copy.src && predicted.bytes == copy.bytes;
+	};
+	using Status = SharedEffects::CopyStatus;
+	if (pass != 0) {
+		const auto found = shared.FindCopy([&](const auto& entry) { return same_packet(entry) && entry.pass == pass; });
+		if (found == nullptr) {
+			return false;
+		}
+		if (same_copy(*found) && copy.gpu) {
+			// Keep the now-known GPU destination as a blocker. Outstanding CPU predictions fail validation.
+			found->status = Status::Gpu;
+			found->completion.effects_end.store(Spec::CopyCompletion::Invalid, std::memory_order_release);
+			return true;
+		} else if (same_copy(*found) && found->status != Status::Gpu) {
+			found->status = Status::Confirmed;
+			return true;
+		}
+		shared.RetireCopies([&](const auto& entry) { return same_packet(entry) && entry.pass == pass; });
+		return false;
+	}
+	// On the GPU thread, after the whole packet's CPU write and its effects notes.
+	shared.RetireCopiesWith(same_packet, [&](auto& entry) {
+		if (copy.gpu || !same_copy(entry) || entry.status == Status::Gpu ||
+		    (replay && entry.status != Status::Confirmed)) {
+			return Spec::CopyCompletion::Invalid;
+		}
+		return m_log.End();
+	});
+	return false; // the GPU path never queues an After outcome
+}
+
+void Speculation::AdvanceCopyProgress(uint64_t serial, const Spec::CopyCursor& next, bool inclusive) {
+	if (!m_shared) {
+		return;
+	}
+	auto& shared = *m_shared;
+	auto& progress = shared.copy_progress;
+	// An empty cursor marks the end of the whole submission, never the end of an isolated hole.
+	const auto reached = next.offsets.front() == 0 ? SharedEffects::CopyProgress {serial + 1, {}, false}
+	                                               : SharedEffects::CopyProgress {serial, next.offsets, inclusive};
+	progress.Advance(reached);
+	const auto first = shared.FirstPendingSerial();
+	if (first == 0 || first > progress.position.serial ||
+	    (first == progress.position.serial && progress.position.offsets.front() == 0)) {
+		return;
+	}
+	std::lock_guard lock(shared.copy_mutex);
+	shared.RetireCopies([&](const auto& entry) {
+		return progress.position.Past(entry.serial, entry.dispatch.cursor.offsets);
+	});
+}
+
+void Speculation::DropCopyCandidates(uint64_t serial, uint32_t chunk, uint64_t pass) {
+	if (!Spec::CopyForwardWriter(m_interrupt_id) || !m_shared) {
+		return;
+	}
+	const auto first = m_shared->FirstPendingSerial();
+	if (first == 0 || (serial != 0 && first > serial)) {
+		return;
+	}
+	std::lock_guard lock(m_shared->copy_mutex);
+	m_shared->RetireCopies([&](const auto& entry) {
+		return (serial == 0 || entry.serial == serial) &&
+		       (chunk == UINT32_MAX || entry.chunk == chunk) && (pass == 0 || entry.pass == pass);
+	});
+}
+
+bool Spec::State::MightReadForwarded(uint64_t address, uint64_t size) {
+	return forward_owner != nullptr && forward_owner->MightReadForwarded(address, size);
+}
+
+bool Speculation::MightReadForwarded(uint64_t address, uint64_t size) const {
+	return GuestRange{address, size}.Valid() && m_shared->MightRead(address, size);
+}
+
+bool Spec::State::ReadForwarded(uint64_t address, void* out, uint64_t size) {
+	return forward_owner != nullptr && forward_owner->ReadForwarded(*this, address, out, size);
+}
+
+bool Speculation::ReadForwarded(Spec::State& state, uint64_t address, void* out, uint64_t size) const {
+	auto& shared = *m_shared;
+	if (out == nullptr || !state.MightReadForwarded(address, size)) {
+		return false;
+	}
+	if (state.JournalIntersects(address, size) || state.WrittenIntersects(address, size)) {
+		return false;
+	}
+	using Candidate = SharedEffects::CopyCandidate;
+	using Status = SharedEffects::CopyStatus;
+	auto& pieces = state.forward_pieces;
+	struct ClearPieces {
+		std::vector<Spec::State::ForwardPiece>& scratch;
+		~ClearPieces() { scratch.clear(); }
+	} clear_pieces {pieces};
+	{
+		std::lock_guard lock(shared.copy_mutex);
+		// Pages and caches are consulted after releasing copy_mutex. Only tokens leave this lock.
+		std::array<Candidate*, Spec::ForwardedRead::MaxDepth> chain {};
+		const auto live_serial = shared.copy_progress.Read().serial;
+		const auto walk = [&](auto&& self, uint64_t at, uint64_t end, uint64_t dest, size_t depth) -> bool {
+			// Refuse mixed ranges and sources too: a capped region can hide pending or omitted copies.
+			if (shared.TouchesCappedCopyRegion({at, end - at})) {
+				return false;
+			}
+			// A newly interested destination, or a chain's source, can still have an omitted writer.
+			if (shared.OmittedOver(at, end - at, live_serial)) {
+				return false;
+			}
+			while (at < end) {
+				auto edge = end;
+				Candidate* writer = nullptr;
+				const bool found = shared.VisitCopies(at, end, [&](Candidate& entry) -> bool {
+					const auto& copy = entry.dispatch.copy;
+					if (copy.dst >= end || copy.dst + copy.bytes <= at) {
+						return true;
+					}
+					if (depth != 0) {
+						const auto& prior = *chain[depth - 1];
+						// All candidates come from queue 0. Compare their PM4 positions to the consumer.
+						if (std::find(chain.begin(), chain.begin() + depth, &entry) != chain.begin() + depth) {
+							return false;
+						}
+						if (std::tie(entry.serial, entry.dispatch.cursor.offsets) >=
+						    std::tie(prior.serial, prior.dispatch.cursor.offsets)) {
+							return true;
+						}
+					}
+					if (copy.dst > at) {
+						edge = std::min(edge, copy.dst);
+						return true;
+					}
+					if (writer != nullptr) {
+						// Only a source walk has a known consumer packet. All eligible writers here
+						// precede it on the same queue, so the latest one is decisive for these bytes.
+						if (depth == 0) {
+							return false;
+						}
+						const auto previous = std::tie(writer->serial, writer->dispatch.cursor.offsets);
+						const auto current = std::tie(entry.serial, entry.dispatch.cursor.offsets);
+						if (previous == current) {
+							return false;
+						}
+						if (previous < current) {
+							writer = &entry;
+						}
+					} else {
+						writer = &entry;
+					}
+					edge = std::min(edge, copy.dst + copy.bytes);
+					return true;
+				});
+				if (!found) {
+					return false;
+				}
+				const auto bytes = edge - at;
+				if (writer != nullptr) {
+					const auto& copy = writer->dispatch.copy;
+					if (writer->status == Status::Gpu) {
+						return false;
+					}
+					if (depth == chain.size()) {
+						return false;
+					}
+					if (!shared.AllInterested(at, bytes, writer->serial)) {
+						shared.LearnInterest(at, bytes);
+						return false;
+					}
+					chain[depth] = writer;
+					const auto src = copy.src + (at - copy.dst);
+					if (writer->record->WrittenIntersects(src, bytes)) {
+						return false;
+					}
+					if (!self(self, src, src + bytes, dest, depth + 1)) {
+						return false;
+					}
+				} else {
+					if (depth == 0) {
+						// The caller's ordinary read handles the whole span if any destination bytes lack a writer.
+						return at == address && edge == end;
+					}
+					if (chain[depth - 1]->record->JournalIntersects(at, bytes)) {
+						return false;
+					}
+					if (pieces.size() == SharedEffects::CopyLimit) {
+						return false;
+					}
+					auto& piece = pieces.emplace_back(Spec::State::ForwardPiece {
+					    dest, at, bytes, {}});
+					for (size_t i = 0; i < depth; ++i) piece.writers[i] = Spec::CopyToken(chain[i]->completion);
+				}
+				at = edge;
+				dest += bytes;
+			}
+			return true;
+		};
+		if (!walk(walk, address, address + size, address, 0)) {
+			return false;
+		}
+	}
+	if (pieces.empty()) {
+		return false;
+	}
+	constexpr uint64_t ByteLimit = uint64_t {16} << 20u; // across the result, including its earlier segments
+	auto retained = state.forwarded_bytes.size();
+	auto& resources = m_renderer.GetGpuResources();
+	auto& buffers = resources.GetBufferCache();
+	auto& textures = resources.GetTextureCache();
+	auto* result = static_cast<uint8_t*>(out);
+	using namespace Libs::LibKernel::Memory;
+	for (auto& piece: pieces) {
+		const auto [dest, src, bytes] = std::tie(piece.destination, piece.source, piece.bytes);
+		if (state.WrittenIntersects(src, bytes) || buffers.HasGpuDirtyBytes(src, bytes) ||
+		    textures.IsRegionImageBacked(src, bytes) || TextureCache::SpecTargetOver(src, bytes)) {
+			return false;
+		}
+		if (state.JournalIntersects(src, bytes)) {
+			return false;
+		}
+		if (TextureCache::SpecTargetOver(dest, bytes) || textures.IsRegionImageBacked(dest, bytes) ||
+		    textures.IsRegionGpuModified(dest, bytes)) {
+			return false;
+		}
+		if (bytes > ByteLimit - retained) {
+			return false;
+		}
+		retained += bytes;
+		if (!IsUniqueGuestBackingRangeAcrossMappings(dest, bytes) || !IsUniqueGuestBackingRangeAcrossMappings(src, bytes)) {
+			return false;
+		}
+		if (!TryReadBackingToHost(src, result + (dest - address), bytes)) {
+			return false;
+		}
+	}
+	// A token keeps the slot alive, but the pass can invalidate it while the backing read is in progress.
+	for (const auto& piece: pieces) {
+		for (const auto& token: piece.writers) {
+			if (token.completion == nullptr) {
+				break;
+			}
+			const auto completed = token.completion->effects_end.load(std::memory_order_acquire);
+			if (completed == Spec::CopyCompletion::Invalid) {
+				return false;
+			}
+		}
+	}
+	for (auto& piece: pieces) {
+		const auto* data = result + (piece.destination - address);
+		state.forwarded_reads.push_back({piece.destination, piece.bytes, state.forwarded_bytes.size(), std::move(piece.writers)});
+		state.forwarded_bytes.insert(state.forwarded_bytes.end(), data, data + piece.bytes);
+	}
+	return true;
+}
 
 std::shared_ptr<Speculation::SharedEffects> Speculation::AcquireSharedEffects() {
 	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return nullptr;
@@ -346,6 +1125,7 @@ void Speculation::Stop() {
 			translator->thread.join();
 		}
 	}
+	DropCopyCandidates();
 	if (m_blocked) Finish(std::move(m_blocked), 0);
 	for (;;) {
 		std::unique_ptr<Result> result;
@@ -359,6 +1139,34 @@ void Speculation::Stop() {
 	}
 }
 
+void Speculation::PrepareCopyForwarding(const std::atomic<uint64_t>& enqueue_serial) {
+	if (!m_shared || m_shared->copy_pages) {
+		return;
+	}
+	m_shared->enqueue_serial = &enqueue_serial;
+	m_shared->active.reserve(SharedEffects::CopyLimit);
+	m_shared->wide.reserve(SharedEffects::CopyLimit);
+	m_shared->copy_page_leaves.reserve(SharedEffects::MaxCopyPageLeaves);
+	m_shared->copy_pages = std::make_unique<std::atomic<SharedEffects::CopyPageLeaf*>[]>(SharedEffects::CopyPageLeafCount);
+	Spec::g_copy_forward_active.store(true, std::memory_order_relaxed);
+}
+
+void Speculation::ReleaseCopyForwarding() {
+	if (!m_shared || !m_shared->copy_pages) {
+		return;
+	}
+	// All graphics and compute workers have stopped.
+	Spec::g_copy_forward_active.store(false, std::memory_order_relaxed);
+	m_shared->copy_pages.reset();
+	m_shared->active = decltype(m_shared->active) {};
+	m_shared->wide = decltype(m_shared->wide) {};
+	m_shared->copy_page_leaves = decltype(m_shared->copy_page_leaves) {};
+	m_shared->capped_copy_leaf_count = 0;
+	m_shared->interest_count = 0;
+	m_shared->enqueue_serial = nullptr;
+	m_shared->overflow_serial = 0;
+}
+
 Speculation::~Speculation() {
 	{
 		std::lock_guard lock(m_mutex);
@@ -367,6 +1175,7 @@ Speculation::~Speculation() {
 	m_ahead_wake.notify_all();
 	for (auto& translator: m_translators)
 		if (translator->thread.joinable()) translator->thread.join();
+	DropCopyCandidates();
 	if (m_shared) std::erase(m_shared->instances, this); // (The shared log holds nothing from this instance from here on.)
 	auto& scheduler = m_renderer.GetCommandScheduler();
 	if (m_blocked) scheduler.DestroyRecorder(std::move(m_blocked->recorder));
@@ -475,7 +1284,9 @@ void Speculation::Push(const Job& job) {
 }
 
 void Speculation::RetireFront() {
-	auto& chunks = m_waitless_jobs ? m_waitless_jobs->active.front().chunks : m_jobs.front().chunks;
+	auto& entry = m_waitless_jobs ? m_waitless_jobs->active.front() : m_jobs.front();
+	DropCopyCandidates(entry.job.serial);
+	auto& chunks = entry.chunks;
 	// Its records' writes are made. What read through them reads memory.
 	for (auto& chunk: chunks) {
 		if (auto record = std::move(chunk.record)) {
@@ -493,6 +1304,10 @@ void Speculation::RetireFront() {
 }
 
 void Speculation::Done(uint64_t serial, const CommandProcessor& cp) {
+	// Committed chunks can finish a submission without a final CommandProcessor::Process call.
+	if (Spec::CopyForwardWriter(m_interrupt_id) && m_shared) {
+		AdvanceCopyProgress(serial, {});
+	}
 	{
 		std::lock_guard lock(m_mutex);
 		WithJobs([&](auto& jobs) {
@@ -526,6 +1341,10 @@ void Speculation::ResyncStatePass() {
 
 // The pass gives each chunk's start snapshot to its translation result.
 bool Speculation::StatePass(const Job& job, uint64_t which, bool one_cut) {
+	const bool publish_copies = Spec::CopyForwardWriter(m_interrupt_id) && m_shared;
+	if (publish_copies) {
+		m_state->SetCopySubmission(this, job.serial, which);
+	}
 	if (job.kind != Job::Kind::Graphics) {
 		if (job.reset) {
 			m_state->Reset();
@@ -585,6 +1404,30 @@ bool Speculation::StatePass(const Job& job, uint64_t which, bool one_cut) {
 		};
 		if (entry != nullptr && which == m_pass && followed && !claimed && !cancelled()) {
 			entry->pass = which;
+			if (publish_copies && !m_quit && !chunk.record->copy_dispatches.empty()) {
+				std::lock_guard copy_lock(m_shared->copy_mutex);
+				const auto progress = m_shared->copy_progress.Read();
+				if (chunk.record->copy_dispatch_overflow) {
+					m_shared->overflow_serial = std::max(m_shared->overflow_serial, job.serial);
+				}
+				for (const auto& dispatch: chunk.record->copy_dispatches) {
+					if (progress.Past(job.serial, dispatch.cursor.offsets)) {
+						continue;
+					}
+					const auto& copy = dispatch.copy;
+					if (!GuestRange{copy.dst, copy.bytes}.Valid()) {
+						m_shared->overflow_serial = std::max(m_shared->overflow_serial, job.serial);
+						continue;
+					}
+					if (!m_shared->Interested(copy.dst, copy.bytes, job.serial)) {
+						m_shared->NoteOmitted(copy.dst, copy.bytes);
+						continue;
+					}
+					if (!m_shared->PublishCopy(static_cast<uint32_t>(entry->chunks.size()), job.serial, which, dispatch, *chunk.record)) {
+						m_shared->overflow_serial = std::max(m_shared->overflow_serial, job.serial);
+					}
+				}
+			}
 			entry->chunks.push_back(std::move(chunk));
 			m_ahead_wake.notify_all();
 		} else {
@@ -907,6 +1750,7 @@ bool Speculation::AheadTurn(Translator& translator, std::unique_lock<std::mutex>
 				m_pass_cancel.store(false, std::memory_order_relaxed);
 				m_state->SetGuardedCommands(m_pass_cancel, m_skip_through, job.serial);
 			}
+			DropCopyCandidates(job.serial);
 			for (auto& chunk: pass->chunks) {
 				if (auto record = std::move(chunk.record)) {
 					Unlink(record.get(), nullptr);
@@ -948,6 +1792,9 @@ bool Speculation::AheadTurn(Translator& translator, std::unique_lock<std::mutex>
 		translator.cp->SetGuardedCommands(translator.cancel, m_skip_through, job.serial);
 	}
 	const auto         which     = work->pass;
+	if (Spec::CopyForwardWriter(m_interrupt_id) && m_shared) {
+		translator.cp->SetCopySubmission(this, job.serial, which);
+	}
 	auto               start     = std::move(chunk.start);
 	const Pm4Execution at        = chunk.at;
 	const auto         stop      = chunk.last ? std::optional<Pm4Execution> {} : std::optional {chunk.end};
@@ -1196,6 +2043,7 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 			// From another state or place: the state pass went wrong (what began from it goes); it goes on from the state
 			// after this submission (Done), which is translated on the normal way.
 			++m_stop_reasons["ahead: another start state"];
+			DropCopyCandidates();
 			++m_pass;
 			m_broken    = true;
 			m_broken_at = job.serial;
@@ -1481,6 +2329,9 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	r.pass   = 0;
 	r.blind  = false;
 	r.state.Clear();
+	if (Spec::CopyForwardReader(m_interrupt_id) && m_shared) {
+		r.state.forward_owner = this;
+	}
 	// (Relocatable buffer references: the mode once a translation, so a live change cannot split a segment's notes.)
 	r.state.reloc_on      = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 	r.state.table_upload  = translator.table_upload.get();
@@ -1740,6 +2591,15 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 		m_renderer.GetRenderExecutor().NativeXprForgetState();
 		outcome = r.stop == nullptr ? Outcome::Whole : r.stop == ChunkEnd ? Outcome::Chunk : Outcome::Partly;
 		if (r.stop != nullptr) execution = std::move(r.stop_execution);
+		if (outcome == Outcome::Chunk && r.pass != 0 && Spec::CopyForwardWriter(m_interrupt_id) && m_shared) {
+			// A replaced dispatch has no packet callback. Retire predictions behind the committed cut.
+			Spec::CopyCursor next;
+			if (CommandProcessor::CopyPosition(execution, next)) {
+				AdvanceCopyProgress(r.serial, next);
+			} else {
+				DropCopyCandidates(r.serial, r.chunk, r.pass);
+			}
+		}
 	} else if (r.resume_at) {
 		// Stopped where `cp` ran a segment as a hole to (SegmentAsHole). A run that missed its hole and ended the
 		// submission (its stack empty) made it whole: an empty execution handed back would process it again from its start.
@@ -2370,6 +3230,29 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		// The checks after Changed(): the stop's reason, or null when they all hold. (Under KYTY_SPECULATE=4 a stop here
 		// runs the segment as a hole, as Changed()'s do: nothing of its preparation ran, so the run is the in-order
 		// path's from the true state.)
+		const bool learn_interest = state.forward_owner != nullptr;
+		const auto note_reader_stop = [&](const Spec::EffectsLog::Entry* write, const Spec::Range& read) {
+			if (learn_interest && write != nullptr && write->kind == Spec::EffectsLog::Kind::HostWrite &&
+			    write->q0_linear_copy) {
+				const auto begin = std::max(read.begin, write->address);
+				const auto end = std::min(read.end, write->address + write->size);
+				if (begin < end) {
+					std::unique_lock lock(m_shared->copy_mutex, std::try_to_lock);
+					if (lock) {
+						m_shared->LearnInterest(begin, end - begin);
+					}
+				}
+			}
+		};
+		const auto wrote_what_it_read = [&](const Spec::EffectsLog::Entry* write, const auto& read) {
+			note_reader_stop(write, {read.begin, read.end});
+			return WroteWhatItRead(write);
+		};
+		const auto attribute_changed_byte = [&](uint64_t address) {
+			bool direct = false;
+			const auto* write = m_log.WriteOverFromStamp(result.effects_from, address, 1, direct);
+			note_reader_stop(direct ? write : nullptr, {address, address + 1});
+		};
 		const auto post_checks = [&]() -> const char* {
 			// The images it uses as it found them: none written through a buffer since (a hole's storage-buffer write, fill or
 			// copy over its memory, or an earlier segment's, replayed in its Before). The normal path's binding uploads such an
@@ -2503,8 +3386,9 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 							} else {
 								write = m_log.FirstWriteOver(result.effects_from, read.begin, size);
 							}
-							if (write != nullptr && !ReadValuesHold(result, index, read))
-								return WroteWhatItRead(write);
+							if (write != nullptr && !ReadValuesHold(result, index, read)) {
+								return wrote_what_it_read(write, read);
+							}
 						}
 					}
 					// (KYTY_SPEC_LATE_READS: a late read, by the processor's writes logged after it was read, and GPU work's since
@@ -2515,27 +3399,31 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 							const auto& read  = state.late_reads[i];
 							const auto  bytes = read.end - read.begin;
 							if (!m_log.stamps.MaybeSince(read.begin, bytes, result.effects_from)) continue;
-							if (const auto* gpu = m_log.FirstGpuWriteOver(result.effects_from, read.begin, bytes))
-								return WroteWhatItRead(gpu);
+							if (const auto* gpu = m_log.FirstGpuWriteOver(result.effects_from, read.begin, bytes)) {
+								return wrote_what_it_read(gpu, read);
+							}
 							const auto since = std::max(result.effects_from, read.since);
 							if (m_log.End() <= since || !m_log.stamps.MaybeSince(read.begin, bytes, since)) continue;
-							if (const auto* write = m_log.FirstWriteOver(since, read.begin, bytes))
-								return WroteWhatItRead(write);
+							if (const auto* write = m_log.FirstWriteOver(since, read.begin, bytes)) {
+								return wrote_what_it_read(write, read);
+							}
 						}
 				} else if (!effects.gpu_writes.Empty() || !effects.host_writes.Empty()) {
 					for (size_t i = from.clean_reads; i < to.clean_reads; ++i) {
 						const auto& read = state.clean_reads[i];
 						if (effects.gpu_writes.Intersects(read.begin, read.end - read.begin) ||
 						    (effects.host_writes.Intersects(read.begin, read.end - read.begin) &&
-						     !ReadValuesHold(result, index, read)))
-							return WroteWhatItRead(m_log.FirstWriteOver(result.effects_from, read.begin, read.end - read.begin));
+						     !ReadValuesHold(result, index, read))) {
+							return wrote_what_it_read(m_log.FirstWriteOver(result.effects_from, read.begin, read.end - read.begin), read);
+						}
 					}
 					// (Late reads as clean ones here: every write since it began.)
 					for (size_t i = from.late_reads; i < to.late_reads; ++i) {
 						const auto& read = state.late_reads[i];
 						if (effects.gpu_writes.Intersects(read.begin, read.end - read.begin) ||
-						    effects.host_writes.Intersects(read.begin, read.end - read.begin))
-							return WroteWhatItRead(m_log.FirstWriteOver(result.effects_from, read.begin, read.end - read.begin));
+						    effects.host_writes.Intersects(read.begin, read.end - read.begin)) {
+							return wrote_what_it_read(m_log.FirstWriteOver(result.effects_from, read.begin, read.end - read.begin), read);
+						}
 					}
 				}
 				// The descriptor sets it binds: none retired since (one may be reused under it).
@@ -2655,15 +3543,34 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 					const void* word = reinterpret_cast<const void*>(read.address);
 					if (WriteGuard::g_count.load(std::memory_order_relaxed) != 0)
 						if (const auto* backing = WriteGuard::GuardedBacking(read.address, 4u)) word = backing;
-					if (*static_cast<const uint32_t*>(word) != read.value)
+					const auto value_now = *static_cast<const uint32_t*>(word);
+					if (value_now != read.value) {
+						if (learn_interest) {
+							const auto* actual = reinterpret_cast<const uint8_t*>(&value_now);
+							const auto* expected = reinterpret_cast<const uint8_t*>(&read.value);
+							const auto mismatch = std::mismatch(actual, actual + sizeof(read.value), expected);
+							attribute_changed_byte(read.address + static_cast<uint64_t>(mismatch.first - actual));
+						}
 						return "commit: a command buffer before wrote otherwise";
+					}
 				}
 				// The words it read from its own speculation's journal that an earlier segment's write gave, as the chain
 				// reads (KYTY_SPECULATE=4: JournalReadsMoved).
-				if (state.journal_reads_on && to.journal_reads > from.journal_reads)
-					if (const char* moved = JournalReadsMoved(result, index))
+				if (state.journal_reads_on && to.journal_reads > from.journal_reads) {
+					Spec::Range changed_bytes;
+					auto* changed = learn_interest
+					                    ? &changed_bytes : nullptr;
+					if (const char* moved = JournalReadsMoved(result, index, changed)) {
+						if (changed_bytes.end != 0) {
+							attribute_changed_byte(changed_bytes.begin);
+						}
 						return moved;
+					}
+				}
 				if (!SegmentWaitsHold(state, from.waits, to.waits)) return "commit: a wait not satisfied";
+			}
+			if (ForwardedReadFailure(result, index)) {
+				return ForwardedReadChanged;
 			}
 			// A completion uploads its images' bytes, metadata and stencil plane in Before, before the segment's own writes
 			// over them execute (the replay, After), and leaves them clean: in order a write before the bind is uploaded
@@ -3558,7 +4465,8 @@ void Speculation::Before(Result& result, size_t index) {
 //   of the runs written before it too, so the guest mapping shows their bytes then.
 // A trade: a written run's write-protected pages take the write fault (TouchForWrite) where CopyGuestMemory kept their
 // protection and wrote through the backing view.
-static bool GuardedCopy(BufferCache& buffers, uint64_t dst, uint64_t src, uint64_t size, uint64_t& done) {
+static bool GuardedCopy(BufferCache& buffers, uint64_t dst, uint64_t src, uint64_t size, uint64_t& done,
+                        Spec::HostWriteKind kind) {
 	constexpr uint64_t MaxPages = 64;
 	done                        = 0;
 	const uint64_t first        = dst & ~(WriteGuard::Page - 1);
@@ -3585,7 +4493,7 @@ static bool GuardedCopy(BufferCache& buffers, uint64_t dst, uint64_t src, uint64
 		parts.Find(dst + at, from + at, end - at, to + at);
 		if (!CommitGuardedCopyWrite(reinterpret_cast<void*>(dst + at), from + at, static_cast<uint32_t>(end - at)))
 			return false;
-		parts.Note();
+		parts.Note(kind);
 		buffers.NoteGuardedCopyWrite(dst + at, end - at);
 		at = done = end;
 	}
@@ -3745,6 +4653,7 @@ void Speculation::After(Result& result, size_t index) {
 		PageManager::FlushDeferredProtection();
 		copy_protection_pending = false;
 	};
+	auto next_copy = from.copy_dispatches;
 	for (size_t i = from.writes; i < to.writes; ++i) {
 		const auto& write = state.writes[i];
 		if (copy_protection_pending) [[unlikely]] {
@@ -3777,13 +4686,26 @@ void Speculation::After(Result& result, size_t index) {
 						if (!buffers.WriteGuestKnownWriter(w.address, &w.value, w.size))
 							std::memcpy(reinterpret_cast<void*>(w.address), &w.value, w.size);
 					}
-					Spec::NoteHostWrite(w.address, w.size);
+					Spec::NoteHostWrite(w.address, w.size, w.host_kind);
 					Spec::NoteLabel(w.address);
 				}
 				i = end - 1;
 				continue;
 			}
 		}
+		const Spec::CopyDispatch* dispatch = nullptr;
+		if (write.copy && next_copy < to.copy_dispatches) {
+			while (next_copy < to.copy_dispatches && state.copy_dispatches[next_copy].copy.gpu) ++next_copy;
+			if (next_copy < to.copy_dispatches && state.copy_dispatches[next_copy].write == i) {
+				dispatch = &state.copy_dispatches[next_copy++];
+			}
+		}
+		const auto finish_copy = [&](bool gpu) {
+			if (dispatch != nullptr) {
+				FinishCopyPacket(result.serial, 0, dispatch->cursor,
+				                 {write.address, write.value, write.size, gpu}, true);
+			}
+		};
 		// (Mode 4: a copy GPU work wrote since the translation, made here as the in-order path makes it now, where
 		// BufferCache::CopyBuffer takes its GPU path: either range GPU-modified in the tracker, or an image over the source.
 		// Else the processor copy below, as before: CopyBuffer's processor path is that copy. Recorded after the segment's
@@ -3792,12 +4714,14 @@ void Speculation::After(Result& result, size_t index) {
 		    (buffers.IsRegionGpuModified(write.address, write.size) || buffers.IsRegionGpuModified(write.value, write.size) ||
 		     textures.FindImageFromRange(write.value, write.size))) {
 			buffers.CopyBuffer(write.address, write.value, write.size, false, false);
+			finish_copy(true);
 			copy_protection_pending = true;
 			copy_upload = AsyncUpload::SubmitSequence();
 			continue;
 		}
 		if (write.copy && AfterGpuCopyNow(buffers, textures, state, from, to, i)) [[unlikely]] {
 			buffers.CopyBuffer(write.address, write.value, write.size, false, false);
+			finish_copy(true);
 			copy_protection_pending = true;
 			copy_upload = AsyncUpload::SubmitSequence();
 			continue;
@@ -3807,9 +4731,15 @@ void Speculation::After(Result& result, size_t index) {
 			// differing destination pages, GuardedCopy above; else, or for what it did not write, the drain and
 			// CopyGuestMemory as before.)
 			uint64_t done = 0;
-			if (batch != 0 && guard && !drained && GuardedCopy(buffers, write.address, write.value, write.size, done)) continue;
-			drain();
-			if (done < write.size) buffers.CopyGuestMemory(write.address + done, write.value + done, write.size - done);
+			if (batch == 0 || !guard || drained ||
+			    !GuardedCopy(buffers, write.address, write.value, write.size, done, write.host_kind)) {
+				drain();
+				if (done < write.size) {
+					buffers.CopyGuestMemory(write.address + done, write.value + done, write.size - done,
+					                        write.host_kind == Spec::HostWriteKind::LinearCopy);
+				}
+			}
+			finish_copy(false);
 		} else {
 			if (!guard || !CommitGuardedWrite(reinterpret_cast<void*>(write.address), &write.value, write.size)) {
 				drain();
@@ -3819,11 +4749,17 @@ void Speculation::After(Result& result, size_t index) {
 					std::memcpy(reinterpret_cast<void*>(write.address), &write.value, write.size);
 			}
 			// (A speculation translated after it that read memory there before: Spec::EffectsLog.)
-			Spec::NoteHostWrite(write.address, write.size);
+			Spec::NoteHostWrite(write.address, write.size, write.host_kind);
 			Spec::NoteLabel(write.address);
 		}
 	}
 	if (copy_protection_pending) protect();
+	for (size_t i = from.copy_dispatches; i < to.copy_dispatches; ++i) {
+		const auto& dispatch = state.copy_dispatches[i];
+		if (dispatch.copy.gpu) {
+			FinishCopyPacket(result.serial, 0, dispatch.cursor, dispatch.copy, true);
+		}
+	}
 	if (from.feedbacks != to.feedbacks) {
 		RenderLockGuard lock(m_renderer.GetMutex());
 		for (size_t i = from.feedbacks; i < to.feedbacks; ++i)
@@ -3841,8 +4777,16 @@ Speculation::HoleRun Speculation::RunHole(Result& result, CommandProcessor& cp, 
 	DrawStateObserver::Invalidate();
 	executor.NativeXprForgetState();
 	Pm4Execution execution;
-	const auto   start     = NowNs();
-	const auto   processed = cp.Process(execution, {hole.packet, hole.dwords});
+	const auto start = NowNs();
+	const auto processed = [&] {
+		if (cp.m_copy_owner == nullptr) {
+			return cp.Process(execution, {hole.packet, hole.dwords});
+		}
+		cp.m_copy_hole_at = &hole.at;
+		const auto status = cp.Process(execution, {hole.packet, hole.dwords});
+		cp.m_copy_hole_at = nullptr;
+		return status;
+	}();
 	m_hole_ns += NowNs() - start;
 	DrawStateObserver::Invalidate();
 	executor.NativeXprForgetState();
@@ -3947,6 +4891,61 @@ static bool ReadGuestNow(void* out, uint64_t address, uint64_t bytes) {
 	return Common::GuardedCopy(out, reinterpret_cast<const void*>(address), bytes) == 0;
 }
 
+// A source can change through a writable guest mapping without an effects-log entry. Require destination equality
+// even when the matching CPU copy completed and both ranges passed the log's overlap checks.
+bool Speculation::ForwardedReadFailure(const Result& result, size_t index) const {
+	const auto& state = result.state;
+	if (state.forwarded_reads.empty()) {
+		return false;
+	}
+	const auto from = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
+	const auto& to = state.closed[index].end;
+	if (from.forwarded_reads == to.forwarded_reads) {
+		return false;
+	}
+
+	auto& resources = m_renderer.GetGpuResources();
+	for (size_t i = from.forwarded_reads; i < to.forwarded_reads; ++i) {
+		const auto& read = state.forwarded_reads[i];
+		uint64_t root_completed = 0;
+		for (const auto& token: read.writers) {
+			if (token.completion == nullptr) {
+				break;
+			}
+			const auto completed = token.completion->effects_end.load(std::memory_order_acquire);
+			if (completed >= Spec::CopyCompletion::Invalid) {
+				return true;
+			}
+			if (&token == &read.writers.front()) {
+				root_completed = completed;
+			}
+		}
+		const auto since = std::max(root_completed, result.effects_from);
+		if ((m_log.stamps.MaybeSince(read.address, read.size, since) &&
+		     m_log.FirstWriteOver(since, read.address, read.size)) ||
+		    (m_log.stamps.MaybeSince(read.address, read.size, result.effects_from) &&
+		     m_log.FirstGpuWriteOver(result.effects_from, read.address, read.size)) ||
+		    (resources.MappingEpoch() != result.epochs.mapping &&
+		     resources.UnmappedSince(result.epochs.mapping, read.address, read.size)) ||
+		    !Libs::LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(read.address, read.size) ||
+		    resources.GetBufferCache().HasGpuDirtyBytes(read.address, read.size) ||
+		    resources.GetTextureCache().IsRegionImageBacked(read.address, read.size) ||
+		    SegmentWritesRange(state, index, from, to, read.address, read.size)) {
+			return true;
+		}
+		std::array<uint8_t, 4096> now;
+		for (uint64_t done = 0; done < read.size;) {
+			const auto bytes = std::min<uint64_t>(now.size(), read.size - done);
+			if (!ReadGuestNow(now.data(), read.address + done, bytes) ||
+			    std::memcmp(now.data(), state.forwarded_bytes.data() + read.offset + done, bytes) != 0) {
+				return true;
+			}
+			done += bytes;
+		}
+	}
+	return false;
+}
+
 // KYTY_SPECULATE=4: the words segment `index` read from the speculation's own journal that a write of an earlier
 // segment gave (Spec::State::journal_reads with `entry` before the segment's own writes), checked at its commit as the
 // chain reads are: such a word notes nothing else the commit checks (a wait over it pushes no WaitCheck). It runs among
@@ -3956,7 +4955,7 @@ static bool ReadGuestNow(void* out, uint64_t address, uint64_t bytes) {
 // has landed, and a word its own writes gave is not checked (in order it reads them). So each must be in memory as the
 // reader took it (Spec::State::journal_words), with no GPU write logged over it since the speculation began (logged as
 // recorded, before it reaches memory: memory cannot tell). Null: all hold.
-const char* Speculation::JournalReadsMoved(const Result& result, size_t index) const {
+const char* Speculation::JournalReadsMoved(const Result& result, size_t index, Spec::Range* changed_bytes) const {
 	const auto&                            state = result.state;
 	const auto                             from  = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
 	const auto&                            to    = state.closed[index].end;
@@ -3972,7 +4971,14 @@ const char* Speculation::JournalReadsMoved(const Result& result, size_t index) c
 			const auto address = read.address + done;
 			const auto n       = std::min<uint64_t>(read.bytes - done, now.size() - (address & (now.size() - 1)));
 			if (!ReadGuestNow(now.data(), address, n)) return "commit: a journal word read, not readable now";
-			if (std::memcmp(now.data(), taken + done, n) != 0) return "commit: a journal word read otherwise";
+			if (std::memcmp(now.data(), taken + done, n) != 0) {
+				if (changed_bytes != nullptr) {
+					const auto mismatch = std::mismatch(now.data(), now.data() + n, taken + done);
+					const auto byte = address + static_cast<uint64_t>(mismatch.first - now.data());
+					*changed_bytes = {byte, byte + 1};
+				}
+				return "commit: a journal word read otherwise";
+			}
 			done += n;
 		}
 	}
@@ -3982,6 +4988,8 @@ const char* Speculation::JournalReadsMoved(const Result& result, size_t index) c
 void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {
 	auto& scheduler = m_renderer.GetCommandScheduler();
 	auto& r         = *result;
+	r.state.forwarded_reads.clear();
+	r.state.forwarded_bytes.clear();
 	r.state.ReleaseConsumePending(); // (its holes' clears are consumed now, or never: spec_predict_dcc=3)
 	// (spec_worker_sets: its proposed sets no commit settled, settled here on the GPU thread while it still counts as live,
 	// not at its Result's reuse on a worker: the catalog's pair sweeps wait for no speculation live, so the pairs those
@@ -4001,6 +5009,10 @@ void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {
 	auto&      owner   = *r.owner;
 	if (!r.recorder->own_thread) ResolvePending(owner, pending, tick);
 	std::lock_guard lock(m_mutex);
+	if ((first < r.state.closed.size() || (r.stop != nullptr && r.stop != ChunkEnd) || r.abandoned) &&
+	    r.serial != 0 && r.pass != 0) {
+		DropCopyCandidates(r.serial, r.chunk, r.pass);
+	}
 	// (A speculation thread's: released when it begins its next translation.)
 	if (r.recorder->own_thread) owner.resolved.emplace_back(pending, tick);
 	// (Its pending writes are made or dropped: what was translated after it reads through its command buffer's record

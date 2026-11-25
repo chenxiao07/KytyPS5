@@ -75,6 +75,10 @@ public:
 	// pending writes dropped, the live count down), so the destructor waits for no tick that will never be submitted.
 	void RequestStop();
 	void Stop();
+	// On mode-4 exit, after all participating instances have stopped.
+	void ReleaseCopyForwarding();
+	// With forwarding enabled, before starting mode-4 workers. The GPU owns the enqueue serial for their lifetime.
+	void PrepareCopyForwarding(const std::atomic<uint64_t>& enqueue_serial);
 
 	// Blocked: committed up to a wait hole not satisfied yet (the submission waits; Resume goes on from there). Chunk:
 	// committed up to the end of its chunk (mode 4: the execution is where the next begins). Yield (mode 4): nothing
@@ -135,6 +139,15 @@ public:
 	static void GpuThreadAffinityAtFlip();
 
 private:
+	friend class CommandProcessor;
+	friend struct Spec::State;
+	bool FinishCopyPacket(uint64_t serial, uint64_t pass, const Spec::CopyCursor& cursor, const Spec::CopyOutcome& copy,
+	                      bool replay = false);
+	void AdvanceCopyProgress(uint64_t serial, const Spec::CopyCursor& next, bool inclusive = false);
+	void DropCopyCandidates(uint64_t serial = 0, uint32_t chunk = UINT32_MAX, uint64_t pass = 0);
+	bool MightReadForwarded(uint64_t address, uint64_t size) const;
+	bool ReadForwarded(Spec::State& state, uint64_t address, void* out, uint64_t size) const;
+
 	// A packet left to the commit (Spec::State::closed: it follows the segment of its index), why, and the
 	// speculation's execution past it.
 	struct Hole {
@@ -282,6 +295,7 @@ private:
 	[[nodiscard]] bool SampledLevelsMapped(const Spec::ImageUse& use, uint64_t mapping) const;
 	// The segments committed, the holes after them run: all, or up to what the work after it no longer holds
 	// (Result::next: the segments committed).
+	[[nodiscard]] bool ForwardedReadFailure(const Result& result, size_t index) const;
 	// Under KYTY_SPECULATE=4 (Spec::State::read_values_on): whether a clean read of segment `index` that a processor
 	// write was logged over since the speculation began still gives the translation's bytes.
 	[[nodiscard]] bool     ReadValuesHold(const Result& result, size_t index, const Spec::Range& read) const;
@@ -299,7 +313,7 @@ private:
 	[[nodiscard]] AsHole SegmentAsHole(Result& result, CommandProcessor& cp, size_t index, bool resume = false);
 	// At segment `index`'s commit (KYTY_SPECULATE=4): why a word it read from the journal that an earlier segment's
 	// write gave no longer holds (null: all hold).
-	[[nodiscard]] const char* JournalReadsMoved(const Result& result, size_t index) const;
+	[[nodiscard]] const char* JournalReadsMoved(const Result& result, size_t index, Spec::Range* changed_bytes) const;
 	// KYTY_SPECULATE=4: a speculation thread; the state pass of a submission (the state it starts from, null: none to
 	// translate, or the pass could not follow it); the state pass on from the GPU thread's last submission when it
 	// cannot follow or is behind (under m_mutex).
@@ -344,6 +358,8 @@ private:
 	void Report();
 
 	RenderContext&                           m_renderer;
+	struct SharedEffects;
+	std::shared_ptr<SharedEffects> m_shared = AcquireSharedEffects(); // outlives the results' completion tokens
 	std::vector<std::unique_ptr<Translator>> m_translators;
 	bool                                     m_pass_thread = false; // (KYTY_SPEC_PASS_THREAD: the last of m_translators)
 	std::deque<std::unique_ptr<Result>>      m_ahead;     // translated ahead (under m_mutex in mode 4)
@@ -356,7 +372,6 @@ private:
 	// In mode 4, `m_live`: the effects_from of every result of this instance from its sample to Finish,
 	// wherever it is meanwhile (translated, ahead, abandoned, in hand, blocked; under m_mutex); `m_oldest_live`: their
 	// least, LiveNone, or LiveSampling while one is being sampled: the shared drop reads it without the lock.
-	struct SharedEffects;
 	static constexpr uint64_t LiveNone = UINT64_MAX, LiveSampling = UINT64_MAX - 1;
 	[[nodiscard]] static std::shared_ptr<SharedEffects> AcquireSharedEffects();
 	[[nodiscard]] Spec::EffectsLog&                     SelectEffectsLog();
@@ -367,7 +382,6 @@ private:
 	[[nodiscard]] uint64_t DropShared();
 	void                   BeginShared(const Result& result);
 	void                   TakeShared();
-	std::shared_ptr<SharedEffects>    m_shared = AcquireSharedEffects(); // (null outside mode 4)
 	std::unique_ptr<Spec::EffectsLog> m_own_log =
 	    m_shared ? nullptr : std::make_unique<Spec::EffectsLog>();
 	// What the normal translation did, and what of it was logged since the result being committed began (its own log, or

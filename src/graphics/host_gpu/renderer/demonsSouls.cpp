@@ -75,7 +75,7 @@ bool TryLinearCopy(const LinearCopyDispatch& dispatch, BufferCache& cache, uint3
                    uint32_t mode) {
 	const auto copy = LinearCopyOf(dispatch, x, y, z, mode);
 	if (!copy) return false;
-	cache.CopyBuffer(copy->dst, copy->src, copy->bytes, false, false);
+	cache.CopyBuffer(copy->dst, copy->src, copy->bytes, false, false, true);
 	cache.ScheduleCopyFeedback(copy->dst, copy->bytes);
 	return true;
 }

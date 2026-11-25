@@ -288,8 +288,9 @@ void CopyShaderCode(ShaderParams& params, std::vector<uint32_t>& code, std::vect
 			std::memcpy(to.data(), from.data(), from.size_bytes());
 			return true;
 		}
+		// The program cache can retain the code under a hash obtained before this read.
 		return Libs::LibKernel::Memory::TryReadGuestNoFault(reinterpret_cast<uint64_t>(from.data()), to.data(),
-		                                                    from.size_bytes());
+		                                                    from.size_bytes(), /*forward=*/false);
 	};
 	if (!copy(params.code, code) || !copy(params.back_code, back_code)) {
 		params.code_unread = true;

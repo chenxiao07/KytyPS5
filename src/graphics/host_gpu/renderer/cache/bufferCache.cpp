@@ -3446,6 +3446,16 @@ StreamBuffer& BufferCache::GetTableUploadBuffer() noexcept {
 // ObtainBuffer for a speculative translation (speculation-state.h), out of line so the normal path keeps main's body.
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSpec(Spec::State& spec, uint64_t vaddr, uint64_t size,
                                                            bool is_written, bool is_texel_buffer) {
+	const auto read_backing = [&](void* out) {
+		if (spec.ForwardReadsEnabled() && spec.ReadForwarded(vaddr, out, size)) {
+			return true;
+		}
+		if (!Libs::LibKernel::Memory::TryReadBackingToHost(vaddr, out, size)) {
+			return false;
+		}
+		spec.NoteCleanRead(vaddr, size);
+		return true;
+	};
 	// As ObtainBuffer: a small range the guest wrote, read from a copy in the (speculation's) ring, as no GPU work wrote
 	// it (speculation-state.h) and with no guest memory write of the speculation pending over it.
 	if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(vaddr, size) &&
@@ -3454,9 +3464,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSpec(Spec::State& spec, ui
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 4);
 		auto [mapped, offset] = upload.Map(size, alignment, false);
-		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(vaddr, mapped, size)) {
+		if (mapped != nullptr && read_backing(mapped)) {
 			upload.Commit();
-			spec.NoteCleanRead(vaddr, size);
 			return {&upload, offset};
 		}
 	}
@@ -3490,9 +3499,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSpec(Spec::State& spec, ui
 			const auto alignment = std::max<uint64_t>(
 			    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 4);
 			auto [mapped, offset] = upload.Map(size, alignment, false);
-			if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(vaddr, mapped, size)) {
+			if (mapped != nullptr && read_backing(mapped)) {
 				upload.Commit();
-				spec.NoteCleanRead(vaddr, size);
 				PostAhead(vaddr, size);
 				return {&upload, offset};
 			}
@@ -3874,7 +3882,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
-                             bool src_gds) {
+                             bool src_gds, bool linear_dispatch) {
 	const bool dst_memory = !dst_gds;
 	const bool src_memory = !src_gds;
 	if ((dst_memory && dst_vaddr == 0) || (src_memory && src_vaddr == 0) || size == 0 ||
@@ -3907,10 +3915,17 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 			}
 			spec->NoteCpuCopy(src_vaddr, size);
 			spec->NoteCpuCopy(dst_vaddr, size);
-			spec->Journal(dst_vaddr, src_vaddr, static_cast<uint32_t>(size), true);
+			spec->Journal(dst_vaddr, src_vaddr, static_cast<uint32_t>(size), true,
+			              linear_dispatch ? Spec::HostWriteKind::LinearCopy : Spec::HostWriteKind::Other);
+			if (linear_dispatch && Spec::CopyForwardActive()) {
+				Spec::ReportLinearCopy(dst_vaddr, src_vaddr, size, false);
+			}
 			return;
 		}
-		CopyGuestMemory(dst_vaddr, src_vaddr, size);
+		CopyGuestMemory(dst_vaddr, src_vaddr, size, linear_dispatch);
+		if (linear_dispatch && Spec::CopyForwardActive()) {
+			Spec::ReportLinearCopy(dst_vaddr, src_vaddr, size, false);
+		}
 		// (While workers run: the copy this thread made, which the weave compares with the reader's record of it.)
 		if (Weave::Active()) Weave::t_copy_done = {.dst = dst_vaddr, .src = src_vaddr, .bytes = size, .path = 1};
 		return;
@@ -3940,6 +3955,9 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		EXIT("BufferCache: resolved Vulkan copy ranges overlap\n");
 	}
 	dst->CopyInRun(command, *src, src_offset, dst_offset, size);
+	if (linear_dispatch && Spec::CopyForwardActive()) {
+		Spec::ReportLinearCopy(dst_vaddr, src_vaddr, size, true);
+	}
 }
 
 // Copies from this size on compare their pages on helper threads too (ParallelPages): below it, waking them costs about
@@ -3997,7 +4015,8 @@ bool BufferCache::WriteGuestKnownWriter(uint64_t vaddr, const void* data, uint64
 	       Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size);
 }
 
-void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size) {
+void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool linear_dispatch) {
+	const auto kind = linear_dispatch ? Spec::HostWriteKind::LinearCopy : Spec::HostWriteKind::Other;
 	// The game's linear copies mostly rewrite what the destination already holds (95% of the bytes in the fixed
 	// scene): only the destination pages whose bytes differ are written, so the others stay clean (no upload of their
 	// bytes to the GPU again). A run of them with a write-protected page (uploaded since it was last written) is marked
@@ -4019,7 +4038,7 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 			if (m_memory_tracker.MarkRegionAsCpuDirtyKeepProtection(address, bytes) &&
 			    (Libs::LibKernel::Memory::TryWriteCpuBacking(address, from, bytes) ||
 			     Libs::LibKernel::Memory::TryWriteBacking(address, from, bytes))) {
-				parts.Note();
+				parts.Note(kind);
 				// (A linear copy's write, so noted: the weave's ring test passes over it for a parcel that read through
 				// the copy.)
 				if (Scout::Running()) Scout::NoteHostWrite(address, bytes, false, /*copy=*/true);
@@ -4030,7 +4049,7 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 		} else if (WriteGuestKnownWriter(address, from, bytes)) {
 			// (KYTY_SPEC_LABEL_KNOWN_WRITER: CPU-dirty pages still watched, written the way above since their upload, are
 			// written the same way again, their epoch moved by the mark: no write fault releasing the watch.)
-			parts.Note();
+			parts.Note(kind);
 			if (Scout::Running()) Scout::NoteHostWrite(address, bytes);
 			return;
 		}
@@ -4038,7 +4057,7 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 		// stale. A linear copy is a dispatch, no point the observation epoch moves at.)
 		m_memory_tracker.NoteHostWrite(address, bytes);
 		std::memcpy(reinterpret_cast<void*>(address), from, bytes);
-		parts.Note();
+		parts.Note(kind);
 		if (Scout::Running()) Scout::NoteHostWrite(address, bytes, false, /*copy=*/true);
 	};
 	// Which destination pages differ: compared on helper threads too when the copy is large (the 4 MiB copy the culling

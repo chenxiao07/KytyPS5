@@ -38,6 +38,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -56,6 +57,7 @@ bool BackingView(uint64_t* base, uint64_t* size);                     // (kernel
 namespace Libs::Graphics {
 class Image;
 class StreamBuffer;
+class Speculation;
 } // namespace Libs::Graphics
 
 namespace Libs::Graphics::Spec {
@@ -74,12 +76,76 @@ struct ReadValue {
 
 // A guest memory write of the command processor (a label) or a copy made on the CPU (a linear copy:
 // BufferCache::CopyBuffer), applied at commit in order.
+enum class HostWriteKind : uint8_t { Other, LinearCopy };
 struct MemoryWrite {
 	uint64_t address = 0;
 	uint64_t value   = 0; // a copy's source address
 	uint32_t size    = 0; // 4 or 8; a copy's bytes
 	bool     copy    = false;
 	bool     gpu     = false; // (a copy its commit makes as the in-order GPU copy, BufferCache::CopyBuffer: mode 4)
+	HostWriteKind host_kind = HostWriteKind::Other;
+};
+
+// The guest buffer bases and offsets, including each parent indirect-buffer packet.
+struct CopyCursor {
+	static constexpr size_t MaxDepth = 8;
+	std::array<const uint32_t*, MaxDepth> buffers {};
+	std::array<uint32_t, MaxDepth> offsets {}; // offset + 1, zero for an unused level
+	bool operator==(const CopyCursor&) const = default;
+};
+struct CopyOutcome {
+	uint64_t dst = 0, src = 0, bytes = 0;
+	bool gpu = false;
+};
+extern thread_local CopyOutcome* t_copy_outcome;
+inline void ReportLinearCopy(uint64_t dst, uint64_t src, uint64_t bytes, bool gpu) {
+	if (t_copy_outcome != nullptr) {
+		*t_copy_outcome = {dst, src, bytes, gpu};
+	}
+}
+// Set before the mode-4 workers can take jobs, cleared after they quiesce.
+extern std::atomic_bool g_copy_forward_active;
+[[nodiscard]] inline bool CopyForwardActive() {
+	return g_copy_forward_active.load(std::memory_order_relaxed);
+}
+[[nodiscard]] inline bool CopyForwardWriter(uint32_t queue) {
+	return CopyForwardActive() && queue == 0;
+}
+[[nodiscard]] inline bool CopyForwardReader(uint32_t queue) {
+	return CopyForwardActive() && queue != 0;
+}
+struct CopyDispatch {
+	CopyCursor cursor;
+	CopyOutcome copy;
+	size_t write = SIZE_MAX;
+};
+struct CopyCompletion {
+	static constexpr uint64_t Pending = UINT64_MAX, Invalid = UINT64_MAX - 1;
+	std::atomic<uint64_t> effects_end {Pending};
+	std::atomic<uint32_t> readers {0};
+};
+// SharedEffects owns the slots. A retired slot can be reused once the last reader releases it.
+struct CopyToken {
+	CopyCompletion* completion = nullptr;
+	CopyToken() = default;
+	explicit CopyToken(CopyCompletion& slot): completion(&slot) {
+		completion->readers.fetch_add(1, std::memory_order_relaxed);
+	}
+	CopyToken(CopyToken&& other) noexcept: completion(std::exchange(other.completion, nullptr)) {}
+	CopyToken& operator=(CopyToken&& other) noexcept {
+		std::swap(completion, other.completion);
+		return *this;
+	}
+	~CopyToken() {
+		if (completion != nullptr) {
+			completion->readers.fetch_sub(1, std::memory_order_release);
+		}
+	}
+};
+struct ForwardedRead {
+	static constexpr size_t MaxDepth = 4;
+	uint64_t address, size, offset;
+	std::array<CopyToken, MaxDepth> writers;
 };
 
 // A word read from the pending guest memory writes of a speculation before it (State::previous), and a wait
@@ -107,7 +173,8 @@ struct Counts {
 	       clean_reads = 0, feedbacks = 0, buffer_ranges = 0, sets = 0, chain_reads = 0, waits = 0, cpu_copies = 0,
 	       late_reads = 0, texel_syncs = 0, pending_buffers = 0, table_ranges = 0, pending_targets = 0, indexed_draws = 0,
 	       scenes = 0, used_pairs = 0, left_clears = 0, journal_reads = 0, journal_words = 0, reloc_refs = 0, reloc_unrel = 0,
-	       covered_waits = 0, read_values = 0, unvalued_reads = 0, srt_verify = 0;
+	       covered_waits = 0, read_values = 0, unvalued_reads = 0, srt_verify = 0,
+	       copy_dispatches = 0, forwarded_reads = 0, forwarded_bytes = 0;
 };
 
 // spec_pending_buffers (under KYTY_SPECULATE=4 only): a table V#'s range with no
@@ -681,6 +748,32 @@ struct State {
 	//   ReadValue::MaxBytes), which keep no bytes: a range one of those touched is never passed by value at the commit
 	//   (Speculation::ReadValuesHold).
 	std::vector<ReadValue> read_values;
+	Speculation* forward_owner = nullptr;
+	// A state-pass cut has at most 128 draw/dispatch packets. Oversized records conservatively block forwarding.
+	static constexpr size_t CopyDispatchLimit = 128;
+	std::vector<CopyDispatch> copy_dispatches;
+	bool copy_dispatch_overflow = false;
+	void NoteCopyDispatch(const CopyDispatch& dispatch) {
+		if (copy_dispatches.size() == CopyDispatchLimit) {
+			copy_dispatch_overflow = true;
+			return;
+		}
+		if (copy_dispatches.capacity() == 0) copy_dispatches.reserve(CopyDispatchLimit);
+		copy_dispatches.push_back(dispatch);
+	}
+	std::vector<ForwardedRead> forwarded_reads;
+	std::vector<uint8_t> forwarded_bytes;
+	// Resolver scratch, empty between reads. Its capacity is reused by this translation state.
+	struct ForwardPiece {
+		uint64_t destination, source, bytes;
+		decltype(ForwardedRead::writers) writers;
+	};
+	std::vector<ForwardPiece> forward_pieces;
+	[[nodiscard]] bool ForwardReadsEnabled() const {
+		return forward_owner != nullptr;
+	}
+	[[nodiscard]] bool MightReadForwarded(uint64_t address, uint64_t size);
+	[[nodiscard]] bool ReadForwarded(uint64_t address, void* out, uint64_t size);
 	std::vector<Range>     unvalued_reads;
 	bool                   read_values_on = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 	// - the sources and destinations of the copies it makes on the CPU at its commit (in order: what the guest or the
@@ -915,7 +1008,8 @@ struct State {
 		        late_reads.size(),     texel_syncs.size(),     pending_buffers.size(), table_ranges.size(), pending_targets.size(),
 		        indexed_draws,         scenes,                 used_pairs.size(),      left_clears.size(),
 		        journal_reads.size(),  journal_words.size(),   reloc_refs.size(),  reloc_unrel.size(),
-		        covered_waits,         read_values.size(),     unvalued_reads.size(), srt_verify.size()};
+		        covered_waits,         read_values.size(),     unvalued_reads.size(), srt_verify.size(),
+		        copy_dispatches.size(), forwarded_reads.size(), forwarded_bytes.size()};
 	}
 	// Its pending guest memory writes or a previous speculation's over the range; the ranges its work or a previous
 	// one's writes.
@@ -1237,8 +1331,9 @@ struct State {
 	void PredictClear(uint64_t address, bool dcc = false) {
 		meta_facts.push_back({address, UINT32_MAX, true, closed.size() + 1, closed.size() + 1, dcc});
 	}
-	void Journal(uint64_t address, uint64_t value, uint32_t size, bool copy = false) {
-		writes.push_back({address, value, size, copy});
+	void Journal(uint64_t address, uint64_t value, uint32_t size, bool copy = false,
+	             HostWriteKind host_kind = HostWriteKind::Other) {
+		writes.push_back({address, value, size, copy, false, host_kind});
 		journal_set.Add(address, size);
 		pending.Add(address, size);
 		if (one_set) pending_set.Add(address, size);
@@ -1255,6 +1350,9 @@ struct State {
 		// (Mostly nothing pending over the words: one look for all of them.)
 		const uint64_t bytes = uint64_t {4} * count;
 		if (bytes != 0 && !pending.MayHold(address, bytes)) {
+			if (clean && forward_owner != nullptr && ReadForwarded(address, out, bytes)) {
+				return true;
+			}
 			if (!CopyGuest(out, address, bytes)) return false;
 			if (clean) NoteCleanReadValue(address, bytes, out);
 			return true;
@@ -1273,6 +1371,9 @@ struct State {
 			const bool read_late =
 			    !none && clean && log_end != nullptr && LateReads() && chain_journal.Intersects(address, bytes);
 			const uint64_t since = read_late ? log_end->load(std::memory_order_acquire) : 0;
+			if (!read_late && clean && forward_owner != nullptr && ReadForwarded(address, out, bytes)) {
+				return true;
+			}
 			if (!CopyGuest(out, address, bytes)) return false;
 			if (read_late) NoteLateRead(address, bytes, since);
 			else if (clean) NoteCleanReadValue(address, bytes, out);
@@ -1282,6 +1383,7 @@ struct State {
 		static auto& copy_runs = LiveSwitch::Find("speculate_copy_runs", 1);
 		if (count > 1 && copy_runs.load(std::memory_order_relaxed) != 0)
 			if (const auto run = ReadCopyRun(address, count, out); run != Run::NotOne) return run == Run::Read;
+		// Mixed journal reads use the word resolver. Cross-queue forwarding is attempted only for whole clean spans.
 		for (uint32_t i = 0; i < count; ++i) {
 			const uint64_t at = address + 4ull * i;
 			const State*   by = nullptr;
@@ -1535,6 +1637,9 @@ struct State {
 		reloc_unrel.resize(std::min(reloc_unrel.size(), checkpoint.reloc_unrel));
 		covered_waits = std::min(covered_waits, checkpoint.covered_waits);
 		read_values.resize(std::min(read_values.size(), checkpoint.read_values));
+		copy_dispatches.resize(std::min(copy_dispatches.size(), checkpoint.copy_dispatches));
+		forwarded_reads.resize(std::min(forwarded_reads.size(), checkpoint.forwarded_reads));
+		forwarded_bytes.resize(std::min(forwarded_bytes.size(), checkpoint.forwarded_bytes));
 		unvalued_reads.resize(std::min(unvalued_reads.size(), checkpoint.unvalued_reads));
 		srt_verify.resize(std::min(srt_verify.size(), checkpoint.srt_verify));
 		bda_all = checkpoint_bda_all;
@@ -1565,6 +1670,11 @@ struct State {
 		journal_words.clear();
 		journal_reads_on = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 		read_values.clear();
+		forward_owner = nullptr;
+		copy_dispatches.clear();
+		copy_dispatch_overflow = false;
+		forwarded_reads.clear();
+		forwarded_bytes.clear();
 		unvalued_reads.clear();
 		read_values_on = journal_reads_on;
 		covered_waits  = 0;
@@ -2050,6 +2160,7 @@ struct EffectsLog {
 	struct Entry {
 		Kind         kind   = Kind::GpuWrite;
 		EffectSource source = EffectSource::Normal;
+		bool         q0_linear_copy = false;
 		uint64_t     address = 0, size = 0; // a set: its handle
 	};
 	// KYTY_SPEC_LOG_FLAT=1 (1 under KYTY_SPECULATE=4, 0 otherwise; read once, at the first log: the containers do not
@@ -2113,6 +2224,7 @@ struct EffectsLog {
 		}
 	};
 	EntryList             entries;
+	bool                  graphics_writer = false; // set by the GPU thread for the current submission
 	uint64_t              base = 0;  // the index of entries.front() since the log began
 	std::atomic<uint64_t> end {0};   // entries since the log began (read where a speculation begins)
 	[[nodiscard]] uint64_t End() const noexcept { return end.load(std::memory_order_acquire); }
@@ -2142,7 +2254,7 @@ struct EffectsLog {
 		return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 1 : 0;
 	}
 	// KYTY_SPEC_LOG_FLAT: Add's entry, stamps, index lists and end, in Add's order.
-	void AddFlat(Kind kind, uint64_t address, uint64_t size) {
+	void AddFlat(Kind kind, uint64_t address, uint64_t size, bool q0_linear_copy) {
 		const uint64_t at = base + (entries.ring.tail - entries.ring.head);
 		if (IndexSwitch() != 0) {
 			if (index_from == UINT64_MAX) index_from = at;
@@ -2168,14 +2280,18 @@ struct EffectsLog {
 		}
 		if (kind != Kind::RetiredSet) stamps.StampRuns(address, size, at + 1);
 		if (kind == Kind::HostWrite) host_stamps.StampRuns(address, size, at + 1);
-		entries.ring.push_back({kind, t_effect_source, address, size});
+		entries.ring.push_back({kind, t_effect_source, q0_linear_copy, address, size});
 		end.store(at + 1, std::memory_order_release);
 	}
 	void ForgetList(uint64_t granule) noexcept {
 		if (granule < index_lists.size()) index_lists[granule] = nullptr;
 	}
-	void                   Add(Kind kind, uint64_t address, uint64_t size) {
-		                  if (entries.flat) return AddFlat(kind, address, size);
+	void                   Add(Kind kind, uint64_t address, uint64_t size, HostWriteKind host_kind = HostWriteKind::Other) {
+		                  const bool q0_linear_copy = kind == Kind::HostWrite && graphics_writer &&
+		                                              host_kind == HostWriteKind::LinearCopy;
+		                  if (entries.flat) {
+			                  return AddFlat(kind, address, size, q0_linear_copy);
+		                  }
 		                  if (IndexSwitch() != 0) {
 			                  const uint64_t at = base + entries.size();
 			                  if (index_from == UINT64_MAX) index_from = at;
@@ -2191,7 +2307,7 @@ struct EffectsLog {
 		                  }
 		                  if (kind != Kind::RetiredSet) stamps.Stamp(address, size, base + entries.size() + 1);
 		                  if (kind == Kind::HostWrite) host_stamps.Stamp(address, size, base + entries.size() + 1);
-		                  entries.push_back({kind, t_effect_source, address, size});
+		                  entries.push_back({kind, t_effect_source, q0_linear_copy, address, size});
 		                  end.store(base + entries.size(), std::memory_order_release);
 	}
 	// The log's number, never another's (the slots name logs by it).
@@ -2444,10 +2560,14 @@ inline void NoteGpuWrite(uint64_t address, uint64_t size) {
 	if (t_effects != nullptr) t_effects->Add(EffectsLog::Kind::GpuWrite, address, size);
 	if (t_effects_async != nullptr) t_effects_async->Add(EffectsLog::Kind::GpuWrite, address, size);
 }
-inline void NoteHostWrite(uint64_t address, uint64_t size) {
+inline void NoteHostWrite(uint64_t address, uint64_t size, HostWriteKind kind = HostWriteKind::Other) {
 	if (size == 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) == 0) return;
-	if (t_effects != nullptr) t_effects->Add(EffectsLog::Kind::HostWrite, address, size);
-	if (t_effects_async != nullptr) t_effects_async->Add(EffectsLog::Kind::HostWrite, address, size);
+	if (t_effects != nullptr) {
+		t_effects->Add(EffectsLog::Kind::HostWrite, address, size, kind);
+	}
+	if (t_effects_async != nullptr) {
+		t_effects_async->Add(EffectsLog::Kind::HostWrite, address, size, kind);
+	}
 }
 // Under KYTY_SPECULATE=4, ObtainBuffer's written note uses the slot of its write
 // memo's. The logs' one writer's, the GPU thread's: no other thread has t_effects set.
@@ -2534,16 +2654,18 @@ struct HostWriteParts {
 			at += n;
 		}
 	}
-	void Note() const;
+	void Note(HostWriteKind kind = HostWriteKind::Other) const;
 };
 inline void NoteRetiredSet(uint64_t set) {
 	if (!On()) return;
 	if (t_effects != nullptr) t_effects->Add(EffectsLog::Kind::RetiredSet, set, 0);
 	if (t_effects_async != nullptr) t_effects_async->Add(EffectsLog::Kind::RetiredSet, set, 0);
 }
-inline void HostWriteParts::Note() const {
-	if (whole) return NoteHostWrite(address, size);
-	for (uint32_t i = 0; i < count; ++i) NoteHostWrite(parts[i].first, parts[i].second);
+inline void HostWriteParts::Note(HostWriteKind kind) const {
+	if (whole) {
+		return NoteHostWrite(address, size, kind);
+	}
+	for (uint32_t i = 0; i < count; ++i) NoteHostWrite(parts[i].first, parts[i].second, kind);
 }
 
 } // namespace Libs::Graphics::Spec

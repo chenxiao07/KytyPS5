@@ -160,10 +160,13 @@ static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
 // waits for the GPU thread while the catalog is held; a fault sets t_shader_hash_failed.)
 thread_local bool t_shader_hash_no_fault = false;
 static thread_local bool t_shader_hash_failed = false;
+// Shader identity can outlive the segment which computes it (ShaderCodeHash's cache).
 static void ReadShaderMemory(uint64_t address, void* out, size_t bytes) {
-	if (LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, out, bytes)) return;
+	if (LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, out, bytes, /*forward=*/false)) {
+		return;
+	}
 	if (t_shader_hash_no_fault) {
-		if (!LibKernel::Memory::TryReadGuestNoFault(address, out, bytes)) { // (a read-watched page only through its clean backing)
+		if (!LibKernel::Memory::TryReadGuestNoFault(address, out, bytes, /*forward=*/false)) {
 			t_shader_hash_failed = true;
 			std::memset(out, 0, bytes);
 		}
@@ -182,7 +185,10 @@ bool ShaderReadGuest(void* out, const void* guest, size_t bytes) {
 		std::memcpy(out, guest, bytes);
 		return true;
 	}
-	if (LibKernel::Memory::TryReadGuestNoFault(reinterpret_cast<uint64_t>(guest), out, bytes)) return true;
+	// The pipeline cache can retain products of these reads under the raw shader identity.
+	if (LibKernel::Memory::TryReadGuestNoFault(reinterpret_cast<uint64_t>(guest), out, bytes, /*forward=*/false)) {
+		return true;
+	}
 	t_shader_read_failed = true;
 	std::memset(out, 0, bytes);
 	return false;
@@ -237,12 +243,14 @@ static uint64_t HashShaderCode(std::span<const uint32_t> code) {
 		thread_local std::vector<uint32_t> scratch;
 		if (scratch.size() < code.size()) scratch.resize(code.size());
 		if (LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(
-		        reinterpret_cast<uint64_t>(code.data()), scratch.data(), code.size_bytes())) {
+		        reinterpret_cast<uint64_t>(code.data()), scratch.data(), code.size_bytes(), /*forward=*/false)) {
 			return XXH3_64bits(scratch.data(), code.size_bytes());
 		}
 		if (t_shader_hash_no_fault) { // (no load that can fault: the guarded copy, then the hash)
-			if (!LibKernel::Memory::TryReadGuestNoFault(reinterpret_cast<uint64_t>(code.data()), scratch.data(), code.size_bytes()))
+			if (!LibKernel::Memory::TryReadGuestNoFault(reinterpret_cast<uint64_t>(code.data()), scratch.data(),
+			                                           code.size_bytes(), /*forward=*/false)) {
 				return t_shader_hash_failed = true, 0;
+			}
 			return XXH3_64bits(scratch.data(), code.size_bytes());
 		}
 	}

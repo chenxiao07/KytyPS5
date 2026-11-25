@@ -723,10 +723,16 @@ void RenderExecutor::PredictDispatch(const HW::Shader& sh_ctx, uint32_t thread_g
 		    .thread_dimensions  = (mode & (1u << 5u)) != 0};
 		if (const auto copy = DemonsSouls::LinearCopyOf(dispatch, thread_group_x, thread_group_y, thread_group_z, mode)) {
 			auto& buffers = m_context.GetBufferCache();
-			if (buffers.IsRegionGpuModified(copy->dst, copy->bytes) || buffers.IsRegionGpuModified(copy->src, copy->bytes))
+			const bool gpu = buffers.IsRegionGpuModified(copy->dst, copy->bytes) ||
+			                 buffers.IsRegionGpuModified(copy->src, copy->bytes);
+			if (Spec::CopyForwardActive()) {
+				Spec::ReportLinearCopy(copy->dst, copy->src, copy->bytes, gpu);
+			}
+			if (gpu) {
 				record.NoteWritten(copy->dst, copy->bytes);
-			else
+			} else {
 				record.Journal(copy->dst, copy->src, static_cast<uint32_t>(copy->bytes), true);
+			}
 			return;
 		}
 	}

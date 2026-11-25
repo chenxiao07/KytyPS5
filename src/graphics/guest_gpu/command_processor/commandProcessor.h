@@ -15,6 +15,12 @@
 
 namespace Libs::Graphics {
 
+class Speculation;
+namespace Spec {
+struct CopyOutcome;
+struct CopyCursor;
+} // namespace Spec
+
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
 // The first entry of an indirect register table (`pairs` register-value pairs; `bank`: 0 context, 1 SH, 2 uconfig) that
 // names no register of its bank (not the sentinel, a context table's fake registers or the bank's NOP), or `pairs` when
@@ -239,6 +245,11 @@ public:
 
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
+	void SetCopySubmission(Speculation* owner, uint64_t serial, uint64_t pass = 0) {
+		m_copy_owner = owner;
+		m_copy_serial = serial;
+		m_copy_pass = pass;
+	}
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 	// The weave (weave.h): GuestGpu::Enqueue's feed of a queue-0 graphics submission to the reader (the queue mutex
@@ -258,12 +269,18 @@ private:
 	uint32_t            m_chunk_every = 0, m_chunk_work = 0, m_chunk_last_opcode = 0;
 	bool                m_at_boundary = false, m_stop_reached = false, m_watched_stop = false;
 	const Pm4Execution* m_stop_at = nullptr;
+	friend class Speculation;
+	Speculation* m_copy_owner = nullptr;
+	uint64_t m_copy_serial = 0, m_copy_pass = 0;
+	const Pm4Execution* m_copy_hole_at = nullptr;
+	static bool CopyPosition(const Pm4Execution& execution, Spec::CopyCursor& cursor);
+	void NoteCopyPacket(const Pm4Execution& execution, const Spec::CopyOutcome& copy);
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
-	void ProcessPm4(Pm4Execution& execution, size_t stop_depth);
+	void ProcessPm4(Pm4Execution& execution, size_t stop_depth, uint32_t mode);
 	template <bool Guarded>
 	void ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth);
 	const std::atomic<bool>*     m_command_cancel = nullptr;

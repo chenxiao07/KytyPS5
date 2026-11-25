@@ -15,6 +15,7 @@
 
 #include <vk_mem_alloc.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <deque>
@@ -164,9 +165,9 @@ public:
 	                                                            uint64_t total, const char** why = nullptr);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
-	                bool src_gds);
+	                bool src_gds, bool linear_dispatch = false);
 	// CopyBuffer's copy on the CPU: only the destination pages whose bytes differ are written.
-	void CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size);
+	void CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool linear_dispatch = false);
 	// A commit's copy bytes written by a guarded write (speculation.cpp, GuardedCopy): the regions' epochs move, as
 	// CopyGuestMemory's writes move them.
 	void NoteGuardedCopyWrite(uint64_t vaddr, uint64_t size);

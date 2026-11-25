@@ -37,6 +37,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -6127,8 +6128,24 @@ bool TextureCache::IsRegionImageBacked(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) return false;
 	if (SpecVirtualOverlap(address, size)) return true; // (a no-image target the calling speculation's commit makes)
 	if (!m_lock.ReadShared([&] { return MayHaveImagesRead(address, size); })) return false;
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+		return false;
+	}
 	const ReadLock lock {m_lock}; // (mode 4: shared on a speculation's thread)
-	return !FindImagesInRegion(address, size, false).empty();
+	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+		const auto* owners = m_image_page_table.Find(page);
+		if (owners == nullptr) {
+			continue;
+		}
+		for (const auto id: *owners) {
+			const auto* image = m_slot_images.try_get(id);
+			if (image != nullptr && image->Overlaps(address, size, false)) {
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 namespace {
