@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <list>
@@ -183,6 +184,7 @@ private:
 		bool         abandoned = false; // claimed by the GPU thread during translation
 		bool         blind  = false; // translated without the one before it while that was not done (mode 4)
 		size_t       submitted = 0, next = 0; // recorded command buffers submitted, segments committed
+		size_t       first_unsettled_proposal = 0;
 		uint64_t     last_tick = 0;           // the last of them's tick (0: none; batched / spliced: not yet submitted)
 		size_t       blocked   = SIZE_MAX;    // the wait hole the commit waits at
 		bool         blocked_as_hole = false; // (... after its segment ran as a hole: `cp` holds the hole's state)

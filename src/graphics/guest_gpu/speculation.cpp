@@ -3664,14 +3664,19 @@ void Speculation::After(Result& result, size_t index) {
 	// waits past its commit (those waiting and it run now, under a write that waits); then the ones waiting while the tries
 	// succeed.
 	if (!state.proposed_sets.empty()) {
-		for (auto& proposed: state.proposed_sets) {
-			if (proposed.settled || proposed.segment > index) continue;
+		// The end ordinal includes proposals through this segment, including those left by a redo.
+		while (result.first_unsettled_proposal < segment.commit_image_index.proposal_end) {
+			auto& proposed = state.proposed_sets[result.first_unsettled_proposal];
 			proposed.settled = true;
-			if (proposed.settle_now) proposed.settle_now();
+			if (proposed.settle_now) {
+				proposed.settle_now();
+			}
 			const bool must_now = proposed.settle_must_now && proposed.settle_must_now();
 			RenderExecutor::SettleOrQueue(proposed.catalog_owner, [settle = proposed.settle] { settle(true); });
-			if (must_now && RenderExecutor::s_settle_pending_n.load(std::memory_order_relaxed) != 0)
+			if (must_now && RenderExecutor::s_settle_pending_n.load(std::memory_order_relaxed) != 0) {
 				RenderExecutor::SettleDrain(true);
+			}
+			++result.first_unsettled_proposal;
 		}
 		RenderExecutor::SettleDrain(false);
 	}
@@ -3981,7 +3986,10 @@ void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {
 	// (spec_worker_sets: its proposed sets no commit settled, settled here on the GPU thread while it still counts as live,
 	// not at its Result's reuse on a worker: the catalog's pair sweeps wait for no speculation live, so the pairs those
 	// sets name are alive, and the aside release's queue and the owner's state are the GPU thread's.)
-	if (!r.state.proposed_sets.empty()) r.state.SettleProposedSets(0, true);
+	if (!r.state.proposed_sets.empty()) {
+		r.state.SettleProposedSets(0, true);
+	}
+	r.first_unsettled_proposal = 0;
 	for (const auto& hole: r.holes) ++m_hole_reasons[hole.reason];
 	if (first < r.state.closed.size() || !r.recorder->recorded.empty() || r.recorder->open != SIZE_MAX)
 		scheduler.DiscardRecorded(*r.recorder);

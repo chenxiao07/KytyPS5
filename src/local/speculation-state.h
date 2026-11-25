@@ -26,7 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <set>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +37,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -2270,13 +2271,71 @@ struct EffectsLog {
 	// Each host write logged from `from` on over the range, clipped to it.
 	template <typename F>
 	void ForEachHostWriteOver(uint64_t from, uint64_t address, uint64_t size, F&& f) const {
-		if (!host_stamps.MaybeSince(address, size, from)) return;
-		for (auto i = std::max(from, base); i < base + entries.size(); ++i) {
+		if (!host_stamps.MaybeSince(address, size, from)) {
+			return;
+		}
+		const auto read_end   = address + size;
+		const auto granule    = address >> IndexGranuleBits;
+		auto       serial     = std::max(from, base);
+		const auto visit = [&](uint64_t i) {
 			const auto& entry = entries[i - base];
-			if (entry.kind != Kind::HostWrite || entry.address >= address + size || address >= entry.address + entry.size)
-				continue;
-			const auto begin = std::max(address, entry.address), end = std::min(address + size, entry.address + entry.size);
+			if (entry.kind != Kind::HostWrite || entry.address >= read_end || address >= entry.address + entry.size) {
+				return false;
+			}
+			const auto begin = std::max(address, entry.address), end = std::min(read_end, entry.address + entry.size);
 			f(begin, end - begin);
+			return true;
+		};
+
+		// Every host write logged by NoteHostWrite is nonempty. For a read within one granule, its overlapping
+		// writes are in either that granule's list or index_wide, in log order within each list.
+		if (read_end > address && granule == ((read_end - 1) >> IndexGranuleBits) &&
+		    serial < base + entries.size() && serial >= index_from && IndexSwitch() != 0) {
+			const auto find_bucket = [&]() -> const std::vector<uint64_t>* {
+				if (granule < index_lists.size()) {
+					return index_lists[granule];
+				}
+				const auto found = index.find(granule);
+				return found == index.end() ? nullptr : &found->second;
+			};
+			const auto first_in = [serial](const std::vector<uint64_t>& list) {
+				return static_cast<size_t>(std::lower_bound(list.begin(), list.end(), serial) - list.begin());
+			};
+			const auto indexed_base = base, indexed_from = index_from;
+			const auto* bucket = find_bucket();
+			const auto bucket_first = bucket != nullptr ? first_in(*bucket) : 0;
+			const auto wide_first   = first_in(index_wide);
+			auto bucket_next = bucket_first, wide_next = wide_first;
+			for (;;) {
+				const auto bucket_at = bucket != nullptr && bucket_next < bucket->size() ? (*bucket)[bucket_next] : UINT64_MAX;
+				const auto wide_at   = wide_next < index_wide.size() ? index_wide[wide_next] : UINT64_MAX;
+				const auto i         = std::min(bucket_at, wide_at);
+				if (i == UINT64_MAX) {
+					serial = base + entries.size();
+					break;
+				}
+				if (bucket_at < wide_at) {
+					++bucket_next;
+				} else {
+					++wide_next;
+				}
+				serial = i + 1;
+				if (visit(i)) {
+					// Offsets survive appends, including vector growth. A wide write's callback can create the
+					// bucket; if the log was trimmed or the index cleared, continue by serial in the full scan.
+					if (base != indexed_base || index_from != indexed_from) {
+						break;
+					}
+					if (bucket == nullptr) {
+						bucket = find_bucket();
+					}
+				}
+			}
+		}
+
+		serial = std::max(serial, base);
+		for (; serial < base + entries.size(); ++serial) {
+			visit(serial);
 		}
 	}
 	// What no speculation began before.

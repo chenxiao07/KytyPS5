@@ -61,6 +61,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <mutex>

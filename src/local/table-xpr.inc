@@ -6502,12 +6502,15 @@ struct SettlePendingPart {
 	const RenderExecutor* owner = nullptr;
 	std::function<void()> work;
 };
-static std::vector<SettlePendingPart> g_settle_pending; // (the GPU thread's; a short list, taken from its front)
+// Owned by the GPU thread. Construct the FIFO when a catalog part first has to wait.
+static std::optional<std::deque<SettlePendingPart>> g_settle_pending;
 
 void RenderExecutor::SettleOrQueue(const void* owner_opaque, std::function<void()> work) {
 	const auto* owner = static_cast<const RenderExecutor*>(owner_opaque);
-	if (owner == nullptr) return work();
-	if (g_settle_pending.empty()) {
+	if (owner == nullptr) {
+		return work();
+	}
+	if (!g_settle_pending || g_settle_pending->empty()) {
 		std::unique_lock<std::shared_mutex> lock(owner->m_catalog_mutex, std::try_to_lock);
 		if (lock.owns_lock()) {
 			t_settle_held = &owner->m_catalog_mutex;
@@ -6518,29 +6521,37 @@ void RenderExecutor::SettleOrQueue(const void* owner_opaque, std::function<void(
 			return;
 		}
 	}
-	g_settle_pending.push_back({owner, std::move(work)});
-	s_settle_pending_n.store(static_cast<uint32_t>(g_settle_pending.size()), std::memory_order_relaxed);
+	if (!g_settle_pending) {
+		g_settle_pending.emplace();
+	}
+	g_settle_pending->push_back({owner, std::move(work)});
+	s_settle_pending_n.store(static_cast<uint32_t>(g_settle_pending->size()), std::memory_order_relaxed);
 }
 
 void RenderExecutor::SettleDrain(bool blocking) {
-	while (!g_settle_pending.empty()) {
-		const auto* owner = g_settle_pending.front().owner;
+	if (!g_settle_pending) {
+		return;
+	}
+	while (!g_settle_pending->empty()) {
+		const auto* owner = g_settle_pending->front().owner;
 		std::unique_lock<std::shared_mutex> lock;
 		if (blocking) {
 			lock = owner->CatalogWrite(); // (outside mode 4 an empty lock: no reader then)
 		} else {
 			lock = std::unique_lock<std::shared_mutex>(owner->m_catalog_mutex, std::try_to_lock);
-			if (!lock.owns_lock()) return;
+			if (!lock.owns_lock()) {
+				return;
+			}
 		}
 		t_settle_held = &owner->m_catalog_mutex;
 		struct Release {
 			~Release() { t_settle_held = nullptr; }
 		} release;
 		// (Every waiting part of this owner at the front, in order, under the one write.)
-		while (!g_settle_pending.empty() && g_settle_pending.front().owner == owner) {
-			auto part = std::move(g_settle_pending.front());
-			g_settle_pending.erase(g_settle_pending.begin());
-			s_settle_pending_n.store(static_cast<uint32_t>(g_settle_pending.size()), std::memory_order_relaxed);
+		while (!g_settle_pending->empty() && g_settle_pending->front().owner == owner) {
+			auto part = std::move(g_settle_pending->front());
+			g_settle_pending->pop_front();
+			s_settle_pending_n.store(static_cast<uint32_t>(g_settle_pending->size()), std::memory_order_relaxed);
 			part.work();
 		}
 	}
@@ -6556,8 +6567,10 @@ void RenderExecutor::SettleClear() {
 			g_entry_overlay_n.store(0, std::memory_order_relaxed);
 		}
 	}
-	if (g_settle_pending.empty()) return;
-	g_settle_pending.clear();
+	if (!g_settle_pending || g_settle_pending->empty()) {
+		return;
+	}
+	g_settle_pending->clear();
 	s_settle_pending_n.store(0, std::memory_order_relaxed);
 }
 
