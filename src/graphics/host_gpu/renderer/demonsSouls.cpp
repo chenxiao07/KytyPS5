@@ -9,9 +9,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <string>
 
 // KYTY_COMPUTE_CHAIN=0: no chains (10-14, the 8 GB laptop's GPU hangs at 2-2, a TDR in ~half of the 10-minute tours
@@ -80,23 +82,13 @@ bool TryLinearCopy(const LinearCopyDispatch& dispatch, BufferCache& cache, uint3
 	return true;
 }
 
-// (Diagnostic, KYTY_LINEAR_COPY_TRACE: why a dispatch of the copy shader took the shader path.)
-static void LinearCopyRefused(const char* reason, uint64_t dst = 0, uint64_t count = 0, uint64_t period = 0) {
-	static const bool           trace = std::getenv("KYTY_LINEAR_COPY_TRACE") != nullptr;
-	static std::atomic<uint32_t> printed {0};
-	if (trace && printed.fetch_add(1) < 300)
-		std::printf("LINEAR-COPY-REFUSED %s dst 0x%llx count %llu period %llu\n", reason,
-		            static_cast<unsigned long long>(dst), static_cast<unsigned long long>(count),
-		            static_cast<unsigned long long>(period));
-}
-
 std::optional<LinearCopy> LinearCopyOf(const LinearCopyDispatch& dispatch, uint32_t x, uint32_t y, uint32_t z, uint32_t mode) {
 	const auto& data = dispatch.user_data;
 	if (data.size() != 12 || dispatch.thread_dimensions || mode != 0x41 || dispatch.threads[0] != 64 ||
 	    dispatch.threads[1] != 1 || dispatch.threads[2] != 1 || !dispatch.group_id[0] || dispatch.group_id[1] ||
 	    dispatch.group_id[2] || dispatch.thread_ids != 1 || dispatch.workgroup_register != 12 || dispatch.tg_size ||
 	    y != 1 || z != 1 || x == 0)
-		return LinearCopyRefused("dispatch shape"), std::nullopt;
+		return std::nullopt;
 	ShaderBufferResource source, destination, parameters;
 	std::memcpy(source.fields, data.data(), 16);
 	std::memcpy(destination.fields, data.data() + 4, 16);
@@ -106,40 +98,30 @@ std::optional<LinearCopy> LinearCopyOf(const LinearCopyDispatch& dispatch, uint3
 		// unanalysed format/swizzle/OOB/cache/addressing variation.
 		if (d->fields[3] != 0x00014004 || (d->fields[1] & 0xffff0000u) != 0x00040000u ||
 		    d->Base48() == 0 || (d->Base48() & 3) != 0)
-			return LinearCopyRefused("buffer descriptor"), std::nullopt;
+			return std::nullopt;
 	}
 	if (parameters.fields[3] != 0x0004dfac || (parameters.fields[1] & 0xffff0000u) != 0x00100000u ||
 	    parameters.NumRecords() != 1 || (parameters.Base48() & 3) != 0)
-		return LinearCopyRefused("parameter descriptor"), std::nullopt;
+		return std::nullopt;
 	std::array<uint32_t, 2> controls {};
 	if (!Libs::LibKernel::Memory::TryReadGpuCleanBackingToHost(parameters.Base48(), controls.data(),
 	                                                           sizeof(controls)))
-		return LinearCopyRefused("parameters not CPU-clean", destination.Base48()), std::nullopt;
+		return std::nullopt;
 	const uint64_t count = controls[0], period = controls[1], bytes = count * 4;
 	if (count == 0 || period < count || count > source.NumRecords() ||
 	    count > destination.NumRecords() || x != (count + 63) / 64 || bytes > 16 * 1024 * 1024)
-		return LinearCopyRefused("count/period", destination.Base48(), count, period), std::nullopt;
+		return std::nullopt;
 	const auto src = source.Base48(), dst = destination.Base48();
 	if ((src < dst + bytes && dst < src + bytes) ||
 	    (parameters.Base48() < dst + bytes && dst < parameters.Base48() + 16))
-		return LinearCopyRefused("overlap", dst, count, period), std::nullopt;
+		return std::nullopt;
 	// (Over consecutive mappings: the game's heaps are mapped a few hundred KiB at a time, and a 4 MiB copy of its
 	// constants spanned ten, which took the shader path every frame: its destination GPU-written, every table
 	// evaluation reading descriptors there waited for the GPU, ~2 drains a frame after the first area.)
 	if (!LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(src, bytes) ||
 	    !LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(dst, bytes) ||
 	    !LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(parameters.Base48(), 16)) {
-		static const bool trace = std::getenv("KYTY_LINEAR_COPY_TRACE") != nullptr;
-		if (trace)
-			std::printf("LINEAR-COPY-MAPPINGS src 0x%llx end 0x%llx dst 0x%llx end 0x%llx bytes 0x%llx\n",
-			            static_cast<unsigned long long>(src), static_cast<unsigned long long>(LibKernel::Memory::MappingEnd(src)),
-			            static_cast<unsigned long long>(dst), static_cast<unsigned long long>(LibKernel::Memory::MappingEnd(dst)),
-			            static_cast<unsigned long long>(bytes));
-		return LinearCopyRefused(!LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(src, bytes)   ? "aliased backing (source)"
-		                         : !LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(dst, bytes) ? "aliased backing (destination)"
-		                                                                                     : "aliased backing (parameters)",
-		                         dst, count, period),
-		       std::nullopt;
+		return std::nullopt;
 	}
 	return LinearCopy {src, dst, bytes};
 }

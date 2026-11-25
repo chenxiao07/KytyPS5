@@ -1051,26 +1051,26 @@ struct State {
 			journal.Clear();
 			written.Clear();
 			for (const State* state: chain) {
-				state->journal_set.ForEach([&](uint64_t begin, uint64_t end) { journal.Add(begin, end - begin); });
-				state->written_set.ForEach([&](uint64_t begin, uint64_t end) { written.Add(begin, end - begin); });
+				state->journal_set.ForEach([&](uint64_t begin, uint64_t end) { journal.Add<true>(begin, end - begin); });
+				state->written_set.ForEach([&](uint64_t begin, uint64_t end) { written.Add<true>(begin, end - begin); });
 				if (filter != nullptr) filter->Merge(state->pending);
 			}
 			merged.Clear();
 			if (one_set)
 				for (const RangeSet* set: {&journal_set, &written_set, &journal, &written})
-					set->ForEach([&](uint64_t begin, uint64_t end) { merged.Add(begin, end - begin); });
+					set->ForEach([&](uint64_t begin, uint64_t end) { merged.Add<true>(begin, end - begin); });
 		};
 		if (fast) {
 			chain_journal.AssignFrom(before->chain_journal);
-			before->journal_set.ForEach([&](uint64_t begin, uint64_t end) { chain_journal.Add(begin, end - begin); });
+			before->journal_set.ForEach([&](uint64_t begin, uint64_t end) { chain_journal.Add<true>(begin, end - begin); });
 			chain_written.AssignFrom(before->chain_written);
-			before->written_set.ForEach([&](uint64_t begin, uint64_t end) { chain_written.Add(begin, end - begin); });
+			before->written_set.ForEach([&](uint64_t begin, uint64_t end) { chain_written.Add<true>(begin, end - begin); });
 			pending.Merge(before->pending);
 			pending_set.Clear();
 			if (one_set) {
 				pending_set.AssignFrom(before->pending_set);
 				for (const RangeSet* set: {&journal_set, &written_set}) // (empty after Clear; kept for any other caller)
-					set->ForEach([&](uint64_t begin, uint64_t end) { pending_set.Add(begin, end - begin); });
+					set->ForEach([&](uint64_t begin, uint64_t end) { pending_set.Add<true>(begin, end - begin); });
 			}
 		} else {
 			merge_all(chain_journal, chain_written, pending_set, &pending);
@@ -1186,14 +1186,18 @@ struct State {
 	}
 
 	void NoteCurrent(uint64_t address, uint64_t size) {
-		if (NoteOnce(1, current, Sealed().current, address, size)) current_set.Add(address, size);
+		if (NoteOnce(1, current, Sealed().current, address, size)) {
+			current_set.Add<true>(address, size);
+		}
 	}
 	void NoteWritten(uint64_t address, uint64_t size) {
 		++open_gen;
 		if (NoteOnce(0, written, Sealed().written, address, size)) {
-			written_set.Add(address, size);
+			written_set.Add<true>(address, size);
 			pending.Add(address, size);
-			if (one_set) pending_set.Add(address, size);
+			if (one_set) {
+				pending_set.Add<true>(address, size);
+			}
 		}
 	}
 	void NoteInvalidated(uint64_t address, uint64_t size) { (void)Note(invalidated, Sealed().invalidated, address, size); }
@@ -1209,11 +1213,10 @@ struct State {
 		if (read_values.size() > Sealed().read_values && read_values.back().address == address &&
 		    read_values.back().size == size && std::memcmp(read_values.back().bytes.data(), data, size) == 0)
 			return;
-		ReadValue value;
+		auto& value   = read_values.emplace_back();
 		value.address = address;
 		value.size    = static_cast<uint32_t>(size);
 		std::memcpy(value.bytes.data(), data, size);
-		read_values.push_back(value);
 	}
 	void NoteBufferRange(uint64_t address, uint64_t size) { (void)Note(buffer_ranges, Sealed().buffer_ranges, address, size); }
 	// The command words a speculation's thread translated (ProcessPm4Spec, at their guest addresses): clean reads of
@@ -1334,11 +1337,15 @@ struct State {
 	void Journal(uint64_t address, uint64_t value, uint32_t size, bool copy = false,
 	             HostWriteKind host_kind = HostWriteKind::Other) {
 		writes.push_back({address, value, size, copy, false, host_kind});
-		journal_set.Add(address, size);
+		journal_set.Add<true>(address, size);
 		pending.Add(address, size);
-		if (one_set) pending_set.Add(address, size);
-		open_journal_set.Add(address, size);
-		if (copy) open_copy_sources.Add(value, size);
+		if (one_set) {
+			pending_set.Add<true>(address, size);
+		}
+		open_journal_set.Add<true>(address, size);
+		if (copy) {
+			open_copy_sources.Add<true>(value, size);
+		}
 		++open_gen;
 	}
 	// The words at `address` as the translation reads them: as the processor's pending writes leave them (in order it

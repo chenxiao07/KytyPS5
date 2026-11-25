@@ -2237,8 +2237,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
                                                             std::unique_ptr<CommandProcessorState>* chunk_start) {
 	auto&                                      scheduler = m_renderer.GetCommandScheduler();
 	std::unique_ptr<Result>                    result;
-	std::vector<std::pair<uint64_t, uint64_t>> local_resolved;
-	auto& resolved = Waitless() ? translator.resolving : local_resolved;
+	auto& resolving = translator.resolving;
 	// KYTY_SPEC_RESULT_POOL_CAP (live spec_result_pool_cap; 0, the default: off): a translator keeps at most that many
 	// finished results for reuse. Without it `free` only grows: a translation finds none to reuse while a translation
 	// going on began before they were retired (a long one, a burst: a level load), makes one, and keeps it (two
@@ -2286,16 +2285,17 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 				it = translator.free.erase(it);
 			}
 		}
-		if (!Waitless() || !translator.resolved.empty()) {
-			resolved.swap(translator.resolved);
+		if (!translator.resolved.empty()) {
+			// Keep both allocations. Finish may append to resolved while the translator drains resolving.
+			resolving.swap(translator.resolved);
 		}
 	}
 	for (auto& freed: surplus) FreeResult(std::move(freed));
 	// (What the commits released of its rings, released on the thread that uses them.)
-	for (const auto& [pending, tick]: resolved) {
+	for (const auto& [pending, tick]: resolving) {
 		ResolvePending(translator, pending, tick);
 	}
-	resolved.clear();
+	resolving.clear();
 	if (const auto cap = hole_states_cap.load(std::memory_order_relaxed);
 	    result && cap > 0 && result->hole_states.size() > static_cast<uint64_t>(cap))
 		result->hole_states.resize(static_cast<size_t>(cap));
