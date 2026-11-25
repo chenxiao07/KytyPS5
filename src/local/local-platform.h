@@ -56,6 +56,9 @@ uint64_t CpuListMask(const char* list);
 // The calling thread's CPU mask (bit n: CPU n; Windows: the process's group, read by setting the process's mask and the
 // thread's back; Linux: sched_getaffinity); 0 when unknown. SetCurrentThreadAffinity: the calling thread on those CPUs.
 uint64_t CurrentThreadAffinity();
+// Read-only affinity queries for compute placement. Zero means the mask is unavailable.
+uint64_t ProcessAffinityMask();
+uint64_t InspectThreadAffinity();
 bool     SetCurrentThreadAffinity(uint64_t mask);
 // The physical performance cores among the CPUs of `mask` the process may run on: SMT siblings count as one core, cores
 // of a lower efficiency class (E-cores) not at all (Windows: CPU set CoreIndex and EfficiencyClass; every core where all

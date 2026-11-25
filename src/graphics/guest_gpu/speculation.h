@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "speculation-state.h"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -61,6 +62,7 @@ public:
 
 	[[nodiscard]] bool ReclaimPending() const noexcept { return m_reclaim.load(std::memory_order_acquire); }
 	void Reclaim(bool idle = false);
+	void EnablePlacementLogging() { m_log_placement = true; }
 	void SeedCompute(uint64_t completed, const CommandProcessor* cp);
 	[[nodiscard]] bool StartWorkers(uint32_t queue_id) noexcept;
 	// Its translators (the workers and the pass thread): the next instance's packet slots and roles start after them.
@@ -70,6 +72,7 @@ public:
 	// (Tooling, the live mode toggle: on the GPU thread, between submissions.) The threads stopped and every result not
 	// committed finished as a lost one (Finish: its recorded command buffers discarded, their ticks given up, its
 	// pending writes dropped, the live count down), so the destructor waits for no tick that will never be submitted.
+	void RequestStop();
 	void Stop();
 
 	// Blocked: committed up to a wait hole not satisfied yet (the submission waits; Resume goes on from there). Chunk:
@@ -208,6 +211,7 @@ private:
 	struct Translator {
 		explicit Translator(RenderContext& renderer, uint32_t number, int interrupt_id);
 		uint32_t                                   index = 0;
+		int64_t                                    applied_cpus = 0;
 		bool                                       pass_only = false; // (KYTY_SPEC_PASS_THREAD: the state pass's own thread)
 		std::unique_ptr<RenderExecutor>            draw, compute;
 		RenderContext::Executors                   executors;
@@ -298,9 +302,11 @@ private:
 	// translate, or the pass could not follow it); the state pass on from the GPU thread's last submission when it
 	// cannot follow or is behind (under m_mutex).
 	void AheadRun(Translator& translator);
+	bool AheadTurn(Translator& translator, std::unique_lock<std::mutex>& lock, const std::atomic<int64_t>& live_cpus);
+	void LogWorker(const Translator& translator) const;
 	// The state pass of a submission (its chunks given to its entry as it passes them, while the pass is `which`):
 	// false: it could not follow it.
-	[[nodiscard]] bool StatePass(const Job& job, uint64_t which);
+	[[nodiscard]] bool StatePass(const Job& job, uint64_t which, bool one_cut);
 	void               ResyncStatePass();
 	void               ClaimBlockingRemainder(uint64_t serial, std::unique_lock<std::mutex>& lock);
 	void               RetireFront();
@@ -386,6 +392,8 @@ private:
 	// whether a thread runs it and whether it cannot follow the submission broken_at; the last submission the GPU
 	// thread took the normal way and the last it did, with its state after it.
 	std::condition_variable           m_ahead_wake;
+	bool                              m_log_placement = false;
+	std::optional<Pm4Execution>        m_pass_resume;
 	std::deque<Entry>                 m_jobs;
 	struct WaitlessJobs {
 		std::list<Entry> active, free;

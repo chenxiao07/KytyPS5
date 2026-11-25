@@ -415,6 +415,16 @@ uint32_t PerformanceLogicalCpus() {
 	return count;
 }
 
+uint64_t ProcessAffinityMask() {
+	DWORD_PTR process = 0, system = 0;
+	return GetProcessAffinityMask(GetCurrentProcess(), &process, &system) != 0 ? static_cast<uint64_t>(process) : 0;
+}
+
+uint64_t InspectThreadAffinity() {
+	GROUP_AFFINITY affinity {};
+	return GetThreadGroupAffinity(GetCurrentThread(), &affinity) != 0 ? static_cast<uint64_t>(affinity.Mask) : 0;
+}
+
 uint64_t CurrentThreadAffinity() {
 	// (No GetThreadAffinityMask: SetThreadAffinityMask returns the mask it replaced; the process's mask, a superset,
 	// then the thread's own back.)
@@ -2798,6 +2808,27 @@ std::string SpareCpu(const char* avoid) {
 	return {};
 #endif
 }
+
+uint64_t ProcessAffinityMask() {
+#if defined(__linux__)
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (sched_getaffinity(getpid(), sizeof(set), &set) != 0) {
+		return 0;
+	}
+	uint64_t mask = 0;
+	for (int cpu = 0; cpu < 64; ++cpu) {
+		if (CPU_ISSET(cpu, &set)) {
+			mask |= uint64_t {1} << cpu;
+		}
+	}
+	return mask;
+#else
+	return 0;
+#endif
+}
+
+uint64_t InspectThreadAffinity() { return CurrentThreadAffinity(); }
 
 uint64_t CurrentThreadAffinity() {
 #if defined(__linux__)

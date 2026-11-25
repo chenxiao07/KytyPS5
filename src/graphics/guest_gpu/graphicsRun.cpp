@@ -1712,6 +1712,9 @@ void GuestGpu::ThreadRun(void* data) {
 		if (!gpu->m_spec_start_failed[0]) {
 			gpu->m_speculation = std::make_unique<Speculation>(
 			    gpu->m_renderer, 0, 0, both_lanes ? std::min(graphics_workers, graphics_limit) : 0u, pass_thread);
+			if (both_lanes) {
+				gpu->m_speculation->EnablePlacementLogging();
+			}
 			(void)start_workers(gpu->m_speculation, 0);
 		}
 		const auto base = gpu->m_speculation ? gpu->m_speculation->TranslatorCount() : 0u;
@@ -1755,6 +1758,11 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_speculation_q49 = std::make_unique<Speculation>(
 				    gpu->m_renderer, ComputeQueueBase + ComputeQueue49 - 1, base + q1_workers, workers, false, gpu);
 			}
+			for (auto* lane: {gpu->m_speculation_q1.get(), gpu->m_speculation_q49.get()}) {
+				if (lane != nullptr) {
+					lane->EnablePlacementLogging();
+				}
+			}
 			const auto start_lane = [gpu, &start_workers](std::unique_ptr<Speculation>& lane, uint32_t id) {
 				if (!lane) {
 					return;
@@ -1777,6 +1785,10 @@ void GuestGpu::ThreadRun(void* data) {
 			};
 			start_lane(gpu->m_speculation_q1, ComputeQueue1);
 			start_lane(gpu->m_speculation_q49, ComputeQueue49);
+			const auto q1_slots = gpu->m_speculation_q1 ? gpu->m_speculation_q1->TranslatorCount() : 0u;
+			const auto q49_slots = gpu->m_speculation_q49 ? gpu->m_speculation_q49->TranslatorCount() : 0u;
+			std::printf("Speculation: %u graphics translator slots, %u compute slots (dedicated)\n",
+			            base, q1_slots + q49_slots);
 			gpu->m_ahead_q1.store(gpu->m_speculation_q1.get(), std::memory_order_release);
 			gpu->m_ahead_q49.store(gpu->m_speculation_q49.get(), std::memory_order_release);
 		}
@@ -1851,6 +1863,11 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 		// (To 0: the threads joined and the unfinished results finished as lost ones (Speculation::Stop: a destroyed
 		// result's recorder waited for ticks never submitted, a hang at the 5th flip), outside the lock.)
+		for (auto* lane: {old_q1.get(), old_q49.get()}) {
+			if (lane != nullptr) {
+				lane->RequestStop();
+			}
+		}
 		if (old) {
 			old->Stop();
 		}
@@ -2013,10 +2030,17 @@ void GuestGpu::ThreadRun(void* data) {
 			}
 		}
 		if (should_stop) {
+			gpu->m_ahead_async.store(nullptr, std::memory_order_release);
 			gpu->m_ahead_q1.store(nullptr, std::memory_order_release);
 			gpu->m_ahead_q49.store(nullptr, std::memory_order_release);
-			for (auto* lane: {gpu->m_speculation_q1.get(), gpu->m_speculation_q49.get()}) {
-				if (lane != nullptr && (lane->Waitless())) {
+			const auto compute_lanes = {gpu->m_speculation_q1.get(), gpu->m_speculation_q49.get()};
+			for (auto* lane: compute_lanes) {
+				if (lane != nullptr) {
+					lane->RequestStop();
+				}
+			}
+			for (auto* lane: compute_lanes) {
+				if (lane != nullptr && lane->Waitless()) {
 					lane->Stop();
 				}
 			}
