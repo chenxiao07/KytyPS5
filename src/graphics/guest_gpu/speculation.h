@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -30,6 +31,8 @@ extern volatile std::atomic_uint32_t kyty_local_speculate_threads;
 }
 
 namespace Libs::Graphics {
+
+class GuestGpu;
 
 class StreamBuffer;
 
@@ -53,8 +56,13 @@ public:
 	// `base`: the first speculation thread's packet slot and executor role less one (after another speculation's).
 	// `pass_thread`: KYTY_SPEC_PASS_THREAD, one translator after the `threads` that takes only the state pass.
 	explicit Speculation(RenderContext& renderer, int interrupt_id = 0, uint32_t base = 0, uint32_t threads = 0,
-	                     bool pass_thread = false, bool guarded_dispatch_args = false);
+	                     bool pass_thread = false, GuestGpu* waitless_gpu = nullptr);
+	[[nodiscard]] bool Waitless() const noexcept { return m_waitless_gpu != nullptr; }
+
+	[[nodiscard]] bool ReclaimPending() const noexcept { return m_reclaim.load(std::memory_order_acquire); }
+	void Reclaim(bool idle = false);
 	void SeedCompute(uint64_t completed, const CommandProcessor* cp);
+	[[nodiscard]] bool StartWorkers(uint32_t queue_id) noexcept;
 	// Its translators (the workers and the pass thread): the next instance's packet slots and roles start after them.
 	[[nodiscard]] uint32_t TranslatorCount() const { return static_cast<uint32_t>(m_translators.size()); }
 	~Speculation();
@@ -104,10 +112,12 @@ public:
 	void Push(const Job& job);
 	[[nodiscard]] Outcome CommitReady(CommandProcessor& cp, const Job& job, uint32_t chunk, Pm4Execution& execution,
 	                                  std::optional<Pm4Execution>& end);
+	[[nodiscard]] Outcome CommitReadyWaitless(CommandProcessor& cp, const Job& job, uint32_t chunk,
+	                                          Pm4Execution& execution, std::optional<Pm4Execution>& end);
 	void                  Done(uint64_t serial, const CommandProcessor& cp);
 	// Mode 4: a translated chunk of the submission with that serial is waiting to be committed (the speculation's own
 	// lock, taken and released here; the caller holds no other instance's).
-	[[nodiscard]] bool    FrontReady(uint64_t serial, uint32_t chunk);
+	[[nodiscard]] bool    FrontReady(uint64_t serial, uint32_t chunk, bool nonblocking = false);
 	static constexpr uint32_t ChunkWork = 128;
 	// The graphics queue's time in a slice of a command buffer (the report's total).
 	void NoteQueueTime(uint64_t ns) noexcept { m_queue_ns += ns; }
@@ -167,6 +177,7 @@ private:
 		std::optional<Pm4Execution> resume_at;
 		Pm4Execution start_at; // where its translation began
 		bool         failed = false, progressed = false;
+		bool         abandoned = false; // claimed by the GPU thread during translation
 		bool         blind  = false; // translated without the one before it while that was not done (mode 4)
 		size_t       submitted = 0, next = 0; // recorded command buffers submitted, segments committed
 		uint64_t     last_tick = 0;           // the last of them's tick (0: none; batched / spliced: not yet submitted)
@@ -204,6 +215,7 @@ private:
 		std::unique_ptr<StreamBuffer>              table_upload, shader_upload;
 		std::vector<std::unique_ptr<Result>>       free;     // (under m_mutex)
 		std::vector<std::pair<uint64_t, uint64_t>> resolved; // (under m_mutex)
+		std::vector<std::pair<uint64_t, uint64_t>> resolving; // waitless worker's spare for resolved
 		std::thread                                thread;
 		uint64_t                                   translating = 0; // (under m_mutex: serial, chunk)
 		uint32_t                                   translating_chunk = 0;
@@ -215,6 +227,7 @@ private:
 		std::atomic<bool>                          cancel_seen {false};
 		uint64_t                                   began_ns = 0;
 		uint64_t                                   since       = 0;
+		bool                                       abandoned   = false; // under m_mutex
 	};
 	// A chunk of a submission (mode 4), once the state pass passed it: the processor state and position it starts at,
 	// where it ends (where the next begins; `last`: the submission's end), the pass's record of it (Spec::t_record),
@@ -290,6 +303,15 @@ private:
 	[[nodiscard]] bool StatePass(const Job& job, uint64_t which);
 	void               ResyncStatePass();
 	void               ClaimBlockingRemainder(uint64_t serial, std::unique_lock<std::mutex>& lock);
+	void               RetireFront();
+	[[nodiscard]] bool ResultEligible(const Result& result) const;
+	template <typename Visit>
+	decltype(auto) WithJobs(Visit&& visit) {
+		if (m_waitless_jobs) {
+			return visit(m_waitless_jobs->active);
+		}
+		return visit(m_jobs);
+	}
 	// (Under m_mutex.) The submission's entry (null: done, or not pushed), the chunk's record (null: none any more); what
 	// links to `from` links to `to` (results, the translations going on, records); when the oldest translation going on
 	// began (m_clock; UINT64_MAX: none): what was retired before is reached by none; a record for a state pass (a
@@ -365,6 +387,14 @@ private:
 	// thread took the normal way and the last it did, with its state after it.
 	std::condition_variable           m_ahead_wake;
 	std::deque<Entry>                 m_jobs;
+	struct WaitlessJobs {
+		std::list<Entry> active, free;
+	};
+	static constexpr size_t WaitlessJobsMax = 64, WaitlessChunksMax = 32, WaitlessAheadMax = 64;
+	GuestGpu* const                   m_waitless_gpu;
+	std::optional<WaitlessJobs>       m_waitless_jobs;
+	std::atomic<bool>                 m_reclaim {false}, m_pass_cancel {false};
+	std::atomic<uint64_t>             m_skip_through {0};
 	uint64_t                          m_pass_active_serial = 0; // pass holding the job span, under m_mutex
 	std::unique_ptr<CommandProcessor> m_state;
 	uint64_t                          m_state_serial = 0, m_pass = 1, m_broken_at = 0;

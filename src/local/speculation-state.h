@@ -556,6 +556,7 @@ struct Segment {
 struct DrawIndirectVerify {
 	uint64_t                packet = 0;   // the packet as translated (its guest address, or a backing view of it)
 	std::array<uint32_t, 5> words {};     // its dwords then
+	bool                    guarded_packet = false;
 	uint64_t                base = 0, args = 0; // the arguments' base register then, and the address drawn from
 	uint32_t                primitive = 0;
 	const void*             buffer = nullptr; // the buffer the drawIndirect reads (its identity only: never dereferenced)

@@ -64,6 +64,7 @@
 #include <optional>
 #include <thread>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -544,6 +545,23 @@ const uint32_t* CommandProcessor::SuspendedPacket(const Pm4Execution& execution,
 	return packet;
 }
 
+const uint32_t* CommandProcessor::ReadGuardedSuspendedPacket(const Pm4Execution& execution, uint32_t& header,
+                                                             uint32_t& dwords) {
+	if (execution.m_buffer_stack.empty()) {
+		return nullptr;
+	}
+	const auto& cursor = execution.m_buffer_stack.back();
+	if (cursor.offset_dw >= cursor.commands.size() || cursor.deferred_advance_dw != 0) {
+		return nullptr;
+	}
+	const auto* packet = cursor.commands.data() + cursor.offset_dw;
+	if (Spec::WorkerCopy(&header, packet, sizeof(header), false) != 0) {
+		return nullptr;
+	}
+	dwords = header == 0x80000000u ? 1u : KYTY_PM4_LEN(header);
+	return dwords != 0 && dwords <= cursor.commands.size() - cursor.offset_dw ? packet : nullptr;
+}
+
 bool CommandProcessor::SuspendedPacketFits(const Pm4Execution& execution) {
 	if (execution.m_buffer_stack.empty()) return false;
 	const auto& cursor = execution.m_buffer_stack.back();
@@ -611,9 +629,10 @@ bool CommandProcessor::AtWait(const Pm4Execution& execution) {
 	return (cursor.commands[cursor.offset_dw] >> 30u) == 3u && (opcode == Pm4::IT_WAIT_REG_MEM || opcode == Pm4::IT_WAIT_REG_MEM_64);
 }
 
-void CommandProcessor::SkipSuspendedPacket(Pm4Execution& execution) {
-	uint32_t dwords = 0;
-	(void)SuspendedPacket(execution, dwords);
+void CommandProcessor::SkipSuspendedPacket(Pm4Execution& execution, uint32_t dwords) {
+	if (dwords == 0) {
+		(void)SuspendedPacket(execution, dwords);
+	}
 	execution.m_buffer_stack.back().offset_dw += dwords;
 	execution.m_made_progress = true;
 }
@@ -1329,11 +1348,49 @@ Speculation* GuestGpu::ComputeLane(uint32_t queue_id) const noexcept {
 	return nullptr;
 }
 
+void GuestGpu::PushGraphics(Speculation& speculation, const Submission& submission) {
+	using Kind = Speculation::Job::Kind;
+	const auto kind = submission.type == SubmissionType::FlipPreparation || submission.type == SubmissionType::FrameBoundary
+	                      ? Kind::Flip
+	                  : submission.type == SubmissionType::Graphics && submission.constant_commands.empty()
+	                      ? Kind::Graphics
+	                      : Kind::Other;
+	speculation.Push({submission.serial, submission.commands, submission.reset_processor, kind});
+}
+
 void GuestGpu::PushCompute(Speculation& speculation, const Submission& submission) {
 	speculation.Push({submission.serial, submission.commands, submission.reset_processor,
 	                  submission.type == SubmissionType::Compute && submission.constant_commands.empty()
 	                      ? Speculation::Job::Kind::Graphics
 	                      : Speculation::Job::Kind::Other});
+}
+
+void GuestGpu::WakeForComputeReclaim() {
+	// Serialize with the idle check so publication cannot miss a sleeping GPU thread.
+	Common::LockGuard lock(m_queue_mutex);
+	m_work_available.Signal();
+}
+
+void GuestGpu::ReclaimCompute(bool idle) {
+	if (m_speculation_q1 && m_speculation_q1->Waitless()) {
+		m_speculation_q1->Reclaim(idle);
+	}
+	if (m_speculation_q49 && m_speculation_q49->Waitless()) {
+		m_speculation_q49->Reclaim(idle);
+	}
+}
+
+bool GuestGpu::ReclaimComputeBeforeIdle() {
+	// The caller holds the queue mutex. Reclamation may enter the renderer and takes lane locks.
+	const bool q1_pending = m_speculation_q1 && m_speculation_q1->ReclaimPending();
+	const bool q49_pending = m_speculation_q49 && m_speculation_q49->ReclaimPending();
+	if (!q1_pending && !q49_pending) {
+		return false;
+	}
+	m_queue_mutex.Unlock();
+	ReclaimCompute(true);
+	m_queue_mutex.Lock();
+	return true;
 }
 
 void GuestGpu::Enqueue(Submission submission) {
@@ -1360,13 +1417,9 @@ void GuestGpu::Enqueue(Submission submission) {
 	}
 	submission.serial      = ++m_serials[submission.queue_id];
 	// (KYTY_SPECULATE=4: the graphics queue's, translated ahead from now on.)
-	if (auto* ahead = m_ahead.load(std::memory_order_acquire); ahead != nullptr && submission.queue_id == 0)
-		ahead->Push({submission.serial, submission.commands, submission.reset_processor,
-		             submission.type == SubmissionType::FlipPreparation || submission.type == SubmissionType::FrameBoundary
-		                 ? Speculation::Job::Kind::Flip
-		             : submission.type == SubmissionType::Graphics && submission.constant_commands.empty()
-		                 ? Speculation::Job::Kind::Graphics
-		                 : Speculation::Job::Kind::Other});
+	if (auto* ahead = m_ahead.load(std::memory_order_acquire); ahead != nullptr && submission.queue_id == 0) {
+		PushGraphics(*ahead, submission);
+	}
 	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) [[unlikely]] {
 		if (auto* ahead = ComputeLane(submission.queue_id); ahead != nullptr) {
 			PushCompute(*ahead, submission);
@@ -1511,48 +1564,52 @@ uint32_t GuestGpu::RetestBlockedFronts(RetestAt at) {
 // Under the queue mutex, capture the serial and chunk of each runnable fixed lane and look for in-order compute.
 // FrontReady takes each lane's lock after releasing the queue mutex. If nothing is ready, re-test the blocked fronts'
 // stored waits and check again if a front unblocks.
-int GuestGpu::ReadyFrontElsewhere() noexcept {
+int GuestGpu::ReadyFrontElsewhere(uint32_t except) noexcept {
 	auto* gpu = g_gpu_state;
 	if (gpu == nullptr || !IsGpuThread()) {
 		return 0;
 	}
-	const bool fixed = gpu->m_speculation_q1 != nullptr;
-	const auto look = [gpu, fixed] {
+	const bool fixed = gpu->m_speculation_q1 != nullptr || gpu->m_speculation_q49 != nullptr;
+	const auto look = [gpu, except, fixed] {
 		struct Front {
 			uint64_t serial = 0;
 			uint32_t chunk  = 0;
 		};
-		Front async, q1, q49;
-		bool compute_front = false;
+		Front q0, async, q1, q49;
+		bool in_order = false;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
-			for (uint32_t id = 1; id < QueueCount; ++id) {
+			for (uint32_t id = except == 0 ? 1u : 0u; id < QueueCount; ++id) {
 				const auto& queue = gpu->m_queues[id];
-				if (queue.empty()) {
+				if (id == except || queue.empty()) {
 					continue;
 				}
 				const auto& front = queue.front();
-				if (front.blocked || front.type != SubmissionType::Compute || !gpu->CanProcessSubmission(front)) {
+				if (front.blocked || !gpu->CanProcessSubmission(front) ||
+				    (id != 0 && front.type != SubmissionType::Compute) || (except != 0 && front.yielded)) {
 					continue;
 				}
 				const bool spec_front = front.constant_commands.empty() && (!fixed || !front.spec_normal);
-				if (gpu->m_speculation_async && id == gpu->m_async_queue && spec_front) {
+				if (id == 0 && gpu->m_speculation && spec_front && front.type == SubmissionType::Graphics) {
+					q0 = {front.serial, front.spec_chunk};
+				} else if (gpu->m_speculation_async && id == gpu->m_async_queue && spec_front) {
 					async = {front.serial, front.spec_chunk};
 				} else if (id == ComputeQueue1 && gpu->m_speculation_q1 && spec_front) {
 					q1 = {front.serial, front.spec_chunk};
 				} else if (id == ComputeQueue49 && gpu->m_speculation_q49 && spec_front) {
 					q49 = {front.serial, front.spec_chunk};
 				} else {
-					compute_front = true;
+					in_order = true;
 				}
 			}
 		}
-		if ((async.serial != 0 && gpu->m_speculation_async->FrontReady(async.serial, async.chunk)) ||
-		    (q1.serial != 0 && gpu->m_speculation_q1->FrontReady(q1.serial, q1.chunk)) ||
-		    (q49.serial != 0 && gpu->m_speculation_q49->FrontReady(q49.serial, q49.chunk))) {
+		if ((q0.serial != 0 && gpu->m_speculation->FrontReady(q0.serial, q0.chunk, true)) ||
+		    (async.serial != 0 && gpu->m_speculation_async->FrontReady(async.serial, async.chunk)) ||
+		    (q1.serial != 0 && gpu->m_speculation_q1->FrontReady(q1.serial, q1.chunk, except != 0)) ||
+		    (q49.serial != 0 && gpu->m_speculation_q49->FrontReady(q49.serial, q49.chunk, except != 0))) {
 			return 1;
 		}
-		return compute_front ? 2 : 0;
+		return in_order ? 2 : 0;
 	};
 	if (const int target = look(); target != 0) {
 		return target;
@@ -1624,7 +1681,17 @@ void GuestGpu::ThreadRun(void* data) {
 		return true;
 	};
 	// (Mode 4's machinery: at the start, and again on a live `mode 4` (mode-toggle.h, below).)
-	const auto start_speculation = [gpu](bool boot) {
+	using FailedLanes = std::array<std::unique_ptr<Speculation>, QueueCount>;
+	const auto start_speculation = [gpu](FailedLanes& failed) {
+		const auto start_workers = [gpu, &failed](std::unique_ptr<Speculation>& lane, uint32_t id) {
+			if (lane->StartWorkers(id)) {
+				return true;
+			}
+			gpu->m_spec_start_failed[id] = true;
+			// The lane is still private. Join any workers that started after releasing the queue mutex.
+			failed[id] = std::move(lane);
+			return false;
+		};
 		// (spec_exact_reg_stop / spec_regional_pending: the buffer cache's granule epochs complete from here on, the mode
 		// reading 4 already: BufferCache::MarkExactEpochsFromNow. Before the speculations below exist, not before every
 		// thread that reads the mode: on a live `mode 4` the weave's workers run on until the loop top pauses them, so
@@ -1637,64 +1704,87 @@ void GuestGpu::ThreadRun(void* data) {
 		const bool  pass_thread      = (pass_env == nullptr || std::atoi(pass_env) > 0) &&
 		                               graphics_workers + 1 < Spec::MaxPacketSlots;
 		static_assert(AsyncUpload::SpecPacketSlots == Spec::MaxPacketSlots); // (the upload pipe's count repeats this test)
-		AsyncUpload::g_spec_pass_made.store(pass_thread ? 1 : 0, std::memory_order_relaxed);
 		const auto compute = LiveSwitch::Find("spec_compute", ModeToggle::Default("spec_compute"))
 		                         .load(std::memory_order_relaxed);
-		const bool both_lanes = compute == 2;
-		std::optional<Common::LockGuard> boot_queue_lock;
-		if (boot && both_lanes) {
-			boot_queue_lock.emplace(gpu->m_queue_mutex);
-		}
+		const bool both_lanes = compute == 3;
 		// Reserve one worker slot per lane. The graphics pass keeps its own slot if enabled.
 		const auto graphics_limit = static_cast<uint32_t>(Spec::MaxPacketSlots) - (pass_thread ? 1u : 0u) - 2u;
-		gpu->m_speculation = std::make_unique<Speculation>(
-		    gpu->m_renderer, 0, 0, both_lanes ? std::min(graphics_workers, graphics_limit) : 0u, pass_thread);
-		gpu->m_ahead.store(gpu->m_speculation.get(), std::memory_order_release);
+		if (!gpu->m_spec_start_failed[0]) {
+			gpu->m_speculation = std::make_unique<Speculation>(
+			    gpu->m_renderer, 0, 0, both_lanes ? std::min(graphics_workers, graphics_limit) : 0u, pass_thread);
+			(void)start_workers(gpu->m_speculation, 0);
+		}
+		const auto base = gpu->m_speculation ? gpu->m_speculation->TranslatorCount() : 0u;
+		const bool pass_started = base != 0 && pass_thread;
+		AsyncUpload::g_spec_pass_made.store(pass_started ? 1 : 0, std::memory_order_relaxed);
 
 		if (compute == 1) {
 			// Round 4's async selection and slot policy. An explicit selector gives a four-worker fallback.
 			const char* async_value = std::getenv("KYTY_SPECULATE_ASYNC");
 			const int   async       = async_value != nullptr ? std::atoi(async_value) : 49;
-			if (async > 0 && static_cast<uint32_t>(async) < QueueCount &&
-			    gpu->m_speculation->TranslatorCount() < Spec::MaxPacketSlots) {
+			if (async > 0 && static_cast<uint32_t>(async) < QueueCount && !gpu->m_spec_start_failed[async] &&
+			    base < Spec::MaxPacketSlots) {
 				const auto  queue   = static_cast<uint32_t>(async);
 				const char* threads = std::getenv("KYTY_SPECULATE_ASYNC_THREADS");
-				const auto  base    = gpu->m_speculation->TranslatorCount();
 				gpu->m_speculation_async = std::make_unique<Speculation>(
 				    gpu->m_renderer, static_cast<int>(ComputeQueueBase + queue - 1), base,
 				    threads != nullptr && std::atoi(threads) > 0 ? static_cast<uint32_t>(std::atoi(threads))
 				                                                 : async_value != nullptr ? 4u : 2u);
-				gpu->m_async_queue = queue;
-				gpu->m_ahead_async.store(gpu->m_speculation_async.get(), std::memory_order_release);
+				if (start_workers(gpu->m_speculation_async, queue)) {
+					gpu->m_async_queue = queue;
+					for (auto& submission: gpu->m_queues[queue]) {
+						if (submission.started) {
+							submission.spec_normal = true;
+						} else {
+							PushCompute(*gpu->m_speculation_async, submission);
+						}
+					}
+					gpu->m_ahead_async.store(gpu->m_speculation_async.get(), std::memory_order_release);
+				}
 			}
 		} else if (both_lanes) {
-			const auto  base       = gpu->m_speculation->TranslatorCount();
 			const char* threads    = std::getenv("KYTY_SPECULATE_ASYNC_THREADS");
 			const int   requested  = threads != nullptr ? std::atoi(threads) : 0;
 			const auto  workers    = requested > 0 ? static_cast<uint32_t>(requested) : 2u;
 			const auto  q1_workers = std::min(workers, static_cast<uint32_t>(Spec::MaxPacketSlots) - base - 1u);
-			gpu->m_speculation_q1 = std::make_unique<Speculation>(
-			    gpu->m_renderer, ComputeQueueBase + ComputeQueue1 - 1, base, q1_workers, false, true);
-			gpu->m_speculation_q49 = std::make_unique<Speculation>(
-			    gpu->m_renderer, ComputeQueueBase + ComputeQueue49 - 1, base + q1_workers, workers, false, true);
-			const auto start_lane = [gpu](Speculation& lane, uint32_t id) {
+			if (!gpu->m_spec_start_failed[ComputeQueue1]) {
+				gpu->m_speculation_q1 = std::make_unique<Speculation>(
+				    gpu->m_renderer, ComputeQueueBase + ComputeQueue1 - 1, base, q1_workers, false, gpu);
+			}
+			if (!gpu->m_spec_start_failed[ComputeQueue49]) {
+				gpu->m_speculation_q49 = std::make_unique<Speculation>(
+				    gpu->m_renderer, ComputeQueueBase + ComputeQueue49 - 1, base + q1_workers, workers, false, gpu);
+			}
+			const auto start_lane = [gpu, &start_workers](std::unique_ptr<Speculation>& lane, uint32_t id) {
+				if (!lane) {
+					return;
+				}
 				auto& queue = gpu->m_queues[id];
 				const auto completed = queue.empty() ? gpu->m_serials[id] : queue.front().serial - 1;
 				// A front already started in order supplies its full state at Done.
 				const auto* cp = queue.empty() || !queue.front().started ? gpu->m_compute_cp[id - 1].get() : nullptr;
-				lane.SeedCompute(completed, cp);
+				lane->SeedCompute(completed, cp);
+				if (!start_workers(lane, id)) {
+					return;
+				}
 				for (auto& submission: queue) {
 					if (submission.started) {
 						submission.spec_normal = true;
 					} else {
-						PushCompute(lane, submission);
+						PushCompute(*lane, submission);
 					}
 				}
 			};
-			start_lane(*gpu->m_speculation_q1, ComputeQueue1);
-			start_lane(*gpu->m_speculation_q49, ComputeQueue49);
+			start_lane(gpu->m_speculation_q1, ComputeQueue1);
+			start_lane(gpu->m_speculation_q49, ComputeQueue49);
 			gpu->m_ahead_q1.store(gpu->m_speculation_q1.get(), std::memory_order_release);
 			gpu->m_ahead_q49.store(gpu->m_speculation_q49.get(), std::memory_order_release);
+		}
+		if (gpu->m_speculation) {
+			for (const auto& submission: gpu->m_queues[0]) {
+				PushGraphics(*gpu->m_speculation, submission);
+			}
+			gpu->m_ahead.store(gpu->m_speculation.get(), std::memory_order_release);
 		}
 	};
 	// (A KYTY_SPECULATE=4 boot: the mode table's values set before the first packet, as a live `mode 4` sets them; the
@@ -1708,7 +1798,9 @@ void GuestGpu::ThreadRun(void* data) {
 		ModeToggle::ApplyTable(4);
 		// (spec_format_ahead: after the table sets the switch; before the threads that birth pairs exist.)
 		gpu->m_renderer.GetPipelineCache().ApplyFormatAhead();
-		start_speculation(true);
+		FailedLanes failed;
+		Common::LockGuard lock(gpu->m_queue_mutex);
+		start_speculation(failed);
 	}
 	// (Tooling: the live mode toggle (mode-toggle.h), applied between submissions when no speculated queue has one started
 	// and not done: a speculation's results and blocked commits belong to the submission they began. Under m_queue_mutex,
@@ -1722,6 +1814,7 @@ void GuestGpu::ThreadRun(void* data) {
 		// only find no readers to drain.)
 		if (want == 4) gpu->m_renderer.GetTextureCache().ApplySharedMode(true);
 		std::unique_ptr<Speculation> old, old_async, old_q49, old_q1;
+		FailedLanes failed;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			const auto started = [&](uint32_t id) {
@@ -1753,19 +1846,7 @@ void GuestGpu::ThreadRun(void* data) {
 #if defined(__linux__)
 				check_write_guard_uffd(); // (the guard turns on with mode 4: #289's check, as at boot)
 #endif
-				start_speculation(false);
-				// (The command buffers queued already, handed over as Enqueue hands them.)
-				for (const auto& s: gpu->m_queues[0])
-					gpu->m_speculation->Push(
-					    {s.serial, s.commands, s.reset_processor,
-					     s.type == SubmissionType::FlipPreparation || s.type == SubmissionType::FrameBoundary ? Speculation::Job::Kind::Flip
-					     : s.type == SubmissionType::Graphics && s.constant_commands.empty()               ? Speculation::Job::Kind::Graphics
-					                                                                                         : Speculation::Job::Kind::Other});
-				if (gpu->m_speculation_async && gpu->m_async_queue != 0) {
-					for (const auto& submission: gpu->m_queues[gpu->m_async_queue]) {
-						PushCompute(*gpu->m_speculation_async, submission);
-					}
-				}
+				start_speculation(failed);
 			}
 		}
 		// (To 0: the threads joined and the unfinished results finished as lost ones (Speculation::Stop: a destroyed
@@ -1808,6 +1889,7 @@ void GuestGpu::ThreadRun(void* data) {
 #endif
 
 	for (;;) {
+		if (mode == 4) gpu->ReclaimCompute();
 		if (ModeToggle::g_request.load(std::memory_order_relaxed) >= 0) apply_mode();
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		// KYTY_WEAVE: paused once a live change has set KYTY_SPECULATE to 4, before another packet or guest command
@@ -1837,6 +1919,9 @@ void GuestGpu::ThreadRun(void* data) {
 				if (resources.FreedReadbackReady()) {
 					gpu->m_commands.push_back(Common::UniqueFunction<void>([&resources] { resources.ServiceFreedReadback(); }));
 					gpu->m_pending_commands.fetch_add(1, std::memory_order_seq_cst);
+					continue;
+				}
+				if (mode == 4 && gpu->ReclaimComputeBeforeIdle()) {
 					continue;
 				}
 				gpu->m_processing = false;
@@ -1887,6 +1972,9 @@ void GuestGpu::ThreadRun(void* data) {
 						gpu->m_queue_mutex.Lock();
 						continue;
 					}
+					if (mode == 4 && gpu->ReclaimComputeBeforeIdle()) {
+						continue;
+					}
 					gpu->m_processing = false;
 					LiveTrace::Event(LiveTrace::RenderIdle, 1, 1);
 					const auto idle = std::chrono::steady_clock::now();
@@ -1925,6 +2013,13 @@ void GuestGpu::ThreadRun(void* data) {
 			}
 		}
 		if (should_stop) {
+			gpu->m_ahead_q1.store(nullptr, std::memory_order_release);
+			gpu->m_ahead_q49.store(nullptr, std::memory_order_release);
+			for (auto* lane: {gpu->m_speculation_q1.get(), gpu->m_speculation_q49.get()}) {
+				if (lane != nullptr && (lane->Waitless())) {
+					lane->Stop();
+				}
+			}
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 			if (Weave::Enabled()) Weave::StopAll(); // (before the scout: its threads read the scout's write clock)
 #endif
@@ -2060,8 +2155,10 @@ bool GuestGpu::Process(Submission& submission) {
 	// The graphics queue's command buffers, speculation on: speculatively first (speculation.h).
 	const auto mode = kyty_local_speculate_mode.load(std::memory_order_relaxed);
 	const bool speculate = submission.type == SubmissionType::Graphics && submission.queue_id == 0 &&
-	                       mode != 0;
-	if (speculate && !m_speculation) m_speculation = std::make_unique<Speculation>(m_renderer);
+	                       mode != 0 && !m_spec_start_failed[0];
+	if (speculate && !m_speculation) {
+		m_speculation = std::make_unique<Speculation>(m_renderer);
+	}
 	// (What the translation does a speculation not committed yet must see.)
 	struct EffectsScope {
 		EffectsScope(Speculation* speculation, Speculation* async) {
@@ -2079,7 +2176,15 @@ bool GuestGpu::Process(Submission& submission) {
 			Spec::t_effects_async = nullptr;
 		}
 		KYTY_CLASS_NO_COPY(EffectsScope);
-	} effects_scope {m_speculation.get(), m_speculation_q49.get()};
+	};
+	std::optional<EffectsScope> effects_scope;
+	if (mode != 0) [[unlikely]] {
+		auto* compute_effects = m_speculation_q49.get();
+		if (m_spec_start_failed[0] && compute_effects == nullptr) {
+			compute_effects = m_speculation_q1 ? m_speculation_q1.get() : m_speculation_async.get();
+		}
+		effects_scope.emplace(m_speculation.get(), compute_effects);
+	}
 	auto* const compute_lane = mode == 4 ? ComputeLane(submission.queue_id) : nullptr;
 
 	cp.BufferInit();
@@ -2233,9 +2338,10 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		}
 		case SubmissionType::Compute: {
-			// The fixed and legacy lanes use the blocking take.
+			// Fixed lanes use claim-and-cancel. The legacy async lane uses the blocking take.
 			if (compute_lane != nullptr && submission.constant_commands.empty()) {
 				auto&                   speculation = *compute_lane;
+				const bool              waitless    = speculation.Waitless();
 				bool                    progressed  = false;
 				const Speculation::Job  job {submission.serial, submission.commands};
 				struct QueueTime {
@@ -2245,10 +2351,20 @@ bool GuestGpu::Process(Submission& submission) {
 				} queue_time {speculation};
 				for (;;) {
 					if (!submission.spec_normal) {
-						const auto outcome = speculation.Blocked(submission.serial)
-						                         ? speculation.Resume(cp, submission.command_execution)
-						                         : speculation.CommitReady(cp, job, submission.spec_chunk,
-						                                                   submission.command_execution, submission.spec_end);
+						Speculation::Outcome outcome;
+						if (speculation.Blocked(submission.serial)) {
+							outcome = speculation.Resume(cp, submission.command_execution);
+						} else if (waitless) {
+							outcome = speculation.CommitReadyWaitless(cp, job, submission.spec_chunk,
+							                                          submission.command_execution, submission.spec_end);
+						} else {
+							outcome = speculation.CommitReady(cp, job, submission.spec_chunk,
+							                                  submission.command_execution, submission.spec_end);
+						}
+						if (outcome == Speculation::Outcome::Yield) {
+							submission.yielded = true;
+							break;
+						}
 						progressed |= outcome != Speculation::Outcome::None;
 						if (outcome == Speculation::Outcome::Blocked) break;
 						if (outcome == Speculation::Outcome::Whole) {
@@ -2422,18 +2538,29 @@ void VerifyDrawIndirect(RenderContext& renderer, const Spec::DrawIndirectVerify&
 	auto&              textures  = renderer.GetTextureCache();
 	auto&              resources = renderer.GetGpuResources();
 	// (Memory as the commit's own checks read it: through the backing view of a page a pending guest write guards.)
-	const auto read = [](uint64_t address, void* out, uint64_t bytes) {
-		if (Libs::LibKernel::Memory::TryReadBackingToHost(address, out, bytes)) return;
+	const auto read = [](uint64_t address, void* out, uint64_t bytes, bool guarded) {
+		if (Libs::LibKernel::Memory::TryReadBackingToHost(address, out, bytes)) {
+			return true;
+		}
 		const void* from = reinterpret_cast<const void*>(address);
-		if (WriteGuard::g_count.load(std::memory_order_relaxed) != 0)
-			if (const auto* backing = WriteGuard::GuardedBacking(address, bytes)) from = backing;
+		if (WriteGuard::g_count.load(std::memory_order_relaxed) != 0) {
+			if (const auto* backing = WriteGuard::GuardedBacking(address, bytes)) {
+				from = backing;
+			}
+		}
+		if (guarded) {
+			return Common::GuardedCopy(out, from, bytes) == 0;
+		}
 		std::memcpy(out, from, bytes);
+		return true;
 	};
 	uint32_t                mismatch = 0;
 	std::array<uint32_t, 5> words {};
-	read(entry.packet, words.data(), sizeof(words));
-	if (words != entry.words) mismatch |= 0x1u;
-	const uint64_t args = entry.base + words[1];
+	const bool packet_read = read(entry.packet, words.data(), sizeof(words), entry.guarded_packet);
+	if (!packet_read || words != entry.words) {
+		mismatch |= 0x1u;
+	}
+	const uint64_t args = entry.base + (packet_read ? words[1] : entry.words[1]);
 	if (args != entry.args) mismatch |= 0x2u;
 	if (entry.stride != size || entry.count != 1) mismatch |= 0x4u;
 	const auto primitive = static_cast<PrimitiveType>(entry.primitive);
@@ -2541,8 +2668,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 	// (KYTY_SPECULATE=4: the state pass, the speculation's threads and the GPU thread's chunked runs take
 	// ProcessPm4Spec. Mode 0 runs main's loop: none of their per-packet checks. The mode is 4 from before the first
 	// speculation until its results are discarded, so a run never changes copies midway.)
-	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) [[unlikely]]
-		return ProcessPm4Spec(execution, stop_depth);
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+		if (GuardedCommandReads()) {
+			return ProcessPm4Spec<true>(execution, stop_depth);
+		}
+		return ProcessPm4Spec<false>(execution, stop_depth);
+	}
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	// (KYTY_WEAVE=1: queue 0's processor while the weave runs on it, the same loop with its hooks at the draw packets.)
 	if (g_weave_order.turns == this) [[unlikely]]
@@ -2830,6 +2961,33 @@ static constexpr uint32_t DrawIndirectRunMax = 64;
 
 // KYTY_SPECULATE=4's PM4 loop (ProcessPm4 chooses it): the state pass's and a speculation's checks, refusals and
 // recoverable exits, and the GPU thread's chunk stops.
+// Both PM4 bodies share the same diagnostics and per-thread scratch.
+static thread_local uint64_t g_spec_seen_arms = 0;
+static thread_local std::array<uint32_t, DrawIndirectRunMax * 5u> g_spec_draw_run_copy;
+static thread_local std::vector<uint32_t> g_spec_write_copy;
+static std::atomic<uint32_t> g_spec_predicated_skip_logs {0};
+static std::atomic<uint32_t> g_spec_release_skip_logs {0};
+static std::atomic<uint32_t> g_spec_malformed_pass_logs {0};
+static std::atomic<uint32_t> g_spec_inside_run_logs {0};
+
+static constexpr auto Pm4RefusalNames = [] {
+	std::array<std::array<char, 16>, 512> names {};
+	for (uint32_t i = 0; i < names.size(); ++i) {
+		const std::string_view prefix = i < 256 ? "packet " : "packet NOP R";
+		auto out = std::copy(prefix.begin(), prefix.end(), names[i].begin());
+		const auto number = i % 256;
+		if (number >= 100) {
+			*out++ = static_cast<char>('0' + number / 100);
+		}
+		if (number >= 10) {
+			*out++ = static_cast<char>('0' + number / 10 % 10);
+		}
+		*out = static_cast<char>('0' + number % 10);
+	}
+	return names;
+}();
+
+template <bool Guarded>
 void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth) {
 	// (Behind a plain global: KYTY_SPECULATE unset, no thread-local read.)
 	auto* const spec = kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr;
@@ -2891,7 +3049,23 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 	// plain load faults on there: the read watchers (Spec::WorkerReadable; a backing view's range readable) and the write
 	// guard's no-access pages (KYTY_WRITE_GUARD, Spec::WriteGuarded: a load there waits in WriteGuard::OnFault for the
 	// lift), so it stops where Windows' probe stops. The read guards are Windows' only (PAGE_GUARD).
-	const bool off_gpu_thread = (spec != nullptr || m_state_only) && !GuestGpu::IsGpuThread();
+	const bool off_gpu_thread = Guarded || ((spec != nullptr || m_state_only) && !GuestGpu::IsGpuThread());
+	// Each level owns its copy so an indirect buffer cannot overwrite its caller's packet.
+	[[maybe_unused]] std::conditional_t<Guarded, std::vector<uint32_t>, bool> command_copy {};
+	const auto command_cancelled = [&] {
+		if constexpr (Guarded) {
+			const bool requested = m_command_cancel->load(std::memory_order_acquire);
+			if (requested && spec != nullptr && spec->cancel_seen != nullptr) {
+				spec->cancel_seen->store(true, std::memory_order_release);
+			}
+			return requested || m_command_skip->load(std::memory_order_acquire) >= m_command_serial;
+		}
+		return false;
+	};
+	const auto stop_before_read = [&] {
+		m_watched_stop = true;
+		execution.m_suspended = true;
+	};
 	uint64_t   clean_end      = 0;
 	const auto watched        = [&](uint64_t host, uint64_t bytes) {
 		if (!off_gpu_thread) return false;
@@ -2919,6 +3093,9 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 	};
 	while (execution.m_buffer_stack.size() > stop_depth) {
 		if (packet_light) spec->light_unmarked = false; // (a packet before this one is done with its Mark)
+		if (Guarded && command_cancelled()) {
+			return stop_before_read();
+		}
 		if (spec != nullptr && spec->refused != nullptr) return refuse(spec->refused);
 		if (g_gpu_state != nullptr && spec == nullptr) { // (a speculation's thread runs no guest commands)
 			g_gpu_state->ProcessCommands();
@@ -2931,9 +3108,8 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		// before the next packet is read through a mapping that has no access now. KYTY_WRITE_GUARD_LOCKFREE: only when a
 		// page armed since lies in one of its buffers, or the ring of armed pages no longer holds them all.)
 		if (spec != nullptr) {
-			static thread_local uint64_t seen_arms = 0;
-			if (const auto arms = WriteGuard::g_arms.load(std::memory_order_acquire); arms != seen_arms) {
-				const uint64_t since = std::exchange(seen_arms, arms);
+			if (const auto arms = WriteGuard::g_arms.load(std::memory_order_acquire); arms != g_spec_seen_arms) {
+				const uint64_t since = std::exchange(g_spec_seen_arms, arms);
 				if (!WriteGuard::LockFree() || WriteGuard::ArmedSinceIn(since, arms, [&](uint64_t page) {
 					    for (const auto& buffer: execution.m_buffer_stack) {
 						    const auto at = reinterpret_cast<uint64_t>(buffer.commands.data());
@@ -2963,11 +3139,22 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		// (Its header's page first, to the page's end; then its words' pages once its length is read.)
 		const auto packet_at = reinterpret_cast<uint64_t>(cursor.commands.data() + cursor.offset_dw); // (the pointer read)
 		clean_end               = 0;
-		if (watched(packet_at, 4u)) return;
-		const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
+		const auto* const source_packet = cursor.commands.data() + cursor.offset_dw;
+		const auto*       packet        = source_packet;
 		const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
-		const auto        packet_header = packet[0];
+		uint32_t          packet_header = 0;
+		if constexpr (Guarded) {
+			if (Spec::WorkerCopy(&packet_header, source_packet, sizeof(packet_header), false) != 0 ||
+			    command_cancelled()) {
+				return stop_before_read();
+			}
+		} else {
+			if (watched(packet_at, 4u)) {
+				return;
+			}
+			packet_header = packet[0];
+		}
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
 		// A state pass or a speculation may pass a command buffer after the GPU thread translated it, and the game may
@@ -2980,10 +3167,26 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			execution.m_suspended = true;
 			return;
 		}
-		if (packet_header != 0x80000000u && watched(packet_at, uint64_t {KYTY_PM4_LEN(packet_header)} * 4u)) return;
-		// (The words a prefetch, a hint, may read from here: off the GPU thread, the checked range only.)
-		const auto run_dw = off_gpu_thread ? static_cast<uint32_t>(std::min<uint64_t>(remaining_dw, (clean_end - packet_at) / 4u))
-		                                   : remaining_dw;
+		uint32_t local_dw = remaining_dw;
+		if constexpr (Guarded) {
+			const uint32_t dwords = packet_header == 0x80000000u ? 1u : KYTY_PM4_LEN(packet_header);
+			// The AA sample register handler consumes four words after the packet.
+			local_dw = packet_header == 0xc0106900u ? std::min(remaining_dw, dwords + 4u) : dwords;
+			if (opcode == Pm4::IT_WRITE_DATA && dwords < 4u) {
+				return stop_before_read();
+			}
+			command_copy.resize(std::max(local_dw, 16u));
+			std::fill(command_copy.begin() + local_dw, command_copy.end(), 0u);
+			if (Spec::WorkerCopy(command_copy.data(), source_packet, uint64_t {local_dw} * 4u, false) != 0 ||
+			    command_copy.front() != packet_header || command_cancelled()) {
+				return stop_before_read();
+			}
+			packet = command_copy.data();
+		} else {
+			if (packet_header != 0x80000000u && watched(packet_at, uint64_t {KYTY_PM4_LEN(packet_header)} * 4u)) {
+				return;
+			}
+		}
 
 		if (packet_header == 0x80000000u) {
 			if (note_words) spec->NoteCommandWords(reinterpret_cast<uint64_t>(cursor.Position() + cursor.offset_dw), 4u);
@@ -3010,8 +3213,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 				DrawStateObserver::ObservePacket(opcode, packet, packet_dw, true);
 #endif
 			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
-			static std::atomic<uint32_t> skip_log_count {0};
-			if (skip_log_count.load(std::memory_order_relaxed) < 2048 && skip_log_count.fetch_add(1, std::memory_order_relaxed) < 2048) {
+			if (g_spec_predicated_skip_logs.load(std::memory_order_relaxed) < 2048 && g_spec_predicated_skip_logs.fetch_add(1, std::memory_order_relaxed) < 2048) {
 				LOGF("\t predicated skip: op=0x%02" PRIx32 ", r=0x%02" PRIx32 ", len=%" PRIu32
 				     ", packet=0x%016" PRIx64 ", cmd_id=0x%08" PRIx32 "\n",
 				     opcode, KYTY_PM4_R(packet_header), packet_dw,
@@ -3019,8 +3221,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			}
 			if (opcode == Pm4::IT_NOP && KYTY_PM4_R(packet_header) == Pm4::R_RELEASE_MEM &&
 			    packet_dw >= 7) {
-				static std::atomic<uint32_t> log_count {0};
-				if (log_count.load(std::memory_order_relaxed) < 128 && log_count.fetch_add(1, std::memory_order_relaxed) < 128) {
+				if (g_spec_release_skip_logs.load(std::memory_order_relaxed) < 128 && g_spec_release_skip_logs.fetch_add(1, std::memory_order_relaxed) < 128) {
 					const auto dst = packet[3] | (static_cast<uint64_t>(packet[4]) << 32u);
 					const auto val = packet[5] | (static_cast<uint64_t>(packet[6]) << 32u);
 					LOGF("\t predicated skip: R_RELEASE_MEM dst=0x%016" PRIx64
@@ -3078,23 +3279,28 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			// reach only when the next packet continues the run as the readers match it. The span is the words copied: a
 			// packet the copy did not take whole is outside it ((count + 1) * 5 <= the span), so no reader reads it.)
 			if (off_gpu_thread) {
-				static thread_local std::array<uint32_t, DrawIndirectRunMax * 5u> run_copy;
+				auto& run_copy = g_spec_draw_run_copy;
 				const uint32_t reach = std::min(draw_run_dw, DrawIndirectRunMax * 5u);
 				// (Words [from, to) copied; returns the end of what was, up to a page without access: Spec::WorkerCopy, on
 				// Linux a page a read watcher guards.)
 				const auto copy = [&](uint32_t from, uint32_t to) {
 					const uint64_t bytes = uint64_t {to - from} * 4u;
-					return from + static_cast<uint32_t>((bytes - Spec::WorkerCopy(run_copy.data() + from, packet + from, bytes, false)) / 4u);
+					return from + static_cast<uint32_t>((bytes - Spec::WorkerCopy(run_copy.data() + from, source_packet + from, bytes, false)) / 4u);
 				};
 				uint32_t copied = copy(0, std::min(reach, 10u));
-				if (copied < 5u) { // (the head's own words: before the packet, as the probe stops)
+				if (copied < 5u || (Guarded && !std::equal(packet, packet + 5, run_copy.begin()))) {
+					// Stop before the head if it cannot be read or changed between the two guarded copies.
 					m_watched_stop        = true;
 					execution.m_suspended = true;
 					return;
 				}
 				if (copied == 10u && reach > 10u && run_copy[5] == 0xc0032500u && run_copy[7] == run_copy[2] &&
-				    run_copy[8] == run_copy[3] && run_copy[9] == run_copy[4])
+				    run_copy[8] == run_copy[3] && run_copy[9] == run_copy[4]) {
 					copied = copy(10u, reach);
+				}
+				if (Guarded && command_cancelled()) {
+					return stop_before_read();
+				}
 				draw_run_dw = copied;
 				run_words   = run_copy.data();
 			} else if (capped) {
@@ -3104,9 +3310,9 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 				for (uint32_t at = 5; inside && at <= to_stop; at += 5u)
 					inside = at + 5u <= remaining_dw && packet[at] == 0xc0032500u && packet[at + 2] == packet[2] &&
 					         packet[at + 3] == packet[3] && packet[at + 4] == packet[4];
-				static std::atomic<uint32_t> inside_reports {0};
-				if (inside && inside_reports.fetch_add(1, std::memory_order_relaxed) < 16)
+				if (inside && g_spec_inside_run_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
 					std::printf("Speculation: a stop inside a run of indirect draws (%u dwords on): the run cut there\n", to_stop);
+				}
 			}
 		}
 		// Off the GPU thread, the words two packets read after the probe, read once in a guarded copy before the packet is
@@ -3130,16 +3336,20 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 				m_watched_stop        = true;
 				execution.m_suspended = true;
 			};
-			if (opcode == Pm4::IT_WRITE_DATA) {
-				static thread_local std::vector<uint32_t> write_copy;
-				const uint32_t                           dwords = KYTY_PM4_LEN(packet_header);
-				write_copy.resize(dwords);
-				if (dwords < 4u || Spec::WorkerCopy(write_copy.data(), packet, uint64_t {dwords} * 4u, false) != 0)
-					return stop_before();
-				handler_words = write_copy.data();
-			} else if ((opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT || opcode == Pm4::IT_SET_SH_REG_INDIRECT ||
-			            opcode == Pm4::IT_SET_UCONFIG_REG_INDIRECT) &&
-			           KYTY_PM4_LEN(packet_header) >= 5u) { // (as the observer reads one; its handler takes 5 only)
+			if constexpr (!Guarded) {
+				if (opcode == Pm4::IT_WRITE_DATA) {
+					auto& write_copy = g_spec_write_copy;
+					const uint32_t dwords = KYTY_PM4_LEN(packet_header);
+					write_copy.resize(dwords);
+					if (dwords < 4u || Spec::WorkerCopy(write_copy.data(), packet, uint64_t {dwords} * 4u, false) != 0) {
+						return stop_before();
+					}
+					handler_words = write_copy.data();
+				}
+			}
+			if ((opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT || opcode == Pm4::IT_SET_SH_REG_INDIRECT ||
+			     opcode == Pm4::IT_SET_UCONFIG_REG_INDIRECT) &&
+			    KYTY_PM4_LEN(packet_header) >= 5u) { // (as the observer reads one; its handler takes 5 only)
 				const uint64_t table = (uint64_t {packet[1]} & 0xfffffffcu) | (uint64_t {packet[2]} << 32u);
 				const uint32_t pairs = packet[4] & 0x3fffu;
 				if (table != 0 && pairs != 0) {
@@ -3147,8 +3357,10 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 					const uint64_t bytes = uint64_t {pairs} * 8u;
 					copy.words.resize(size_t {pairs} * 2u);
 					// (KYTY_WRITE_GUARD_SPEC: a table on a guarded page through the backing view, as GuardTable reads it.)
-					if (Spec::WorkerCopy(copy.words.data(), reinterpret_cast<const void*>(table), bytes, true) != 0)
+					if (Spec::WorkerCopy(copy.words.data(), reinterpret_cast<const void*>(table), bytes, true) != 0 ||
+					    (Guarded && command_cancelled())) {
 						return stop_before();
+					}
 					// (Shared with a state pass's GuardTable; a speculation's compares its own copy with it.)
 					copy.packet = packet, copy.table = table, copy.pairs = pairs, copy.shared = spec == nullptr;
 					table_words = {copy.words.data(), copy.words.size()};
@@ -3168,9 +3380,10 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			++m_chunk_work;
 		}
 		m_chunk_last_opcode = opcode;
-		if (note_words)
+		if (note_words) {
 			spec->NoteCommandWords(reinterpret_cast<uint64_t>(cursor.Position() + cursor.offset_dw),
-			                       uint64_t {KYTY_PM4_LEN(packet_header)} * 4u);
+			                       uint64_t {Guarded ? local_dw : KYTY_PM4_LEN(packet_header)} * 4u);
+		}
 		if (spec != nullptr) {
 			// (packet_light: a register packet's EnterPacket and Mark left out; see `packet_light`.)
 			const bool light = packet_light &&
@@ -3192,13 +3405,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			}
 			if (!SpeculationTakes(opcode, packet_header)) {
 				// (By opcode in the speculation's report.)
-				static const auto names = [] {
-					std::array<std::string, 512> all; // (NOPs by their R type after the opcodes)
-					for (uint32_t i = 0; i < 256; ++i) all[i] = "packet " + std::to_string(i);
-					for (uint32_t i = 0; i < 256; ++i) all[256 + i] = "packet NOP R" + std::to_string(i);
-					return all;
-				}();
-				return refuse(names[opcode == Pm4::IT_NOP ? 256u + (KYTY_PM4_R(packet_header) & 0xffu) : opcode].c_str());
+				return refuse(Pm4RefusalNames[opcode == Pm4::IT_NOP ? 256u + (KYTY_PM4_R(packet_header) & 0xffu) : opcode].data());
 			}
 		}
 		// The CP writes an indirect draw's start instance into the user SGPR the packet names
@@ -3257,7 +3464,14 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		// (A speculation off the GPU thread, which AddPm4 does not count: its indexed draws, which its commit counts for
 		// the presenter's 3D view, FrameGen::TakeScene. A refused packet's go with it: Rollback.)
 		if (note_words && FrameGen::IsIndexedDrawPacket(opcode)) ++spec->indexed_draws;
-		if (DrawsOrDispatches(opcode)) PrefetchNextDraw(packet, run_dw);
+		if constexpr (!Guarded) {
+			if (DrawsOrDispatches(opcode)) {
+				const auto run_dw = off_gpu_thread
+				                        ? static_cast<uint32_t>(std::min<uint64_t>(remaining_dw, (clean_end - packet_at) / 4u))
+				                        : remaining_dw;
+				PrefetchNextDraw(packet, run_dw);
+			}
+		}
 		if (XprCapture::Enabled()) {
 			if (opcode == Pm4::IT_DRAW_INDEX_INDIRECT) {
 				XprCapture::ObserveDraw(m_draw_indirect_args_base_addr + packet[1]);
@@ -3312,7 +3526,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 				}
 			} else if (packet_header == 0xc0083800u && !GraphicsRunDebugDumpEnabled()) {
 				// Several indexed indirect draws of consecutive arguments, as a run of DRAW_INDEX_INDIRECT.
-				const auto consumed = TryNativeMultiDraw({packet, remaining_dw});
+				const auto consumed = TryNativeMultiDraw({packet, local_dw});
 				if (consumed) {
 					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
 					execution.m_made_progress = true;
@@ -3332,7 +3546,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 				}
 			} else if (packet_header == 0xc0012d00u && !GraphicsRunDebugDumpEnabled()) {
 				// A draw of vertices as a table draw (the normal path stores the pair's state).
-				const auto consumed = TryNativeAutoDraw({packet, remaining_dw});
+				const auto consumed = TryNativeAutoDraw({packet, local_dw});
 				if (consumed) {
 					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
 					execution.m_made_progress = true;
@@ -3342,7 +3556,8 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 				if (spec != nullptr) return refuse("draw");
 			} else if (packet_header == 0xc0032400u && !GraphicsRunDebugDumpEnabled() && SpecDrawIndirect()) {
 				// A draw of vertices of GPU-read arguments as a table draw (the normal path stores the pair's state).
-				const auto consumed = TryNativeIndirectAutoDraw({packet, remaining_dw});
+				const auto consumed = TryNativeIndirectAutoDraw(
+				    {packet, local_dw}, Guarded ? cursor.Position() + cursor.offset_dw : nullptr);
 				if (consumed) {
 					m_draw_run_skip = 0;
 					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
@@ -3354,7 +3569,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			} else if ((packet_header == 0xc0042700u || packet_header == 0xc0033500u) &&
 			           !GraphicsRunDebugDumpEnabled()) {
 				// Direct indexed draws from the same records (the normal path stores them).
-				const auto consumed = TryNativeDirectDraw({packet, remaining_dw});
+				const auto consumed = TryNativeDirectDraw({packet, local_dw});
 				if (consumed) {
 					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
 					execution.m_made_progress = true;
@@ -3395,6 +3610,12 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		}
 
 		if (handler == nullptr) {
+			if constexpr (Guarded) {
+				if (spec != nullptr) {
+					return refuse("malformed packet");
+				}
+				return stop_before_read();
+			}
 			const auto offset = total_dw - remaining_dw;
 			LOGF("unknown PM4 packet: data=0x%016" PRIx64 ", num_dw=%" PRIu32
 			     ", offset=0x%05" PRIx32 ", current=0x%016" PRIx64 "\n",
@@ -3425,10 +3646,10 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 				const Common::RecoverableExitScope recoverable;
 				packet_dw = handler(*this, packet_header & ~1u, handler_words + 1, remaining_dw, total_dw) + 1;
 			} catch (const Common::RecoverableExit& malformed) {
-				static std::atomic<uint32_t> reports {0};
-				if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+				if (g_spec_malformed_pass_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
 					std::printf("Speculation: a state pass ended at a malformed packet (header 0x%08x): %s\n", packet_header,
 					            malformed.message.c_str());
+				}
 				execution.m_suspended = true;
 				return;
 			}
@@ -3444,11 +3665,21 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			} catch (const Common::RecoverableExit&) {
 				Spec::Refuse("malformed packet");
 			}
+			if constexpr (Guarded) {
+				if (packet_dw > remaining_dw) {
+					return refuse("malformed packet");
+				}
+			}
 			if (spec->refused != nullptr) {
 				// Refused in an indirect buffer it opened: this level goes on past it.
 				if (execution.m_buffer_stack.size() > buffer_index + 1 && packet_dw != 0)
 					execution.m_buffer_stack[buffer_index].deferred_advance_dw = packet_dw;
 				return refuse(spec->refused);
+			}
+		}
+		if constexpr (Guarded) {
+			if (packet_dw > remaining_dw) {
+				return stop_before_read();
 			}
 		}
 		EXIT_IF(packet_dw > remaining_dw);
@@ -3812,7 +4043,7 @@ uint32_t CommandProcessor::TryNativeAutoDraw(std::span<const uint32_t> packet) {
 #endif
 }
 
-uint32_t CommandProcessor::TryNativeIndirectAutoDraw(std::span<const uint32_t> packet) {
+uint32_t CommandProcessor::TryNativeIndirectAutoDraw(std::span<const uint32_t> packet, const uint32_t* command_words) {
 	LiveCensus::Scope census(LiveCensus::NativeXpr, 3);
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	using Prospero::PrimitiveType;
@@ -3865,7 +4096,8 @@ uint32_t CommandProcessor::TryNativeIndirectAutoDraw(std::span<const uint32_t> p
 		if (taken.fetch_add(1, std::memory_order_relaxed) % static_cast<uint64_t>(every) == 0) {
 			const auto&             emitted = executor.m_table_args_emit;
 			Spec::DrawIndirectVerify entry;
-			entry.packet = reinterpret_cast<uint64_t>(packet.data());
+			entry.packet = reinterpret_cast<uint64_t>(command_words != nullptr ? command_words : packet.data());
+			entry.guarded_packet = command_words != nullptr;
 			std::memcpy(entry.words.data(), packet.data(), sizeof(entry.words));
 			entry.base      = m_draw_indirect_args_base_addr;
 			entry.args      = args;
@@ -3888,6 +4120,7 @@ uint32_t CommandProcessor::TryNativeIndirectAutoDraw(std::span<const uint32_t> p
 	return 5u;
 #else
 	(void)packet;
+	(void)command_words;
 	return 0;
 #endif
 }
@@ -4214,7 +4447,8 @@ void CommandProcessor::DispatchIndirectAddressImpl(uint64_t args_addr, uint32_t 
 	DispatchIndirectArgs args {};
 	const auto* source = reinterpret_cast<const void*>(args_addr);
 	if constexpr (GuardedArgs) {
-		// Speculative sync may refuse the arguments while returning true.
+		// Speculative sync can report a refusal while returning true. The guest may also release the arguments
+		// while the worker is still in this handler.
 		if (const auto* spec = Spec::Current(); spec != nullptr && spec->refused != nullptr) {
 			return;
 		}

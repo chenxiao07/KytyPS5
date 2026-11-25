@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <immintrin.h> // (_mm_pause: CommitReady's spin)
 #include <map>
 #include <string>
@@ -284,9 +285,9 @@ void Speculation::TakeShared() {
 static void PrepareCommitImageScratch();
 
 Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t base, uint32_t threads, bool pass_thread,
-                         bool guarded_dispatch_args)
+                         GuestGpu* waitless_gpu)
     : m_renderer(renderer), m_chain(std::make_unique<CommandProcessor>(renderer, interrupt_id)),
-      m_interrupt_id(interrupt_id),
+      m_interrupt_id(interrupt_id), m_waitless_gpu(waitless_gpu),
       m_state(std::make_unique<CommandProcessor>(renderer, interrupt_id)) {
 	if (Spec::ModeFour()) PrepareCommitImageScratch();
 	m_state->SetStateOnly(true);
@@ -298,9 +299,6 @@ Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t bas
 	threads = std::clamp<uint32_t>(threads, 1u, static_cast<uint32_t>(Spec::MaxPacketSlots) - std::min<uint32_t>(base, Spec::MaxPacketSlots - 1));
 	for (uint32_t i = 0; i < threads; ++i) {
 		m_translators.push_back(std::make_unique<Translator>(renderer, base + i, interrupt_id));
-		if (guarded_dispatch_args) {
-			m_translators.back()->cp->SetGuardedDispatchArgs();
-		}
 	}
 	// KYTY_SPEC_PASS_THREAD: the state pass's own translator, last (the caller left it a packet slot).
 	if (pass_thread && base + threads < Spec::MaxPacketSlots) {
@@ -308,13 +306,32 @@ Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t bas
 		m_translators.back()->pass_only = true;
 		m_pass_thread                   = true;
 	}
-	if (m_shared) JoinSharedEffects(); // (Before its threads: Push makes them.)
+	if (Waitless()) {
+		m_waitless_jobs.emplace();
+		m_waitless_jobs->free.resize(WaitlessJobsMax);
+		m_done_state = std::make_unique<CommandProcessorState>();
+		m_retired_records.reserve(2 * WaitlessJobsMax * WaitlessChunksMax + Spec::MaxPacketSlots);
+		for (auto& worker: m_translators) {
+			worker->free.reserve(2 * WaitlessAheadMax + Spec::MaxPacketSlots);
+			worker->resolved.reserve(2 * WaitlessAheadMax + Spec::MaxPacketSlots);
+			worker->resolving.reserve(2 * WaitlessAheadMax + Spec::MaxPacketSlots);
+		}
+	}
+	if (m_shared) {
+		JoinSharedEffects(); // Before starting any workers.
+	}
 }
 
 void Speculation::Stop() {
 	{
 		std::lock_guard lock(m_mutex);
 		m_quit = true;
+		if (Waitless()) {
+			m_pass_cancel.store(true, std::memory_order_release);
+			for (auto& worker: m_translators) {
+				worker->cancel.store(true, std::memory_order_release);
+			}
+		}
 	}
 	m_ahead_wake.notify_all();
 	for (auto& translator: m_translators)
@@ -365,6 +382,18 @@ Speculation::Outcome Speculation::Resume(CommandProcessor& cp, Pm4Execution& exe
 	return Continue(std::move(m_blocked), cp, execution);
 }
 
+bool Speculation::StartWorkers(uint32_t queue_id) noexcept {
+	try {
+		for (auto& translator: m_translators) {
+			translator->thread = std::thread([this, worker = translator.get()] { AheadRun(*worker); });
+		}
+		return true;
+	} catch (const std::exception& failure) {
+		std::printf("Speculation q%u: worker start failed (%s); running in order\n", queue_id, failure.what());
+		return false;
+	}
+}
+
 void Speculation::SeedCompute(uint64_t completed, const CommandProcessor* cp) {
 	// The lane is still private and no worker has begun its state pass.
 	if (cp != nullptr) {
@@ -376,34 +405,98 @@ void Speculation::SeedCompute(uint64_t completed, const CommandProcessor* cp) {
 	}
 	m_done_serial = m_state_serial = m_taken = completed;
 	m_taken_chunk = UINT32_MAX;
+	if (Waitless()) {
+		m_skip_through.store(completed, std::memory_order_relaxed);
+	}
+}
+
+bool Speculation::ResultEligible(const Result& result) const {
+	return result.pass == m_pass &&
+	       (!Waitless() || (!result.abandoned && result.serial > m_skip_through.load(std::memory_order_acquire) &&
+	                       result.serial > m_done_serial && !Taken(result.serial, result.chunk)));
+}
+
+void Speculation::Reclaim(bool idle) {
+	if (!m_reclaim.exchange(false, std::memory_order_acq_rel)) {
+		return;
+	}
+	for (;;) {
+		std::unique_ptr<Result> result;
+		{
+			std::unique_lock lock(m_mutex, std::defer_lock);
+			// During idle service the queue mutex is released. Wait only for bookkeeping, never for a result.
+			if (idle) {
+				lock.lock();
+			} else if (!lock.try_lock()) {
+				m_reclaim.store(true, std::memory_order_release);
+				return;
+			}
+			const auto stale = std::ranges::find_if(m_ahead, [&](const auto& ahead) { return !ResultEligible(*ahead); });
+			if (stale == m_ahead.end()) {
+				return;
+			}
+			result = std::move(*stale);
+			m_ahead.erase(stale);
+			m_ahead_wake.notify_all();
+		}
+		Finish(std::move(result), 0);
+	}
 }
 
 void Speculation::Push(const Job& job) {
 	{
 		std::lock_guard lock(m_mutex);
-		if (!m_translators[0]->thread.joinable())
-			for (auto& translator: m_translators)
-				translator->thread = std::thread([this, worker = translator.get()] { AheadRun(*worker); });
-		m_jobs.push_back({job});
-		m_jobs.back().pushed_ns = NowNs();
+		if (m_waitless_jobs) {
+			auto& [active, free] = *m_waitless_jobs;
+			if (free.empty() || m_retired_records.size() >= WaitlessJobsMax * WaitlessChunksMax) {
+				return;
+			}
+			active.splice(active.end(), free, free.begin());
+			auto& entry = active.back();
+			entry.job = job;
+			entry.pass = 0;
+			entry.pushed_ns = NowNs();
+		} else {
+			m_jobs.push_back({job});
+			m_jobs.back().pushed_ns = NowNs();
+		}
 	}
 	m_ahead_wake.notify_all();
 }
 
-void Speculation::Done(uint64_t serial, const CommandProcessor& cp) {
-	std::lock_guard lock(m_mutex);
-	while (!m_jobs.empty() && m_jobs.front().job.serial <= serial) {
-		// (Its records' writes are made: what read through them reads memory.)
-		for (auto& chunk: m_jobs.front().chunks)
-			if (auto record = std::move(chunk.record)) {
-				Unlink(record.get(), nullptr);
-				Retire(std::move(record));
-			}
+void Speculation::RetireFront() {
+	auto& chunks = m_waitless_jobs ? m_waitless_jobs->active.front().chunks : m_jobs.front().chunks;
+	// Its records' writes are made. What read through them reads memory.
+	for (auto& chunk: chunks) {
+		if (auto record = std::move(chunk.record)) {
+			Unlink(record.get(), nullptr);
+			Retire(std::move(record));
+		}
+	}
+	if (m_waitless_jobs) {
+		auto& [active, free] = *m_waitless_jobs;
+		chunks.clear();
+		free.splice(free.end(), active, active.begin());
+	} else {
 		m_jobs.pop_front();
 	}
+}
+
+void Speculation::Done(uint64_t serial, const CommandProcessor& cp) {
+	std::lock_guard lock(m_mutex);
+	WithJobs([&](auto& jobs) {
+		while (!jobs.empty() && jobs.front().job.serial <= serial) {
+			RetireFront();
+		}
+	});
 	m_done_serial = serial;
-	if (!m_done_state) m_done_state = std::make_unique<CommandProcessorState>();
+	if (!m_done_state) {
+		m_done_state = std::make_unique<CommandProcessorState>();
+	}
 	cp.SaveStateTo(*m_done_state);
+	if (Waitless()) {
+		m_reclaim.store(true, std::memory_order_release);
+	}
 	m_ahead_wake.notify_all();
 }
 
@@ -431,7 +524,7 @@ bool Speculation::StatePass(const Job& job, uint64_t which) {
 		chunk.at = execution;
 		{
 			std::lock_guard lock(m_mutex);
-			if (Taken(job.serial, UINT32_MAX)) {
+			if (!Waitless() && Taken(job.serial, UINT32_MAX)) {
 				m_state->SetChunking(0);
 				return false;
 			}
@@ -459,8 +552,12 @@ bool Speculation::StatePass(const Job& job, uint64_t which) {
 		// (Not followed: what is not passed is translated the normal way.)
 		auto*      entry    = EntryOf(job.serial);
 		const bool followed = processed == Pm4ProcessResult::Complete || boundary;
-		const bool claimed  = Taken(job.serial, UINT32_MAX);
-		if (entry != nullptr && which == m_pass && followed && !claimed) {
+		const bool claimed  = !Waitless() && Taken(job.serial, UINT32_MAX);
+		const auto cancelled = [&] {
+			return Waitless() && (m_pass_cancel.load(std::memory_order_acquire) ||
+			                     job.serial <= m_skip_through.load(std::memory_order_acquire));
+		};
+		if (entry != nullptr && which == m_pass && followed && !claimed && !cancelled()) {
 			entry->pass = which;
 			entry->chunks.push_back(std::move(chunk));
 			m_ahead_wake.notify_all();
@@ -468,9 +565,10 @@ bool Speculation::StatePass(const Job& job, uint64_t which) {
 			Unlink(chunk.record.get(), nullptr);
 			Retire(std::move(chunk.record));
 		}
-		if (!boundary || entry == nullptr || which != m_pass || claimed) {
+		if (!boundary || entry == nullptr || which != m_pass || claimed ||
+		    (Waitless() && (cancelled() || entry->chunks.size() >= WaitlessChunksMax))) {
 			m_state->SetChunking(0);
-			return followed && entry != nullptr && !claimed;
+			return followed && entry != nullptr && !claimed && !(Waitless() && boundary);
 		}
 	}
 }
@@ -481,9 +579,14 @@ const Spec::State* Speculation::RecordOf(uint64_t serial, uint32_t chunk) {
 }
 
 Speculation::Entry* Speculation::EntryOf(uint64_t serial) {
-	for (auto& entry: m_jobs)
-		if (entry.job.serial == serial) return &entry;
-	return nullptr;
+	return WithJobs([&](auto& jobs) -> Entry* {
+		for (auto& entry: jobs) {
+			if (entry.job.serial == serial) {
+				return &entry;
+			}
+		}
+		return nullptr;
+	});
 }
 
 void Speculation::Unlink(const Spec::State* from, const Spec::State* to) {
@@ -493,9 +596,15 @@ void Speculation::Unlink(const Spec::State* from, const Spec::State* to) {
 	for (auto& ahead: m_ahead) relink(ahead->state);
 	for (auto& translator: m_translators)
 		if (translator->current != nullptr) relink(translator->current->state);
-	for (auto& entry: m_jobs)
-		for (auto& chunk: entry.chunks)
-			if (chunk.record) relink(*chunk.record);
+	WithJobs([&](auto& jobs) {
+		for (auto& entry: jobs) {
+			for (auto& chunk: entry.chunks) {
+				if (chunk.record) {
+					relink(*chunk.record);
+				}
+			}
+		}
+	});
 	if (m_pass_record != nullptr) relink(*m_pass_record);
 }
 
@@ -690,21 +799,33 @@ void Speculation::AheadRun(Translator& translator) {
 			// (KYTY_SPEC_PASS_THREAD: only its thread takes the pass, and it takes nothing else.)
 			const bool takes_pass = translator.pass_only || !m_pass_thread;
 			pass                  = takes_pass && !m_state_busy && !m_broken ? EntryOf(m_state_serial + 1) : nullptr;
-			if (pass != nullptr && Taken(pass->job.serial, UINT32_MAX)) {
+			if (pass != nullptr && !Waitless() && Taken(pass->job.serial, UINT32_MAX)) {
 				pass = nullptr;
 			}
 			work                  = nullptr;
 			if (translator.pass_only) return pass != nullptr;
-			if (pass == nullptr)
-				for (auto& entry: m_jobs) {
-					if (entry.pass != m_pass || entry.job.serial <= m_done_serial) continue;
-					for (uint32_t c = 0; c < entry.chunks.size() && work == nullptr; ++c)
-						if (!entry.chunks[c].taken && !Taken(entry.job.serial, c)) {
-							work       = &entry;
-							work_chunk = c;
+			if (pass == nullptr && (!Waitless() || (m_ahead.size() < WaitlessAheadMax &&
+			    (translator.free.size() < WaitlessAheadMax || std::ranges::any_of(translator.free, [&](const auto& result) {
+				    return result->retired < Horizon();
+			    }))))) {
+				WithJobs([&](auto& jobs) {
+					for (auto& entry: jobs) {
+						if (entry.pass != m_pass || entry.job.serial <= m_done_serial ||
+						    (Waitless() && entry.job.serial <= m_skip_through.load(std::memory_order_acquire))) {
+							continue;
 						}
-					if (work != nullptr) break;
-				}
+						for (uint32_t c = 0; c < entry.chunks.size() && work == nullptr; ++c) {
+							if (!entry.chunks[c].taken && !Taken(entry.job.serial, c)) {
+								work       = &entry;
+								work_chunk = c;
+							}
+						}
+						if (work != nullptr) {
+							break;
+						}
+					}
+				});
+			}
 			return pass != nullptr || work != nullptr;
 		};
 		if (!ready()) {
@@ -731,6 +852,10 @@ void Speculation::AheadRun(Translator& translator) {
 			const auto job   = pass->job;
 			const auto which = m_pass;
 			m_pass_active_serial = job.serial;
+			if (Waitless()) {
+				m_pass_cancel.store(false, std::memory_order_relaxed);
+				m_state->SetGuardedCommands(m_pass_cancel, m_skip_through, job.serial);
+			}
 			// (Chunks of an earlier pass over it go: what read through their records reads memory.)
 			for (auto& chunk: pass->chunks)
 				if (auto record = std::move(chunk.record)) {
@@ -762,6 +887,9 @@ void Speculation::AheadRun(Translator& translator) {
 		translator.cancel.store(false, std::memory_order_relaxed);
 		translator.cancel_seen.store(false, std::memory_order_relaxed);
 		const auto         job       = work->job;
+		if (Waitless()) {
+			translator.cp->SetGuardedCommands(translator.cancel, m_skip_through, job.serial);
+		}
 		const auto         which     = work->pass;
 		auto               start     = std::move(chunk.start);
 		const Pm4Execution at        = chunk.at;
@@ -774,8 +902,12 @@ void Speculation::AheadRun(Translator& translator) {
 		                                ? static_cast<uint32_t>(before_entry->chunks.size() - 1)
 		                                : UINT32_MAX;
 		const Result* previous = nullptr;
-		for (const auto& ahead: m_ahead)
-			if (ahead->serial == before_serial && ahead->chunk == before_chunk && ahead->pass == which) previous = ahead.get();
+		for (const auto& ahead: m_ahead) {
+			if (ahead->serial == before_serial && ahead->chunk == before_chunk && ahead->pass == which &&
+			    (!Waitless() || ResultEligible(*ahead))) {
+				previous = ahead.get();
+			}
+		}
 		if (work_chunk == 0) {
 			m_start_delay_ns += NowNs() - work->pushed_ns;
 			++m_started;
@@ -799,9 +931,23 @@ void Speculation::AheadRun(Translator& translator) {
 			m_longest_ns = std::max(m_longest_ns, took);
 		}
 		translator.translating = 0;
+		bool wake_reclaim = false;
+		if (Waitless()) {
+			result->abandoned = std::exchange(translator.abandoned, false);
+			wake_reclaim = !ResultEligible(*result);
+			if (wake_reclaim) {
+				m_reclaim.store(true, std::memory_order_release);
+			}
+		}
 		m_ahead.push_back(std::move(result));
 		m_ahead_gen.store(m_ahead_gen.load(std::memory_order_relaxed) + 1, std::memory_order_release); // (under m_mutex)
 		m_ahead_wake.notify_all();
+		if (wake_reclaim) {
+			// Enqueue takes the queue mutex before m_mutex.
+			lock.unlock();
+			m_waitless_gpu->WakeForComputeReclaim();
+			lock.lock();
+		}
 	}
 }
 
@@ -1013,10 +1159,114 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 	return outcome;
 }
 
-bool Speculation::FrontReady(uint64_t serial, uint32_t chunk) {
-	std::lock_guard lock(m_mutex);
+Speculation::Outcome Speculation::CommitReadyWaitless(CommandProcessor& cp, const Job& job, uint32_t chunk,
+                                                      Pm4Execution& execution, std::optional<Pm4Execution>& end) {
+	std::unique_ptr<Result> result;
+	{
+		std::unique_lock lock(m_mutex, std::try_to_lock);
+		const auto claim_remainder = [&] {
+			m_skip_through.store(job.serial, std::memory_order_release);
+			m_reclaim.store(true, std::memory_order_release);
+			++m_ahead_misses;
+			end.reset();
+			return Outcome::None;
+		};
+		if (!lock) {
+			return claim_remainder();
+		}
+		const auto chunk_end = [&] {
+			end.reset();
+			if (auto* entry = EntryOf(job.serial);
+			    entry != nullptr && entry->pass == m_pass && chunk < entry->chunks.size() && !entry->chunks[chunk].last) {
+				end = std::move(entry->chunks[chunk].end);
+			}
+		};
+		const auto translating = [&] {
+			return std::ranges::any_of(m_translators, [&](const auto& worker) {
+				return worker->translating == job.serial && worker->translating_chunk == chunk;
+			});
+		};
+		for (;;) {
+			const auto found = std::ranges::find_if(m_ahead, [&](const auto& ahead) {
+				return ahead->serial == job.serial && ahead->chunk == chunk && ResultEligible(*ahead);
+			});
+			if (found != m_ahead.end()) {
+				result = std::move(*found);
+				m_ahead.erase(found);
+				m_ahead_wake.notify_all();
+				break;
+			}
+			const bool busy = translating();
+			if (busy && !(m_ready_checked_serial == job.serial && m_ready_checked_chunk == chunk)) {
+				m_ready_checked_serial = job.serial;
+				m_ready_checked_chunk = chunk;
+				lock.unlock();
+				const auto queue_id = static_cast<uint32_t>(m_interrupt_id - GuestGpu::ComputeQueueBase + 1);
+				const int other = GuestGpu::ReadyFrontElsewhere(queue_id);
+				if (!lock.try_lock()) {
+					return claim_remainder();
+				}
+				if (!translating()) {
+					continue;
+				}
+				if (other != 0) {
+					end.reset();
+					return Outcome::Yield;
+				}
+			}
+
+			// Claim before executing any packet that can release the guest's command storage.
+			chunk_end();
+			// Without a published end, claim_remainder also marks the whole job to skip.
+			if (job.serial > m_taken || (job.serial == m_taken && chunk > m_taken_chunk)) {
+				m_taken = job.serial;
+				m_taken_chunk = chunk;
+			}
+			if (busy) {
+				for (auto& worker: m_translators) {
+					if (worker->translating == job.serial && worker->translating_chunk == chunk) {
+						worker->abandoned = true;
+						worker->cancel.store(true, std::memory_order_release);
+					}
+				}
+			}
+			if (m_pass_active_serial == job.serial) {
+				m_pass_cancel.store(true, std::memory_order_release);
+			}
+			if (!end) {
+				return claim_remainder();
+			}
+			++m_ahead_misses;
+			return Outcome::None;
+		}
+		if (!cp.SameState(*result->start_state) || !CommandProcessor::SamePosition(execution, result->start_at)) {
+			++m_pass;
+			m_reclaim.store(true, std::memory_order_release);
+			m_broken = true;
+			m_broken_at = job.serial;
+			m_taken = job.serial;
+			m_taken_chunk = UINT32_MAX;
+			end.reset();
+			lock.unlock();
+			Finish(std::move(result), 0);
+			return Outcome::None;
+		}
+		chunk_end();
+	}
+	return Commit(std::move(result), cp, execution);
+}
+
+bool Speculation::FrontReady(uint64_t serial, uint32_t chunk, bool nonblocking) {
+	std::unique_lock lock(m_mutex, std::defer_lock);
+	if (nonblocking || Waitless()) {
+		if (!lock.try_lock()) {
+			return false;
+		}
+	} else {
+		lock.lock();
+	}
 	return std::ranges::any_of(m_ahead, [&](const auto& ahead) {
-		return ahead->serial == serial && ahead->chunk == chunk && ahead->pass == m_pass;
+		return ahead->serial == serial && ahead->chunk == chunk && ResultEligible(*ahead);
 	});
 }
 
@@ -1082,7 +1332,8 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
                                                             std::unique_ptr<CommandProcessorState>* chunk_start) {
 	auto&                                      scheduler = m_renderer.GetCommandScheduler();
 	std::unique_ptr<Result>                    result;
-	std::vector<std::pair<uint64_t, uint64_t>> resolved;
+	std::vector<std::pair<uint64_t, uint64_t>> local_resolved;
+	auto& resolved = Waitless() ? translator.resolving : local_resolved;
 	// KYTY_SPEC_RESULT_POOL_CAP (live spec_result_pool_cap; 0, the default: off): a translator keeps at most that many
 	// finished results for reuse. Without it `free` only grows: a translation finds none to reuse while a translation
 	// going on began before they were retired (a long one, a burst: a level load), makes one, and keeps it (two
@@ -1130,11 +1381,16 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 				it = translator.free.erase(it);
 			}
 		}
-		resolved.swap(translator.resolved);
+		if (!Waitless() || !translator.resolved.empty()) {
+			resolved.swap(translator.resolved);
+		}
 	}
 	for (auto& freed: surplus) FreeResult(std::move(freed));
 	// (What the commits released of its rings, released on the thread that uses them.)
-	for (const auto& [pending, tick]: resolved) ResolvePending(translator, pending, tick);
+	for (const auto& [pending, tick]: resolved) {
+		ResolvePending(translator, pending, tick);
+	}
+	resolved.clear();
 	if (const auto cap = hole_states_cap.load(std::memory_order_relaxed);
 	    result && cap > 0 && result->hole_states.size() > static_cast<uint64_t>(cap))
 		result->hole_states.resize(static_cast<size_t>(cap));
@@ -1184,8 +1440,10 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 		kyty_local_speculations_live.fetch_add(1, std::memory_order_seq_cst); // (Finish takes it back)
 		if (previous != nullptr && previous->retired == 0)
 			r.state.previous = &previous->state;
-		else if (record != nullptr && std::ranges::any_of(m_jobs, [&](const Entry& entry) {
-			         return std::ranges::any_of(entry.chunks, [&](const Chunk& chunk) { return chunk.record.get() == record; });
+		else if (record != nullptr && WithJobs([&](const auto& jobs) {
+			         return std::ranges::any_of(jobs, [&](const Entry& entry) {
+				         return std::ranges::any_of(entry.chunks, [&](const Chunk& chunk) { return chunk.record.get() == record; });
+			         });
 		         }))
 			r.state.previous = record;
 		else
@@ -1261,13 +1519,18 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 			// (A packet that does not fit its buffer, refused "malformed packet" before its Mark: a command buffer the game
 			// rewrote after the GPU thread passed it. Not sized (SuspendedPacket would end the process) and nothing taken:
 			// the checkpoint is the packet before's, so a Rollback would drop that packet's notes; the GPU thread redoes it.)
-			if (!CommandProcessor::SuspendedPacketFits(spec)) {
+			uint32_t dwords = 0, header = 0;
+			const uint32_t* packet = nullptr;
+			if (Waitless()) {
+				packet = CommandProcessor::ReadGuardedSuspendedPacket(spec, header, dwords);
+			} else if (CommandProcessor::SuspendedPacketFits(spec)) {
+				packet = CommandProcessor::SuspendedPacket(spec, dwords);
+			}
+			if (packet == nullptr) {
 				r.failed = true;
-				r.stop   = r.state.refused;
+				r.stop = r.state.refused;
 				break;
 			}
-			uint32_t   dwords  = 0;
-			const auto packet  = CommandProcessor::SuspendedPacket(spec, dwords);
 			if (r.state.light_unmarked) // (mode 4: a refused register packet's Mark, if no level of ProcessPm4Spec took it)
 				r.state.Mark(LocalVulkanRecording::RecordedWrites()), r.state.light_unmarked = false;
 			const bool partial = LocalVulkanRecording::RecordedWrites() != r.state.checkpoint_work;
@@ -1280,12 +1543,12 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 				}();
 				static std::atomic<uint32_t> reports {0};
 				if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
-					std::printf("Speculation: packet 0x%08x refused (%s) after recording work\n", *packet, r.state.refused);
+					std::printf("Speculation: packet 0x%08x refused (%s) after recording work\n", Waitless() ? header : *packet, r.state.refused);
 				r.failed = true;
-				r.stop   = names[(*packet >> 8u) & 0xffu].c_str();
+				r.stop   = names[((Waitless() ? header : *packet) >> 8u) & 0xffu].c_str();
 				break;
 			}
-			if (!IsHole(*packet) || r.state.stop) {
+			if (!IsHole(Waitless() ? header : *packet) || r.state.stop) {
 				r.stop = r.state.refused;
 				break;
 			}
@@ -1295,10 +1558,10 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 			auto& hole  = r.holes.emplace_back();
 			hole.packet = packet;
 			hole.dwords = dwords;
-			hole.header = *packet;
+			hole.header = Waitless() ? header : *packet;
 			hole.reason = r.state.refused;
 			hole.at     = spec; // (spec_stop_as_hole)
-			CommandProcessor::SkipSuspendedPacket(spec);
+			CommandProcessor::SkipSuspendedPacket(spec, Waitless() ? dwords : 0);
 			hole.after = spec;
 			scheduler.EndRecording(*r.recorder);
 			r.state.CloseSegment(r.recorder->recorded.size());

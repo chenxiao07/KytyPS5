@@ -2185,7 +2185,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	if (!SyncCommandMemory(reinterpret_cast<uint64_t>(indirect_buffer),
 	                       uint64_t {indirect_num_dw} * sizeof(uint32_t), "IndirectBuffer"))
 		return 3;
-	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
+	if (!cp.GuardedCommandReads()) {
+		GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
+	}
 
 	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw});
 

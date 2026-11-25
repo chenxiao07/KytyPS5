@@ -116,15 +116,19 @@ private:
 	};
 
 	void              Enqueue(Submission submission);
+	static void       PushGraphics(Speculation& speculation, const Submission& submission);
 	static void       PushCompute(Speculation& speculation, const Submission& submission);
 	[[nodiscard]] Speculation* ComputeLane(uint32_t queue_id) const noexcept;
+	void              WakeForComputeReclaim();
+	void              ReclaimCompute(bool idle = false);
+	[[nodiscard]] bool ReclaimComputeBeforeIdle();
 	void              WaitForIdle();
 	bool              CanProcessSubmission(const Submission& submission) const;
 
 public:
-	// KYTY_SPECULATE=4, on the GPU thread (Speculation::CommitReady, holding no speculation's lock): another queue's
-	// compute front runnable now: 1 a fixed lane's front with its chunk translated, 2 an unspeculated front; 0 none.
-	[[nodiscard]] static int ReadyFrontElsewhere() noexcept;
+	// On the GPU thread, with no lane lock held. A runnable front elsewhere: 1 with a translated chunk, 2 in order.
+	// A waitless compute lane can also yield to queue 0.
+	[[nodiscard]] static int ReadyFrontElsewhere(uint32_t except = 0) noexcept;
 
 private:
 	// KYTY_SPECULATE=4, on the GPU thread holding m_queue_mutex (released for the reads, taken again): the blocked fronts
@@ -181,6 +185,7 @@ private:
 	// KYTY_SPECULATE (speculation.h): made at the first graphics command buffer it translates.
 	std::unique_ptr<Speculation>                                     m_speculation;
 	std::atomic<Speculation*>                                        m_ahead {nullptr}; // KYTY_SPECULATE=4's
+	std::array<bool, QueueCount>                                     m_spec_start_failed {}; // GPU thread only
 	// KYTY_SPEC_COMPUTE=1 retains round 4's single configurable async queue.
 	std::unique_ptr<Speculation>                                     m_speculation_async;
 	std::atomic<Speculation*>                                        m_ahead_async {nullptr};
@@ -197,6 +202,7 @@ private:
 	std::jthread    m_thread;
 
 	friend class CommandProcessor;
+	friend class Speculation;
 };
 } // namespace Libs::Graphics
 

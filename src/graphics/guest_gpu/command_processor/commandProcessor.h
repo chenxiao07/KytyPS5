@@ -8,6 +8,7 @@
 #include "weave.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -106,7 +107,14 @@ public:
 	// index and indirect bases, instances, counters, predication, context pushes), translating and executing nothing:
 	// the state a command buffer leaves, before it is translated.
 	void SetStateOnly(bool state_only) noexcept { m_state_only = state_only; }
-	void SetGuardedDispatchArgs() noexcept { m_guarded_dispatch_args = true; }
+	// Used by waitless workers and their state passes, once per job.
+	void SetGuardedCommands(const std::atomic<bool>& cancel, const std::atomic<uint64_t>& skip, uint64_t serial) noexcept {
+		m_command_cancel = &cancel;
+		m_command_skip = &skip;
+		m_command_serial = serial;
+		m_guarded_dispatch_args = true;
+	}
+	[[nodiscard]] bool GuardedCommandReads() const noexcept { return m_command_skip != nullptr; }
 	// Chunks of a command buffer (KYTY_SPECULATE=4): a state pass suspends before every `every`-th draw or dispatch that
 	// does not continue a run of indirect draws (TakeBoundary: it did); Process suspends before the packet at `at` (the
 	// next chunk's start; null: none; TakeStopReached: it did). Positions are compared by the packets they are at.
@@ -126,11 +134,13 @@ public:
 	static void PrintPacketAt(const Pm4Execution& at, const char* what);
 	// The packet a suspended execution stopped at (its length in `dwords`), and past it.
 	[[nodiscard]] static const uint32_t* SuspendedPacket(const Pm4Execution& execution, uint32_t& dwords);
+	[[nodiscard]] static const uint32_t* ReadGuardedSuspendedPacket(const Pm4Execution& execution, uint32_t& header,
+	                                                                uint32_t& dwords);
 	// SuspendedPacket would size it (the packet is in its buffer: not past a rewritten buffer's end).
 	[[nodiscard]] static bool            SuspendedPacketFits(const Pm4Execution& execution);
 	// The execution stopped at a WAIT_REG_MEM.
 	[[nodiscard]] static bool AtWait(const Pm4Execution& execution);
-	static void                          SkipSuspendedPacket(Pm4Execution& execution);
+	static void                          SkipSuspendedPacket(Pm4Execution& execution, uint32_t dwords = 0);
 
 	void            BufferInit();
 	void            BufferFlush();
@@ -162,7 +172,7 @@ public:
 	[[nodiscard]] uint32_t TryNativeAutoDraw(std::span<const uint32_t> packet);
 	// KYTY_SPEC_DRAW_INDIRECT (live spec_draw_indirect): a DRAW_INDIRECT (non-indexed) as a table draw, its arguments
 	// read on the GPU: the packet's dwords, or 0.
-	[[nodiscard]] uint32_t TryNativeIndirectAutoDraw(std::span<const uint32_t> packet);
+	[[nodiscard]] uint32_t TryNativeIndirectAutoDraw(std::span<const uint32_t> packet, const uint32_t* command_words = nullptr);
 	// A DRAW_INDEX_INDIRECT_MULTI of a count it holds, as that many DRAW_INDEX_INDIRECT: the packet's dwords, or 0.
 	[[nodiscard]] uint32_t TryNativeMultiDraw(std::span<const uint32_t> packet);
 	uint32_t TryDrawIndirectRun(std::span<const uint32_t> packets);
@@ -254,7 +264,11 @@ private:
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution, size_t stop_depth);
+	template <bool Guarded>
 	void ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth);
+	const std::atomic<bool>*     m_command_cancel = nullptr;
+	const std::atomic<uint64_t>* m_command_skip = nullptr;
+	uint64_t                     m_command_serial = 0;
 	// ProcessPm4's loop, one body: <false> as it is, <true> with the weave's hooks at queue 0's draw packets (taken
 	// only while the weave runs on this processor; a build without KYTY_LOCAL_VULKAN_RECORDING instantiates only
 	// <false>).
