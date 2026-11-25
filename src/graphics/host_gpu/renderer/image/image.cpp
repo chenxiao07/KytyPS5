@@ -603,23 +603,38 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	// thread writes, is neither read nor written here. The segment's commands then hold the clear exactly where the
 	// in-order Transit makes it when the commit finds the image as the segment found it (Speculation::Before stops the
 	// segment otherwise). Without a speculation: the backing's, as before.
-	auto* const       zero_spec  = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr;
+	const bool        speculative_readers = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0;
+	auto* const       zero_spec = speculative_readers ? Spec::Current() : nullptr;
 	Spec::ImageEntry* zero_entry = nullptr;
 	if (zero_spec != nullptr && destination_layout != vk::ImageLayout::eUndefined && backing.image && ZeroNewImages() &&
 	    vk::blockExtent(info.pixel_format)[0] == 1) {
 		auto* const entry = SpeculativeEntry(); // (the entry GetBarriers below takes)
 		if (entry->state.layout == vk::ImageLayout::eUndefined && entry->subresources.empty()) zero_entry = entry;
 	}
-	if (zero_entry != nullptr ||
-	    (zero_spec == nullptr && backing.state.layout == vk::ImageLayout::eUndefined && backing.subresource_states.empty() &&
-	     destination_layout != vk::ImageLayout::eUndefined && backing.image && ZeroNewImages() &&
-	     vk::blockExtent(info.pixel_format)[0] == 1)) {
+	const VulkanImageState zeroed {vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+	                               vk::ImageLayout::eTransferDstOptimal};
+	const auto backing_undefined = [&] {
+		return backing.state.layout == vk::ImageLayout::eUndefined && backing.subresource_states.empty();
+	};
+	bool zero_backing = false;
+	if (zero_spec == nullptr && (speculative_readers || backing_undefined()) &&
+	    destination_layout != vk::ImageLayout::eUndefined && backing.image && ZeroNewImages() &&
+	    vk::blockExtent(info.pixel_format)[0] == 1) {
+		if (speculative_readers) {
+			const StateLock lock(*this);
+			if (backing_undefined()) {
+				backing.state = zeroed;
+				zero_backing = true;
+			}
+		} else {
+			zero_backing = true;
+		}
+	}
+	if (zero_entry != nullptr || zero_backing) {
 		m_scheduler.EndRendering();
 		ZeroNewImage(backing.image, FullAspectMask(info.pixel_format), command_buffer);
-		const VulkanImageState zeroed {vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
-		                               vk::ImageLayout::eTransferDstOptimal};
 		if (zero_entry != nullptr) zero_entry->state = zeroed;
-		else backing.state = zeroed;
+		else if (!speculative_readers) backing.state = zeroed;
 	}
 	if (LiveTrace::WriteTicks()) {
 		constexpr auto writes = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
