@@ -411,6 +411,10 @@ bool Speculation::StatePass(const Job& job, uint64_t which) {
 		chunk.at = execution;
 		{
 			std::lock_guard lock(m_mutex);
+			if (Taken(job.serial, UINT32_MAX)) {
+				m_state->SetChunking(0);
+				return false;
+			}
 			chunk.start = std::move(m_pass_snapshot);
 			chunk.record = TakeRecord();
 			if (const auto* entry = EntryOf(job.serial); entry != nullptr && !entry->chunks.empty())
@@ -435,7 +439,8 @@ bool Speculation::StatePass(const Job& job, uint64_t which) {
 		// (Not followed: what is not passed is translated the normal way.)
 		auto*      entry    = EntryOf(job.serial);
 		const bool followed = processed == Pm4ProcessResult::Complete || boundary;
-		if (entry != nullptr && which == m_pass && followed) {
+		const bool claimed  = Taken(job.serial, UINT32_MAX);
+		if (entry != nullptr && which == m_pass && followed && !claimed) {
 			entry->pass = which;
 			entry->chunks.push_back(std::move(chunk));
 			m_ahead_wake.notify_all();
@@ -443,19 +448,11 @@ bool Speculation::StatePass(const Job& job, uint64_t which) {
 			Unlink(chunk.record.get(), nullptr);
 			Retire(std::move(chunk.record));
 		}
-		if (!boundary || entry == nullptr || which != m_pass) {
+		if (!boundary || entry == nullptr || which != m_pass || claimed) {
 			m_state->SetChunking(0);
-			return followed && entry != nullptr;
+			return followed && entry != nullptr && !claimed;
 		}
 	}
-}
-
-bool Speculation::ChunkInOrder() {
-	static auto& on = LiveSwitch::Find("spec_chunk_in_order", [] {
-		const char* value = std::getenv("KYTY_SPEC_CHUNK_IN_ORDER");
-		return value != nullptr ? std::atoll(value) : ModeToggle::Default("spec_chunk_in_order");
-	}());
-	return on.load(std::memory_order_relaxed) != 0;
 }
 
 const Spec::State* Speculation::RecordOf(uint64_t serial, uint32_t chunk) {
@@ -673,6 +670,9 @@ void Speculation::AheadRun(Translator& translator) {
 			// (KYTY_SPEC_PASS_THREAD: only its thread takes the pass, and it takes nothing else.)
 			const bool takes_pass = translator.pass_only || !m_pass_thread;
 			pass                  = takes_pass && !m_state_busy && !m_broken ? EntryOf(m_state_serial + 1) : nullptr;
+			if (pass != nullptr && Taken(pass->job.serial, UINT32_MAX)) {
+				pass = nullptr;
+			}
 			work                  = nullptr;
 			if (translator.pass_only) return pass != nullptr;
 			if (pass == nullptr)
@@ -710,6 +710,7 @@ void Speculation::AheadRun(Translator& translator) {
 			translator.since = ++m_clock;
 			const auto job   = pass->job;
 			const auto which = m_pass;
+			m_pass_active_serial = job.serial;
 			// (Chunks of an earlier pass over it go: what read through their records reads memory.)
 			for (auto& chunk: pass->chunks)
 				if (auto record = std::move(chunk.record)) {
@@ -722,6 +723,7 @@ void Speculation::AheadRun(Translator& translator) {
 			lock.lock();
 			translator.since = 0;
 			m_state_busy     = false;
+			m_pass_active_serial = 0;
 			if (!followed) {
 				m_broken    = true;
 				m_broken_at = job.serial;
@@ -793,6 +795,45 @@ static bool CancelSpinOn() {
 }
 static constexpr uint32_t CancelSpinUnseen = 1024, CancelSpinTail = 8192;
 
+void Speculation::ClaimBlockingRemainder(uint64_t serial, std::unique_lock<std::mutex>& lock) {
+	// Claim under the same mutex that workers and the pass use to take a command span.
+	if (!Taken(serial, UINT32_MAX)) {
+		m_taken       = serial;
+		m_taken_chunk = UINT32_MAX;
+	}
+	for (auto& worker: m_translators) {
+		if (worker->translating == serial) {
+			worker->cancel.store(true, std::memory_order_relaxed);
+		}
+	}
+	const auto reading = [&] {
+		return m_pass_active_serial == serial ||
+		       std::ranges::any_of(m_translators, [serial](const auto& worker) { return worker->translating == serial; });
+	};
+	if (!reading()) {
+		return;
+	}
+	// Flush held commits before a worker wait, as in CommitReady's wait for a requested chunk.
+	if (FlushEvery() > 1) {
+		lock.unlock();
+		m_renderer.GetCommandScheduler().FlushRecorded();
+		lock.lock();
+	}
+	if ((GuestGpu::ServeInWaits() & 4u) != 0) {
+		while (reading()) {
+			if (GuestGpu::CommandsPending()) {
+				lock.unlock();
+				GuestGpu::ServePendingCommands();
+				lock.lock();
+			} else {
+				m_ahead_wake.wait_for(lock, std::chrono::microseconds(50));
+			}
+		}
+	} else {
+		m_ahead_wake.wait(lock, [&] { return !reading(); });
+	}
+}
+
 Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& job, uint32_t chunk, Pm4Execution& execution,
                                               std::optional<Pm4Execution>& end) {
 	std::unique_ptr<Result> result;
@@ -804,18 +845,8 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 		const auto chunk_end = [&] {
 			end.reset();
 			if (const auto* entry = EntryOf(job.serial);
-			    entry != nullptr && entry->pass == m_pass && chunk < entry->chunks.size() && !entry->chunks[chunk].last)
+			    entry != nullptr && entry->pass == m_pass && chunk < entry->chunks.size() && !entry->chunks[chunk].last) {
 				end = entry->chunks[chunk].end;
-		};
-		// The normal way: the speculation's threads do not begin it, nor, its end unknown, any chunk of it after it.
-		const auto take = [&] {
-			chunk_end();
-			// (KYTY_SPEC_CHUNK_IN_ORDER: a chunk the pass has not cut is translated here up to where the pass will end it;
-			// the chunks after it stay the speculation's threads'.)
-			const auto taken = end || ChunkInOrder() ? chunk : UINT32_MAX;
-			if (job.serial > m_taken || (job.serial == m_taken && taken > m_taken_chunk)) {
-				m_taken       = job.serial;
-				m_taken_chunk = taken;
 			}
 		};
 		for (;;) {
@@ -928,7 +959,13 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 				m_wait_ns += NowNs() - waited;
 				continue;
 			}
-			take();
+			chunk_end();
+			if (!end) {
+				ClaimBlockingRemainder(job.serial, lock);
+			} else if (!Taken(job.serial, chunk)) {
+				m_taken       = job.serial;
+				m_taken_chunk = chunk;
+			}
 			++m_ahead_misses;
 			return Outcome::None;
 		}
@@ -939,16 +976,21 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 			++m_pass;
 			m_broken    = true;
 			m_broken_at = job.serial;
-			m_taken     = job.serial;
-			m_taken_chunk = UINT32_MAX;
 			end.reset();
+			ClaimBlockingRemainder(job.serial, lock);
 			lock.unlock();
 			Finish(std::move(result), 0);
 			return Outcome::None;
 		}
 		chunk_end();
 	}
-	return Commit(std::move(result), cp, execution);
+	const auto outcome = Commit(std::move(result), cp, execution);
+	// A final chunk has no stop. Claim it if the commit falls back, including a possible fallback after Resume.
+	if (!end && outcome != Outcome::Whole && outcome != Outcome::Chunk) {
+		std::unique_lock lock(m_mutex);
+		ClaimBlockingRemainder(job.serial, lock);
+	}
+	return outcome;
 }
 
 bool Speculation::FrontReady(uint64_t serial, uint32_t chunk) {

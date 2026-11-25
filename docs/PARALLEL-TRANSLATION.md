@@ -61,7 +61,6 @@ switch acts only in mode 4. A verify switch N checks every Nth use against the p
 | KYTY_SPECULATE_ASYNC_THREADS | that queue's threads | - | 2 | |
 | KYTY_MIMALLOC (Windows) | the emulator's operator new/delete from mimalloc; fixed at process start from the environment (a boot in mode 0 switched live to 4 keeps the CRT heap, so a heap A/B is two boots) | 0 | 1 | |
 | KYTY_RENDER_CPUS | CPUs the workers avoid (the render thread's) | - | unset | |
-| spec_chunk_in_order | a chunk's translation starts from the state pass's state at its start | - | 1 | |
 | spec_late_reads | a read of memory a pending write of an unlinked chain covered is checked at commit | - | 1 | |
 | spec_start_instance_free | the start-instance SGPR left out of a chunk's start-state comparison | - | 1 | |
 | spec_predict_dcc | 1: a DCC surface's clear predicted on a worker; 3: also a surface whose fast clear another speculation's hole will consume before this one commits is read as not cleared (a consume-pending registry; the commit checks the read): the view save's cleared-target holes 1180 -> 408 a report, Latria 1216 -> 356 | - | 3 | |

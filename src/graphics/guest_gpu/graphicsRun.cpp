@@ -2026,15 +2026,11 @@ bool GuestGpu::Process(Submission& submission) {
 						submission.spec_normal = true;
 					}
 					cp.SetStopAt(submission.spec_end ? &*submission.spec_end : nullptr);
-					// (KYTY_SPEC_CHUNK_IN_ORDER: no end known, the chunk the pass will cut, Speculation::ChunkInOrder.)
-					const bool chunked = !submission.spec_end && Speculation::ChunkInOrder();
-					if (chunked) cp.SetChunking(Speculation::ChunkWork);
+					// With no end, CommitReady claimed the remainder. spec_normal keeps that replay across a wait.
 					const auto processed = cp.Process(submission.command_execution, submission.commands);
 					cp.SetStopAt(nullptr);
-					const bool at_boundary = chunked && cp.TakeBoundary();
-					if (chunked) cp.SetChunking(0);
 					progressed |= submission.command_execution.MadeProgress();
-					if (cp.TakeStopReached() || at_boundary) {
+					if (cp.TakeStopReached()) {
 						submission.spec_normal = false;
 						submission.spec_end.reset();
 						++submission.spec_chunk;
@@ -3290,8 +3286,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 					spec->NoteCommandWords(
 					    reinterpret_cast<uint64_t>(cursor.Position() + cursor.offset_dw + KYTY_PM4_LEN(packet_header)),
 					    uint64_t {consumed - KYTY_PM4_LEN(packet_header)} * 4u);
-				// (KYTY_SPEC_CHUNK_IN_ORDER: the run's other draws counted as the state pass counts them, one a packet, so
-				// the in-order chunk ends where the pass cut it.)
+				// Count the remaining draws as the state pass does, one per packet.
 				if (m_chunk_every != 0) m_chunk_work += consumed / 5u - 1u;
 				if (Scout::Running() && !IsAsyncComputeQueue()) Scout::SkipDraws(consumed / 5u - 1u);
 				execution.m_buffer_stack[buffer_index].offset_dw += consumed;

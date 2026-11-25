@@ -32,7 +32,7 @@ inline constexpr Row Table[] = {
     {"fill_buffer_clears", 1, 0},       {"spec_draw_indirect", 1, 0},    {"spec_predict_dcc", 3, 0},
     {"spec_read_one_set", 1, 0},        {"speculate_flush_every", 8, 0}, {"speculate_keep_pass", 1, 0},
     {"speculate_texel_sync", 1, 0},     {"spec_late_reads", 1, 0},       {"spec_start_instance_free", 1, 0},
-    {"spec_chunk_in_order", 1, 0},      {"serve_in_waits", 7, 1},        {"write_guard_spec", 1, 0},
+    {"serve_in_waits", 7, 1},        {"write_guard_spec", 1, 0},
     {"eager_feedback", 1, 0},           {"feedback_batch", 1, 0},        {"table_serials", 1, 0},
     {"table_memo", 1, 0},               {"spec_worker_packets", 1, 0},  {"table_learn_portable", 2, 0},
     {"table_dead_user_data", 1, 0},     {"spec_gpu_affinity", 1, 0},

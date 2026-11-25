@@ -108,11 +108,6 @@ public:
 	// lock, taken and released here; the caller holds no other instance's).
 	[[nodiscard]] bool    FrontReady(uint64_t serial, uint32_t chunk);
 	static constexpr uint32_t ChunkWork = 128;
-	// KYTY_SPEC_CHUNK_IN_ORDER (live spec_chunk_in_order, default off): a chunk the state pass has not cut when the GPU
-	// thread comes for it ("not passed yet") is translated in order up to where the pass will end it (ChunkWork draws
-	// and dispatches from its start), not to the command buffer's end; the chunks after it stay the speculation's
-	// threads' (~1.3 ms of in-order translation each, 0.4-0.9 ms a frame at the arch, 1 Nov).
-	[[nodiscard]] static bool ChunkInOrder();
 	// The graphics queue's time in a slice of a command buffer (the report's total).
 	void NoteQueueTime(uint64_t ns) noexcept { m_queue_ns += ns; }
 	// What the normal translation does while a speculation is not committed (Spec::t_effects of the thread that
@@ -293,6 +288,7 @@ private:
 	// false: it could not follow it.
 	[[nodiscard]] bool StatePass(const Job& job, uint64_t which);
 	void               ResyncStatePass();
+	void               ClaimBlockingRemainder(uint64_t serial, std::unique_lock<std::mutex>& lock);
 	// (Under m_mutex.) The submission's entry (null: done, or not pushed), the chunk's record (null: none any more); what
 	// links to `from` links to `to` (results, the translations going on, records); when the oldest translation going on
 	// began (m_clock; UINT64_MAX: none): what was retired before is reached by none; a record for a state pass (a
@@ -368,6 +364,7 @@ private:
 	// thread took the normal way and the last it did, with its state after it.
 	std::condition_variable           m_ahead_wake;
 	std::deque<Entry>                 m_jobs;
+	uint64_t                          m_pass_active_serial = 0; // pass holding the job span, under m_mutex
 	std::unique_ptr<CommandProcessor> m_state;
 	uint64_t                          m_state_serial = 0, m_pass = 1, m_broken_at = 0;
 	bool                              m_state_busy = false, m_broken = false;
