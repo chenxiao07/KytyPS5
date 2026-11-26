@@ -1653,6 +1653,14 @@ void GuestGpu::ThreadRun(void* data) {
 	BdaDirtyRegions::g_translating = true;
 	LiveTrace::g_mark_thread = true;
 	const auto cpu_plan = InitializePerformanceSwitches();
+#if defined(_WIN32) && defined(KYTY_LOCAL_VULKAN_RECORDING)
+	const auto apply_irq_avoid = [gpu, &cpu_plan] {
+		if (!g_irq_avoid_at_boot) return;
+		const auto& adapter = gpu->m_renderer.GetGraphics().GetPhysicalDeviceProperties();
+		LocalPlatform::ApplyGpuIrqAvoid(adapter.vendorID, adapter.deviceID, cpu_plan,
+		                               kyty_local_speculate_threads.load(std::memory_order_relaxed));
+	};
+#endif
 #if defined(__linux__)
 	static const auto check_write_guard_uffd = [] { // (static: apply_mode calls it too)
 	// KYTY_WRITE_GUARD with the userfaultfd write watch (KYTY_UFFD_WP=1, the Steam Deck build's default unless 0;
@@ -1844,6 +1852,9 @@ void GuestGpu::ThreadRun(void* data) {
 	auto mode = kyty_local_speculate_mode.load(std::memory_order_relaxed);
 	gpu->m_renderer.GetTextureCache().ApplySharedMode(mode == 4);
 	if (mode == 4) {
+#if defined(_WIN32) && defined(KYTY_LOCAL_VULKAN_RECORDING)
+		apply_irq_avoid();
+#endif
 		ModeToggle::ApplyTable(4);
 		// (spec_format_ahead: after the table sets the switch; before the threads that birth pairs exist.)
 		gpu->m_renderer.GetPipelineCache().ApplyFormatAhead();
@@ -1854,9 +1865,15 @@ void GuestGpu::ThreadRun(void* data) {
 	// (Tooling: the live mode toggle (mode-toggle.h), applied between submissions when no speculated queue has one started
 	// and not done: a speculation's results and blocked commits belong to the submission they began. Under m_queue_mutex,
 	// so Enqueue pushes to the old speculation or to the new one, never to one being destroyed.)
-	const auto apply_mode = [gpu, &start_speculation] {
+	const auto apply_mode = [&, gpu] {
 		const int want = ModeToggle::g_request.load(std::memory_order_acquire);
 		if (want < 0) return;
+		int pending = want;
+		if (want == 0 && mode == 0) {
+			if (ModeToggle::g_request.compare_exchange_strong(pending, -1, std::memory_order_acq_rel))
+				Speculation::GpuThreadAffinityAtFlip();
+			return;
+		}
 		// (KYTY_SPEC_TEXCACHE_SHARED: the texture cache lock's shared mode for mode 4, before m_queue_mutex (its take
 		// waits for the lock's exclusive holder: no new lock order) and before start_speculation makes the threads that
 		// take it shared. Turned on even if the switch to mode 4 below waits for a later call: until then mode 0's takes
@@ -1874,8 +1891,15 @@ void GuestGpu::ThreadRun(void* data) {
 			    (gpu->m_speculation_q1 && started(ComputeQueue1))) {
 				return;
 			}
-			ModeToggle::g_request.store(-1, std::memory_order_release);
-			if (static_cast<int>(mode) == want) return;
+			if (!ModeToggle::g_request.compare_exchange_strong(pending, -1, std::memory_order_acq_rel)) return;
+		}
+		if (static_cast<int>(mode) == want) return;
+#if defined(_WIN32) && defined(KYTY_LOCAL_VULKAN_RECORDING)
+		if (want == 4) apply_irq_avoid();
+#endif
+		{
+			// Enqueue can append work during IRQ discovery. Only this thread starts submissions.
+			Common::LockGuard lock(gpu->m_queue_mutex);
 			ModeToggle::ApplyTable(want);
 			if (want == 0) {
 				gpu->m_ahead.store(nullptr, std::memory_order_release);

@@ -1774,24 +1774,39 @@ void Speculation::LogWorker(const Translator& translator) const {
 // (Whether the GPU thread runs apart from the workers' cores now: the mask above applied. The GPU thread's own.)
 static std::atomic<bool> g_gpu_apart {false};
 void Speculation::GpuThreadAffinityAtFlip() {
-	static uint64_t original = 0; // (the GPU thread's mask before it was changed; 0: not changed)
+#if defined(_WIN32) && defined(KYTY_LOCAL_VULKAN_RECORDING)
+	auto& irq = LocalPlatform::g_gpu_irq_affinity;
+	auto& original = irq.speculation_base;
+#else
+	static uint64_t original = 0; // Mask before speculation changed it.
+#endif
 	static int64_t  seen     = 0;
-	const auto      restore  = [](const char* why) {
+	const auto      restore  = [](uint64_t& saved_mask, const char* why) {
 		g_gpu_apart.store(false, std::memory_order_relaxed);
-		if (original == 0) return;
-		const bool done = LocalPlatform::SetCurrentThreadAffinity(original);
-		std::printf("Speculation: GPU thread mask 0x%llx %s (spec_gpu_affinity: %s)\n", static_cast<unsigned long long>(original),
+		if (saved_mask == 0) return;
+		const bool done = LocalPlatform::SetCurrentThreadAffinity(saved_mask);
+		std::printf("Speculation: GPU thread mask 0x%llx %s (spec_gpu_affinity: %s)\n", static_cast<unsigned long long>(saved_mask),
 		            done ? "restored" : "NOT restored", why);
-		if (done) original = 0;
+		if (done) saved_mask = 0;
+		std::fflush(stdout);
 	};
 	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) {
-		// (Out of mode 4: the mask back, and applied again on the return to 4.)
-		if (original != 0) {
-			restore("mode not 4");
-			original = 0; // (tried once: a refused restore is said, not retried)
-			std::fflush(stdout);
+		// Keep a refused restore pending for a later live mode 0 request.
+#if defined(_WIN32) && defined(KYTY_LOCAL_VULKAN_RECORDING)
+		if (irq.targets != 0) {
+			restore(irq.base, "mode not 4");
+			if (irq.base == 0) {
+				irq = {};
+			}
+		} else
+#endif
+		{
+			restore(original, "mode not 4");
 		}
-		g_gpu_apart.store(false, std::memory_order_relaxed);
+#if defined(_WIN32) && defined(KYTY_LOCAL_VULKAN_RECORDING)
+		if (irq.targets == 0 && LocalPlatform::g_irq_avoid_ever_armed.load(std::memory_order_relaxed))
+			LocalPlatform::RestoreIrqIdeal();
+#endif
 		seen = 0;
 		return;
 	}
@@ -1804,33 +1819,49 @@ void Speculation::GpuThreadAffinityAtFlip() {
 	seen      = value;
 	seen_cpus = cpus;
 	if (value == 0) {
-		restore("off");
-		std::fflush(stdout);
+		restore(original, "off");
 		return;
 	}
 	const uint64_t workers = cpus != 0 ? static_cast<uint64_t>(cpus) : LocalPlatform::CpuListMask(SpeculationCpus().first.c_str());
-	const uint64_t current = original != 0 ? original : LocalPlatform::CurrentThreadAffinity();
-	const uint64_t wanted  = current & ~LocalPlatform::CoresOf(workers); // (whole cores: the workers' SMT siblings too)
-	const uint32_t cores   = LocalPlatform::PerformanceCoresIn(wanted);
+	const uint64_t keep = ~LocalPlatform::CoresOf(workers); // (whole cores: the workers' SMT siblings too)
+	uint64_t current, wanted, mask, restore_mask;
+	bool combined_irq_mask = false;
+#if defined(_WIN32) && defined(KYTY_LOCAL_VULKAN_RECORDING)
+	if (LocalPlatform::g_irq_avoid_ever_armed.load(std::memory_order_relaxed) && irq.targets != 0) {
+		current = irq.base;
+		wanted = current & keep;
+		mask = irq.Filter(wanted);
+		restore_mask = irq.filtered_base;
+		combined_irq_mask = true;
+	} else
+#endif
+	{
+		current = original != 0 ? original : LocalPlatform::CurrentThreadAffinity();
+		wanted = mask = current & keep;
+		restore_mask = current;
+	}
+	const uint32_t cores   = LocalPlatform::PerformanceCoresIn(mask);
 	const char*    refused = workers == 0        ? "the workers have no CPU list"
 	                         : current == 0      ? "the GPU thread's mask is not known"
 	                         : wanted == current ? "the GPU thread's CPUs and the workers' are apart already"
 	                         : cores < 2         ? "fewer than 2 performance cores would be left to the GPU thread"
 	                                             : nullptr;
-	if (refused == nullptr && !LocalPlatform::SetCurrentThreadAffinity(wanted)) refused = "the OS refused the mask";
+	if (refused == nullptr && !LocalPlatform::SetCurrentThreadAffinity(mask)) refused = "the OS refused the mask";
 	if (refused != nullptr) {
 		std::printf("Speculation: GPU thread affinity not changed: %s (mask 0x%llx, workers 0x%llx, %u performance cores "
 		            "left; spec_gpu_affinity)\n",
 		            refused, static_cast<unsigned long long>(current), static_cast<unsigned long long>(workers), cores);
-		restore(refused);
+		// A failed combined mask can leave the GPU on the workers' new cores.
+		if (!combined_irq_mask || workers == 0 || wanted == current) restore(original, refused);
+		else g_gpu_apart.store(false, std::memory_order_relaxed);
 		std::fflush(stdout);
 		return;
 	}
-	if (original == 0) original = current;
+	if (original == 0) original = restore_mask;
 	g_gpu_apart.store(true, std::memory_order_relaxed);
 	std::printf("Speculation: GPU thread mask 0x%llx -> 0x%llx (%u performance cores), off the cores of the workers' 0x%llx "
 	            "(spec_gpu_affinity)\n",
-	            static_cast<unsigned long long>(current), static_cast<unsigned long long>(wanted), cores,
+	            static_cast<unsigned long long>(current), static_cast<unsigned long long>(mask), cores,
 	            static_cast<unsigned long long>(workers));
 	std::fflush(stdout);
 }

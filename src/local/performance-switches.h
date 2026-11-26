@@ -82,6 +82,10 @@ extern volatile std::atomic_uint32_t kyty_local_weave_workers;
 extern volatile std::atomic_uint32_t kyty_local_weave_calls;
 }
 
+#if defined(_WIN32) && defined(KYTY_LOCAL_VULKAN_RECORDING)
+inline bool g_irq_avoid_at_boot = false;
+#endif
+
 inline CpuShape::Plan InitializePerformanceSwitches() {
 	CpuShape::Plan cpu_plan;
 	struct Switch {
@@ -266,6 +270,10 @@ inline CpuShape::Plan InitializePerformanceSwitches() {
 	if (const char* text = std::getenv("KYTY_TABLE_TARGET_READ");
 	    (text == nullptr || *text == '\0') && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4)
 		kyty_local_table_target_read.store(ModeToggle::TableTargetRead4, std::memory_order_relaxed);
+#endif
+#if defined(_WIN32) && defined(KYTY_LOCAL_VULKAN_RECORDING)
+	const char* irq_avoid = std::getenv("KYTY_IRQ_AVOID");
+	g_irq_avoid_at_boot = irq_avoid == nullptr || *irq_avoid == '\0' || std::strcmp(irq_avoid, "1") == 0;
 #endif
 	// External tools find the render thread by this name (for example to pin it).
 	LocalPlatform::SetThreadName("Kyty.Gpu");

@@ -222,7 +222,7 @@ inline Plan Choose(const std::vector<Core>& cores, uint64_t affinity, uint32_t r
 }
 
 std::string CpuList(uint64_t mask);
-Plan BootPlan(uint32_t requested_workers, bool pass_enabled, bool pipe_enabled);
+Plan BootPlan(uint32_t requested_workers, bool pass_enabled, bool pipe_enabled, bool placement_only = false);
 uint32_t PipeCopyBudget(uint32_t workers, uint64_t mask, bool pass, bool automatic);
 std::optional<uint32_t> PipeOverride();
 

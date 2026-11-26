@@ -77,8 +77,6 @@
 #include <zstd.h>
 
 extern "C" {
-// (spec_format_ahead's preparation at the warmup's load: the workers mode 4's CPU check counts, FormatAheadBootAsked.)
-extern volatile std::atomic_uint32_t kyty_local_speculate_threads;
 // 1: find graphics pipelines through a block-hashed index of the full key.
 volatile std::atomic<uint32_t> kyty_local_pipeline_index_mode {1};
 // (speculation.cpp, KYTY_SPECULATE) Speculative translations going on and results unfinished, and EvictIdlePipelines
@@ -5263,11 +5261,8 @@ static bool FormatAheadBootAsked() {
 	const char* threads = std::getenv("KYTY_SPECULATE_THREADS");
 	const auto requested_workers = ParsePerformanceSwitch(threads, 1, 12);
 	if (threads != nullptr && *threads != '\0' && !requested_workers) return false;
-	if (const char* named = std::getenv("KYTY_SPECULATE_CPUS"); named == nullptr || *named == '\0') {
-		const uint32_t workers = requested_workers.value_or(::kyty_local_speculate_threads.load(std::memory_order_relaxed));
-		const uint32_t cpus = LocalPlatform::PerformanceLogicalCpus();
-		if (cpus != 0 && cpus < 3u + workers + 2u) return false;
-	}
+	// CPU eligibility is decided before pass and upload-pipe sizing. Use the early placement query.
+	if (CpuShape::BootPlan(requested_workers.value_or(0), false, false, /*placement_only=*/true).stands_down) return false;
 	const char* value = std::getenv("KYTY_SPEC_FORMAT_AHEAD");
 	return value == nullptr || *value == '\0' || std::strtoll(value, nullptr, 10) != 0; // (unset: the row's 1)
 }

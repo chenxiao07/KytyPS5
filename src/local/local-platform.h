@@ -2,11 +2,14 @@
 // Host-OS helpers for the local performance and diagnostic code (thread names, thread
 // ids, CPU pinning), so the local headers stay free of <windows.h> and Linux-only APIs.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace CpuShape { struct Plan; }
 
 namespace LocalPlatform {
 
@@ -60,6 +63,25 @@ uint64_t CurrentThreadAffinity();
 uint64_t ProcessAffinityMask();
 uint64_t InspectThreadAffinity();
 bool     SetCurrentThreadAffinity(uint64_t mask);
+#if defined(_WIN32) && defined(KYTY_LOCAL_VULKAN_RECORDING)
+struct GraphicsIrqLayout;
+struct GpuIrqAffinity {
+	uint64_t targets = 0, base = 0, filtered_base = 0;
+	uint64_t speculation_base = 0; // Saved until the GPU thread's speculation mask is restored.
+	uint64_t Filter(uint64_t mask) const;
+};
+struct RecordingIrqPlacement {
+	const GraphicsIrqLayout* layout = nullptr;
+	int ideal = -1;
+};
+
+extern GpuIrqAffinity g_gpu_irq_affinity; // Accessed only on the GPU thread.
+extern std::atomic<bool> g_irq_avoid_ever_armed;
+extern RecordingIrqPlacement g_recording_irq_placement;
+void ApplyGpuIrqAvoid(uint32_t vendor, uint32_t device, const CpuShape::Plan& boot_plan, uint32_t workers);
+void ApplyRecordingIrqAvoid(const RecordingIrqPlacement& placement);
+bool RestoreIrqIdeal();
+#endif
 // The physical performance cores among the CPUs of `mask` the process may run on: SMT siblings count as one core, cores
 // of a lower efficiency class (E-cores) not at all (Windows: CPU set CoreIndex and EfficiencyClass; every core where all
 // are alike). Linux: the distinct cores (CoreSiblings' thread_siblings_list) among the CPUs of `mask`, every class alike.

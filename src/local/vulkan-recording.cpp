@@ -509,6 +509,22 @@ private:
     static void KeepAffinity() {
         static const char* const list = std::getenv("KYTY_RECORDING_CPUS");
         if (list) LocalPlatform::PinThreadToCpuList(list);
+#if defined(_WIN32) && defined(KYTY_LOCAL_VULKAN_RECORDING)
+        if (LocalPlatform::g_irq_avoid_ever_armed.load(std::memory_order_acquire)) {
+            static thread_local bool was_mode4 = false;
+            // Record follows the mode at its own existing pin points. The ideal processor is a scheduler hint.
+            // A 4 -> 0 -> 4 between pins leaves Record in the placement of the mode it ends in.
+            // Folded batches can delay a placement update until Record's next actual pin. No end state is wrong.
+            const bool active = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+            if (was_mode4 == active) return;
+            if (active) {
+                LocalPlatform::ApplyRecordingIrqAvoid(LocalPlatform::g_recording_irq_placement);
+                was_mode4 = true;
+            } else if (LocalPlatform::RestoreIrqIdeal()) {
+                was_mode4 = false;
+            }
+        }
+#endif
     }
     void CompleteChunk(uint64_t& current) {
         const size_t index = current % ChunkCount;
