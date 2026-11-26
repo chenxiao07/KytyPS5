@@ -39,6 +39,7 @@ const std::vector<std::string>& GameVariables() {
 	                                             "KYTY_FRAMEGEN_BACKEND",
 	                                             "KYTY_UPSCALER",
 	                                             "KYTY_FSR4",
+	                                             "FFXVK_FSR4_MODEL",
 	                                             "KYTY_HD_OUTPUT",
 	                                             "KYTY_OUTPUT_HEIGHT",
 	                                             "KYTY_GPU",
@@ -146,6 +147,10 @@ bool Commands::FsrUpscaler() const {
 
 bool Commands::Fsr4() const {
 	return S().Str("upscaler") == "fsr4" && context_.Fsr4Available();
+}
+
+bool Commands::Fsr4ModelLite() const {
+	return S().Str("fsr4_model") == "lite";
 }
 
 int Commands::WindowHeight(const std::string& resolution, bool fullscreen, int display) {
@@ -291,6 +296,10 @@ Launch Commands::Play(const GameInfo& game, bool direct) const {
 		convars += "r_aaMethod=0;r_aaEnableTemporalProjectMatrixJitter=false";
 	}
 	if (!convars.empty()) Put(set, "KYTY_GAME_CONVARS", convars);
+	// FSR 4 Lite model: passes FFXVK_FSR4_MODEL=lite to ffx-vk-linux (AMD's DLLs: the "Lite"
+	// neural network, same quality for most content, faster).
+	if (Fsr4() && Fsr4ModelLite())
+		Put(set, "FFXVK_FSR4_MODEL", "lite");
 	// Frame generation: FSR 3's (built in, any graphics card), else DLSS's (KYTY_FRAMEGEN =
 	// generated frames per frame).
 	const bool fsr_frames = S().Bool("fsr");

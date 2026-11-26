@@ -1091,6 +1091,24 @@ void LauncherWindow::GraphicsPage() {
 		    }
 	    },
 	    note);
+	// (FSR 4 model: the Lite neural network is the same quality for most content, faster; the
+	// Standard model is the default. Only shown when FSR 4 is chosen and available.)
+	if (chosen == "fsr4" && fsr4_available_) {
+		std::vector<std::string> models {"standard", "lite"};
+		std::vector<std::string> model_labels {T("upscaler.fsr4ModelStandard"), T("upscaler.fsr4ModelLite")};
+		const auto current_model = S().Str("fsr4_model");
+		int        model_index = 0;
+		if (current_model == "lite") model_index = 1;
+		Row(
+		    "upscaler.fsr4Model",
+		    [&] {
+			    if (Combo("##fsr4_model", &model_index, model_labels, 200)) {
+				    S().Set("fsr4_model", models[static_cast<size_t>(model_index)]);
+				    Changed();
+			    }
+		    },
+		    T("upscaler.fsr4ModelNote"));
+	}
 
 	const auto allowed  = AllowedRenderHeights();
 	const int  selected = SelectedRender();
@@ -1584,11 +1602,12 @@ std::string LauncherWindow::Summary(std::vector<std::pair<std::string, std::stri
 	const auto res         = Times(S().Str("resolution"));
 	const bool dlss        = commands_.Dlss();
 	const auto upscaled_by =
-	    std::string(T(dlss                         ? "summary.dlss"
-	                : commands_.Fsr4()             ? "summary.fsr4"
-	                : commands_.FsrUpscaler()      ? "summary.fsr3"
-	                : S().Str("upscaler") == "off" ? "summary.noAa"
-	                                               : "summary.taa"));
+	    std::string(T(dlss                                                ? "summary.dlss"
+	                : commands_.Fsr4() && commands_.Fsr4ModelLite() ? "summary.fsr4lite"
+	                : commands_.Fsr4()                               ? "summary.fsr4"
+	                : commands_.FsrUpscaler()                        ? "summary.fsr3"
+	                : S().Str("upscaler") == "off"                   ? "summary.noAa"
+	                                                                      : "summary.taa"));
 	const bool hd          = commands_.HdOutput();
 	const bool sr          = dlss || commands_.FsrUpscaler();
 	int        height      = sr ? S().Int("render_dlss") : S().Int("render");

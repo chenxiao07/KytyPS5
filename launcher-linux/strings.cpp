@@ -160,9 +160,15 @@ const Table& English() {
 	                          "in its log and uses FSR 3."},
 	    {"upscaler.fsr4Missing", "FSR 4 needs libffx_vk_linux.so (run get-fsr4-linux.sh) and AMD's DLLs in the "
 	                             "emulator's fsr4 folder: amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll "
-	                             "(FSR SDK 2.4) and amdvkffx64.dll (AMD's Windows driver). Until then FSR 3 runs."},
+	                             "(FSR SDK 2.4); amdvkffx64.dll (AMD's Windows driver) is optional. Until then FSR 3 runs."},
 	    {"upscaler.fsr4NoAmd", "FSR 4 is for AMD Radeon graphics cards; FSR 3 runs here."},
 	    {"summary.fsr4", "FSR 4"},
+	    {"summary.fsr4lite", "FSR 4 Lite"},
+	    {"upscaler.fsr4Model", "FSR 4 model"},
+	    {"upscaler.fsr4ModelStandard", "Standard"},
+	    {"upscaler.fsr4ModelLite", "Lite"},
+	    {"upscaler.fsr4ModelNote", "The Lite model runs the same quality for most content, faster (the same model "
+	                               "that runs on integrated GPUs). Standard is the default."},
 	    {"fsr.native", "Native AA"},
 	    {"upscaler.off", "Off (no anti-aliasing)"},
 	    {"upscaler.offNote", "Demon's Souls without its own anti-aliasing (TAA) and the camera "

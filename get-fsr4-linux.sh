@@ -7,11 +7,11 @@
 # supply. Put these in the same fsr4 folder:
 #   amd_fidelityfx_loader_vk.dll, amd_fidelityfx_upscaler_vk.dll   AMD FSR SDK 2.4: Kits/FidelityFX/signedbin
 #                                                                  (github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
-#   amdvkffx64.dll                                                 AMD Adrenalin driver for Windows (26.10.1 was
-#                                                                  the one ffx-vk-linux was tested with): the FSR 4
-#                                                                  model itself comes from the driver
+#   amdvkffx64.dll                                                 AMD Adrenalin driver for Windows (optional: when present,
+#                                                                  the SDK uses its FSR4 instead)
 # Then build the emulator again (./build-linux.sh: CMake finds _Build/deps/ffx-vk-linux), and pick "FSR 4" as the
-# upscaler (launcher: Graphics page; or KYTY_UPSCALER=fsr KYTY_FSR4=1).
+# upscaler (launcher: Graphics page; or KYTY_UPSCALER=fsr KYTY_FSR4=1). Choose the FSR 4 model on the Graphics page:
+# Standard or Lite (built into the SDK's DLLs, works without the driver).
 #
 # Needs git, cmake, a C++20 compiler, python3, pkg-config and the development packages of Vulkan (headers, loader and
 # vk.xml), OpenSSL, libdrm with libdrm_amdgpu, and SPIRV-Tools, e.g. on Debian/Ubuntu:
@@ -29,7 +29,7 @@ REPO="${FFX_VK_LINUX_REPO:-https://github.com/DuIslingr/ffx-vk-linux}"
 # so it is pinned, not "whatever the default branch has today". This is the one the OpenSSL patch below was made against
 # and that was built with this emulator. FFX_VK_LINUX_REF=<full commit id, tag or branch> tries another (a newer one: then
 # the patch may not apply, and nothing here has been tested with it).
-PINNED_REF=4d339b8d4540744d9c0d0c6b961074f1f266867c
+PINNED_REF=e1d5a415ed78dd5db7c6d00258d06acccb424307
 REF="${FFX_VK_LINUX_REF:-$PINNED_REF}"
 
 for tool in git cmake c++ python3 pkg-config; do
@@ -88,7 +88,7 @@ cp -f "$BUILD/libffx_vk_linux.so" "$EMU/fsr4/libffx_vk_linux.so"
 echo
 echo "Built: $EMU/fsr4/libffx_vk_linux.so"
 missing=0
-for dll in amd_fidelityfx_loader_vk.dll amd_fidelityfx_upscaler_vk.dll amdvkffx64.dll; do
+for dll in amd_fidelityfx_loader_vk.dll amd_fidelityfx_upscaler_vk.dll; do
 	if [ -f "$EMU/fsr4/$dll" ]; then
 		echo "  found   $dll"
 	else
@@ -96,6 +96,11 @@ for dll in amd_fidelityfx_loader_vk.dll amd_fidelityfx_upscaler_vk.dll amdvkffx6
 		missing=1
 	fi
 done
+if [ -f "$EMU/fsr4/amdvkffx64.dll" ]; then
+	echo "  found   amdvkffx64.dll (optional: the SDK uses its FSR4 instead)"
+else
+	echo "  missing amdvkffx64.dll (optional: FSR4 from AMD's SDK DLLs alone)"
+fi
 if [ "$missing" = 1 ]; then
 	echo "Copy the missing DLLs into $EMU/fsr4 (they are AMD's, not downloaded here)."
 fi
