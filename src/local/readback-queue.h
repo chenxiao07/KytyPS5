@@ -189,7 +189,7 @@ public:
 			const CopyPacket copy {packet, destination, static_cast<uint32_t>(regions.size())};
 			const LocalVulkanRecording::Segment segments[] {{&copy, sizeof(copy)},
 			                                                {regions.data(), regions.size_bytes()}};
-			if (LocalVulkanRecording::EnqueueDeferred(ReplayCopy, segments, true)) {
+			if (LocalVulkanRecording::EnqueueDeferred(ReplayCopy, segments, true, /*fold_barrier=*/true)) {
 				m_worker_records = true;
 				return value;
 			}
@@ -200,7 +200,8 @@ public:
 		Record(d, command, regions, destination);
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		const LocalVulkanRecording::Segment segments[] {{&packet, sizeof(packet)}};
-		if (!direct && LocalVulkanRecording::EnqueueDeferred(ReplaySubmit, segments, true)) return value;
+		if (!direct && LocalVulkanRecording::EnqueueDeferred(ReplaySubmit, segments, true, /*fold_barrier=*/true)) return value;
+		LocalVulkanRecording::EndSubmitFold();
 #endif
 		Submit(packet, d);
 		return value;

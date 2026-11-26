@@ -4,6 +4,7 @@
 #include "live-counters.h"
 #include "live-trace-gpu.h"
 #include "local-platform.h"
+#include "mode-toggle.h"
 #include "spin-gate.h"
 #include "time-census.h"
 
@@ -57,12 +58,50 @@ constexpr size_t ChunkCount = 64;
 constexpr uint32_t End = std::numeric_limits<uint32_t>::max();
 vk::detail::DispatchLoaderDynamic original;
 
+// The offset and kind share the old 32-bit payload field, with no mask in the legacy loop.
+enum class PacketKind : uint16_t { Record, Barrier, Submit };
+static_assert(ChunkBytes - 1 <= std::numeric_limits<uint16_t>::max());
 struct Header {
     void (*execute)(void*) = nullptr;
     void (*destroy)(void*) = nullptr;
-    uint32_t payload = 0;
+    uint16_t payload = 0;
+    PacketKind kind = PacketKind::Record;
     uint32_t next = End;
 };
+
+void InvalidateRawState();
+
+struct FoldSubmitInfo {
+    const Libs::Graphics::MasterSemaphore* timeline;
+    uint64_t epoch;
+    uint64_t boundary;
+    bool ends_fold;
+    uint64_t graphics_boundary = 0;
+};
+
+struct SubmitPacket {
+    // Keep the same capture footprint as EnqueueDeferred. Only fold packets copy the second segment.
+    std::array<Segment, 8> copied {};
+    size_t commands;
+    const SubmitReplay* replay;
+
+    const FoldSubmitInfo& FoldInfo() const {
+        return *static_cast<const FoldSubmitInfo*>(copied[1].data);
+    }
+
+    void operator()() {
+        InvalidateRawState();
+        replay->single({copied.data(), 1}, original);
+    }
+};
+
+std::mutex g_submit_fold_switch_mutex;
+
+// Serialize only the publication and the edges of a direct submit. Packets published during a direct
+// submit end their own fold, so neither edge can be crossed. Never hold this lock in a driver call.
+std::mutex g_graphics_publication_mutex;
+uint64_t g_graphics_boundary = 0;
+size_t g_direct_graphics_submits = 0;
 } // namespace
 struct ChunkPool;
 struct Chunk {
@@ -222,7 +261,7 @@ public:
         return target;
     }
     template<typename Function>
-    void Command(Function function) {
+    void Command(Function function, PacketKind kind = PacketKind::Record) {
         static_assert(std::is_nothrow_move_constructible_v<Function>);
         static_assert(std::is_nothrow_destructible_v<Function>);
         auto* header = static_cast<Header*>(Allocate(sizeof(Header), alignof(Header)));
@@ -232,7 +271,8 @@ public:
         new (header) Header {
             .execute = [](void* pointer) { (*static_cast<Function*>(pointer))(); },
             .destroy = nullptr,
-            .payload = static_cast<uint32_t>(static_cast<std::byte*>(payload) - data),
+            .payload = static_cast<uint16_t>(static_cast<std::byte*>(payload) - data),
+            .kind = kind,
         };
         if constexpr (!std::is_trivially_destructible_v<Function>)
             header->destroy = [](void* pointer) { static_cast<Function*>(pointer)->~Function(); };
@@ -296,14 +336,18 @@ public:
     }
     // (By reference: the wrappers pass a named capture, which a by-value parameter would copy on the GPU thread's
     // hottest path.)
-    template<typename Capture>
+    template<bool Submit = false, typename Capture>
     bool Enqueue(Capture&& capture) {
-        if (passive) [[unlikely]] return EnqueuePassive(capture);
+        if constexpr (!Submit) {
+            if (passive) [[unlikely]] return EnqueuePassive(capture);
+        }
         for (int attempt = 0; attempt < 2; ++attempt) {
             WaitForRoom();
             auto& chunk = *slots[sequence % ChunkCount];
             Writer writer(chunk);
-            capture(writer);
+            FoldSubmitInfo* submit = nullptr;
+            if constexpr (Submit) submit = capture(writer);
+            else capture(writer);
             if (writer.valid && writer.command != End) {
                 if (chunk.last != End)
                     reinterpret_cast<Header*>(chunk.data.data() + chunk.last)->next = writer.command;
@@ -311,7 +355,8 @@ public:
                 chunk.last = writer.command;
                 chunk.used = writer.used;
                 ++chunk.count;
-                if (chunk.count >= 128 || chunk.used >= ChunkBytes * 3 / 4) Publish();
+                if constexpr (Submit) Publish<true>(submit);
+                else if (chunk.count >= 128 || chunk.used >= ChunkBytes * 3 / 4) Publish();
                 return true;
             }
             if (!writer.overflow || chunk.count == 0) break;
@@ -322,6 +367,8 @@ public:
     void Flush() {
         if (!passive) Publish();
     }
+    void EndSubmitFold() { ++submit_fold_boundary; }
+    uint64_t SubmitFoldBoundary() const { return submit_fold_boundary; }
     // Packets recorded or published and not yet replayed (a direct call would wait for them).
     [[nodiscard]] bool Pending() const {
         if (passive) return false;
@@ -386,6 +433,7 @@ private:
     std::unique_ptr<std::array<Chunk, ChunkCount>> own;
     std::array<Chunk*, ChunkCount> slots {};
     uint64_t sequence = 0;
+    uint64_t submit_fold_boundary = 0; // producer only
     alignas(64) std::atomic<uint64_t> published {0};
     alignas(64) std::atomic<uint64_t> completed {0};
     alignas(64) std::atomic<bool> sleeping {false};
@@ -438,11 +486,19 @@ private:
         for (; sequence - done >= ChunkCount; done = completed.load(std::memory_order_acquire))
             completed.wait(done, std::memory_order_acquire);
     }
-    void Publish() {
+    template<bool Submit = false>
+    void Publish(FoldSubmitInfo* submit = nullptr) {
         WaitForRoom();
         auto& chunk = *slots[sequence % ChunkCount];
         if (chunk.count == 0) return;
-        published.store(++sequence, std::memory_order_seq_cst);
+        if constexpr (Submit) {
+            const std::lock_guard lock(g_graphics_publication_mutex);
+            submit->graphics_boundary = g_graphics_boundary;
+            submit->ends_fold |= g_direct_graphics_submits != 0;
+            published.store(++sequence, std::memory_order_seq_cst);
+        } else {
+            published.store(++sequence, std::memory_order_seq_cst);
+        }
         // Wake the worker only when it said it blocks (both sides seq_cst): a wake-up is a
         // system call on Windows, and the worker is usually busy or still spinning.
         if (sleeping.load(std::memory_order_seq_cst)) published.notify_one();
@@ -454,13 +510,123 @@ private:
         static const char* const list = std::getenv("KYTY_RECORDING_CPUS");
         if (list) LocalPlatform::PinThreadToCpuList(list);
     }
+    void CompleteChunk(uint64_t& current) {
+        const size_t index = current % ChunkCount;
+        auto& chunk = *slots[index];
+        if (chunk.pool) {
+            slots[index] = &(*own)[index];
+            chunk.pool->Put(&chunk);
+        } else {
+            chunk.used = 0;
+            chunk.count = 0;
+            chunk.first = chunk.last = End;
+        }
+        completed.store(++current, std::memory_order_release);
+        completed.notify_one();
+    }
+    // Look ahead through the published recording packets. A submit is always the last packet in its chunk.
+    bool ReplayFold(uint64_t& current, const SubmitPacket& first) {
+        const auto& info = first.FoldInfo();
+        const uint64_t ready = published.load(std::memory_order_acquire);
+        // Each submit publishes its chunk, so a second submit needs at least one more published chunk.
+        if (ready == current + 1 || first.commands >= MaxFoldCommands || info.ends_fold) return false;
+
+        if (first.replay->has_wait(first.copied[0], *info.timeline)) return false;
+
+        std::array<Segment, MaxFoldCommands> requests;
+        std::array<uint64_t, MaxFoldCommands + 1> request_chunks;
+        requests[0] = first.copied[0];
+        request_chunks[0] = current;
+        size_t count = 1;
+        size_t commands = first.commands;
+        for (uint64_t scan = current + 1; scan < ready; ++scan) {
+            const auto& chunk = *slots[scan % ChunkCount];
+            for (auto pos = chunk.first; pos != End;) {
+                const auto* header = reinterpret_cast<const Header*>(chunk.data.data() + pos);
+                if (header->kind == PacketKind::Barrier) goto planned;
+                if (header->kind == PacketKind::Submit) {
+                    const auto& candidate = *reinterpret_cast<const SubmitPacket*>(chunk.data.data() + header->payload);
+                    const auto& next_info = candidate.FoldInfo();
+                    if (candidate.replay != first.replay || next_info.epoch != info.epoch ||
+                        next_info.timeline != info.timeline || next_info.boundary != info.boundary ||
+                        next_info.graphics_boundary != info.graphics_boundary ||
+                        commands + candidate.commands > MaxFoldCommands ||
+                        !first.replay->can_append(requests[count - 1], candidate.copied[0])) goto planned;
+                    request_chunks[count] = scan;
+                    requests[count++] = candidate.copied[0];
+                    commands += candidate.commands;
+                    if (commands == MaxFoldCommands || next_info.ends_fold ||
+                        first.replay->has_wait(candidate.copied[0], *info.timeline)) goto planned;
+                }
+                pos = header->next;
+            }
+        }
+    planned:
+        if (count == 1) return false;
+
+        request_chunks[count] = request_chunks[count - 1] + 1;
+        size_t request = 0;
+        for (uint64_t replay = current; replay < request_chunks[count]; ++replay) {
+            auto& chunk = *slots[replay % ChunkCount];
+            if (chunk.pool) t_splice_target = chunk.target;
+            // ReplayChunk already executed the packets before the first submit.
+            for (auto pos = replay == current ? chunk.last : chunk.first; pos != End;) {
+                const auto* header = reinterpret_cast<const Header*>(chunk.data.data() + pos);
+                auto* payload = chunk.data.data() + header->payload;
+                if (header->kind == PacketKind::Submit) {
+                    InvalidateRawState();
+                    first.replay->prepare(requests[request++], original);
+                } else {
+                    header->execute(payload);
+                }
+                if (header->destroy) header->destroy(payload);
+                pos = header->next;
+            }
+        }
+        struct Completion {
+            Stream& stream;
+            uint64_t& current;
+            const uint64_t* request_chunks;
+        } completion {*this, current, request_chunks.data()};
+        first.replay->fold({requests.data(), count}, original, *info.timeline, info.epoch,
+                           {&completion, [](void* context, size_t next_request) {
+                               auto& done = *static_cast<Completion*>(context);
+                               // The recording-only chunks before the next submit have already replayed.
+                               const auto end = done.request_chunks[next_request];
+                               while (done.current < end) done.stream.CompleteChunk(done.current);
+                           }});
+        return true;
+    }
+    template<bool Fold>
+    void ReplayChunk(Chunk* chunk, uint64_t& current) {
+        if (chunk->pool) t_splice_target = chunk->target;
+        for (auto offset = chunk->first; offset != End;) {
+            const auto* header = reinterpret_cast<const Header*>(chunk->data.data() + offset);
+            auto* payload = chunk->data.data() + header->payload;
+            if constexpr (Fold) {
+                if (header->kind == PacketKind::Submit) {
+                    const auto& submit = *reinterpret_cast<const SubmitPacket*>(payload);
+                    if (IsCurrentSubmitFold(submit.FoldInfo().epoch) && ReplayFold(current, submit)) return;
+                }
+            }
+            header->execute(payload);
+            if (header->destroy) header->destroy(payload);
+            offset = header->next;
+        }
+        CompleteChunk(current);
+    }
     void Run() {
         executing = this;
         LocalPlatform::SetThreadName("Kyty.Record");
         KeepAffinity();
+        constexpr uint64_t RepinInterval = 4096;
+        uint64_t next_pin = RepinInterval;
         uint64_t current = 0;
         for (;;) {
-            if ((current & 4095u) == 0) KeepAffinity();
+            if (current >= next_pin) {
+                KeepAffinity();
+                next_pin = current + RepinInterval;
+            }
             for (auto ready = published.load(std::memory_order_acquire); current == ready;
                  ready = published.load(std::memory_order_acquire)) {
                 const uint32_t spins = SpinGate::Open(true) ? kyty_local_recording_spin.load(std::memory_order_relaxed) : 0;
@@ -476,26 +642,18 @@ private:
                 sleeping.store(false, std::memory_order_relaxed);
             }
             if (stopping.load(std::memory_order_acquire)) return;
-            const size_t index = current % ChunkCount;
-            auto&        chunk = *slots[index];
-            if (chunk.pool) t_splice_target = chunk.target;
-            for (auto offset = chunk.first; offset != End;) {
-                const auto* header = reinterpret_cast<const Header*>(chunk.data.data() + offset);
-                header->execute(chunk.data.data() + header->payload);
-                if (header->destroy) header->destroy(chunk.data.data() + header->payload);
-                offset = header->next;
+            // Tagged submits sample or activate the epoch before publishing. After acquiring
+            // publication above, the gate sees that activation or a later state.
+            auto* chunk = slots[current % ChunkCount];
+            if (SubmitFoldEnabled()) {
+                // Fold-specific submits always close their chunk.
+                const auto* last = reinterpret_cast<const Header*>(chunk->data.data() + chunk->last);
+                if (last->kind == PacketKind::Submit) {
+                    ReplayChunk<true>(chunk, current);
+                    continue;
+                }
             }
-            if (chunk.pool) {
-                // A spliced chunk: back to its producer's pool, the slot to this stream's own chunk.
-                slots[index] = &(*own)[index];
-                chunk.pool->Put(&chunk);
-            } else {
-                chunk.used = 0;
-                chunk.count = 0;
-                chunk.first = chunk.last = End;
-            }
-            completed.store(++current, std::memory_order_release);
-            completed.notify_one();
+            ReplayChunk<false>(chunk, current);
         }
     }
 };
@@ -597,7 +755,13 @@ PassiveProducerScope::~PassiveProducerScope() {
     passive_producer.reset();
 }
 
-void Install() { InstallDispatch(); }
+void Install() {
+    // Register the switch before live control starts.
+    const auto& setting = LiveSwitch::Find("submit_fold", ModeToggle::Default("submit_fold"));
+    if (setting.load(std::memory_order_relaxed) == 1)
+        Detail::g_submit_fold_state.store(Detail::SubmitFoldPending, std::memory_order_relaxed);
+    InstallDispatch();
+}
 const vk::detail::DispatchLoaderDynamic& DirectDispatch() { return original; }
 void* ReplaceBindPipeline(void* entry) {
     auto* replaced = reinterpret_cast<void*>(original.vkCmdBindPipeline);
@@ -615,7 +779,7 @@ uint64_t StateEpoch() {
     return executing ? executing->state_epoch.load(std::memory_order_relaxed) : UINT64_MAX;
 }
 bool EnqueuePacket(ReplayPacket replay, std::span<const Segment> segments,
-                   std::shared_ptr<const void> owner) {
+                   std::shared_ptr<const void> owner, bool fold_barrier) {
     if (!PacketsEnabled() || !replay || segments.size() > 8) return false;
     for (const auto& segment : segments)
         if (segment.size && !segment.data) return false;
@@ -626,7 +790,8 @@ bool EnqueuePacket(ReplayPacket replay, std::span<const Segment> segments,
         for (size_t i = 0; i < segments.size(); ++i)
             copied[i] = {writer.Copy(segments[i].data, segments[i].size), segments[i].size};
         const auto count = segments.size();
-        writer.Command([owner, copied, count, replay] { replay({copied.data(), count}, original); });
+        writer.Command([owner, copied, count, replay] { replay({copied.data(), count}, original); },
+                       fold_barrier ? PacketKind::Barrier : PacketKind::Record);
     });
 }
 bool EnqueuePacketCopy(ReplayPacket replay, const Segment& segment, void** copy) {
@@ -646,7 +811,42 @@ bool DeferredSubmitEnabled() {
     return producer && !t_passive && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0 &&
         kyty_local_deferred_submit_mode.load(std::memory_order_relaxed) != 0;
 }
-bool EnqueueDeferred(ReplayPacket replay, std::span<const Segment> segments, bool publish) {
+uint64_t ActivateSubmitFold(uint64_t pending) {
+    // Direct submits sample the gate under the same queue lock. An untracked submit must finish before
+    // activation, and every direct submit after activation will use the publication boundary.
+    const auto active = pending + 1;
+    if (Detail::g_submit_fold_state.compare_exchange_strong(pending, active, std::memory_order_seq_cst)) return active;
+    return 0; // A live switch can cancel this activation while it waits for the queue.
+}
+bool IsCurrentSubmitFold(uint64_t epoch) {
+    return Detail::g_submit_fold_state.load(std::memory_order_seq_cst) == epoch;
+}
+bool SetSubmitFold(int64_t value) {
+    const std::lock_guard lock(g_submit_fold_switch_mutex);
+    if (!LiveSwitch::Set("submit_fold", value)) return false;
+    auto& state = Detail::g_submit_fold_state;
+    const auto current = state.load(std::memory_order_relaxed);
+    constexpr auto mask = Detail::SubmitFoldPending | Detail::SubmitFoldActive;
+    if ((current & mask) == 0 && value == 1)
+        state.store(current + Detail::SubmitFoldPending, std::memory_order_seq_cst);
+    else if ((current & mask) != 0 && value != 1)
+        state.store((current | mask) + 1, std::memory_order_seq_cst);
+    return true;
+}
+void DirectGraphicsSubmit::Begin() {
+    const std::lock_guard lock(g_graphics_publication_mutex);
+    ++g_graphics_boundary;
+    ++g_direct_graphics_submits;
+}
+void DirectGraphicsSubmit::End() {
+    const std::lock_guard lock(g_graphics_publication_mutex);
+    --g_direct_graphics_submits;
+    ++g_graphics_boundary;
+}
+void EndSubmitFold() {
+    if (producer && SubmitFoldEnabled()) producer->EndSubmitFold();
+}
+bool EnqueueDeferred(ReplayPacket replay, std::span<const Segment> segments, bool publish, bool fold_barrier) {
     if (!DeferredSubmitEnabled() || !replay || segments.size() > 8) return false;
     auto* stream = RecordingStream();
     if (!stream) return false;
@@ -656,10 +856,26 @@ bool EnqueueDeferred(ReplayPacket replay, std::span<const Segment> segments, boo
             copied[i] = {writer.Copy(segments[i].data, segments[i].size), segments[i].size};
         const auto count = segments.size();
         // A new command buffer may reuse a handle: drop raw-state reuse as a direct call would.
-        writer.Command([copied, count, replay] { InvalidateRawState(); replay({copied.data(), count}, original); });
+        writer.Command([copied, count, replay] { InvalidateRawState(); replay({copied.data(), count}, original); },
+                       fold_barrier ? PacketKind::Barrier : PacketKind::Record);
     });
     if (queued && publish) stream->Flush();
     return queued;
+}
+bool EnqueueSubmit(const SubmitReplay& replay, const Segment& segment, uint32_t commands,
+                   const Libs::Graphics::MasterSemaphore& timeline, uint64_t epoch, bool ends_fold) {
+    if (!DeferredSubmitEnabled()) return false;
+    auto* stream = RecordingStream();
+    if (!stream) return false;
+    return stream->Enqueue<true>([&](Writer& writer) {
+        const FoldSubmitInfo info {&timeline, epoch, stream->SubmitFoldBoundary(), ends_fold};
+        SubmitPacket packet {.commands = commands, .replay = &replay};
+        packet.copied[0] = {writer.Copy(segment.data, segment.size), segment.size};
+        auto* copied = const_cast<FoldSubmitInfo*>(writer.Copy(&info, 1));
+        packet.copied[1] = {copied, sizeof(info)};
+        writer.Command(packet, PacketKind::Submit);
+        return copied;
+    });
 }
 namespace {
 std::atomic<uint64_t> g_deferred_queued {0};
@@ -668,8 +884,8 @@ std::atomic<uint64_t> g_deferred_done {0};
 void NoteDeferredSubmitQueued() { g_deferred_queued.fetch_add(1, std::memory_order_release); }
 uint64_t DeferredSubmitsQueued() { return g_deferred_queued.load(std::memory_order_acquire); }
 uint64_t DeferredSubmitsDone() { return g_deferred_done.load(std::memory_order_acquire); }
-void NoteDeferredSubmitDone() {
-    g_deferred_done.fetch_add(1, std::memory_order_release);
+void NoteDeferredSubmitDone(size_t requests) {
+    g_deferred_done.fetch_add(requests, std::memory_order_release);
     g_deferred_done.notify_all();
 }
 void WaitDeferredSubmits() {

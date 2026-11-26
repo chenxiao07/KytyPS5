@@ -553,7 +553,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	request->tick = m_scheduler.CurrentTick();
 	m_download_ticks[slot] = request->tick;
 	if (LiveTrace::WriteTicks()) LiveTrace::Event(LiveTrace::ReadbackTicks, address, size | request->tick << 32u);
-	m_scheduler.Flush();
+	m_scheduler.Flush(CommandScheduler::FlushReason::Readback);
 	// Keep GPU ownership and page protection until the caller has copied every byte.
 	// Subsequent accesses to this window must retire this request before proceeding.
 	m_guest_readbacks[slot] = request;
@@ -3125,7 +3125,7 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	// download is submitted first; the offload worker writes the bytes back when the GPU is done.
 	if (TextureOffload::MustWaitBeforeRead(vaddr, size) && GuestGpu::IsGpuThread() && !CommandScheduler::InDeferredOperation()) {
 		TextureOffload::NoteReadWait(size);
-		m_scheduler.Flush();
+		m_scheduler.Flush(CommandScheduler::FlushReason::Readback);
 		TextureOffload::WaitRestores(vaddr, size);
 	}
 	// Texture bytes dropped from RAM that the upload reads (a buffer over an offloaded texture's

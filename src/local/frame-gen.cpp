@@ -69,6 +69,9 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "gpu_blit_shaders/fsr_hud_mask_spv.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#endif
 
 #include <cfloat>
 #include <chrono>
@@ -1477,6 +1480,14 @@ void Copy16(float (&out)[16], const RowMatrix& m) {
 
 bool Enabled() {
 	return g_ready;
+}
+
+bool UsesStreamlineFrameGeneration() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	return g_ready && !g_fsr;
+#else
+	return false;
+#endif
 }
 
 bool Requested() {
@@ -2962,6 +2973,16 @@ vk::Result CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateIn
 	// call.
 	const vk::Queue game = graphics.present_queue != nullptr ? graphics.present_queue : graphics.queue;
 	create.gameQueue         = {static_cast<VkQueue>(game), graphics.queue_family, nullptr};
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	if (graphics.present_queue == nullptr) {
+		// The SDK uses this callback for submissions on the shared graphics queue.
+		create.gameQueue.submitFunc = [](uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+			const LocalVulkanRecording::DirectGraphicsSubmit boundary;
+			return VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueSubmit(static_cast<VkQueue>(g_fsr_state.graphics->queue),
+			                                                  count, submits, fence);
+		};
+	}
+#endif
 	create.asyncComputeQueue = {static_cast<VkQueue>(graphics.fsr_compute_queue), graphics.fsr_compute_family, nullptr};
 	create.presentQueue      = {static_cast<VkQueue>(graphics.fsr_present_queue), graphics.fsr_present_family, nullptr};
 	create.imageAcquireQueue = {static_cast<VkQueue>(graphics.fsr_acquire_queue), graphics.fsr_compute_family, nullptr};

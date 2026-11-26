@@ -447,7 +447,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 				    !cache->m_offload_unsubmitted)
 					return;
 				cache->m_offload_unsubmitted = false;
-				cache->m_scheduler.Flush();
+				cache->m_scheduler.Flush(CommandScheduler::FlushReason::Readback);
 			});
 		}
 		Common::HostException::SetProbeHandler(TextureOffload::OnFault);
@@ -2569,7 +2569,7 @@ void TextureCache::InitializeImage(ImageId id, bool window) {
 		if (CommandScheduler::ThreadRecorder() != nullptr) throw CommandScheduler::RecorderRefusal {"texture offload restore"};
 		if (m_offload_unsubmitted) {
 			m_offload_unsubmitted = false;
-			m_scheduler.Flush();
+			m_scheduler.Flush(CommandScheduler::FlushReason::Readback);
 		}
 		TextureOffload::WaitRestores(image.info.data.address, image.info.data.size);
 	}
@@ -5405,7 +5405,7 @@ void TextureCache::OffloadScan(uint64_t tick) {
 	// (The collector's retirements just recorded theirs: on their way now, for whoever waits for them.)
 	if (m_offload_unsubmitted) {
 		m_offload_unsubmitted = false;
-		m_scheduler.Flush();
+		m_scheduler.Flush(CommandScheduler::FlushReason::Readback);
 	}
 	if (tick % 120 != 0) return;
 #if KYTY_FILE_OFFLOAD_SUPPORTED

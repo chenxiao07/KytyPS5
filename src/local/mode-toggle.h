@@ -8,6 +8,9 @@
 // for the new mode are set at the same moment, a switch whose environment variable is set kept. With KYTY_SPECULATE
 // unset nothing of mode 4 is made until a `mode 4`; the GPU thread's loop reads one relaxed atomic.
 #include "live-switch.h"
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+#include "vulkan-recording.h"
+#endif
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -46,6 +49,7 @@ inline constexpr Row Table[] = {
     {"spec_compute", 3, 0}, // (mode 4 startup: 0 off, 1 legacy async, 3 both claim and cancel)
     {"spec_log_flat", 1, 0}, // (the effects log's Add cheaper, the same contents; read at the first log: speculation-state.h)
     {"spec_commit_walks", 1, 0}, // (read the effects log indexes during commit, sampled per submission slice)
+    {"submit_fold", 1, 0}, // (fold queued graphics submits, sampled at replay)
 };
 // KYTY_TABLE_TARGET_READ (not a live switch: read where image sets are made): on under mode 4.
 inline constexpr uint32_t TableTargetRead4 = 1, TableTargetRead0 = 0;
@@ -71,7 +75,14 @@ inline void ApplyTable(int mode) {
 		for (const char* c = row.name; *c != '\0'; ++c) variable += static_cast<char>(*c >= 'a' && *c <= 'z' ? *c - 32 : *c);
 		const char* env = std::getenv(variable.c_str());
 		const int64_t value = mode == 4 ? row.on4 : row.on0;
-		if (env == nullptr || *env == '\0') LiveSwitch::Find(row.name, value).store(value, std::memory_order_relaxed);
+		if (env != nullptr && *env != '\0') continue;
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+		if (std::strcmp(row.name, "submit_fold") == 0) {
+			LocalVulkanRecording::SetSubmitFold(value);
+			continue;
+		}
+#endif
+		LiveSwitch::Find(row.name, value).store(value, std::memory_order_relaxed);
 	}
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 	const char* target_read = std::getenv("KYTY_TABLE_TARGET_READ");

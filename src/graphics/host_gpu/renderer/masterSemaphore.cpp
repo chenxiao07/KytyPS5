@@ -7,6 +7,9 @@
 #include "device-fault.h"
 
 #include "local-platform.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -120,6 +123,14 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		return;
 	}
 
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	if (LocalVulkanRecording::SubmitFoldEnabled()) {
+		auto& wait = m_submit_waits[tick % m_submit_waits.size()];
+		auto marked = wait.load(std::memory_order_seq_cst);
+		while (marked < tick && !wait.compare_exchange_weak(marked, tick, std::memory_order_seq_cst)) {
+		}
+	}
+#endif
 	LiveCensus::Scope census(LiveCensus::GpuWait, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
 	                         reinterpret_cast<uint64_t>(__builtin_return_address(1)));
 	LiveCensus::WaitScope waiting(LiveCensus::WaitGpu);

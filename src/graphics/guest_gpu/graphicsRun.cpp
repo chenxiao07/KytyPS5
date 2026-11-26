@@ -4664,7 +4664,7 @@ bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
-	BufferFlush();
+	if (Spec::Current() == nullptr) GetScheduler().Flush(CommandScheduler::FlushReason::Wait);
 
 	// The guest commands queued meanwhile run while the GPU thread waits for the flip (live serve_in_flip_waits, 0: they
 	// wait for it to end; a speculation's thread never waits here).
@@ -5103,7 +5103,7 @@ void CommandProcessor::Flip() {
 	LiveTrace::Event(LiveTrace::FlipSubmit, request);
 	Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, m_flip.handle, m_flip.index,
 	                               m_flip.flip_mode, m_flip.flip_arg, request);
-	GetScheduler().Flush();
+	GetScheduler().Flush(CommandScheduler::FlushReason::Flip);
 }
 
 void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
@@ -5126,7 +5126,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr),
 	                                 value, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                 m_flip.flip_arg, request);
-	GetScheduler().Flush();
+	GetScheduler().Flush(CommandScheduler::FlushReason::Flip);
 }
 
 void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache_action,
@@ -5155,7 +5155,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(
 	    m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, m_flip.handle,
 	    m_flip.index, m_flip.flip_mode, m_flip.flip_arg, request, m_interrupt_event_id);
-	GetScheduler().Flush();
+	GetScheduler().Flush(CommandScheduler::FlushReason::Flip);
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
@@ -5172,7 +5172,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	LiveTrace::Event(LiveTrace::FlipSubmit, request_id, 1);
 	HudAnchor::NoteFlip();
 	m_renderer.GetVideoOut().PrepareFlip(request_id, CurrentBuffer());
-	GetScheduler().Flush();
+	GetScheduler().Flush(CommandScheduler::FlushReason::Flip);
 	m_renderer.GetVideoOut().CompleteFlip(request_id);
 }
 

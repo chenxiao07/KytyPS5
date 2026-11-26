@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -7,6 +8,7 @@
 #include <vector>
 
 namespace vk::detail { class DispatchLoaderDynamic; }
+namespace Libs::Graphics { class MasterSemaphore; }
 struct VkCommandBuffer_T;
 
 // Vulkan command recording on a worker thread (KYTY_VULKAN_RECORDING). The
@@ -33,7 +35,7 @@ bool PacketsEnabled();
 // Segments are copied transactionally. An optional immutable owner is retained
 // until replay finishes; callers never lend stack or mutable-cache pointers.
 bool EnqueuePacket(ReplayPacket replay, std::span<const Segment> segments,
-                   std::shared_ptr<const void> owner = {});
+                   std::shared_ptr<const void> owner = {}, bool fold_barrier = false);
 // One segment, no owner, and (when true is returned) `copy`: where its copy lives in the stream's chunk. A passive
 // producer's chunk stays where it is, read by nobody, until the render thread splices its segment (then its replay reads
 // it) or discards it; the splicing thread may rewrite the copy's bytes before the splice (a speculation's relocatable
@@ -48,14 +50,71 @@ void InvalidateReplayState();
 // commands instead of draining the recording queue first (KYTY_DEFERRED_SUBMIT).
 // A submit packet is published at once: other threads may wait on its tick.
 bool DeferredSubmitEnabled();
-bool EnqueueDeferred(ReplayPacket replay, std::span<const Segment> segments, bool publish);
+// A queued submit on a separate queue forms a boundary in graphics submit replay.
+bool EnqueueDeferred(ReplayPacket replay, std::span<const Segment> segments, bool publish,
+                     bool fold_barrier = false);
+namespace Detail {
+// Each generation has three states: off, pending activation, and active.
+inline constexpr uint64_t SubmitFoldPending = 1;
+inline constexpr uint64_t SubmitFoldActive = 2;
+inline constinit std::atomic<uint64_t> g_submit_fold_state {0};
+}
+inline bool SubmitFoldEnabled() {
+    return (Detail::g_submit_fold_state.load(std::memory_order_relaxed) & Detail::SubmitFoldActive) != 0;
+}
+// Zero while off. The producer runs activate under the graphics queue lock before assigning a tick.
+template<typename Activate>
+uint64_t SubmitFoldEpoch(Activate activate) {
+    const auto state = Detail::g_submit_fold_state.load(std::memory_order_relaxed);
+    if ((state & Detail::SubmitFoldPending) != 0) [[unlikely]] return activate(state);
+    return (state & Detail::SubmitFoldActive) != 0 ? state : 0;
+}
+// The caller holds the graphics queue lock shared by the direct submit paths.
+uint64_t ActivateSubmitFold(uint64_t pending);
+bool IsCurrentSubmitFold(uint64_t epoch);
+bool SetSubmitFold(int64_t value);
+void EndSubmitFold(); // a direct readback submit on this producer, without publishing or draining
+// Bracket a direct graphics-queue submit under the caller's existing queue lock.
+class DirectGraphicsSubmit {
+public:
+    explicit DirectGraphicsSubmit(bool active = SubmitFoldEnabled()) : m_active(active) {
+        if (m_active) Begin();
+    }
+    ~DirectGraphicsSubmit() {
+        if (m_active) End();
+    }
+    DirectGraphicsSubmit(const DirectGraphicsSubmit&) = delete;
+    DirectGraphicsSubmit& operator=(const DirectGraphicsSubmit&) = delete;
+
+private:
+    static void Begin();
+    static void End();
+    const bool m_active;
+};
+// Graphics submissions use the existing cap, leaving the two slots reserved by the scheduler.
+inline constexpr uint32_t MaxFoldCommands = 22;
+struct FoldCompletion {
+    void* context;
+    // After a successful driver call, release replayed chunks before the next pending request (if any).
+    void (*complete)(void*, size_t next_request);
+};
+struct SubmitReplay {
+    ReplayPacket single;
+    void (*prepare)(const Segment&, const vk::detail::DispatchLoaderDynamic&);
+    void (*fold)(std::span<const Segment>, const vk::detail::DispatchLoaderDynamic&,
+                 const Libs::Graphics::MasterSemaphore&, uint64_t epoch, FoldCompletion);
+    bool (*has_wait)(const Segment&, const Libs::Graphics::MasterSemaphore&);
+    bool (*can_append)(const Segment&, const Segment&);
+};
+bool EnqueueSubmit(const SubmitReplay& replay, const Segment& segment, uint32_t commands,
+                   const Libs::Graphics::MasterSemaphore& timeline, uint64_t epoch, bool ends_fold);
 // Deferred queue submissions: counted when queued and when the worker has handed them to
 // the driver. WaitDeferredSubmits blocks until every submission queued so far reached the
 // driver (not the GPU). A present must not depend on a signal still in the worker's queue:
 // the Windows driver then blocks inside vkQueuePresentKHR, holding the queue lock the
 // worker needs for that very submission.
 void NoteDeferredSubmitQueued();
-void NoteDeferredSubmitDone();
+void NoteDeferredSubmitDone(size_t requests = 1);
 void WaitDeferredSubmits();
 // Deferred submissions queued and handed to the driver so far (diagnostics).
 uint64_t DeferredSubmitsQueued();

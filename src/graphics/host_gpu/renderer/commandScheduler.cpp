@@ -350,7 +350,7 @@ void CommandScheduler::Shutdown() {
 		m_operation_state = OperationState::Draining;
 	}
 	if (!m_command.IsInvalid()) {
-		Submit();
+		Submit({}, FlushReason::Wait);
 	}
 	m_master.Wait(CurrentTick() - 1);
 	PopPendingOperations();
@@ -397,9 +397,9 @@ void CommandScheduler::EndRendering() {
 	}
 }
 
-void CommandScheduler::Flush() {
-	SubmitInfo submit;
-	Flush(submit);
+void CommandScheduler::Flush(FlushReason reason) {
+	Submit({}, reason);
+	BeginNext();
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
@@ -409,7 +409,7 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 
 void CommandScheduler::FlushAndWait() {
 	if (Rec() != nullptr) throw RecorderRefusal {"FlushAndWait"};
-	const auto tick = Submit();
+	const auto tick = Submit({}, FlushReason::Wait);
 	m_master.Wait(tick);
 	BeginNext();
 }
@@ -418,7 +418,7 @@ void CommandScheduler::Finish() {
 	if (Rec() != nullptr) throw RecorderRefusal {"Finish"};
 	CheckActive();
 	if (!m_command.IsInvalid()) {
-		Submit();
+		Submit({}, FlushReason::Wait);
 	}
 	m_master.Wait(CurrentTick() - 1);
 	BeginNext();
@@ -440,7 +440,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
-		const auto submitted_tick = Submit();
+		const auto submitted_tick = Submit({}, FlushReason::Wait);
 		EXIT_IF(submitted_tick != tick);
 		m_master.Wait(tick);
 		BeginNext();
@@ -491,8 +491,9 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
-		m_pending_operations.push({std::move(operation), CurrentTick()});
-		if (m_pending_operations.size() == 1) m_pending_front_tick.store(CurrentTick(), std::memory_order_relaxed);
+		const auto tick = CurrentTick();
+		m_pending_operations.push({std::move(operation), tick});
+		if (m_pending_operations.size() == 1) m_pending_front_tick.store(tick, std::memory_order_relaxed);
 		m_pending_operation_count.fetch_add(1, std::memory_order_release);
 		return;
 	}
@@ -513,7 +514,8 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
-		m_priority_operations.push({std::move(operation), CurrentTick()});
+		const auto tick = CurrentTick();
+		m_priority_operations.push({std::move(operation), tick});
 		lock.unlock();
 		m_operation_available.notify_one();
 		return;
@@ -642,10 +644,15 @@ struct DeferredSubmit {
 	VkCommandBuffer      commands[CommandScheduler::MaxSubmitEntries];
 };
 static_assert(CommandScheduler::MaxSubmitEntries <= 32, "DeferredSubmit::ended_mask");
-void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
-                  const vk::detail::DispatchLoaderDynamic& dispatch) {
-	const auto& submit = *static_cast<const DeferredSubmit*>(segments[0].data);
-	AsyncUpload::Wait(submit.upload_sequence);
+static_assert(LocalVulkanRecording::MaxFoldCommands + 2 == CommandScheduler::MaxSubmitEntries);
+
+const DeferredSubmit& GetSubmit(const LocalVulkanRecording::Segment& segment) {
+	return *static_cast<const DeferredSubmit*>(segment.data);
+}
+
+void PrepareDeferredSubmit(const LocalVulkanRecording::Segment& segment,
+                           const vk::detail::DispatchLoaderDynamic& dispatch) {
+	const auto& submit = GetSubmit(segment);
 	LiveTrace::Event(LiveTrace::GpuSubmit, submit.tick, 1);
 	for (uint32_t i = 0; i < submit.count; ++i) {
 		if ((submit.ended_mask >> i) & 1u) continue;
@@ -660,6 +667,16 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
 			EXIT("deferred vkEndCommandBuffer failed, tick=%" PRIu64 "\n", submit.tick);
 		}
 	}
+	for (uint32_t i = 0; i < submit.signals; ++i) {
+		if (submit.signal_ticks[i] != submit.tick) continue;
+		DeviceFault::NoteSubmit((uint64_t)(submit.signal_semaphores[i]), submit.tick, submit.commands, submit.count, // NOLINT
+		                        submit.wait_semaphores, submit.wait_ticks, submit.waits);
+		break;
+	}
+}
+
+VkResult SubmitDeferredToDriver(const DeferredSubmit& submit, std::span<const VkCommandBuffer> commands,
+                               const vk::detail::DispatchLoaderDynamic& dispatch) {
 	VkTimelineSemaphoreSubmitInfo timeline {};
 	timeline.sType                     = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
 	timeline.waitSemaphoreValueCount   = submit.waits;
@@ -672,28 +689,88 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
 	info.waitSemaphoreCount   = submit.waits;
 	info.pWaitSemaphores      = submit.wait_semaphores;
 	info.pWaitDstStageMask    = submit.wait_stages;
-	info.commandBufferCount   = submit.count;
-	info.pCommandBuffers      = submit.commands;
+	info.commandBufferCount   = static_cast<uint32_t>(commands.size());
+	info.pCommandBuffers      = commands.data();
 	info.signalSemaphoreCount = submit.signals;
 	info.pSignalSemaphores    = submit.signal_semaphores;
-	for (uint32_t i = 0; i < submit.signals; ++i) {
-		if (submit.signal_ticks[i] != submit.tick) continue;
-		DeviceFault::NoteSubmit((uint64_t)(submit.signal_semaphores[i]), submit.tick, submit.commands, submit.count, // NOLINT
-		                        submit.wait_semaphores, submit.wait_ticks, submit.waits);
-		break;
+	return Libs::Graphics::AntiLag::QueueSubmit(submit.queue, info, dispatch.vkQueueSubmit, dispatch.vkQueueSubmit2);
+}
+
+void FinishDeferredSubmit(VkResult result, std::span<const LocalVulkanRecording::Segment> requests) {
+	const auto& last = GetSubmit(requests.back());
+	if (result != VK_SUCCESS) {
+		if (result == VK_ERROR_DEVICE_LOST) DeviceFault::Report();
+		for (const auto& request: requests.first(requests.size() - 1)) {
+			Log::WriteFatal(fmt::sprintf("deferred vkQueueSubmit failed: %d, tick=%" PRIu64 "\n",
+			                            static_cast<int>(result), GetSubmit(request).tick));
+		}
+		EXIT("deferred vkQueueSubmit failed: %d, tick=%" PRIu64 "\n", static_cast<int>(result), last.tick);
 	}
+	last.driver_tick->store(last.tick, std::memory_order_release);
+	LocalVulkanRecording::NoteDeferredSubmitDone(requests.size());
+}
+
+void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
+                  const vk::detail::DispatchLoaderDynamic& dispatch) {
+	const auto& submit = GetSubmit(segments.front());
+	AsyncUpload::Wait(submit.upload_sequence);
+	PrepareDeferredSubmit(segments.front(), dispatch);
 	VkResult result;
 	{
 		Common::LockGuard lock(*submit.queue_mutex);
-		result = Libs::Graphics::AntiLag::QueueSubmit(submit.queue, info, dispatch.vkQueueSubmit, dispatch.vkQueueSubmit2);
+		result = SubmitDeferredToDriver(submit, {submit.commands, submit.count}, dispatch);
 	}
-	if (result != VK_SUCCESS) {
-		if (result == VK_ERROR_DEVICE_LOST) DeviceFault::Report();
-		EXIT("deferred vkQueueSubmit failed: %d, tick=%" PRIu64 "\n", static_cast<int>(result), submit.tick);
-	}
-	submit.driver_tick->store(submit.tick, std::memory_order_release);
-	LocalVulkanRecording::NoteDeferredSubmitDone();
+	FinishDeferredSubmit(result, segments);
 }
+
+bool HasFoldWait(const LocalVulkanRecording::Segment& segment, const MasterSemaphore& timeline) {
+	return timeline.HasSubmitWait(GetSubmit(segment).tick);
+}
+
+bool CanAppendFold(const LocalVulkanRecording::Segment& previous, const LocalVulkanRecording::Segment& next) {
+	const auto& last = GetSubmit(previous);
+	const auto& candidate = GetSubmit(next);
+	return candidate.waits == 0 && candidate.queue == last.queue && candidate.queue_mutex == last.queue_mutex &&
+	       candidate.tick == last.tick + 1;
+}
+
+void ReplayFoldedSubmit(std::span<const LocalVulkanRecording::Segment> requests,
+                        const vk::detail::DispatchLoaderDynamic& dispatch,
+                        const MasterSemaphore& timeline, uint64_t epoch,
+                        LocalVulkanRecording::FoldCompletion completion) {
+	std::array<VkCommandBuffer, LocalVulkanRecording::MaxFoldCommands> commands;
+	std::array<size_t, LocalVulkanRecording::MaxFoldCommands + 1> offsets;
+	offsets[0] = 0;
+	uint64_t upload_sequence = 0;
+	for (size_t i = 0; i < requests.size(); ++i) {
+		const auto& submit = GetSubmit(requests[i]);
+		std::copy_n(submit.commands, submit.count, commands.data() + offsets[i]);
+		offsets[i + 1] = offsets[i] + submit.count;
+		upload_sequence = std::max(upload_sequence, submit.upload_sequence);
+	}
+	AsyncUpload::Wait(upload_sequence);
+	for (size_t first = 0; first < requests.size();) {
+		size_t last = first;
+		VkResult result;
+		{
+			Common::LockGuard lock(*GetSubmit(requests[first]).queue_mutex);
+			// A waiter may have marked a tick during preparation, upload, or contention for the queue.
+			// After this last check, the submit's tail signal covers any later waiter.
+			if (LocalVulkanRecording::IsCurrentSubmitFold(epoch)) {
+				while (last + 1 < requests.size() && !timeline.HasSubmitWait(GetSubmit(requests[last]).tick)) ++last;
+			}
+			result = SubmitDeferredToDriver(GetSubmit(requests[last]),
+			                               {commands.data() + offsets[first], offsets[last + 1] - offsets[first]}, dispatch);
+		}
+		const auto submitted = requests.subspan(first, last - first + 1);
+		FinishDeferredSubmit(result, submitted);
+		first = last + 1;
+		completion.complete(completion.context, first);
+	}
+}
+
+constexpr LocalVulkanRecording::SubmitReplay GraphicsSubmitReplay {
+    ReplaySubmit, PrepareDeferredSubmit, ReplayFoldedSubmit, HasFoldWait, CanAppendFold};
 // A recorded buffer dropped before submission, in order with the commands replayed into it.
 void ReplayDiscard(std::span<const LocalVulkanRecording::Segment> segments,
                    const vk::detail::DispatchLoaderDynamic& dispatch) {
@@ -737,7 +814,7 @@ CommandScheduler::SubmitEntry CommandScheduler::ClosePrologue() {
 	return entry;
 }
 
-uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+uint64_t CommandScheduler::Submit(SubmitInfo submit, FlushReason reason) {
 	if (Rec() != nullptr) throw RecorderRefusal {"Submit"};
 	EXIT_IF(m_command.IsInvalid());
 	m_command.EndRendering();
@@ -752,7 +829,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	m_batched = 0;
 	if (!m_prologue.IsInvalid()) entries[n++] = ClosePrologue();
 	entries[n++]          = {m_command.m_buffer, false, m_command.m_timestamp_slot};
-	const auto tick       = SubmitBuffers({entries.data(), n}, submit);
+	const auto tick       = SubmitBuffers({entries.data(), n}, submit, reason);
 	m_command.m_buffer    = nullptr;
 	m_recorded_dispatches = 0;
 	m_recorded_draws      = 0;
@@ -761,7 +838,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	return tick;
 }
 
-uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, SubmitInfo submit) {
+uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, SubmitInfo submit,
+                                        [[maybe_unused]] FlushReason reason) {
 	// The work may run once submitted: the pages it writes are read-protected first. KYTY_SPEC_PROTECT_ASYNC (mode 4): by
 	// the upload worker, ahead of the upload sequence taken below, which the work waits for
 	// (PageManager::FlushDeferredProtectionAtSubmit).
@@ -779,8 +857,26 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 	if (LocalVulkanRecording::DeferredSubmitEnabled()) {
 		DeferredSubmit deferred {};
 		// This thread alone allocates ticks and the worker submits them in stream order: no queue
-		// lock here (it only waited for the worker's vkQueueSubmit, 1.2% of the render thread).
-		deferred.tick = m_master.NextTick();
+		// lock in steady state (it only waited for the worker's vkQueueSubmit, 1.2% of the render thread).
+		const auto fold_epoch = LocalVulkanRecording::SubmitFoldEpoch([&] (uint64_t pending) {
+			const Common::LockGuard lock(m_graphics.queue_mutex);
+			return LocalVulkanRecording::ActivateSubmitFold(pending);
+		});
+		bool ends_fold = false;
+		if (fold_epoch != 0) {
+			// Both callback queues assign ticks under this lock. A priority callback can already be waiting
+			// on the open tick, so check the active one as well as the newest tick in each queue.
+			std::lock_guard lock(m_operation_mutex);
+			deferred.tick = m_master.NextTick();
+			// A wait or callback registered while folding was off could target the tick then open.
+			ends_fold = m_submit_fold_epoch != fold_epoch ||
+			            (!m_pending_operations.empty() && m_pending_operations.back().tick == deferred.tick) ||
+			            (!m_priority_operations.empty() && m_priority_operations.back().tick == deferred.tick) ||
+			            m_priority_active_tick == deferred.tick;
+			m_submit_fold_epoch = fold_epoch;
+		} else {
+			deferred.tick = m_master.NextTick();
+		}
 		submit.AddSignal(m_master.Handle(), deferred.tick);
 		deferred.count          = static_cast<uint32_t>(entries.size());
 		deferred.timestamp_slot = UINT32_MAX;
@@ -807,7 +903,12 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		const LocalVulkanRecording::Segment segments[] {
 		    {&deferred, offsetof(DeferredSubmit, commands) + deferred.count * sizeof(VkCommandBuffer)}};
 		LocalVulkanRecording::NoteDeferredSubmitQueued();
-		if (!LocalVulkanRecording::EnqueueDeferred(ReplaySubmit, segments, true)) {
+		const bool queued = fold_epoch == 0
+		    ? LocalVulkanRecording::EnqueueDeferred(ReplaySubmit, segments, true)
+		    : LocalVulkanRecording::EnqueueSubmit(
+		          GraphicsSubmitReplay, segments[0], deferred.count, m_master, fold_epoch,
+		          ends_fold || reason != FlushReason::Work || deferred.waits != 0 || deferred.signals != 1);
+		if (!queued) {
 			// Keep order: everything recorded so far, then this exact submit.
 			LocalVulkanRecording::Drain();
 			ReplaySubmit(segments, VULKAN_HPP_DEFAULT_DISPATCHER);
@@ -855,9 +956,14 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		                        submit.num_wait_semaphores);
 #endif
 
-		result = static_cast<vk::Result>(Libs::Graphics::AntiLag::QueueSubmit(
-		    static_cast<VkQueue>(graphics.queue), *reinterpret_cast<const VkSubmitInfo*>(&submit_info),
-		    VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueSubmit, VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueSubmit2));
+		{
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+			const LocalVulkanRecording::DirectGraphicsSubmit boundary;
+#endif
+			result = static_cast<vk::Result>(Libs::Graphics::AntiLag::QueueSubmit(
+			    static_cast<VkQueue>(graphics.queue), *reinterpret_cast<const VkSubmitInfo*>(&submit_info),
+			    VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueSubmit, VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueSubmit2));
+		}
 		m_driver_tick.store(tick, std::memory_order_release);
 	}
 

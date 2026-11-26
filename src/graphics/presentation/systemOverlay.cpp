@@ -12,6 +12,9 @@
 #include "libs/dialog.h"
 #include "libs/ime.h"
 #include "libs/imeDialog.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -431,9 +434,27 @@ ImGuiKey ControllerButtonToKey(int button) {
 	}
 }
 
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+PFN_vkQueueSubmit g_overlay_queue_submit = nullptr;
+
+VKAPI_ATTR VkResult VKAPI_CALL SubmitOverlayTexture(VkQueue queue, uint32_t count, const VkSubmitInfo* submits,
+                                                    VkFence fence) {
+	// ImGui uploads its textures inside RenderDrawData, under graphics.queue_mutex.
+	const LocalVulkanRecording::DirectGraphicsSubmit boundary;
+	return g_overlay_queue_submit(queue, count, submits, fence);
+}
+#endif
+
 PFN_vkVoidFunction LoadVulkanFunction(const char* name, void* user_data) {
 	auto& graphics = *static_cast<GraphicContext*>(user_data);
-	return graphics.instance.getProcAddr(name);
+	const auto function = graphics.instance.getProcAddr(name);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	if (function != nullptr && std::string_view(name) == "vkQueueSubmit") {
+		g_overlay_queue_submit = reinterpret_cast<PFN_vkQueueSubmit>(function);
+		return reinterpret_cast<PFN_vkVoidFunction>(SubmitOverlayTexture);
+	}
+#endif
+	return function;
 }
 
 // (With the result named: an F11 on an RTX 2060 SUPER ended here without saying what had failed, issue #174.)
