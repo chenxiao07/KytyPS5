@@ -194,6 +194,7 @@ std::atomic<uint32_t>                              g_retiring_used {0}, g_retiri
 std::atomic<uint64_t> g_freed_seq {0};
 thread_local uint32_t t_holds       = 0;     // (the calling thread's Holds open, nested)
 uint32_t              g_workers     = 0;     // (ApplyStartGates' count)
+uint32_t              g_cpus        = 0;     // (ApplyStartGates': logical CPUs on the performance cores)
 int                   g_answer      = -1;    // (the GPU thread's: Start's answer, -1 not decided)
 bool                  g_told_paused = false; // (Pause's line, once a run)
 
@@ -458,24 +459,26 @@ void ApplyStartGates() {
 		StandDown("Weave: KYTY_WEAVE=1 stands down: KYTY_SPECULATE=4 is on (one parallel path at a time).");
 		return;
 	}
+	// The logical CPUs on the performance cores the process may run on, counted before any core is kept: the worker
+	// count reads them, and UploadCpuFallback, with KYTY_WEAVE_WORKERS set too.
+	uint32_t cores = 0, performance = 0, logical = 0;
+	LocalPlatform::CoreCounts(cores, performance, logical);
+	g_cpus = performance != 0 ? performance
+	         : logical != 0   ? logical
+	                          : std::thread::hardware_concurrency();
 	// The workers: KYTY_WEAVE_WORKERS, or as many as the performance cores spare after the GPU thread's core, the
 	// recording and upload workers, the reader and the game's threads: their logical CPUs less 8, at most 8 (8 on a
 	// 16-thread CPU, 4 on a 6-core with SMT). Under 2 the weave stands down; a count set lifts the check. Where the
 	// classes are not known every core counts.
 	uint32_t workers = kyty_local_weave_workers.load(std::memory_order_relaxed);
 	if (workers == 0) {
-		uint32_t cores = 0, performance = 0, logical = 0;
-		LocalPlatform::CoreCounts(cores, performance, logical);
-		const uint32_t cpus = performance != 0 ? performance
-		                      : logical != 0   ? logical
-		                                       : std::thread::hardware_concurrency();
-		workers             = cpus > 8 ? std::min(MaxWorkers, cpus - 8) : 0;
+		workers = g_cpus > 8 ? std::min(MaxWorkers, g_cpus - 8) : 0;
 		if (workers < 2) {
 			kyty_local_weave_mode.store(0, std::memory_order_relaxed);
 			std::printf(
 			    "Weave: KYTY_WEAVE=1 stands down: %u logical CPUs on the performance cores, under the 10 it needs "
 			    "(KYTY_WEAVE_WORKERS lifts the check). This run stays in mode 0.\n",
-			    cpus);
+			    g_cpus);
 			std::fflush(stdout);
 			return;
 		}
@@ -504,6 +507,13 @@ const char* RenderCoreFallback() noexcept {
 
 uint32_t Workers() noexcept {
 	return Enabled() ? g_workers : 0;
+}
+
+// While the weave runs on UploadCpuMinCpus or more logical CPUs of the performance class (weave.h), an unset
+// KYTY_LINUX_UPLOAD_CPU keeps the upload worker alone on a CPU (async-upload.h). Without the weave the worker seldom
+// waits for a CPU.
+bool UploadCpuFallback() noexcept {
+	return Enabled() && g_cpus >= UploadCpuMinCpus;
 }
 
 bool Start(const Bodies& bodies) {

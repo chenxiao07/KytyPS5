@@ -2730,13 +2730,40 @@ static std::vector<Core> MachineCores(uint64_t& allowed) {
 	return cores;
 }
 
+#if defined(__linux__)
+// KeepThreadAloneOnCpu's CPUs (bit n: CPU n) and the thread each is kept for: Kyty.CoreKeeper keeps every other thread
+// off them, and AvoidCpuList and SpareCpu avoid them as they avoid the render core. g_kept_by_default: those an unset
+// value chose, which ReleaseRenderCore lets go. g_kept_mutex also holds AvoidCpuList and ReleaseRenderCore apart.
+static std::atomic<uint64_t> g_kept_cpus {0};
+static std::atomic<uint32_t> g_kept_owner[64] {};
+static uint64_t              g_kept_by_default = 0; // (under g_kept_mutex)
+static std::mutex            g_kept_mutex;
+static uint64_t KeptCpusOtherThan(uint32_t tid) {
+	uint64_t kept = g_kept_cpus.load(std::memory_order_acquire);
+	for (uint64_t rest = kept; rest != 0; rest &= rest - 1) {
+		const int cpu = std::countr_zero(rest);
+		if (g_kept_owner[cpu].load(std::memory_order_relaxed) == tid) kept &= ~(uint64_t {1} << cpu);
+	}
+	return kept;
+}
+#endif
+
 void AvoidCpuList(const char* avoid_cpus) {
+#if defined(__linux__)
+	// (ReleaseRenderCore holds this lock from clearing the kept core and CPUs to the end of its walk, so this thread is
+	// narrowed either before the walk, which gives the CPUs back, or after it, from what is still kept.)
+	const std::lock_guard lock(g_kept_mutex);
+#endif
 	cpu_set_t  set;
 	const auto core = g_render_core.load(std::memory_order_relaxed);
 	// With the render thread's core kept for it, that core is what other threads avoid, not the list (KYTY_RENDER_CPUS,
 	// e.g. "1-7": what the render thread may run on, which left a helper born on its CPU only CPU 0).
-	if (const auto avoid = core != 0 ? core : CpuListMask(avoid_cpus);
-	    avoid != 0 && sched_getaffinity(0, sizeof(set), &set) == 0) {
+	uint64_t avoid = core != 0 ? core : CpuListMask(avoid_cpus);
+#if defined(__linux__)
+	// (And KeepThreadAloneOnCpu's CPUs but the caller's own: a thread the kept upload worker makes is born on its CPU.)
+	avoid |= KeptCpusOtherThan(ThreadId());
+#endif
+	if (avoid != 0 && sched_getaffinity(0, sizeof(set), &set) == 0) {
 		for (int cpu = 0; cpu < 64; ++cpu)
 			if ((avoid >> cpu) & 1u) CPU_CLR(cpu, &set);
 		// (A thread the render thread made inherits its CPUs, its one CPU or all of
@@ -2783,9 +2810,10 @@ std::string SpareCpu(const char* avoid) {
 	cpu_set_t set;
 	CPU_ZERO(&set);
 	if (sched_getaffinity(getpid(), sizeof(set), &set) != 0) return {};
-	// (With KYTY_RENDER_CORE the render thread's core is avoided too: Kyty.CoreKeeper moves every other thread off it every
-	// 250 ms, a pin there included; a CPU off that core it never touches.)
-	const uint64_t avoid_mask = CpuListMask(avoid) | g_render_core.load(std::memory_order_relaxed);
+	// (With KYTY_RENDER_CORE the render thread's core is avoided too, and KeepThreadAloneOnCpu's CPUs: Kyty.CoreKeeper
+	// moves every other thread off them every 250 ms, a pin there included; a CPU off them it never touches.)
+	const uint64_t kept       = g_kept_cpus.load(std::memory_order_acquire);
+	const uint64_t avoid_mask = CpuListMask(avoid) | g_render_core.load(std::memory_order_relaxed) | kept;
 	int            sibling    = -1; // (the highest CPU outside the list whose core has one of the list's CPUs)
 	for (int cpu = 63; cpu >= 0; --cpu) {
 		if (!CPU_ISSET(cpu, &set) || ((avoid_mask >> cpu) & 1u) != 0) continue;
@@ -2912,8 +2940,10 @@ int KeepRenderCoreAlone(const char* fallback) {
 					uint64_t mask = 0;
 					for (int c = 0; c < 64; ++c)
 						if (CPU_ISSET(c, &set)) mask |= uint64_t {1} << c;
-					if ((mask & core) == 0) continue;
-					MaskToSet((mask & ~core) != 0 ? mask & ~core : allowed & ~core, &set);
+					// (And KeepThreadAloneOnCpu's CPUs, but a kept thread's own: none kept, the render core alone.)
+					const uint64_t avoid = core | KeptCpusOtherThan(static_cast<uint32_t>(tid));
+					if ((mask & avoid) == 0) continue;
+					MaskToSet((mask & ~avoid) != 0 ? mask & ~avoid : allowed & ~avoid, &set);
 					(void)sched_setaffinity(tid, sizeof(set), &set);
 				}
 				closedir(tasks);
@@ -2932,9 +2962,9 @@ int KeepRenderCoreAlone(const char* fallback) {
 }
 
 // The keeper stopped first (woken from its sleep, it ends after the pass it may be in), so it moves no thread after
-// this. Every thread it, AvoidCpuList or inheritance kept off the core has the process's CPUs less it, and a thread the
-// GPU thread made since the keeper's last pass is still on that thread's one CPU: those get the process's CPUs
-// again.
+// this. Every thread it, AvoidCpuList or inheritance kept off the core has the process's CPUs less it (and less the
+// CPUs KeepThreadAloneOnCpu kept), and a thread the GPU thread made since the keeper's last pass is still on that
+// thread's one CPU: those get the process's CPUs again, and so do the threads the unset default kept.
 void ReleaseRenderCore() {
 #if defined(__linux__)
 	const uint64_t core    = g_render_core.load(std::memory_order_relaxed);
@@ -2948,10 +2978,24 @@ void ReleaseRenderCore() {
 	keeper.woken.notify_all();
 	while (g_core_keeper_running.load(std::memory_order_acquire))
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	// (Under g_kept_mutex to the end of the walk: a thread in AvoidCpuList meanwhile is narrowed before the walk, which
+	// then gives its CPUs back, or after it, from what is still kept.)
+	const std::lock_guard lock(g_kept_mutex);
 	g_render_core.store(0, std::memory_order_relaxed);
 	cpu_set_t set;
 	MaskToSet(allowed, &set);
 	(void)sched_setaffinity(0, sizeof(set), &set);
+	// The threads the unset default kept (KeepThreadAloneOnCpu): nobody keeps their CPUs for them now, so they get the
+	// process's CPUs. A CPU named by hand stays its thread's, pinned as in a run without the keeper.
+	const uint64_t kept     = g_kept_cpus.load(std::memory_order_relaxed);
+	const uint64_t released = kept & std::exchange(g_kept_by_default, 0);
+	g_kept_cpus.fetch_and(~released, std::memory_order_acq_rel);
+	for (uint64_t rest = released; rest != 0; rest &= rest - 1) {
+		const int  cpu   = std::countr_zero(rest);
+		const auto owner = static_cast<pid_t>(g_kept_owner[cpu].exchange(0, std::memory_order_relaxed));
+		if (owner > 0) (void)sched_setaffinity(owner, sizeof(set), &set);
+	}
+	// (While a CPU was kept, the keeper and AvoidCpuList kept the other threads off it too: the narrowed CPUs less it.)
 	const uint64_t narrowed = allowed & ~core;
 	if (DIR* tasks = opendir("/proc/self/task"); tasks != nullptr) {
 		while (const dirent* entry = readdir(tasks)) {
@@ -2960,7 +3004,7 @@ void ReleaseRenderCore() {
 			uint64_t mask = 0;
 			for (int c = 0; c < 64; ++c)
 				if (CPU_ISSET(c, &set)) mask |= uint64_t {1} << c;
-			if (mask != narrowed && (mask & ~core) != 0) continue;
+			if ((mask & ~kept) != (narrowed & ~kept) && (mask & ~core) != 0) continue;
 			MaskToSet(allowed, &set);
 			(void)sched_setaffinity(tid, sizeof(set), &set);
 		}
@@ -2968,6 +3012,140 @@ void ReleaseRenderCore() {
 	}
 #endif
 }
+
+#if defined(__linux__)
+// Whether a /proc/interrupts line names a GPU driver's device: one of its names, split at spaces and commas (a shared
+// line lists its devices "a, b"), is amdgpu, radeon, nvidia, nouveau, i915 or xe.
+static bool NamesGpuDriver(const char* line) {
+	static constexpr const char* Drivers[] = {"amdgpu", "radeon", "nvidia", "nouveau", "i915", "xe"};
+	for (const char* p = line;;) {
+		p += std::strspn(p, " ,\t"); // (the separators before the next name)
+		const size_t length = std::strcspn(p, " ,\t");
+		if (length == 0) return false; // (the line's end)
+		for (const char* driver: Drivers)
+			if (std::strlen(driver) == length && std::strncmp(p, driver, length) == 0) return true;
+		p += length;
+	}
+}
+
+// The CPU that took most of the GPU's interrupts so far (the /proc/interrupts lines NamesGpuDriver accepts); -1: none
+// seen.
+static int GpuInterruptCpu() {
+	FILE* file = std::fopen("/proc/interrupts", "r");
+	if (file == nullptr) return -1;
+	char             line[8192];
+	std::vector<int> ids; // (the header's CPU numbers, in column order)
+	if (std::fgets(line, sizeof(line), file) != nullptr)
+		for (const char* p = line; (p = std::strstr(p, "CPU")) != nullptr; p += 3) ids.push_back(std::atoi(p + 3));
+	std::vector<unsigned long long> counts(ids.size(), 0);
+	while (std::fgets(line, sizeof(line), file) != nullptr) {
+		line[std::strcspn(line, "\n")] = '\0';
+		if (!NamesGpuDriver(line)) continue;
+		const char* p = std::strchr(line, ':');
+		if (p == nullptr) continue;
+		++p;
+		for (auto& count: counts) {
+			char*                    end = nullptr;
+			const unsigned long long n   = std::strtoull(p, &end, 10);
+			if (end == p) break;
+			count += n;
+			p = end;
+		}
+	}
+	std::fclose(file);
+	int                best = -1;
+	unsigned long long most = 0;
+	for (size_t i = 0; i < ids.size(); ++i)
+		if (counts[i] > most) most = counts[i], best = ids[i];
+	return best;
+}
+
+// The render thread's CPUs as KeepThreadAloneOnCpu avoids them: its core where KeepRenderCoreAlone keeps one, else the
+// cores of KYTY_RENDER_CPUS (the thread placed by hand); 0: neither.
+static uint64_t RenderCpusToAvoid() {
+	if (const uint64_t core = g_render_core.load(std::memory_order_relaxed); core != 0) return core;
+	return CoresOf(CpuListMask(std::getenv("KYTY_RENDER_CPUS")));
+}
+
+// KeepThreadAloneOnCpu's "auto" (the header): -1 where no core qualifies.
+static int AutoKeptCpu() {
+	uint64_t   unused  = 0;
+	auto       cores   = MachineCores(unused);
+	const auto allowed = g_affinity_at_load;
+	const auto fastest = PerformanceClass(cores, allowed);
+	std::sort(cores.begin(), cores.end(),
+	          [](const Core& a, const Core& b) { return std::countr_zero(a.cpus) < std::countr_zero(b.cpus); });
+	const uint64_t render = RenderCpusToAvoid();
+	const uint64_t kept   = g_kept_cpus.load(std::memory_order_acquire);
+	const int      irq    = GpuInterruptCpu();
+	size_t         start  = 0;
+	for (size_t i = 0; i < cores.size(); ++i)
+		if ((cores[i].cpus & render) != 0) start = i + 1;
+	for (size_t n = 0; n < cores.size(); ++n) {
+		const Core&    core = cores[(start + n) % cores.size()];
+		const uint64_t cpus = core.cpus & allowed;
+		if (cpus == 0 || core.efficiency != fastest || (core.cpus & 1u) != 0 || (core.cpus & (render | kept)) != 0 ||
+		    (irq >= 0 && irq < 64 && ((core.cpus >> irq) & 1u) != 0))
+			continue;
+		return std::countr_zero(cpus);
+	}
+	return -1;
+}
+
+int KeepThreadAloneOnCpu(const char* name, bool auto_by_default) {
+	const char* value = std::getenv(name);
+	const bool  unset = value == nullptr || *value == '\0';
+	if (unset && !auto_by_default) return -1;
+	if (!unset && (std::strcmp(value, "0") == 0 || std::strcmp(value, "off") == 0)) return -1;
+	long        cpu     = -1;
+	const char* how     = "";
+	const char* refused = nullptr;
+	if (unset || std::strcmp(value, "auto") == 0) {
+		if (unset && !g_core_keeper_running.load(std::memory_order_acquire)) return -1; // (no keeper: no default)
+		cpu = AutoKeptCpu();
+		how = unset ? " (unset: auto)" : "";
+		if (cpu < 0) refused = "auto found no core";
+		value = "auto";
+	} else {
+		char* end = nullptr;
+		cpu       = std::strtol(value, &end, 10);
+		if (end == value || *end != '\0') cpu = -1;
+	}
+	const uint64_t bit = cpu >= 0 && cpu < 64 ? uint64_t {1} << cpu : 0;
+	if (refused == nullptr)
+		refused = bit == 0                           ? "not a CPU number"
+		          : (g_affinity_at_load & bit) == 0  ? "a CPU the process may not run on"
+		          : (RenderCpusToAvoid() & bit) != 0 ? "the render thread's core"
+		                                             : nullptr;
+	const uint32_t tid = ThreadId();
+	if (refused == nullptr) {
+		const std::lock_guard lock(g_kept_mutex);
+		cpu_set_t             set;
+		// (The default needs the keeper. ReleaseRenderCore, a weave that could not start, may have stopped it since the
+		// test above: it clears the kept CPUs under this lock, after the keeper has stopped.)
+		if (unset && !g_core_keeper_running.load(std::memory_order_acquire)) return -1;
+		if ((g_kept_cpus.load(std::memory_order_relaxed) & bit) != 0) {
+			refused = "kept for another thread";
+		} else if (!MaskToSet(bit, &set) || sched_setaffinity(0, sizeof(set), &set) != 0) {
+			refused = "sched_setaffinity refused it";
+		} else {
+			g_kept_owner[cpu].store(tid, std::memory_order_relaxed);
+			g_kept_cpus.fetch_or(bit, std::memory_order_release);
+			if (unset) g_kept_by_default |= bit;
+		}
+	}
+	if (refused != nullptr) {
+		std::printf("%s=%s%s: not kept (%s)\n", name, value, how, refused);
+		std::fflush(stdout);
+		return -1;
+	}
+	std::printf("%s=%s%s: thread %u kept alone on CPU %ld (Kyty.CoreKeeper, while it runs, keeps the process's other "
+	            "threads off it)\n",
+	            name, value, how, tid, cpu);
+	std::fflush(stdout);
+	return static_cast<int>(cpu);
+}
+#endif
 
 void MakeBackgroundThread(const char* avoid_cpus) {
 	(void)setpriority(PRIO_PROCESS, static_cast<id_t>(ThreadId()), 10);

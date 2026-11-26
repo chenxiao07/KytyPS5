@@ -115,7 +115,8 @@ bool CurrentThreadStack(uint64_t* low, uint64_t* high);
 bool FlushProcessWriteBuffers();
 
 // The calling thread kept off the CPUs of a list (KYTY_RENDER_CPUS; null or empty: any CPU) and off the core
-// KeepRenderCoreAlone keeps; with below-normal priority too: background work that must not hold up the game's threads.
+// KeepRenderCoreAlone keeps (Linux: and off the CPUs KeepThreadAloneOnCpu keeps for other threads); with below-normal
+// priority too: background work that must not hold up the game's threads.
 void AvoidCpuList(const char* avoid_cpus);
 void MakeBackgroundThread(const char* avoid_cpus);
 // The render thread (KYTY_RENDER_CORE=<cpu>, or auto: the lowest-numbered core of the performance class other than
@@ -131,9 +132,28 @@ int KeepRenderCoreAlone(const char* fallback = nullptr);
 // The core KeepRenderCoreAlone kept because of its caller's `fallback` let go, on the thread it placed, as if it had
 // never been kept (a weave that could not start: the run goes on in mode 0). Windows: the default CPU set every CPU,
 // the thread's mask the process's, and every thread AvoidCpuList kept off the core given it back. Linux: the keeper
-// stopped, the thread on the process's CPUs, and every thread kept off the core given it back. A core KYTY_RENDER_CORE
-// asked for, or the Steam Deck build's default, stays.
+// stopped, the thread on the process's CPUs, and every thread kept off the core (and off KeepThreadAloneOnCpu's CPUs)
+// given them back. A core KYTY_RENDER_CORE asked for, or the Steam Deck build's default, stays.
 void ReleaseRenderCore();
+#if defined(__linux__)
+// Linux: the calling thread pinned to the CPU that the environment variable `name` gives (KYTY_LINUX_UPLOAD_CPU), and
+// that CPU kept for it alone: Kyty.CoreKeeper (KeepRenderCoreAlone, while it runs) moves every other thread of the
+// process off it as it does off the render core, every 250 ms, and AvoidCpuList and SpareCpu avoid it (a thread the
+// caller makes later is born on its CPU and leaves it at its AvoidCpuList). A thread woken onto a CPU that another
+// thread holds waits there for its turn; alone on its CPU it runs at once. A number: that CPU. "auto": the first CPU
+// of the next core of the performance class after the render thread's (its kept core, else the cores of
+// KYTY_RENDER_CPUS), skipping CPU 0's core, a core already kept and the core of the CPU that took most of the GPU's
+// interrupts (beside the GPU thread where cores sit in clusters). Unset or empty: auto when `auto_by_default` (the
+// caller's: the upload worker passes Weave::UploadCpuFallback() unless KYTY_RECORDING_CPUS placed it) and
+// Kyty.CoreKeeper runs; else nothing. No count of CPUs is checked: the caller's condition, or the user who sets a
+// value, answers for it. "0" or "off": nothing. Refused, with a line: a CPU that is not a number the process may run
+// on, the render thread's (as for auto), one already kept, auto finding no core, or sched_setaffinity refusing it.
+// ReleaseRenderCore lets go the threads the unset default kept, and the other threads get the kept CPUs back; a CPU
+// named by hand stays pinned, as without the keeper. Where ReleaseRenderCore keeps the render core (KYTY_RENDER_CORE
+// named it, or the Steam Deck build's), every kept thread stays kept.
+// Returns the CPU (-1: not done).
+int KeepThreadAloneOnCpu(const char* name, bool auto_by_default = false);
+#endif
 // The cores of the performance class (the highest efficiency class; every core where all are alike) the process may run
 // on, their logical CPUs, and all the logical CPUs it may run on (Windows: GetLogicalProcessorInformationEx; Linux: the
 // sysfs topology, the class from /sys/devices/cpu_core/cpus where there is one). 0s where not known.
