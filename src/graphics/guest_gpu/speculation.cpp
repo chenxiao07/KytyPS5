@@ -1228,6 +1228,8 @@ void Speculation::RequestStop() {
 			return;
 		}
 		m_quit = true;
+		m_claimed_walk.reset();
+		if (m_claimed_active != 0) m_pass_cancel.store(true, std::memory_order_release);
 		if (Waitless()) {
 			m_pass_cancel.store(true, std::memory_order_release);
 			for (auto& worker: m_translators) {
@@ -1291,6 +1293,8 @@ Speculation::~Speculation() {
 	{
 		std::lock_guard lock(m_mutex);
 		m_quit = true;
+		m_claimed_walk.reset();
+		if (m_claimed_active != 0) m_pass_cancel.store(true, std::memory_order_release);
 	}
 	WakeAll();
 	for (auto& translator: m_translators)
@@ -1433,12 +1437,18 @@ void Speculation::Done(uint64_t serial, const CommandProcessor& cp) {
 	}
 	{
 		std::lock_guard lock(m_mutex);
+		if (m_claimed_active != 0 && m_claimed_active <= serial) {
+			m_claimed_retired.store(serial, std::memory_order_release);
+		}
 		WithJobs([&](auto& jobs) {
 			while (!jobs.empty() && jobs.front().job.serial <= serial) {
 				RetireFront();
 			}
 		});
 		m_done_serial = serial;
+		if (m_claimed_walk && m_claimed_walk->serial <= serial) {
+			m_claimed_walk.reset();
+		}
 		if (!m_done_state) {
 			m_done_state = std::make_unique<CommandProcessorState>();
 		}
@@ -1461,12 +1471,13 @@ void Speculation::ResyncStatePass() {
 		m_pass_resume.reset();
 		m_pass_active_serial = 0;
 		m_state_serial = m_done_serial;
+		m_claimed_seed_serial = 0;
 		m_broken       = false;
 	}
 }
 
 // The pass gives each chunk's start snapshot to its translation result.
-bool Speculation::StatePass(const Job& job, uint64_t which, bool one_cut) {
+Speculation::PassResult Speculation::StatePass(const Job& job, uint64_t which, bool one_cut) {
 	const bool publish_copies = Spec::CopyForwardWriter(m_interrupt_id) && m_shared;
 	if (publish_copies) {
 		m_state->SetCopySubmission(this, job.serial, which);
@@ -1475,7 +1486,8 @@ bool Speculation::StatePass(const Job& job, uint64_t which, bool one_cut) {
 		if (job.reset) {
 			m_state->Reset();
 		}
-		return job.kind == Job::Kind::Flip; // A flip preparation leaves the state as it is.
+		// A flip preparation leaves the state as it is.
+		return job.kind == Job::Kind::Flip ? PassResult::Followed : PassResult::Stopped;
 	}
 	Pm4Execution execution;
 	if (m_pass_resume) {
@@ -1489,6 +1501,15 @@ bool Speculation::StatePass(const Job& job, uint64_t which, bool one_cut) {
 		m_state->SetFlip({});
 		m_state->SetChunking(ChunkWork);
 	}
+	// Under m_mutex. The raw reader stays registered until AheadTurn releases it.
+	const auto handoff = [&](bool keep_cursor) {
+		if (m_claimed_walk && m_claimed_walk->serial == job.serial &&
+		    m_claimed_walk->generation == which && which == m_pass && !m_broken) {
+			if (keep_cursor) m_claimed_walk->cursor = std::move(execution);
+			return PassResult::Claimed;
+		}
+		return PassResult::Stopped;
+	};
 	for (;;) {
 		// A chunk from here: where it starts, and its record, which reads through the one before while that is not done.
 		Chunk chunk;
@@ -1497,7 +1518,7 @@ bool Speculation::StatePass(const Job& job, uint64_t which, bool one_cut) {
 			std::lock_guard lock(m_mutex);
 			if (!Waitless() && Taken(job.serial, UINT32_MAX)) {
 				m_state->SetChunking(0);
-				return false;
+				return handoff(execution.Started());
 			}
 			chunk.start = std::move(m_pass_snapshot);
 			chunk.record = TakeRecord();
@@ -1567,12 +1588,58 @@ bool Speculation::StatePass(const Job& job, uint64_t which, bool one_cut) {
 		if (!boundary || entry == nullptr || which != m_pass || claimed || cancelled() ||
 		    (Waitless() && entry->chunks.size() >= WaitlessChunksMax)) {
 			m_state->SetChunking(0);
-			return followed && entry != nullptr && !claimed && !(Waitless() && boundary);
+			if (claimed && followed) return handoff(true);
+			return followed && entry != nullptr && !claimed && !(Waitless() && boundary)
+			           ? PassResult::Followed : PassResult::Stopped;
 		}
 		if (one_cut) {
 			m_pass_resume = std::move(execution);
-			return true;
+			return PassResult::Followed;
 		}
+	}
+}
+
+void Speculation::WalkClaimedPass(const Job& job, std::unique_lock<std::mutex>& lock) {
+	const auto serial = job.serial;
+	auto claim = std::move(*m_claimed_walk);
+	m_claimed_walk.reset();
+	m_claimed_active = serial;
+	m_state_busy = true;
+	m_pass_cancel.store(false, std::memory_order_relaxed);
+	bool complete = claim.cursor && !claim.cursor->Started();
+	lock.unlock();
+
+	if (!complete) {
+		if (!claim.cursor) {
+			if (job.reset) m_state->Reset();
+			m_state->ResetDeCe();
+			m_state->SetFlip({});
+			claim.cursor.emplace();
+		}
+		m_state->SetChunking(0);
+		m_state->SetCopySubmission(nullptr, 0);
+		m_state->SetGuardedCommands(m_pass_cancel, m_claimed_retired, serial);
+		m_state->BeginClaimedCommands();
+		Spec::State scratch;
+		Spec::t_record = &scratch;
+		complete = m_state->Process(*claim.cursor, job.commands) == Pm4ProcessResult::Complete;
+		Spec::t_record = nullptr;
+		m_state->EndClaimedCommands();
+		(void)m_state->TakeWatchedStop();
+	}
+
+	lock.lock();
+	m_claimed_active = 0;
+	m_state_busy = false;
+	const bool retired = serial <= m_done_serial;
+	const bool cancelled = claim.generation != m_pass || m_broken || m_quit;
+	if (complete && !retired && !cancelled) {
+		m_state_serial = serial;
+		m_claimed_seed_serial = serial;
+		LiveCounters::Add(LiveCounters::SpecQ0ClaimedWalksCompletedN);
+	} else if (!retired && claim.generation == m_pass && !m_broken) {
+		m_broken = true;
+		m_broken_at = serial;
 	}
 }
 
@@ -1844,8 +1911,13 @@ bool Speculation::AheadTurn(Translator& translator, std::unique_lock<std::mutex>
 	ResyncStatePass();
 	const bool takes_pass = translator.pass_only || !m_pass_thread;
 	auto* pass = takes_pass && !m_state_busy && !m_broken ? EntryOf(m_state_serial + 1) : nullptr;
+	bool walk_claimed = false;
 	if (pass != nullptr && !Waitless() && Taken(pass->job.serial, UINT32_MAX)) {
-		pass = nullptr;
+		if (m_claimed_walk && m_claimed_walk->armed && m_claimed_walk->serial == pass->job.serial) {
+			if (m_claimed_walk->generation == m_pass) walk_claimed = true;
+			else m_claimed_walk.reset();
+		}
+		if (!walk_claimed) pass = nullptr;
 	}
 	Entry* work = nullptr;
 	uint32_t work_chunk = 0;
@@ -1883,6 +1955,11 @@ bool Speculation::AheadTurn(Translator& translator, std::unique_lock<std::mutex>
 			PinSpeculationWorker(mask);
 		}
 	}
+	if (walk_claimed) {
+		const auto job = pass->job;
+		WalkClaimedPass(job, lock);
+		return true;
+	}
 	if (pass != nullptr) {
 		m_state_busy = true;
 		translator.since = ++m_clock;
@@ -1904,7 +1981,7 @@ bool Speculation::AheadTurn(Translator& translator, std::unique_lock<std::mutex>
 			pass->chunks.clear();
 		}
 		lock.unlock();
-		const bool followed = StatePass(job, which, false);
+		const auto followed = StatePass(job, which, false);
 		lock.lock();
 		translator.since = 0;
 		m_state_busy = false;
@@ -1912,11 +1989,11 @@ bool Speculation::AheadTurn(Translator& translator, std::unique_lock<std::mutex>
 		if (!Waitless() || !m_pass_resume) {
 			m_pass_active_serial = 0;
 		}
-		if (!followed) {
+		if (followed == PassResult::Stopped) {
 			m_broken = true;
 			m_broken_at = job.serial;
 		}
-		if (which == m_pass && !m_pass_resume) {
+		if (which == m_pass && !m_pass_resume && followed != PassResult::Claimed) {
 			m_state_serial = job.serial;
 		}
 		WakeGpu(job.serial); // The pass may have released the last reader of the claimed span.
@@ -2039,10 +2116,32 @@ static constexpr uint32_t CancelSpinUnseen = 1024, CancelSpinTail = 8192;
 
 void Speculation::ClaimBlockingRemainder(uint64_t serial, std::unique_lock<std::mutex>& lock) {
 	// Claim under the same mutex that workers and the pass use to take a command span.
+	bool latched = false;
 	if (!Taken(serial, UINT32_MAX)) {
 		m_taken       = serial;
 		m_taken_chunk = UINT32_MAX;
+		if (m_interrupt_id == 0 && Spec::ModeFour()) {
+			const bool has_seed = m_state_serial == serial - 1 || m_done_serial == serial - 1;
+			const bool broken = m_broken && m_done_serial < m_broken_at;
+			// CommitReady is taking the GPU's head. A retired frame boundary can still be in m_jobs.
+			const auto* entry = EntryOf(serial);
+			if (m_state_serial < serial && has_seed && !broken && entry != nullptr &&
+			    entry->job.kind == Job::Kind::Graphics) {
+				m_claimed_walk = ClaimedPass {.serial = serial, .generation = m_pass, .cursor = {}};
+				latched = true;
+			}
+		}
 	}
+	const auto arm_pass = [&] {
+		if (!latched || !m_claimed_walk || m_claimed_walk->serial != serial) return;
+		if (m_quit || m_claimed_walk->generation != m_pass || (m_broken && m_done_serial < m_broken_at) ||
+		    m_state_serial >= serial) {
+			m_claimed_walk.reset();
+			return;
+		}
+		m_claimed_walk->armed = true;
+		WakePass();
+	};
 	for (auto& worker: m_translators) {
 		if (worker->translating == serial) {
 			worker->cancel.store(true, std::memory_order_relaxed);
@@ -2050,6 +2149,7 @@ void Speculation::ClaimBlockingRemainder(uint64_t serial, std::unique_lock<std::
 	}
 	const auto reading = [&] { return ReadingSpan(serial); };
 	if (!reading()) {
+		arm_pass();
 		return;
 	}
 	// Flush held commits before a worker wait, as in CommitReady's wait for a requested chunk.
@@ -2074,6 +2174,7 @@ void Speculation::ClaimBlockingRemainder(uint64_t serial, std::unique_lock<std::
 		const ScopedGpuWait waiting(*this, serial);
 		GpuWake().wait(lock, [&] { return !reading(); });
 	}
+	arm_pass();
 }
 
 Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& job, uint32_t chunk, Pm4Execution& execution,
@@ -2083,12 +2184,28 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 		std::unique_lock lock(m_mutex);
 		// Where the chunk ends (the rest of it the normal way, up to there, when there is none for it or its commit
 		// stops).
-		const auto chunk_end = [&] {
+		const auto chunk_end = [&]() -> const Chunk* {
 			end.reset();
 			if (const auto* entry = EntryOf(job.serial);
-			    entry != nullptr && entry->pass == m_pass && chunk < entry->chunks.size() && !entry->chunks[chunk].last) {
-				end = entry->chunks[chunk].end;
+			    entry != nullptr && entry->pass == m_pass && chunk < entry->chunks.size()) {
+				const auto& cut = entry->chunks[chunk];
+				if (!cut.last) end = cut.end;
+				return &cut;
 			}
+			return nullptr;
+		};
+		const auto accept_start = [&](const CommandProcessorState& start, const Pm4Execution& at) {
+			if (!cp.SameState(start) || !CommandProcessor::SamePosition(execution, at)) return false;
+			if (m_claimed_seed_serial != 0 && job.serial > m_claimed_seed_serial) m_claimed_seed_serial = 0;
+			return true;
+		};
+		const auto break_pass = [&] {
+			DropCopyCandidates();
+			++m_pass;
+			m_broken = true;
+			m_broken_at = job.serial;
+			end.reset();
+			ClaimBlockingRemainder(job.serial, lock);
 		};
 		for (;;) {
 			// (Those of chunks before it, taken the normal way since, or of a state pass that went wrong.)
@@ -2229,7 +2346,19 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 				m_wait_ns += NowNs() - waited;
 				continue;
 			}
-			chunk_end();
+			const auto* cut = chunk_end();
+			if (cut != nullptr && !cut->last && m_claimed_seed_serial != 0 && job.serial > m_claimed_seed_serial) {
+				// A fallback also needs a reachable stop. A recycled predecessor may have predicted
+				// different incoming predication and sent the pass down a different PM4 path.
+				if (!cut->start) {
+					end.reset(); // No snapshot to check. Drain the whole span before replay.
+				} else if (!accept_start(*cut->start, cut->at)) {
+					++m_stop_reasons["ahead: cut start state or position mismatch"];
+					++m_ahead_misses;
+					break_pass();
+					return Outcome::None;
+				}
+			}
 			if (!end) {
 				ClaimBlockingRemainder(job.serial, lock);
 			} else if (!Taken(job.serial, chunk)) {
@@ -2239,16 +2368,10 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 			++m_ahead_misses;
 			return Outcome::None;
 		}
-		if (!cp.SameState(*result->start_state) || !CommandProcessor::SamePosition(execution, result->start_at)) {
-			// From another state or place: the state pass went wrong (what began from it goes); it goes on from the state
-			// after this submission (Done), which is translated on the normal way.
+		if (!accept_start(*result->start_state, result->start_at)) {
+			// Discard the prediction chain and wait for the authoritative state at Done.
 			++m_stop_reasons["ahead: another start state"];
-			DropCopyCandidates();
-			++m_pass;
-			m_broken    = true;
-			m_broken_at = job.serial;
-			end.reset();
-			ClaimBlockingRemainder(job.serial, lock);
+			break_pass();
 			lock.unlock();
 			Finish(std::move(result), 0);
 			return Outcome::None;

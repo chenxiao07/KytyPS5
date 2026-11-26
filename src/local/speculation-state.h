@@ -297,6 +297,13 @@ inline thread_local bool (*t_backing_copy)(void* out, uint64_t address, uint64_t
 #endif
 }
 
+// A claimed packet can supply a recycled address. Use the guarded copy even for a rebased Windows view.
+[[nodiscard]] inline uint64_t ClaimedWorkerCopy(void* out, uint64_t address, uint64_t bytes) {
+	if (!GuestRange{address, bytes}.Valid()) return bytes;
+	const auto* backing = WriteGuard::GuardedBacking(address, bytes);
+	return WorkerCopy(out, backing != nullptr ? backing : reinterpret_cast<const void*>(address), bytes, false);
+}
+
 inline constexpr size_t CommitImageScratchCapacity = 1024;
 // Mode 4 storage for one result's pending-use notes and one segment's staged slots.
 inline constexpr size_t RestoreGeneralScratchBytes = 64 * 1024;

@@ -281,11 +281,26 @@ private:
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution, size_t stop_depth, uint32_t mode);
-	template <bool Guarded>
+	[[nodiscard]] bool UpdatePm4DrawState(uint32_t opcode, uint32_t header, const uint32_t* packet,
+	                                      bool off_gpu_thread);
+	[[nodiscard]] bool ClaimedCommandReads() const noexcept { return m_claimed_commands; }
+	void BeginClaimedCommands() noexcept {
+		m_claimed_commands = true;
+		m_claimed_words_left = 1u << 20u;
+	}
+	void EndClaimedCommands() noexcept {
+		m_claimed_commands = false;
+		m_command_cancel = nullptr;
+		m_command_skip = nullptr;
+		m_guarded_dispatch_args = false;
+	}
+	template <bool Guarded, bool Claimed = false>
 	void ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth);
 	const std::atomic<bool>*     m_command_cancel = nullptr;
 	const std::atomic<uint64_t>* m_command_skip = nullptr;
 	uint64_t                     m_command_serial = 0;
+	uint32_t                     m_claimed_words_left = 0;
+	bool                         m_claimed_commands = false;
 	// ProcessPm4's loop, one body: <false> as it is, <true> with the weave's hooks at queue 0's draw packets (taken
 	// only while the weave runs on this processor; a build without KYTY_LOCAL_VULKAN_RECORDING instantiates only
 	// <false>).

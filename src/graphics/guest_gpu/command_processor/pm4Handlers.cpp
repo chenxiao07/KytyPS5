@@ -138,8 +138,9 @@ void ReportOtherData(uint32_t cmd_id, uint32_t offset) {
 }
 
 // (`packet`: the packet the table is of, for ProcessPm4Spec's copy, t_indirect_table_copy.)
+template <bool Claimed>
 [[nodiscard]] bool GuardTable(uint32_t*& table, uint32_t pairs, uint32_t bank, const uint32_t* packet) {
-	if (GuestGpu::IsGpuThread()) {
+	if (!Claimed && GuestGpu::IsGpuThread()) {
 		// (KYTY_WRITE_GUARD: a table on a page a pending guest write guards, through the backing view: the bytes this
 		// thread wrote, local/write-guard.h.)
 		if (const auto* backing = WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(table), uint64_t {pairs} * 8u))
@@ -156,6 +157,8 @@ void ReportOtherData(uint32_t cmd_id, uint32_t offset) {
 	if (keyed && early.shared) {
 		early.packet = nullptr;
 		words        = early.words.data();
+	} else if constexpr (Claimed) {
+		return false;
 	} else {
 		copy.resize(size_t {pairs} * 2u);
 		words = copy.data();
@@ -224,10 +227,12 @@ void ReportOtherData(uint32_t cmd_id, uint32_t offset) {
 // that waits for the GPU thread (spec_thread_gpu_faults). A page without access exits: the state pass, the one such thread
 // these packets run on (a speculation takes neither, SpeculationTakes), ends before the packet. (Spec::WorkerCopy: on
 // Linux a page a read watcher guards counts as one without access, where a plain load would fault and fetch the label.)
-template <typename T>
+template <typename T, bool Claimed>
 [[nodiscard]] T SpecWorkerRead(uint64_t address) {
 	T value {};
-	if (Spec::WorkerCopy(&value, reinterpret_cast<const void*>(address), sizeof(T), true) != 0) {
+	const auto unread = Claimed ? Spec::ClaimedWorkerCopy(&value, address, sizeof(T))
+	                        : Spec::WorkerCopy(&value, reinterpret_cast<const void*>(address), sizeof(T), true);
+	if (unread != 0) {
 		Spec::Refuse("GPU-written guest memory");
 		EXIT("a GPU-written word at 0x%016" PRIx64 " on a page without access, off the GPU thread\n", address);
 	}
@@ -1640,7 +1645,8 @@ KYTY_CP_OP_PARSER(CpOpSetPredication) {
 	return payload_dw;
 }
 
-KYTY_CP_OP_PARSER(CpOpCondExec) {
+template <bool Claimed>
+KYTY_CP_OP_PARSER(CpOpCondExecImpl) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_COND_EXEC);
@@ -1658,7 +1664,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
-	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(addr, sizeof(uint32_t))) {
+	if (!Claimed && !Libs::LibKernel::Memory::SyncGpuCleanBacking(addr, sizeof(uint32_t))) {
 		static std::atomic<uint32_t> sync_fallback_logs {0};
 		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
 			LOGF("CondExec: failed to synchronise the predicate at 0x%016" PRIx64
@@ -1668,7 +1674,8 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	}
 	// (A state pass's, in a guarded copy: SpecWorkerRead.)
 	const uint32_t predicate =
-	    OnSpecWorker() ? SpecWorkerRead<uint32_t>(addr) : *reinterpret_cast<const volatile uint32_t*>(addr);
+	    (Claimed || OnSpecWorker()) ? SpecWorkerRead<uint32_t, Claimed>(addr)
+	                               : *reinterpret_cast<const volatile uint32_t*>(addr);
 	if (predicate == 0) {
 		return payload_dw + exec_count;
 	}
@@ -1676,6 +1683,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	return payload_dw;
 }
 
+template <bool Claimed>
 KYTY_CP_OP_PARSER(CpOpBranch) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1703,9 +1711,15 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
+	if constexpr (Claimed) {
+		const GuestRange then_range {reinterpret_cast<uint64_t>(then_buffer), uint64_t {then_num_dw} * 4u};
+		const GuestRange else_range {reinterpret_cast<uint64_t>(else_buffer), uint64_t {else_num_dw} * 4u};
+		EXIT_NOT_IMPLEMENTED(!then_range.Valid() || (mode == 2 && else_num_dw != 0 && !else_range.Valid()));
+	}
 	// (A state pass's, in a guarded copy: SpecWorkerRead.)
-	const uint64_t compare =
-	    OnSpecWorker() ? SpecWorkerRead<uint64_t>(reinterpret_cast<uint64_t>(compare_addr)) : *compare_addr;
+	const uint64_t compare = (Claimed || OnSpecWorker())
+	                             ? SpecWorkerRead<uint64_t, Claimed>(reinterpret_cast<uint64_t>(compare_addr))
+	                             : *compare_addr;
 	const bool take_then = TestWaitRegMemValue(compare, reference, mask, function);
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
@@ -2144,13 +2158,14 @@ KYTY_CP_OP_PARSER(CpOpSetBase) {
 	return 3;
 }
 
-KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
+template <bool Claimed>
+KYTY_CP_OP_PARSER(CpOpIndirectBufferImpl) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_INDIRECT_BUFFER);
 
 	if (KYTY_PM4_LEN(cmd_id) == 14u) {
-		return CpOpBranch(cp, cmd_id, buffer, dw, num_dw);
+		return CpOpBranch<Claimed>(cp, cmd_id, buffer, dw, num_dw);
 	}
 
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 4u);
@@ -2182,6 +2197,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 		     indirect_num_dw, buffer[2]);
 	}
 
+	if constexpr (Claimed) {
+		const GuestRange range {reinterpret_cast<uint64_t>(indirect_buffer), uint64_t {indirect_num_dw} * 4u};
+		EXIT_NOT_IMPLEMENTED((range.address & 3u) != 0 || !range.Valid());
+	}
 	if (!SyncCommandMemory(reinterpret_cast<uint64_t>(indirect_buffer),
 	                       uint64_t {indirect_num_dw} * sizeof(uint32_t), "IndirectBuffer"))
 		return 3;
@@ -2424,7 +2443,8 @@ inline void Count(uint32_t fast, uint32_t mismatches) {
 } // namespace
 } // namespace Pm4Regfile
 
-KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
+template <bool Claimed>
+KYTY_CP_OP_PARSER(CpOpIndirectCxRegsImpl) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_CONTEXT_REG_INDIRECT);
@@ -2444,9 +2464,12 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectCxRegs"))
 		return KYTY_PM4_LEN(cmd_id) - 1u;
-	if (!GuardTable(indirect_buffer, indirect_num_dw, 0, buffer - 1)) return KYTY_PM4_LEN(cmd_id) - 1u;
+	if (!GuardTable<Claimed>(indirect_buffer, indirect_num_dw, 0, buffer - 1)) {
+		EXIT_NOT_IMPLEMENTED(Claimed);
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
-	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
+	const uint32_t rf_mode = Claimed ? 0 : Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
 	                             reinterpret_cast<uint8_t*>(&cp.GetUcfg())};
 	uint32_t       rf_fast = 0, rf_mismatches = 0;
@@ -2463,12 +2486,14 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 
 		// The sentinel is an encoded descriptor value and must be checked before normalization.
 		if (raw_cmd_offset == 0xffffffffu) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("\t temporary: skipping indirect CX sentinel pair offset = 0xffffffff, value "
-				     "= 0x%08" PRIx32 "\n",
-				     value);
-				logged = true;
+			if constexpr (!Claimed) {
+				static bool logged = false;
+				if (!logged) {
+					LOGF("\t temporary: skipping indirect CX sentinel pair offset = 0xffffffff, value "
+					     "= 0x%08" PRIx32 "\n",
+					     value);
+					logged = true;
+				}
 			}
 			continue;
 		}
@@ -2504,7 +2529,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	return KYTY_PM4_LEN(cmd_id) - 1u;
 }
 
-KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
+template <bool Claimed>
+KYTY_CP_OP_PARSER(CpOpIndirectShRegsImpl) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_SH_REG_INDIRECT);
@@ -2524,9 +2550,12 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectShRegs"))
 		return KYTY_PM4_LEN(cmd_id) - 1u;
-	if (!GuardTable(indirect_buffer, indirect_num_dw, 1, buffer - 1)) return KYTY_PM4_LEN(cmd_id) - 1u;
+	if (!GuardTable<Claimed>(indirect_buffer, indirect_num_dw, 1, buffer - 1)) {
+		EXIT_NOT_IMPLEMENTED(Claimed);
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
-	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
+	const uint32_t rf_mode = Claimed ? 0 : Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
 	                             reinterpret_cast<uint8_t*>(&cp.GetUcfg())};
 	uint32_t       rf_fast = 0, rf_mismatches = 0;
@@ -2561,7 +2590,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	return KYTY_PM4_LEN(cmd_id) - 1u;
 }
 
-KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
+template <bool Claimed>
+KYTY_CP_OP_PARSER(CpOpIndirectUcRegsImpl) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG_INDIRECT);
@@ -2581,9 +2611,12 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectUcRegs"))
 		return KYTY_PM4_LEN(cmd_id) - 1u;
-	if (!GuardTable(indirect_buffer, indirect_num_dw, 2, buffer - 1)) return KYTY_PM4_LEN(cmd_id) - 1u;
+	if (!GuardTable<Claimed>(indirect_buffer, indirect_num_dw, 2, buffer - 1)) {
+		EXIT_NOT_IMPLEMENTED(Claimed);
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
-	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
+	const uint32_t rf_mode = Claimed ? 0 : Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
 	                             reinterpret_cast<uint8_t*>(&cp.GetUcfg())};
 	uint32_t       rf_fast = 0, rf_mismatches = 0;
@@ -2619,6 +2652,26 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	Pm4Regfile::Count(rf_fast, rf_mismatches);
 
 	return KYTY_PM4_LEN(cmd_id) - 1u;
+}
+
+KYTY_CP_OP_PARSER(CpOpCondExec) {
+	return CpOpCondExecImpl<false>(cp, cmd_id, buffer, dw, num_dw);
+}
+
+KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
+	return CpOpIndirectBufferImpl<false>(cp, cmd_id, buffer, dw, num_dw);
+}
+
+KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
+	return CpOpIndirectCxRegsImpl<false>(cp, cmd_id, buffer, dw, num_dw);
+}
+
+KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
+	return CpOpIndirectShRegsImpl<false>(cp, cmd_id, buffer, dw, num_dw);
+}
+
+KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
+	return CpOpIndirectUcRegsImpl<false>(cp, cmd_id, buffer, dw, num_dw);
 }
 
 KYTY_CP_OP_PARSER(CpOpMarker) {
@@ -2852,7 +2905,8 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	return 7;
 }
 
-KYTY_CP_OP_PARSER(CpOpSetContextReg) {
+template <bool Claimed>
+KYTY_CP_OP_PARSER(CpOpSetContextRegImpl) {
 	KYTY_PROFILER_FUNCTION();
 
 	auto cmd_offset = NormalizeRegisterOffset(buffer[0]);
@@ -2863,6 +2917,7 @@ KYTY_CP_OP_PARSER(CpOpSetContextReg) {
 
 	if (cmd_offset >= Pm4::CX_NUM) {
 		if (!GuestGpu::IsGpuThread()) { // (as CpOpSetShaderReg's)
+			if constexpr (Claimed) EXIT_NOT_IMPLEMENTED(Claimed);
 			if (Spec::Current() != nullptr) Spec::Refuse("register packet of other data");
 			else ReportOtherData(cmd_id, buffer[0]);
 			return KYTY_PM4_LEN(cmd_id) - 1u;
@@ -2903,7 +2958,8 @@ KYTY_CP_OP_PARSER(CpOpSetContextReg) {
 	return s + 1;
 }
 
-KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
+template <bool Claimed>
+KYTY_CP_OP_PARSER(CpOpSetShaderRegImpl) {
 	KYTY_PROFILER_FUNCTION();
 
 	auto cmd_offset = buffer[0];
@@ -2916,6 +2972,7 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 		// work wrote: the speculation is refused, a state pass skips it; its chunks' start states then differ, which the
 		// commit checks. A mode 4 run ended here during the arch's load, 11-01.)
 		if (!GuestGpu::IsGpuThread()) {
+			if constexpr (Claimed) EXIT_NOT_IMPLEMENTED(Claimed);
 			if (Spec::Current() != nullptr) Spec::Refuse("register packet of other data");
 			else ReportOtherData(cmd_id, buffer[0]);
 			return KYTY_PM4_LEN(cmd_id) - 1u;
@@ -2950,7 +3007,8 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 	return s + 1;
 }
 
-KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
+template <bool Claimed>
+KYTY_CP_OP_PARSER(CpOpSetUconfigRegImpl) {
 	KYTY_PROFILER_FUNCTION();
 
 	if (Gen5::AgcIsInternalDataPacket(cmd_id, buffer)) {
@@ -2975,6 +3033,7 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	}
 	if (cmd_offset >= Pm4::UC_NUM) {
 		if (!GuestGpu::IsGpuThread()) { // (as CpOpSetShaderReg's)
+			if constexpr (Claimed) EXIT_NOT_IMPLEMENTED(Claimed);
 			if (Spec::Current() != nullptr) Spec::Refuse("register packet of other data");
 			else ReportOtherData(cmd_id, buffer[0]);
 			return KYTY_PM4_LEN(cmd_id) - 1u;
@@ -3011,6 +3070,33 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	auto s = pfunc(cp, cmd_id, cmd_offset, buffer + 1, dw);
 	EXIT_IF(s == 0);
 	return s + 1;
+}
+
+KYTY_CP_OP_PARSER(CpOpSetContextReg) {
+	return CpOpSetContextRegImpl<false>(cp, cmd_id, buffer, dw, num_dw);
+}
+
+KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
+	return CpOpSetShaderRegImpl<false>(cp, cmd_id, buffer, dw, num_dw);
+}
+
+KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
+	return CpOpSetUconfigRegImpl<false>(cp, cmd_id, buffer, dw, num_dw);
+}
+
+cp_op_parser_func_t ClaimedPm4Handler(uint32_t opcode, cp_op_parser_func_t handler) {
+	switch (opcode) {
+		case Pm4::IT_COND_EXEC: return CpOpCondExecImpl<true>;
+		case Pm4::IT_INDIRECT_BUFFER: return CpOpIndirectBufferImpl<true>;
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT: return CpOpIndirectCxRegsImpl<true>;
+		case Pm4::IT_SET_SH_REG_INDIRECT: return CpOpIndirectShRegsImpl<true>;
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT: return CpOpIndirectUcRegsImpl<true>;
+		case Pm4::IT_SET_CONTEXT_REG: return CpOpSetContextRegImpl<true>;
+		case Pm4::IT_SET_SH_REG: return CpOpSetShaderRegImpl<true>;
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX: return CpOpSetUconfigRegImpl<true>;
+		default: return handler;
+	}
 }
 
 KYTY_CP_OP_PARSER(CpOpWaitFlipDone) {

@@ -337,9 +337,10 @@ private:
 	void WakeStampRefill();
 	void WakeAll() noexcept;
 	void LogWorker(const Translator& translator) const;
-	// The state pass of a submission (its chunks given to its entry as it passes them, while the pass is `which`):
-	// false: it could not follow it.
-	[[nodiscard]] bool StatePass(const Job& job, uint64_t which, bool one_cut);
+	// Cuts belong to the current generation. Claimed leaves a private continuation for the guarded pass.
+	enum class PassResult { Followed, Stopped, Claimed };
+	[[nodiscard]] PassResult StatePass(const Job& job, uint64_t which, bool one_cut);
+	void WalkClaimedPass(const Job& job, std::unique_lock<std::mutex>& lock);
 	void               ResyncStatePass();
 	void               ClaimBlockingRemainder(uint64_t serial, std::unique_lock<std::mutex>& lock);
 	void               RetireFront();
@@ -451,6 +452,16 @@ private:
 	};
 	bool                              m_log_placement = false;
 	std::optional<Pm4Execution>        m_pass_resume;
+	struct ClaimedPass {
+		uint64_t serial;
+		uint64_t generation;
+		std::optional<Pm4Execution> cursor; // Empty stack in a saved cursor means the raw pass finished.
+		bool armed = false;
+	};
+	std::optional<ClaimedPass>         m_claimed_walk; // Under m_mutex, separate from a lent turn's resume.
+	uint64_t                          m_claimed_active = 0; // Guarded walk, never in ReadingSpan.
+	uint64_t                          m_claimed_seed_serial = 0; // The prediction awaits validation at a later take.
+	std::atomic<uint64_t>             m_claimed_retired {0};
 	std::deque<Entry>                 m_jobs;
 	struct WaitlessJobs {
 		std::list<Entry> active, free;

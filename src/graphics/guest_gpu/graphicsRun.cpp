@@ -2764,6 +2764,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth, ui
 	// speculation until its results are discarded, so a run never changes copies midway.)
 	if (mode != 0) [[unlikely]] {
 		if (GuardedCommandReads()) {
+			if (ClaimedCommandReads()) return ProcessPm4Spec<true, true>(execution, stop_depth);
 			return ProcessPm4Spec<true>(execution, stop_depth);
 		}
 		return ProcessPm4Spec<false>(execution, stop_depth);
@@ -3116,16 +3117,38 @@ static constexpr auto Pm4RefusalNames = [] {
 	return names;
 }();
 
-template <bool Guarded>
+// Indirect draws name the start-instance SGPR. Direct draws clear that selection.
+inline bool CommandProcessor::UpdatePm4DrawState(uint32_t opcode, uint32_t header, const uint32_t* packet,
+                                                 bool off_gpu_thread) {
+	switch (opcode) {
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+			// (Off the GPU thread, one too short to hold it is other data, its word 3 past its probed words: the execution
+			// suspends before reading it. Only a state pass meets one: a speculation takes these by their headers.)
+			if (KYTY_PM4_LEN(header) < 4u && off_gpu_thread) return false;
+			m_sh_ctx.SetStartInstanceUserSgpr(GsUserSgprAt(packet[3] & 0xffffu));
+			break;
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DISPATCH_DRAW_PREAMBLE: m_sh_ctx.SetStartInstanceUserSgpr(-1); break;
+		default: break;
+	}
+	return true;
+}
+
+template <bool Guarded, bool Claimed>
 void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth) {
 	const bool copy_forward = m_copy_owner != nullptr;
 	// (Behind a plain global: KYTY_SPECULATE unset, no thread-local read.)
-	auto* const spec = kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr;
+	auto* const spec = !Claimed && kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr;
 	// (A speculation's translation off the GPU thread: its command words among its segment's reads, Spec::State::
 	// NoteCommandWords. The GPU thread's holes read them when they run.)
 	const bool note_words = spec != nullptr && !GuestGpu::IsGpuThread();
 	// (spec_flush_keep: read once a call; mode 4 only.)
-	const bool flush_keep = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+	const bool flush_keep = !Claimed && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
 	// (Mode 4, a speculation's thread off the GPU thread: packet_light.) A register packet (SET_CONTEXT_REG, SET_SH_REG,
 	// SET_UCONFIG_REG(_INDEX); not the INDIRECT forms, which read memory) takes no Spec::EnterPacket and no Mark at its
 	// start. Its handlers (pm4Handlers.cpp CpOpSetContextReg / CpOpSetShaderReg / CpOpSetUconfigReg and the HwCtx / HwSh /
@@ -3184,6 +3207,10 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 	[[maybe_unused]] std::conditional_t<Guarded, std::vector<uint32_t>, bool> command_copy {};
 	const auto command_cancelled = [&] {
 		if constexpr (Guarded) {
+			if constexpr (Claimed) {
+				return m_command_skip->load(std::memory_order_acquire) >= m_command_serial ||
+				       m_command_cancel->load(std::memory_order_acquire);
+			}
 			const bool requested = m_command_cancel->load(std::memory_order_acquire);
 			if (requested && spec != nullptr && spec->cancel_seen != nullptr) {
 				spec->cancel_seen->store(true, std::memory_order_release);
@@ -3194,6 +3221,9 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 	};
 	const auto stop_before_read = [&] {
 		m_watched_stop = true;
+		execution.m_suspended = true;
+	};
+	[[maybe_unused]] const auto suspend_claimed = [&] {
 		execution.m_suspended = true;
 	};
 	uint64_t   clean_end      = 0;
@@ -3221,13 +3251,45 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		clean_end = std::max(clean_end, end);
 		return false;
 	};
+	const auto copy_table = [&](uint32_t opcode, const uint32_t* packet, uint32_t dwords,
+	                            std::span<const uint32_t>& table_words) {
+		if (opcode != Pm4::IT_SET_CONTEXT_REG_INDIRECT && opcode != Pm4::IT_SET_SH_REG_INDIRECT &&
+		    opcode != Pm4::IT_SET_UCONFIG_REG_INDIRECT) {
+			return true;
+		}
+		if constexpr (Claimed) {
+			if (dwords != 5u) return false;
+		} else if (dwords < 5u) {
+			return true;
+		}
+		const uint64_t table = (uint64_t {packet[1]} & 0xfffffffcu) | (uint64_t {packet[2]} << 32u);
+		const uint32_t pairs = packet[4] & 0x3fffu;
+		if (table == 0 || pairs == 0) return true;
+		auto& copy = t_indirect_table_copy;
+		const uint32_t words = pairs * 2u;
+		const uint64_t bytes = uint64_t {words} * 4u;
+		if constexpr (Claimed) {
+			if (words > m_claimed_words_left) return false;
+			m_claimed_words_left -= words;
+		}
+		copy.words.resize(words);
+		const auto unread = Claimed ? Spec::ClaimedWorkerCopy(copy.words.data(), table, bytes)
+		                            : Spec::WorkerCopy(copy.words.data(), reinterpret_cast<const void*>(table), bytes, true);
+		if (unread != 0) return false;
+		if constexpr (Guarded && !Claimed) {
+			if (command_cancelled()) return false;
+		}
+		copy.packet = packet, copy.table = table, copy.pairs = pairs, copy.shared = spec == nullptr;
+		table_words = {copy.words.data(), copy.words.size()};
+		return true;
+	};
 	while (execution.m_buffer_stack.size() > stop_depth) {
 		if (packet_light) spec->light_unmarked = false; // (a packet before this one is done with its Mark)
 		if (Guarded && command_cancelled()) {
 			return stop_before_read();
 		}
 		if (spec != nullptr && spec->refused != nullptr) return refuse(spec->refused);
-		if (g_gpu_state != nullptr && spec == nullptr) { // (a speculation's thread runs no guest commands)
+		if (!Claimed && g_gpu_state != nullptr && spec == nullptr) { // (a speculation's thread runs no guest commands)
 			g_gpu_state->ProcessCommands();
 			// (KYTY_EAGER_FEEDBACK: completed copy-feedback snapshots written back between packets; its verify's
 			// synchronous download only outside a recorder.)
@@ -3253,6 +3315,15 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		}
 		const auto buffer_index = execution.m_buffer_stack.size() - 1;
 		auto&      cursor       = execution.m_buffer_stack[buffer_index];
+		if constexpr (Claimed) {
+			const auto address = reinterpret_cast<uint64_t>(cursor.Position());
+			if (execution.m_buffer_stack.size() > Spec::CopyCursor::MaxDepth ||
+			    (address & 3u) != 0 || !GuestRange{address, cursor.commands.size_bytes()}.Valid() ||
+			    cursor.offset_dw > cursor.commands.size() ||
+			    cursor.deferred_advance_dw > cursor.commands.size() - cursor.offset_dw) {
+				return suspend_claimed();
+			}
+		}
 		EXIT_IF(cursor.offset_dw > cursor.commands.size());
 		if (cursor.deferred_advance_dw != 0) {
 			EXIT_IF(cursor.deferred_advance_dw > cursor.commands.size() - cursor.offset_dw);
@@ -3269,14 +3340,25 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		// (Its header's page first, to the page's end; then its words' pages once its length is read.)
 		const auto packet_at = reinterpret_cast<uint64_t>(cursor.commands.data() + cursor.offset_dw); // (the pointer read)
 		clean_end               = 0;
-		const auto* const source_packet = cursor.commands.data() + cursor.offset_dw;
+		const auto* const source_packet = (Claimed ? cursor.Position() : cursor.commands.data()) + cursor.offset_dw;
 		const auto*       packet        = source_packet;
+		[[maybe_unused]] const auto copy_packet = [&](void* to, uint64_t bytes) {
+			if constexpr (Claimed) {
+				return Spec::ClaimedWorkerCopy(to, reinterpret_cast<uint64_t>(source_packet), bytes);
+			}
+			return Spec::WorkerCopy(to, source_packet, bytes, false);
+		};
 		const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
 		uint32_t          packet_header = 0;
 		if constexpr (Guarded) {
-			if (Spec::WorkerCopy(&packet_header, source_packet, sizeof(packet_header), false) != 0 ||
-			    command_cancelled()) {
+			const auto unread = copy_packet(&packet_header, sizeof(packet_header));
+			if constexpr (Claimed) {
+				if (command_cancelled()) return stop_before_read();
+				if (unread != 0 || (packet_header != 0x80000000u && (packet_header >> 30u) != 3u)) {
+					return suspend_claimed();
+				}
+			} else if (unread != 0 || command_cancelled()) {
 				return stop_before_read();
 			}
 		} else {
@@ -3293,6 +3375,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		// below (one ended a mode 4 run while the stone arch loaded, 10-31).
 		if ((m_state_only || spec != nullptr) && packet_header != 0x80000000u &&
 		    (remaining_dw < 2 || KYTY_PM4_LEN(packet_header) == 0 || KYTY_PM4_LEN(packet_header) > remaining_dw)) {
+			if constexpr (Claimed) return suspend_claimed();
 			if (spec != nullptr) return refuse("malformed packet");
 			execution.m_suspended = true;
 			return;
@@ -3301,14 +3384,26 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		if constexpr (Guarded) {
 			const uint32_t dwords = packet_header == 0x80000000u ? 1u : KYTY_PM4_LEN(packet_header);
 			// The AA sample register handler consumes four words after the packet.
-			local_dw = packet_header == 0xc0106900u ? std::min(remaining_dw, dwords + 4u) : dwords;
-			if (opcode == Pm4::IT_WRITE_DATA && dwords < 4u) {
+			const bool aa_samples = (Claimed ? packet_header & ~1u : packet_header) == 0xc0106900u;
+			local_dw = aa_samples ? std::min(remaining_dw, dwords + 4u) : dwords;
+			if constexpr (Claimed) {
+				if ((aa_samples && local_dw != dwords + 4u) || (opcode == Pm4::IT_WRITE_DATA && dwords < 4u)) {
+					return suspend_claimed();
+				}
+				if (local_dw > m_claimed_words_left) {
+					return suspend_claimed();
+				}
+				m_claimed_words_left -= local_dw;
+			} else if (opcode == Pm4::IT_WRITE_DATA && dwords < 4u) {
 				return stop_before_read();
 			}
-			command_copy.resize(std::max(local_dw, 16u));
-			std::fill(command_copy.begin() + local_dw, command_copy.end(), 0u);
-			if (Spec::WorkerCopy(command_copy.data(), source_packet, uint64_t {local_dw} * 4u, false) != 0 ||
-			    command_copy.front() != packet_header || command_cancelled()) {
+			command_copy.resize(Claimed ? local_dw : std::max(local_dw, 16u));
+			if constexpr (!Claimed) std::fill(command_copy.begin() + local_dw, command_copy.end(), 0u);
+			const auto unread = copy_packet(command_copy.data(), uint64_t {local_dw} * 4u);
+			if constexpr (Claimed) {
+				if (command_cancelled()) return stop_before_read();
+				if (unread != 0 || command_copy.front() != packet_header) return suspend_claimed();
+			} else if (unread != 0 || command_copy.front() != packet_header || command_cancelled()) {
 				return stop_before_read();
 			}
 			packet = command_copy.data();
@@ -3321,6 +3416,90 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		if (packet_header == 0x80000000u) {
 			if (note_words) spec->NoteCommandWords(reinterpret_cast<uint64_t>(cursor.Position() + cursor.offset_dw), 4u);
 			cursor.offset_dw++;
+			execution.m_made_progress = true;
+			continue;
+		}
+
+		if constexpr (Claimed) {
+			const auto dwords = KYTY_PM4_LEN(packet_header);
+			const auto handler = g_cp_op_func[opcode];
+			const auto custom = KYTY_PM4_R(packet_header);
+			if (handler == nullptr ||
+			    (opcode == Pm4::IT_NOP && custom != Pm4::R_ZERO && g_cp_op_custom_func[custom] == nullptr)) {
+				return suspend_claimed();
+			}
+			if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
+				cursor.offset_dw += dwords;
+				execution.m_made_progress = true;
+				continue;
+			}
+			if (!UpdatePm4DrawState(opcode, packet_header, packet, true)) return suspend_claimed();
+			if (opcode != Pm4::IT_DRAW_INDEX_INDIRECT) m_draw_run_skip = 0;
+
+			uint32_t consumed = dwords;
+			if (StatePassRuns(opcode, packet_header)) {
+				switch (opcode) {
+					case Pm4::IT_WRITE_DATA: break; // Completion stores and other guest writes leave no CP state.
+					case Pm4::IT_DMA_DATA:
+						if (dwords != 7u) return suspend_claimed();
+						break;
+					case Pm4::IT_COPY_DATA:
+						if (dwords != 6u) return suspend_claimed();
+						break;
+					case Pm4::IT_DISPATCH_DIRECT:
+						if (dwords != 5u) return suspend_claimed();
+						m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(packet[4]));
+						break;
+					default: {
+						if (opcode == Pm4::IT_SET_PREDICATION) {
+							if (dwords < 3u) return suspend_claimed();
+							// Nonzero predication can require GPU progress and a readback.
+							if (StatePassPredicationReads(packet)) return suspend_claimed();
+						}
+						if ((opcode == Pm4::IT_SET_CONTEXT_REG || opcode == Pm4::IT_SET_SH_REG ||
+						     opcode == Pm4::IT_SET_UCONFIG_REG || opcode == Pm4::IT_SET_UCONFIG_REG_INDEX) &&
+						    dwords < 3u) {
+							return suspend_claimed();
+						}
+						if (opcode == Pm4::IT_NOP && custom == Pm4::R_CONTEXT_STATE && dwords >= 3u) {
+							const auto op = static_cast<ContextStateOperation>(packet[1]);
+							if ((op == ContextStateOperation::Pop && !m_context_state_pushed) ||
+							    ((op == ContextStateOperation::Push || op == ContextStateOperation::PushClear) &&
+							     m_context_state_pushed)) {
+								return suspend_claimed();
+							}
+						}
+						if (opcode == Pm4::IT_INDIRECT_BUFFER &&
+						    execution.m_buffer_stack.size() >= Spec::CopyCursor::MaxDepth) {
+							return suspend_claimed();
+						}
+						t_indirect_table_copy.packet = nullptr;
+						std::span<const uint32_t> table_words;
+						if (command_cancelled()) return stop_before_read();
+						const bool copied = copy_table(opcode, packet, dwords, table_words);
+						if (command_cancelled()) return stop_before_read();
+						if (!copied) return suspend_claimed();
+						// Only COND_EXEC uses the containing extent to validate its forward skip.
+						const auto extent = opcode == Pm4::IT_COND_EXEC ? remaining_dw : local_dw;
+						try {
+							const Common::RecoverableExitScope recoverable;
+							const auto run = ClaimedPm4Handler(opcode, handler);
+							consumed = run(*this, packet_header & ~1u, packet + 1, extent, extent) + 1u;
+						} catch (const Common::RecoverableExit&) {
+							return suspend_claimed();
+						}
+						if (execution.m_suspended) return; // A nested buffer already suspended execution.
+						if (command_cancelled()) return stop_before_read();
+						if (consumed < dwords || consumed > extent) return suspend_claimed();
+						break;
+					}
+				}
+			} else if (opcode == Pm4::IT_REWIND || opcode == Pm4::IT_WRITE_CONST_RAM ||
+			           opcode == Pm4::IT_DUMP_CONST_RAM || opcode == Pm4::IT_GET_LOD_STATS) {
+				// These packets need execution state or effects that the private pass cannot reproduce.
+				return suspend_claimed();
+			}
+			execution.m_buffer_stack[buffer_index].offset_dw += consumed;
 			execution.m_made_progress = true;
 			continue;
 		}
@@ -3480,24 +3659,8 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 					handler_words = write_copy.data();
 				}
 			}
-			if ((opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT || opcode == Pm4::IT_SET_SH_REG_INDIRECT ||
-			     opcode == Pm4::IT_SET_UCONFIG_REG_INDIRECT) &&
-			    KYTY_PM4_LEN(packet_header) >= 5u) { // (as the observer reads one; its handler takes 5 only)
-				const uint64_t table = (uint64_t {packet[1]} & 0xfffffffcu) | (uint64_t {packet[2]} << 32u);
-				const uint32_t pairs = packet[4] & 0x3fffu;
-				if (table != 0 && pairs != 0) {
-					auto&          copy  = t_indirect_table_copy;
-					const uint64_t bytes = uint64_t {pairs} * 8u;
-					copy.words.resize(size_t {pairs} * 2u);
-					// (KYTY_WRITE_GUARD_SPEC: a table on a guarded page through the backing view, as GuardTable reads it.)
-					if (Spec::WorkerCopy(copy.words.data(), reinterpret_cast<const void*>(table), bytes, true) != 0 ||
-					    (Guarded && command_cancelled())) {
-						return stop_before();
-					}
-					// (Shared with a state pass's GuardTable; a speculation's compares its own copy with it.)
-					copy.packet = packet, copy.table = table, copy.pairs = pairs, copy.shared = spec == nullptr;
-					table_words = {copy.words.data(), copy.words.size()};
-				}
+			if (!copy_table(opcode, packet, KYTY_PM4_LEN(packet_header), table_words)) {
+				return stop_before();
 			}
 		}
 		// A state pass's chunk boundary (SetChunking): not within a run of indirect draws, which a translation takes
@@ -3541,26 +3704,9 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 				return refuse(Pm4RefusalNames[opcode == Pm4::IT_NOP ? 256u + (KYTY_PM4_R(packet_header) & 0xffu) : opcode].data());
 			}
 		}
-		// The CP writes an indirect draw's start instance into the user SGPR the packet names
-		// (START_INST_LOC); every path below translates the draw's shaders for it.
-		switch (opcode) {
-			case Pm4::IT_DRAW_INDIRECT:
-			case Pm4::IT_DRAW_INDEX_INDIRECT:
-			case Pm4::IT_DRAW_INDIRECT_MULTI:
-			case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
-				// (Off the GPU thread, one too short to hold it is other data, its word 3 past its probed words: the execution
-				// suspends before reading it. Only a state pass meets one: a speculation takes these by their headers.)
-				if (KYTY_PM4_LEN(packet_header) < 4u && off_gpu_thread) {
-					execution.m_suspended = true;
-					return;
-				}
-				m_sh_ctx.SetStartInstanceUserSgpr(GsUserSgprAt(packet[3] & 0xffffu));
-				break;
-			case Pm4::IT_DRAW_INDEX_2:
-			case Pm4::IT_DRAW_INDEX_AUTO:
-			case Pm4::IT_DRAW_INDEX_OFFSET_2:
-			case Pm4::IT_DISPATCH_DRAW_PREAMBLE: m_sh_ctx.SetStartInstanceUserSgpr(-1); break;
-			default: break;
+		if (!UpdatePm4DrawState(opcode, packet_header, packet, off_gpu_thread)) {
+			execution.m_suspended = true;
+			return;
 		}
 		// A state pass: what changes the processor's state only (a run of indirect draws ends within its packets).
 		if (m_state_only) {

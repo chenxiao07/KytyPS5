@@ -443,6 +443,7 @@ enum Id : uint32_t {
 	SpecRestoreGeneralTaken,
 	SpecRestoreGeneralBudget,
 	SpecRestoreGeneralCatalogBusy,
+	SpecQ0ClaimedWalksCompletedN,
 	Count
 };
 
@@ -453,7 +454,8 @@ inline constexpr const char* Names[Count] = {
     "spec_commit_image_index_overflow_fallbacks",
     "spec_restore_general_taken",
     "spec_restore_general_refused_budget",
-    "spec_restore_general_refused_catalog_busy"};
+    "spec_restore_general_refused_catalog_busy",
+    "spec_q0_claimed_walks_completed_n"};
 static_assert(__builtin_strcmp(Names[SpecTablePatchRegisteredKept], "spec_table_patch_registered_kept") == 0 &&
                   __builtin_strcmp(Names[SpecTablePatchRegisteredRefused], "spec_table_patch_registered_refused") == 0,
               "spec_table_patch counters out of step with Names");
@@ -465,8 +467,11 @@ static_assert(__builtin_strcmp(Names[SpecCommitImageIndexOverflowFallbacks], "sp
 static_assert(__builtin_strcmp(Names[SpecRestoreGeneralTaken], "spec_restore_general_taken") == 0 &&
                   __builtin_strcmp(Names[SpecRestoreGeneralBudget], "spec_restore_general_refused_budget") == 0 &&
                   __builtin_strcmp(Names[SpecRestoreGeneralCatalogBusy], "spec_restore_general_refused_catalog_busy") == 0 &&
-                  SpecRestoreGeneralCatalogBusy + 1 == Count,
+                  SpecRestoreGeneralCatalogBusy + 1 == SpecQ0ClaimedWalksCompletedN,
               "spec_restore_general counters out of step with Names");
+static_assert(__builtin_strcmp(Names[SpecQ0ClaimedWalksCompletedN], "spec_q0_claimed_walks_completed_n") == 0 &&
+                  SpecQ0ClaimedWalksCompletedN + 1 == Count,
+              "spec_q0_claimed_walks_completed_n out of step with Names");
 static_assert(__builtin_strcmp(Names[RegQuietFallbacks], "reg_quiet_fallbacks") == 0, "quiet inserts counter out of step with Names");
 inline std::atomic<uint64_t> g_values[Count];
 // The render thread's counts: it is their only writer, so an increment needs no locked
