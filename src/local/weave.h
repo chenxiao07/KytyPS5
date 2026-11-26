@@ -46,6 +46,9 @@ inline constexpr uint64_t RingBytes = uint64_t {16} << 20u, SlabBytes = uint64_t
 inline constexpr uint32_t RingRecords   = 1024;
 inline constexpr uint64_t SlabKeepBytes = 256;
 inline constexpr uint32_t ParcelSlots = 512, FeedEntries = 1024, FreedEntries = 65536, CopyRecords = 16384;
+// The logical CPUs of the performance class UploadCpuFallback needs. On 10 or 11 the weave runs, but the CPU kept for
+// the upload worker costs the other threads more than the worker's own wait saves.
+inline constexpr uint32_t UploadCpuMinCpus = 12;
 
 // --- Start-up and run time ---
 
@@ -55,6 +58,9 @@ void ApplyStartGates();
 // What an unset KYTY_RENDER_CORE stands for (KeepRenderCoreAlone's fallback; the start line names it): "auto" while
 // the weave stays up after its gates (the GPU thread's core kept for it), else null.
 [[nodiscard]] const char* RenderCoreFallback() noexcept;
+// Whether an unset KYTY_LINUX_UPLOAD_CPU keeps the upload worker alone on a CPU (Linux, async-upload.h): while the
+// weave stays up after its gates on UploadCpuMinCpus or more logical CPUs of the performance class.
+[[nodiscard]] bool UploadCpuFallback() noexcept;
 // The resolved worker count (0 when stood down).
 [[nodiscard]] uint32_t Workers() noexcept;
 // The switch on and not stood down (the start-up result: a stand-down sets the switch to 0).

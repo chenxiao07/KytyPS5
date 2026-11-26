@@ -16,6 +16,9 @@
 #include "parallel-pages.h"
 #include "spin-gate.h"
 #include "write-guard.h"
+#if defined(__linux__)
+#include "weave.h" // (Weave::UploadCpuFallback: KYTY_LINUX_UPLOAD_CPU's default, Worker::Run)
+#endif
 
 #include <algorithm>
 #include <cstdio>
@@ -258,6 +261,19 @@ private:
 		// Created by the render thread: do not inherit its dedicated CPU.
 		LocalPlatform::PinThreadToCpuList(std::getenv("KYTY_RECORDING_CPUS"));
 		RaisePriority();
+#if defined(__linux__)
+		// KYTY_LINUX_UPLOAD_CPU=<cpu>: this worker alone on that CPU. Kicked while asleep, it can be woken onto a CPU
+		// another thread holds and wait there for its turn, mostly behind the recording worker, the game's job workers
+		// and the weave's, seldom on an idle CPU. Alone it answers a kick at once, so the threads waiting on its copies
+		// wait less, with no CPU spent spinning.
+		// Unset: auto (a core beside the GPU thread's) while the weave runs on Weave::UploadCpuMinCpus or more logical
+		// CPUs of the performance class (Weave::UploadCpuFallback), unless KYTY_RECORDING_CPUS placed this worker above
+		// (as KYTY_RENDER_CPUS keeps KYTY_RENDER_CORE's default off); else not; 0: not. The threads it makes later that
+		// call AvoidCpuList are born on its CPU and leave it: the pipe's copy threads, the second lane's and the copy
+		// pool's (Kyty.UploadCopy).
+		const bool placed = LocalPlatform::CpuListMask(std::getenv("KYTY_RECORDING_CPUS")) != 0;
+		(void)LocalPlatform::KeepThreadAloneOnCpu("KYTY_LINUX_UPLOAD_CPU", Weave::UploadCpuFallback() && !placed);
+#endif
 		// Pause iterations the worker polls for new copies before it sleeps (while its CPUs idle: spin-gate.h).
 		constexpr uint32_t UploadSpins = 20000;
 		for (;;) {
@@ -920,6 +936,10 @@ private:
 		LocalPlatform::SetThreadName("Kyty.Upload2");
 		t_worker = true;
 		LocalPlatform::PinThreadToCpuList(std::getenv("KYTY_RECORDING_CPUS"));
+#if defined(__linux__)
+		// (Made by the worker, it is born on its CPUs: off the one KYTY_LINUX_UPLOAD_CPU keeps for it, if any.)
+		LocalPlatform::AvoidCpuList(nullptr);
+#endif
 		RaisePriority();
 		uint32_t seen = 0;
 		for (;;) {
