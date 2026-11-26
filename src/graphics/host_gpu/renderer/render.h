@@ -36,6 +36,27 @@ class Shader;
 } // namespace HW
 namespace Spec {
 struct State;
+
+// Commit-local staging for all sets completed by one packet-spliced segment.
+struct PendingImagePlan {
+	struct Slot {
+		Image*                  image = nullptr;
+		uint64_t                set = 0;
+		ImageId                 id;
+		uint64_t                serial = 0;
+		vk::ImageView           view;
+		uint32_t                registrations = 0;
+		vk::DescriptorType      type = vk::DescriptorType::eSampledImage;
+		vk::ImageLayout         layout = vk::ImageLayout::eUndefined;
+		TextureCache::ImageDesc desc;
+	};
+	std::unique_ptr<Slot[]> slots;
+	size_t                 capacity = 0, size = 0;
+	size_t                 next_slot = 0; // the same proposal and slot order in both passes
+	bool                   applying = false;
+
+	[[nodiscard]] std::span<const Slot> Slots() const { return {slots.get(), size}; }
+};
 } // namespace Spec
 
 struct GraphicContext;
@@ -49,6 +70,7 @@ struct DrawIndexBufferSource;
 struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
+class TextureCache;
 struct RenderExecutorTestAccess;
 
 enum class CommandBufferDebugOp : uint32_t {
@@ -483,7 +505,7 @@ public:
 	// At the start of a translation: what this executor kept of the catalog from its last one, dropped when the owner
 	// changed it since (TableXpr::epoch; table-xpr.inc).
 	void ForgetStaleCatalog();
-	static constexpr uint32_t Roles = 13; // (the GPU thread, Spec::MaxPacketSlots speculation threads)
+	static constexpr uint32_t Roles = 14; // (the GPU thread, Spec::MaxPacketSlots speculation threads)
 	// (Mode 4, the GPU thread) A segment's commit settles each proposal's catalog part under its owner's catalog write
 	// taken with a try-lock (SettleOrQueue; `owner`: the proposal's catalog owner, Spec::State::ProposedSet::catalog_owner,
 	// null: run at once, its own writes taken); held by a worker's read, or a part already waiting, the part waits in a list
@@ -599,13 +621,19 @@ private:
 	template <typename P>
 	[[nodiscard]] bool TableEvaluate(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
 	template <typename P>
+	void TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data, bool versioned);
+	template <typename P, bool Versioned>
 	void TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
 	template <typename P>
 	[[nodiscard]] TableImageSet* TableSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
 	                                      const NativeXprDrawState* draw_state);
 	template <typename P>
 	[[nodiscard]] bool TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
-	                               std::array<vk::DeviceAddress, 2>& blocks, bool* writes);
+	                               std::array<vk::DeviceAddress, 2>& blocks, bool* writes, bool versioned);
+	template <typename P, bool Versioned>
+	[[nodiscard]] bool TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
+	                               std::array<vk::DeviceAddress, 2>& blocks, bool* writes,
+	                               TableXpr& table);
 	// A copy in the table upload ring of a small range the guest wrote, as TableBlocks makes one (0: none;
 	// table-xpr.inc).
 	template <typename P>
@@ -613,7 +641,8 @@ private:
 	                                              uint64_t& observation, uint64_t& cpu, bool& copied);
 	[[nodiscard]] vk::DeviceAddress TableRingCopy(uint64_t address, uint64_t size);
 	// spec_worker_images: a worker's set's pending slots completed by the GPU thread at its commit (Speculation::Before).
-	[[nodiscard]] bool TableCompletePendingImages(TableImageSet& set);
+	[[nodiscard]] bool TableCompletePendingImages(TableImageSet& set, Spec::PendingImagePlan* plan);
+	[[nodiscard]] static uint64_t TablePredictPendingConflict(const TableImageSet& set, TextureCache& textures) noexcept;
 	// (Mode 4; table-xpr.inc) A speculation makes the table entry a draw lacks (a new pair, a new draw state from a
 	// sibling's capture, a variant), draws with it, and its commit publishes it (nullopt: not made, refused as before).
 	[[nodiscard]] std::optional<TableResult> TableWorkerEntry(CommandBuffer& buffer, TablePair* existing, uint64_t pair_hash,
@@ -652,12 +681,10 @@ private:
 	void                         TableRuns(TablePair& pair);
 	void                         TableReset(TablePair& pair);
 	[[nodiscard]] bool           TableEvaluate(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
-	void                         TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
 	[[nodiscard]] TableImageSet* TableSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
 	                                      const NativeXprDrawState* draw_state);
-	[[nodiscard]] bool           TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
-	                                         std::array<vk::DeviceAddress, 2>& blocks, bool* writes);
-	void                         TablePrepareBda(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
+	void                         TablePrepareBda(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
+	                                            bool flat);
 	[[nodiscard]] bool           TableTransit(const TableImageSet& set, vk::CommandBuffer vk_buffer,
 	                                          const NativeXprDrawState* draw_state);
 	// TableTransit would record nothing: the set's images are those the draw state's targets allow, none awaits an
@@ -800,6 +827,7 @@ private:
 	std::unordered_set<uint64_t> m_depth_tiled_reports;
 
 	friend class CommandProcessor;
+	friend class Speculation;
 	friend struct RenderExecutorTestAccess;
 };
 

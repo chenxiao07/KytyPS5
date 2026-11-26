@@ -79,6 +79,7 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fmt/format.h>
@@ -552,7 +553,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	request->tick = m_scheduler.CurrentTick();
 	m_download_ticks[slot] = request->tick;
 	if (LiveTrace::WriteTicks()) LiveTrace::Event(LiveTrace::ReadbackTicks, address, size | request->tick << 32u);
-	m_scheduler.Flush();
+	m_scheduler.Flush(CommandScheduler::FlushReason::Readback);
 	// Keep GPU ownership and page protection until the caller has copied every byte.
 	// Subsequent accesses to this window must retire this request before proceeding.
 	m_guest_readbacks[slot] = request;
@@ -791,6 +792,54 @@ void BufferCache::DrainGuestReadback(uint64_t address, uint64_t size, bool gpu_r
 	}
 }
 
+void BufferCache::StartWriteVersions() {
+	// Mode 0 can subtract GPU coverage without updating the per-buffer versions.
+	m_write_memo.fill({});
+	m_write_versions.store(true, std::memory_order_relaxed);
+}
+
+// A live, in-bounds buffer still owns the range. Every removal of GPU-written bytes stamps
+// the registered buffers the subtraction overlaps. An unchanged version proves the memo's
+// bytes are still GPU-written, so SynchronizeBuffer's coverage check would return and Add
+// would leave the range set unchanged. ObtainBuffer drains pending readbacks before testing.
+void BufferCache::NoteCoverageSubtracted(uint64_t address, uint64_t size) {
+	if (size == 0) {
+		return;
+	}
+	const auto end = address + size;
+	auto it = m_buffers.upper_bound(address);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		auto& buffer = m_slot_buffers[it->second];
+		if (buffer.CpuAddress() + buffer.Size() > address) {
+			buffer.coverage_subtracted = m_gpu_coverage_epoch;
+		}
+	}
+}
+
+bool BufferCache::WriteVersionHit(WriteMemo& memo, uint64_t address, uint64_t size) {
+	if (!WriteVersionsConfigured() || kyty_local_buffer_residency_mode.load(std::memory_order_relaxed) == 0 ||
+	    native_buffer_download_depth != 0) {
+		return false;
+	}
+	const auto* buffer = GetBufferIfLive(memo.id);
+	if (buffer == nullptr || !buffer->IsInBounds(address, size) || buffer->coverage_subtracted > memo.coverage) {
+		return false;
+	}
+	memo.registration = RegistrationEpoch();
+	memo.coverage = m_gpu_coverage_epoch;
+	return true;
+}
+
+bool BufferCache::WrittenOwnerHolds(const Buffer& owner, uint64_t address, uint64_t size, uint64_t registered) {
+	if (RegistrationEpoch() != registered || owner.is_deleted || !owner.IsInBounds(address, size)) {
+		return false;
+	}
+	return true;
+}
+
 void BufferCache::FinishGuestReadback(size_t slot, bool detach) {
 	auto request = m_guest_readbacks[slot];
 	if (!request) return;
@@ -821,6 +870,7 @@ void BufferCache::FinishGuestReadback(size_t slot, bool detach) {
 		m_gpu_modified_ranges.SubtractSorted(request->parts);
 		++m_gpu_coverage_epoch;
 	}
+	NoteRangesSubtracted(request->parts);
 	// The renderer may have dirtied other pages in the widened window since handoff.
 	for (const auto& page: request->pages)
 		m_memory_tracker.UnmarkRegionAsGpuModified(page.address, page.size);
@@ -1131,6 +1181,7 @@ bool BufferCache::VerifyEagerFeedback(const EagerFeedback& entry) {
 		m_gpu_modified_ranges.SubtractSorted(copies);
 		++m_gpu_coverage_epoch;
 	}
+	NoteRangesSubtracted(copies);
 	m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
 	LiveCounters::Add(LiveCounters::EagerVerified);
 	if (mismatched != 0) {
@@ -1232,6 +1283,7 @@ bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t s
 		m_gpu_modified_ranges.SubtractSorted(copies);
 		++m_gpu_coverage_epoch;
 	}
+	NoteRangesSubtracted(copies);
 	// Only complete dirty-page coverage allows dropping protection. CPU-clean bytes
 	// are never published from the snapshot. Any later upload/GPU write invalidates it.
 	m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
@@ -1302,15 +1354,97 @@ void BufferCache::ChangeRegister(BufferId id) {
 	// The page table first, one 8-byte store an entry (a speculation's thread reads it concurrently: LoadOwner), then the
 	// epochs: a speculation that acquires the new epoch then reads the new entry (an unregister's cleared one); one that
 	// read the old entry took the old epoch, which its commit's registration check finds moved.
+	//
+	// QUIET INSERTS (under KYTY_SPECULATE=4 only, from mode 4's first start: QuietResolution). A QUIET INSERT is a
+	// registration (insert) in mode 4 over pages no buffer holds. Every registration is meant to be one, because each
+	// caller unregistered whatever was there first - CreateBuffer joins every buffer ResolveOverlaps found (JoinOverlap ->
+	// DeleteBuffer -> Unregister) before Register; ServeAhead registers only a range ResolveOverlaps finds free;
+	// SplitUnmappedBuffers, MoveSpilledBufferBack and Defragment DeleteBuffer the old one, then Register its pieces / its
+	// move inside the old one's caching pages - and it is checked here, not assumed: the page table's old entries are
+	// read by the exchange that writes the new ones, and a registration that met an entry still held is LOUD (the
+	// change as before the quiet inserts; counted, reg_quiet_fallbacks). A quiet insert stores the page table,
+	// m_region_registrations and BdaDirtyRegions::Mark (the BDA region proofs, GpuResourceManager::SynchronizeDirtyBdaRegions
+	// and SynchronizeRegionRequest, are about the absence of a buffer: a new one's CPU-dirty pages must be synced before
+	// BDA reads reach them - they keep moving), the spans, the sync change, m_buffers, the LRU, the BDA entries and the
+	// hoist watch exactly as before; it writes no granule epoch, no resolution region epoch (m_region_resolution) and
+	// publishes no registration epoch. Every other change (each unregister; every registration outside mode 4) is LOUD:
+	// the page table, the granules, the regions (both arrays), then the published epoch, the order the comment above
+	// needs. m_change_counter gives every change its value: the published epoch + 1, as before, unless quiet inserts came
+	// since the last loud change (then above it; the next loud change publishes its own value, past theirs).
+	//
+	// WHY IT IS EXACT. (1) Every proof the published epoch, the resolution regions or the granules carry is about a range
+	// that HAD an owner at its lookup (a found buffer: NoteBufferRange, Changed's buffer ranges, RelocEligible, the pending
+	// walk's found entries and their summary, the patch step's moved test, the held V# entries, the args / index held
+	// entries, native records' deps, the write memo, the BDA head memo's "held", TableWorkerKeepsMoved's ranges), and its
+	// claim is "that owner is still the owner". An insert changes no owner: only an unregister ends one, and every
+	// unregister stays loud over the old owner's whole range. A worker that met the new buffer N read N's page entry after
+	// its victims' loud stores (the GPU thread's program order, LoadOwner's seq_cst load): a range in a victim's pages is
+	// stopped by the victim's granules, one in N's new pages had no owner before N. (2) No result rests on the absence of an
+	// owner through a published epoch; each absence is a hint or is tested again at the commit by the GPU thread's own
+	// state, never by an epoch:
+	//  - FindBufferSpec's miss: refused (the hole runs the lookup in order) and posted (PostAhead) - a hint;
+	//  - ServeAhead's overlap test: ResolveOverlaps over m_buffers on the GPU thread at the serve (quiet inserts keep
+	//    m_buffers as before), nothing kept;
+	//  - ObtainBufferSpec's miss: a table V# left pending - the commit's Before obtains it in order (FindBuffer,
+	//    EnsureBufferContents, ObtainBuffer) and the patch step writes the address RegisteredBuffer finds then for every
+	//    pending entry; spec_ring_index's ring copy and the small read-only direct read take guest bytes whatever the
+	//    owner (the in-order ObtainBuffer takes the same small read with or without a buffer), proven by their clean
+	//    reads' guest-memory epochs at the commit (Changed checks clean reads for unmaps only, never for registrations,
+	//    as before); else refused;
+	//  - TableBlocks' pending V#s (the same pending entries) and its ring copies (owner-independent, as in order);
+	//  - EnsureBdaReadable on a worker: a page with no owner goes to FindBufferSpec (refused); the BDA head memo keeps
+	//    "held" (presence) only, which only an unregister ends;
+	//  - IsRegionRegistered: GPU-thread callers only (eager feedback, the feedback read, the unmap / map paths, readbacks),
+	//    answered from the page table / m_buffers at the call, nothing cached under an epoch.
+	// The GPU thread's "the epoch moved" tests that inserts used to trip need only unregisters: TableDraw's "a later
+	// lookup that registers a buffer (a merge replaces an earlier one)" and the dispatch retry (a merge unregisters),
+	// Before's "preparation registered buffers" (a buffer merged away under the recorded work), the pending dedupe (an
+	// answer after its own FindBuffer). (3) Absence-of-owner readers that are not proofs keep moving: the BDA regions.
+	// THE MODE FLIP is exact both ways: m_region_resolution is written by every loud change in mode 4, so from the floor on
+	// (MarkExactEpochsFromNow, which makes it: the granules' floor, guarded in RegisteredSince and RegionResolutionEpoch)
+	// it holds every unregister. 0 -> 4: the readers move to the resolution array from the floor, and from then on (1)-(2)
+	// apply (the GPU thread, and the speculations, made after the floor; a weave worker, which runs on past the mode's
+	// store until the weave pauses, never moves: it asks m_region_registrations in either mode). 4 -> 0: the readers move
+	// back to m_region_registrations, which got every change, quiet inserts included, at
+	// values above the epoch published before them: a worker's epoch from mode 4 answers "moved" over a quiet insert's
+	// regions (a stop, never a miss), and the granules, which skipped the quiet inserts, are only ever asked about
+	// unregisters by (1). Mode 0: no change is quiet, so every change publishes its value (the first one after a live
+	// switch from mode 4 publishes past any quiet insert's); in a mode-0 boot the values and stores are the ones before
+	// the quiet inserts, the page table's stores plain ones, and m_region_resolution is never made.
+	const bool  mode4      = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
+	auto* const resolution = mode4 ? m_region_resolution.load(std::memory_order_acquire) : nullptr;
+	bool        quiet      = insert && resolution != nullptr;
 	PageTable::PageRange pages {};
 	EXIT_IF(!PageTable::TryGetPageRange(m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size(), pages));
+	bool held = false; // (a quiet insert's page that still held a buffer: the change is loud)
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
 		const BufferId entry = insert ? id : BufferId {};
-		__atomic_store_n(reinterpret_cast<uint64_t*>(&m_page_table[page]), std::bit_cast<uint64_t>(entry), __ATOMIC_RELEASE);
+		if (quiet) {
+			const auto old =
+			    __atomic_exchange_n(reinterpret_cast<uint64_t*>(&m_page_table[page]), std::bit_cast<uint64_t>(entry), __ATOMIC_ACQ_REL);
+			held = held || static_cast<bool>(std::bit_cast<BufferId>(old));
+		} else {
+			__atomic_store_n(reinterpret_cast<uint64_t*>(&m_page_table[page]), std::bit_cast<uint64_t>(entry), __ATOMIC_RELEASE);
+		}
 	}
-	const auto epoch = m_registration_epoch.load(std::memory_order_relaxed) + 1;
-	// spec_exact_reg_stop: the granules' epochs, for RegisteredSinceExact (KYTY_SPECULATE=4 only).
-	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+	if (held) {
+		// (No registration is meant to meet one: the change made as before the quiet inserts, the epochs after the page
+		// table as there.)
+		quiet = false;
+		LiveCounters::Add(LiveCounters::RegQuietFallbacks);
+		// Replacing a page owner can leave the old buffer live and its write version unchanged.
+		// Drop memos over this page range before publishing the new registration epoch.
+		const auto begin = uint64_t {pages.first} << PageTable::kPageBits;
+		const auto end   = uint64_t {pages.last_exclusive} << PageTable::kPageBits;
+		for (auto& memo: m_write_memo) {
+			if (memo.size != 0 && memo.vaddr < end && begin < memo.vaddr + memo.size) {
+				memo = {};
+			}
+		}
+	}
+	const auto epoch = ++m_change_counter;
+	// spec_exact_reg_stop: the granules' epochs, for RegisteredSinceExact (KYTY_SPECULATE=4 only; not a quiet insert's).
+	if (mode4 && !quiet) {
 		constexpr uint64_t leaf_mask = (uint64_t {1} << RegLeafBits) - 1;
 		const auto         begin     = m_slot_buffers[id].CpuAddress();
 		const auto         bytes     = m_slot_buffers[id].Size();
@@ -1340,13 +1474,14 @@ void BufferCache::ChangeRegister(BufferId id) {
 	          last   = (m_slot_buffers[id].CpuAddress() + m_slot_buffers[id].Size() - 1) / TRACKER_REGION_SIZE;
 	     region <= last && region < TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE; ++region) {
 		m_region_registrations[region].store(epoch, std::memory_order_release);
+		if (resolution != nullptr && !quiet) resolution[region].store(epoch, std::memory_order_release); // (quiet inserts)
 		BdaDirtyRegions::Mark(region);
 	}
 	// While the weave is enabled, the change's span by its epoch (RegisteredOverSince), before the epoch is published.
 	if (Weave::Enabled())
 		g_registration_log[epoch % RegistrationLog] = {epoch, m_slot_buffers[id].CpuAddress(),
 		                                               m_slot_buffers[id].Size()};
-	m_registration_epoch.store(epoch, std::memory_order_release);
+	if (!quiet) m_registration_epoch.store(epoch, std::memory_order_release);
 	LiveCounters::Add(LiveCounters::BufferRegistrations);
 	auto& buffer = m_slot_buffers[id];
 	// The batch's hoist check: a registration over a hoisted range of a KernelBatchMap2 call in progress marks it touched.
@@ -1552,6 +1687,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 		m_gpu_modified_ranges.SubtractSorted(copies);
 		++m_gpu_coverage_epoch;
 	}
+	NoteRangesSubtracted(copies);
 }
 
 bool BufferCache::TryReportLodStatsOnGpu(uint64_t address, bool reset) {
@@ -1921,6 +2057,9 @@ void BufferCache::DiscardGpuWrites(uint64_t vaddr, uint64_t size) {
 		m_gpu_modified_ranges.ForEachIntersection(first, last - first, [&](RangeSet::Range range) { dropped += range.size; });
 		m_gpu_modified_ranges.Subtract(first, last - first);
 		++m_gpu_coverage_epoch;
+	}
+	if (Spec::ModeFour() && WriteVersionsConfigured()) {
+		NoteCoverageSubtracted(first, last - first);
 	}
 	LiveCounters::Add(LiveCounters::DiscardedGpuBytes, dropped);
 	InvalidateCopyFeedback(first, last - first);
@@ -2432,6 +2571,7 @@ bool BufferCache::ServiceFreedReadback(FreeBlocksQuery free_blocks, FreeBlockSpl
 			m_gpu_modified_ranges.SubtractSorted(written);
 			++m_gpu_coverage_epoch;
 		}
+		NoteRangesSubtracted(written);
 		// The pages with no GPU-written byte left are the CPU's again.
 		for (const auto& range: written) {
 			const auto page_begin = range.address & ~(TRACKER_PAGE_SIZE - 1);
@@ -2985,7 +3125,7 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	// download is submitted first; the offload worker writes the bytes back when the GPU is done.
 	if (TextureOffload::MustWaitBeforeRead(vaddr, size) && GuestGpu::IsGpuThread() && !CommandScheduler::InDeferredOperation()) {
 		TextureOffload::NoteReadWait(size);
-		m_scheduler.Flush();
+		m_scheduler.Flush(CommandScheduler::FlushReason::Readback);
 		TextureOffload::WaitRestores(vaddr, size);
 	}
 	// Texture bytes dropped from RAM that the upload reads (a buffer over an offloaded texture's
@@ -3372,6 +3512,16 @@ StreamBuffer& BufferCache::GetTableUploadBuffer() noexcept {
 // ObtainBuffer for a speculative translation (speculation-state.h), out of line so the normal path keeps main's body.
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSpec(Spec::State& spec, uint64_t vaddr, uint64_t size,
                                                            bool is_written, bool is_texel_buffer) {
+	const auto read_backing = [&](void* out) {
+		if (spec.ForwardReadsEnabled() && spec.ReadForwarded(vaddr, out, size)) {
+			return true;
+		}
+		if (!Libs::LibKernel::Memory::TryReadBackingToHost(vaddr, out, size)) {
+			return false;
+		}
+		spec.NoteCleanRead(vaddr, size);
+		return true;
+	};
 	// As ObtainBuffer: a small range the guest wrote, read from a copy in the (speculation's) ring, as no GPU work wrote
 	// it (speculation-state.h) and with no guest memory write of the speculation pending over it.
 	if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(vaddr, size) &&
@@ -3380,9 +3530,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSpec(Spec::State& spec, ui
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 4);
 		auto [mapped, offset] = upload.Map(size, alignment, false);
-		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(vaddr, mapped, size)) {
+		if (mapped != nullptr && read_backing(mapped)) {
 			upload.Commit();
-			spec.NoteCleanRead(vaddr, size);
 			return {&upload, offset};
 		}
 	}
@@ -3416,9 +3565,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSpec(Spec::State& spec, ui
 			const auto alignment = std::max<uint64_t>(
 			    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 4);
 			auto [mapped, offset] = upload.Map(size, alignment, false);
-			if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(vaddr, mapped, size)) {
+			if (mapped != nullptr && read_backing(mapped)) {
 				upload.Commit();
-				spec.NoteCleanRead(vaddr, size);
 				PostAhead(vaddr, size);
 				return {&upload, offset};
 			}
@@ -3442,7 +3590,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSpec(Spec::State& spec, ui
 	if (is_written) spec.NoteWritten(vaddr, size);
 	else if (m_memory_tracker.IsRegionCpuModified(vaddr, size) || spec.JournalIntersects(vaddr, size))
 		spec.NoteCurrent(vaddr, size);
-	if (spec.touched_buffers.empty() || spec.touched_buffers.back() != *owner) spec.touched_buffers.push_back(*owner);
+	if ((spec.touched_buffers.empty() || spec.touched_buffers.back() != *owner) && spec.TouchBufferOnce(*owner)) {
+		spec.touched_buffers.push_back(*owner);
+	}
 	if (!Spec::t_no_range) {
 		spec.NoteBufferRange(vaddr, size); // (spec_reloc_refs: the caller records it)
 		// (A buffer reference the commit cannot relocate: not a V# (patched by its entry), not the table path's index
@@ -3485,14 +3635,18 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	// standing 9.11 -> 8.91 ms render in the same process.)
 	auto& memo = m_write_memo[((vaddr >> 4u) ^ (size * 0x9e3779b97f4a7c15ull >> 40u)) % m_write_memo.size()];
 	if (is_written && memo.vaddr == vaddr && memo.size == size && memo.texel == is_texel_buffer &&
-	    memo.registration == RegistrationEpoch() && memo.coverage == m_gpu_coverage_epoch) {
+	    ((memo.registration == RegistrationEpoch() && memo.coverage == m_gpu_coverage_epoch) ||
+	     (Spec::ModeFour() && WriteVersionHit(memo, vaddr, size)))) {
 		if (auto* buffer = m_slot_buffers.try_get(memo.id); buffer != nullptr && !buffer->is_deleted && buffer->IsInBounds(vaddr, size)) {
 			TouchBuffer(*buffer);
 			InvalidateCopyFeedback(vaddr, size);
 			NoteGpuWrite(vaddr, size);
-			Spec::NoteGpuWrite(vaddr, size);
+			if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) [[unlikely]]
+				Spec::NoteGpuWriteRepeat(static_cast<size_t>(&memo - m_write_memo.data()), true, vaddr, size);
+			else
+				Spec::NoteGpuWrite(vaddr, size);
 			// (No change-ring mark for the weave: the range stayed GPU-written since the write below that made this memo
-			// and marked it, since every give-back moves m_gpu_coverage_epoch, so no worker's read of it could pass.)
+			// and marked it. Both memo paths rule out a give-back over those bytes.)
 			LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
 			LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
 			return {buffer, buffer->Offset(vaddr)};
@@ -3515,7 +3669,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			m_gpu_modified_ranges.Add(vaddr, size);
 		}
 		NoteGpuWrite(vaddr, size);
-		Spec::NoteGpuWrite(vaddr, size);
+		static_assert(sizeof(m_write_memo) / sizeof(m_write_memo[0]) == Spec::EffectsRepeatSlots, "a slot a memo's");
+		if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) [[unlikely]]
+			Spec::NoteGpuWriteRepeat(static_cast<size_t>(&memo - m_write_memo.data()), false, vaddr, size);
+		else
+			Spec::NoteGpuWrite(vaddr, size);
 		// (While workers run: the scout's change ring marks the range GPU-written, which the weave's open tests a
 		// parcel's pages against; the tickets' test passes over the mark.)
 		if (Weave::Active() && Scout::Running()) Scout::NoteGpuMark(vaddr, size);
@@ -3791,7 +3949,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
-                             bool src_gds) {
+                             bool src_gds, bool linear_dispatch) {
 	const bool dst_memory = !dst_gds;
 	const bool src_memory = !src_gds;
 	if ((dst_memory && dst_vaddr == 0) || (src_memory && src_vaddr == 0) || size == 0 ||
@@ -3824,10 +3982,17 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 			}
 			spec->NoteCpuCopy(src_vaddr, size);
 			spec->NoteCpuCopy(dst_vaddr, size);
-			spec->Journal(dst_vaddr, src_vaddr, static_cast<uint32_t>(size), true);
+			spec->Journal(dst_vaddr, src_vaddr, static_cast<uint32_t>(size), true,
+			              linear_dispatch ? Spec::HostWriteKind::LinearCopy : Spec::HostWriteKind::Other);
+			if (linear_dispatch && Spec::CopyForwardActive()) {
+				Spec::ReportLinearCopy(dst_vaddr, src_vaddr, size, false);
+			}
 			return;
 		}
-		CopyGuestMemory(dst_vaddr, src_vaddr, size);
+		CopyGuestMemory(dst_vaddr, src_vaddr, size, linear_dispatch);
+		if (linear_dispatch && Spec::CopyForwardActive()) {
+			Spec::ReportLinearCopy(dst_vaddr, src_vaddr, size, false);
+		}
 		// (While workers run: the copy this thread made, which the weave compares with the reader's record of it.)
 		if (Weave::Active()) Weave::t_copy_done = {.dst = dst_vaddr, .src = src_vaddr, .bytes = size, .path = 1};
 		return;
@@ -3857,6 +4022,9 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		EXIT("BufferCache: resolved Vulkan copy ranges overlap\n");
 	}
 	dst->CopyInRun(command, *src, src_offset, dst_offset, size);
+	if (linear_dispatch && Spec::CopyForwardActive()) {
+		Spec::ReportLinearCopy(dst_vaddr, src_vaddr, size, true);
+	}
 }
 
 // Copies from this size on compare their pages on helper threads too (ParallelPages): below it, waking them costs about
@@ -3914,7 +4082,8 @@ bool BufferCache::WriteGuestKnownWriter(uint64_t vaddr, const void* data, uint64
 	       Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size);
 }
 
-void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size) {
+void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool linear_dispatch) {
+	const auto kind = linear_dispatch ? Spec::HostWriteKind::LinearCopy : Spec::HostWriteKind::Other;
 	// The game's linear copies mostly rewrite what the destination already holds (95% of the bytes in the fixed
 	// scene): only the destination pages whose bytes differ are written, so the others stay clean (no upload of their
 	// bytes to the GPU again). A run of them with a write-protected page (uploaded since it was last written) is marked
@@ -3936,7 +4105,7 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 			if (m_memory_tracker.MarkRegionAsCpuDirtyKeepProtection(address, bytes) &&
 			    (Libs::LibKernel::Memory::TryWriteCpuBacking(address, from, bytes) ||
 			     Libs::LibKernel::Memory::TryWriteBacking(address, from, bytes))) {
-				parts.Note();
+				parts.Note(kind);
 				// (A linear copy's write, so noted: the weave's ring test passes over it for a parcel that read through
 				// the copy.)
 				if (Scout::Running()) Scout::NoteHostWrite(address, bytes, false, /*copy=*/true);
@@ -3947,7 +4116,7 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 		} else if (WriteGuestKnownWriter(address, from, bytes)) {
 			// (KYTY_SPEC_LABEL_KNOWN_WRITER: CPU-dirty pages still watched, written the way above since their upload, are
 			// written the same way again, their epoch moved by the mark: no write fault releasing the watch.)
-			parts.Note();
+			parts.Note(kind);
 			if (Scout::Running()) Scout::NoteHostWrite(address, bytes);
 			return;
 		}
@@ -3955,7 +4124,7 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 		// stale. A linear copy is a dispatch, no point the observation epoch moves at.)
 		m_memory_tracker.NoteHostWrite(address, bytes);
 		std::memcpy(reinterpret_cast<void*>(address), from, bytes);
-		parts.Note();
+		parts.Note(kind);
 		if (Scout::Running()) Scout::NoteHostWrite(address, bytes, false, /*copy=*/true);
 	};
 	// Which destination pages differ: compared on helper threads too when the copy is large (the 4 MiB copy the culling
@@ -4036,6 +4205,13 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	// (A speculative translation's own writes count.)
 	const auto* spec = Spec::Current();
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size) || (spec != nullptr && spec->WrittenIntersects(vaddr, size));
+}
+
+bool BufferCache::SpecTableCpuWritten(const Spec::State& spec, uint64_t vaddr, uint64_t size) {
+	const auto dirty = m_memory_tracker.ReadRegionDirtyForSpeculation(vaddr, size);
+	// As IsRegionGpuModified, this translation's own GPU writes count too. A journaled write only
+	// bars the ring copy; cpu_written still decides whether the fallthrough needs EnsureBufferContents.
+	return dirty.cpu && !dirty.gpu && !spec.WrittenIntersects(vaddr, size);
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {

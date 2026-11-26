@@ -464,6 +464,7 @@ struct RenderExecutor::TableXpr {
 	};
 	static constexpr size_t                WrittenEntries = 1024;
 	std::array<WrittenRange, WrittenEntries> written;
+	std::optional<std::array<uint32_t, 128>> buffer_format_classes;
 	// The draw's blocks (per stage): its slots (IR::TablePlan::BlockDwords), then its buffers.
 	std::array<std::vector<uint32_t>, 2> blocks;
 	// An indirect image's candidates for the draw or dispatch being made (per stage), in the order its set binds them
@@ -484,6 +485,10 @@ struct RenderExecutor::TableXpr {
 	// program with several dense roots has their candidates one after another there. Written for a stage with an indirect
 	// image only (TableEvaluate, TableScoutApply), the one TableResolveSet reads it for.)
 	std::array<std::vector<uint32_t>, 2> indirect_counts;
+	// Indexed by the low bits of the hash TableGather already computed.
+	static constexpr size_t WrittenWideEntries = 4096;
+	static_assert(ResolvedEntries % WrittenWideEntries == 0, "the proof index uses the gathered hash's low bits");
+	std::vector<WrittenRange> written_wide;
 };
 // KYTY_TABLE_MEMO: a descriptor set left service (NativeXprRetireSet): a memo entry may hold it.
 void RenderExecutor::TableMemoRetired() {
@@ -1288,69 +1293,121 @@ static void TableAsideDrain(uint64_t frame) {
 	for (auto& item: due) aside.retiring.emplace_back(marks, std::move(item.holder));
 }
 
+// Read-only prediction under the caller's render lock.
+uint64_t RenderExecutor::TablePredictPendingConflict(const TableImageSet& proposed_set, TextureCache& textures) noexcept {
+	if (proposed_set.pending_images.empty() || proposed_set.pending_targets.empty()) {
+		return 0;
+	}
+	// Other cache users can run under the cache lock alone. Skip the prediction if a read would wait.
+	std::shared_lock shared(textures.m_lock, std::defer_lock);
+	std::unique_lock exclusive(textures.m_lock, std::defer_lock);
+	if (!(textures.m_lock.SharedMode() ? shared.try_lock() : exclusive.try_lock())) {
+		return 0;
+	}
+	const TextureCache& cache = textures;
+	const auto handle = reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(proposed_set.set));
+	for (const auto target: proposed_set.pending_targets) {
+		const auto* image = cache.m_slot_images.try_get(target);
+		if (image == nullptr || image->info.data.size == 0) {
+			continue;
+		}
+		const auto& data = image->info.data;
+		for (const auto& pending: proposed_set.pending_images) {
+			const auto& range = pending.desc.info.data;
+			if (range.size != 0 && range.address < data.End() && data.address < range.End()) {
+				return handle;
+			}
+		}
+	}
+	return 0;
+}
+
 // spec_worker_images: the GPU thread, at the commit of the segment that built `set` (Speculation::Before, before the replay
 // binds it): each pending slot's image as its own TableResolveSet would find it now (FindImage: made if needed;
 // FindTexture: uploaded, its view), transited to the sampled layout in the open buffer, its view written into the slot,
-// and the image added to the set's (its later draws validate and transit it as any). All of them, or false (the
-// segment stops; the set is never published).
-bool RenderExecutor::TableCompletePendingImages(TableImageSet& set) {
-	auto&                                textures = m_context.GetTextureCache();
-	std::vector<vk::DescriptorImageInfo> infos(set.pending_images.size());
-	std::vector<vk::WriteDescriptorSet>  writes;
-	size_t                               done = 0;
-	for (size_t i = 0; i < set.pending_images.size(); ++i) {
-		auto&      pending = set.pending_images[i];
-		auto       desc    = pending.desc;
-		const auto id      = textures.FindImage(desc, false, true); // (may fail: no memory for it, a refusal)
-		if (!id) continue;
-		// An image a draw that bound the set renders to: the slot would hold it read-only as a texture (the dep below, not
-		// a target) while that draw's attachment holds it, where the owner's build lays it out as the target
-		// (TableResolveSet). The segment stops: in order, the owner's build. (The rest of the set's slots are left: it is
-		// retired unpublished.)
-		if (std::ranges::find(set.pending_targets, id) != set.pending_targets.end()) break;
-		// (Its view with metadata: FindTexture's metadata step still a no-op here, the in-order point before the work,
-		// else the slot fails and the segment stops.)
-		if (pending.metadata && !textures.MetadataBindNoop(id, desc)) continue;
-		const auto view = textures.FindTexture(id, desc);
-		if (!view) continue;
-		auto& image = textures.GetImage(id);
-		image.usage.texture = true;
-		const ImageSubresourceRange range {desc.view_info.base_level, desc.view_info.level_count, desc.view_info.base_layer,
-		                                   desc.view_info.layer_count};
-		// (The open buffer read at each slot: a slot's FindImage / FindTexture that reclaims memory (a failed creation:
-		// ReclaimImageMemory waits for the current tick) submitted the one open before and began the next.)
-		image.Transit(pending.layout, vk::AccessFlagBits2::eShaderRead, range,
-		              m_context.GetCommandScheduler().Current().Handle());
-		infos[i] = vk::DescriptorImageInfo {nullptr, view, pending.layout};
-		vk::WriteDescriptorSet write;
-		write.dstSet          = set.set;
-		write.dstBinding      = pending.binding;
-		write.dstArrayElement = pending.element;
-		write.descriptorCount = 1;
-		write.descriptorType  = pending.type;
-		write.pImageInfo      = &infos[i];
-		writes.push_back(write);
-		auto& dep  = set.images.emplace_back();
-		dep.id     = id;
-		dep.serial = image.serial;
-		dep.layout = pending.layout;
-		dep.range  = range;
-		dep.desc   = desc;
-		set.image_ids.push_back(id);
-		// (Its view's metadata noted as the owner's build notes a dep's, KYTY_TABLE_SERIALS.)
-		if (pending.metadata) textures.NoteMetaUse(desc.info.metadata.range.address, id.index);
-		++done;
-	}
-	if (!writes.empty())
-		m_context.GetGraphics().device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr
+// and the image added to the set's dependencies. With a plan, acquire all slots before placing any, so their
+// images and views can be checked together. Both paths place each slot in its original descriptor layout.
+bool RenderExecutor::TableCompletePendingImages(TableImageSet& set, Spec::PendingImagePlan* plan) {
+	enum class Completion { Normal, Acquire, Apply };
+	const auto complete = [&]<Completion Pass>() {
+		auto& textures = m_context.GetTextureCache();
+		std::vector<vk::DescriptorImageInfo> infos(Pass == Completion::Acquire ? 0 : set.pending_images.size());
+		std::vector<vk::WriteDescriptorSet> writes;
+		size_t     done  = 0;
+		const auto place = [&](size_t i, Image& image, ImageId id, const TextureCache::ImageDesc& desc,
+		                       vk::ImageView view) {
+			const auto& pending = set.pending_images[i];
+			const ImageSubresourceRange range {desc.view_info.base_level, desc.view_info.level_count, desc.view_info.base_layer,
+			                                   desc.view_info.layer_count};
+			// Acquisition can submit and reopen the scheduler on memory pressure. Use the current buffer.
+			image.Transit(pending.layout, vk::AccessFlagBits2::eShaderRead, range, m_context.GetCommandScheduler().Current().Handle());
+			infos[i] = vk::DescriptorImageInfo {nullptr, view, pending.layout};
+			vk::WriteDescriptorSet write;
+			write.dstSet          = set.set;
+			write.dstBinding      = pending.binding;
+			write.dstArrayElement = pending.element;
+			write.descriptorCount = 1;
+			write.descriptorType  = pending.type;
+			write.pImageInfo      = &infos[i];
+			writes.push_back(write);
+			auto& dep  = set.images.emplace_back();
+			dep.id     = id;
+			dep.serial = image.serial;
+			dep.layout = pending.layout;
+			dep.range  = range;
+			dep.desc   = desc;
+			set.image_ids.push_back(id);
+		};
+		if constexpr (Pass == Completion::Apply) {
+			if (set.pending_images.size() > plan->size - plan->next_slot) return false;
+		}
+		for (size_t i = 0; i < set.pending_images.size(); ++i) {
+			const auto& pending = set.pending_images[i];
+			if constexpr (Pass == Completion::Apply) {
+				const auto& slot = plan->slots[plan->next_slot++];
+				place(i, *slot.image, slot.id, slot.desc, slot.view);
+				++done;
+				continue;
+			}
+			auto       desc = pending.desc;
+			const auto id   = textures.FindImage(desc, false, true);
+			if (!id) continue;
+			// (A pending slot resolving to a target of a draw that binds this set stops the segment, as before.)
+			if (std::ranges::find(set.pending_targets, id) != set.pending_targets.end()) {
+				break;
+			}
+			// (Its view's metadata step must still be a no-op at this in-order point.)
+			if (pending.metadata && !textures.MetadataBindNoop(id, desc)) continue;
+			const auto view = textures.FindTexture(id, desc);
+			if (!view) continue;
+			auto& image = textures.GetImage(id);
+			image.usage.texture = true;
+			if constexpr (Pass == Completion::Acquire) {
+				if (plan->size == plan->capacity) return false;
+				const auto handle = reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(set.set));
+				plan->slots[plan->size++] = {&image, handle, id, image.serial, view, image.registrations, pending.type,
+				                            pending.layout, desc};
+			} else {
+				place(i, image, id, desc, view);
+			}
+			if (pending.metadata) textures.NoteMetaUse(desc.info.metadata.range.address, id.index);
+			++done;
+		}
+		const bool ok = done == set.pending_images.size();
+		if constexpr (Pass == Completion::Acquire) return ok;
+		if (!writes.empty())
+			m_context.GetGraphics().device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
-		                                                    , LocalVulkanRecording::DirectDispatch()
+			                                                    , LocalVulkanRecording::DirectDispatch()
 #endif
-		);
-	bool ok = done == set.pending_images.size();
-	set.span_begin = set.span_end = 0; // (its span grew: found again at its next proof)
-	if (ok) set.pending_images.clear(), std::vector<ImageId>().swap(set.pending_targets);
-	return ok;
+			);
+		set.span_begin = set.span_end = 0; // (its span grew: found again at its next proof)
+		if (ok) set.pending_images.clear(), std::vector<ImageId>().swap(set.pending_targets);
+		return ok;
+	};
+	if (plan == nullptr) return complete.template operator()<Completion::Normal>();
+	if (plan->applying) return complete.template operator()<Completion::Apply>();
+	return complete.template operator()<Completion::Acquire>();
 }
 
 RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& buffer, TablePair& pair,
@@ -1402,16 +1459,23 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			const auto  since    = CatalogTable()->epoch;
 			const bool  replaces = t_table_revalidating; // (spec_worker_revalidate: built for a set found no longer valid)
 			auto        holder   = std::make_shared<std::unique_ptr<TableImageSet>>(std::move(set));
+			using Settlement = Spec::State::ProposedSet::Settlement;
 			spec->proposed_sets.push_back({&pair, words_hash, raw, spec->closed.size(), false,
-			                               [owner, target, words_hash, since, holder, replaces](bool commit) {
+			                               [owner, target, words_hash, since, holder, replaces](Settlement action) {
+				                               const bool commit = action == Settlement::Publish;
+				                               const bool restored = action == Settlement::RetireRestored;
 				                               if (commit && TableAsideReleaseOn()) TableAsideDrain(owner->m_context.FrameNumber());
-				                               // (spec_worker_images: never completed, never published or kept; the roles' pointers to it
-				                               // dropped first, under the write lock their reads exclude; its descriptor set retired as the
-				                               // owner retires one. No other translation binds it (an unpublished proposal is foreign to
-				                               // them, TableSet), and its own segment's commit stopped before any replay that binds it ran.)
-				                               if (*holder && !(*holder)->pending_images.empty()) {
+				                               // An incomplete or restored set stays unpublished. Foreign translations cannot bind it.
+				                               if (*holder && (restored || !(*holder)->pending_images.empty())) {
 					                               const auto write = owner->CatalogWrite();
 					                               target->ForgetSet(holder->get());
+					                               if (restored && owner->m_table_xpr) {
+						                               auto& table = *owner->m_table_xpr;
+						                               if (table.last_set == holder->get()) table.last_set = nullptr;
+						                               if (table.memo_set == holder->get()) table.memo_set = nullptr;
+						                               ++table.epoch; // workers drop cached references on their next lookup
+					                               }
+					                               // Retire at or after the splice's tick. The proposal keeps the wrapper.
 					                               owner->NativeXprRetireSet((*holder)->pool, (*holder)->set);
 					                               return;
 				                               }
@@ -1459,12 +1523,15 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				return replaces || (*holder && !(*holder)->pending_images.empty());
 			};
 			if (!raw->pending_images.empty()) {
+				spec->proposed_sets.back().pending_image_slots = raw->pending_images.size();
 				// (The images it completes, each with its serial and the slot's layout, and the set's handle: for its segment's
 				// Before, and spec_set_cpu_dirty_stop off for the commits of later segments that bind it, CommitSegments'
 				// reuse test.)
-				spec->proposed_sets.back().complete = [owner, raw, spec, index = spec->proposed_sets.size() - 1] {
+				spec->proposed_sets.back().complete = [owner, raw, spec, index = spec->proposed_sets.size() - 1]
+				    (Spec::PendingImagePlan* plan) {
 					const auto first = raw->images.size();
-					const bool ok    = owner->TableCompletePendingImages(*raw);
+					const bool ok    = owner->TableCompletePendingImages(*raw, plan);
+					if (plan != nullptr && !plan->applying) return ok;
 					auto&      textures  = owner->m_context.GetTextureCache();
 					auto&      completed = spec->proposed_sets[index].completed;
 					const auto handle    = reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(raw->set));
@@ -2709,16 +2776,25 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 // writes). False: a buffer the shaders cannot take.
 // The V#s' words and their resolved entries (TableXpr::entries), as soon as TableEvaluate made the slots they are read
 // from: the entries' lines (a 4 MiB direct-mapped table: TLB misses too) load while the image set is found (TableSet).
-void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data) {
-	TableGather<Weave::Ordered>(pair, user_data);
+// Use the proof path selected by the draw or dispatch before gathering any buffers.
+template <typename P>
+void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
+                                 bool versioned) {
+	if constexpr (!P::worker) {
+		if (versioned) [[unlikely]] {
+			TableGather<P, true>(pair, user_data);
+			return;
+		}
+	}
+	TableGather<P, false>(pair, user_data);
 }
 
-// (Under Weave::Worker: the worker's own entries.)
-template <typename P>
+template <typename P, bool Versioned>
 void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data) {
-	using Kind        = ShaderRecompiler::IR::TablePlan::Operand::Kind;
-	auto&      table  = TableOf<P>();
-	const auto stages = pair.programs[1] != nullptr ? 2u : 1u;
+	using Kind         = ShaderRecompiler::IR::TablePlan::Operand::Kind;
+	auto&       table  = TableOf<P>();
+	const auto* proofs = Versioned && !table.written_wide.empty() ? table.written_wide.data() : nullptr;
+	const auto  stages = pair.programs[1] != nullptr ? 2u : 1u;
 	for (uint32_t st = 0; st < stages; ++st) {
 		const auto& program = *pair.programs[st];
 		const auto& plan    = program.table_plan;
@@ -2757,6 +2833,13 @@ void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<con
 			} else {
 				words4 = fresh;
 				entry  = &table.resolved[XXH3_64bits(words4.data(), sizeof(words4)) & (TableXpr::ResolvedEntries - 1)];
+			}
+			if constexpr (Versioned) {
+				if (proofs != nullptr && (program.info.buffers[i].written || program.info.buffers[i].atomic)) {
+					const auto index = static_cast<size_t>(entry - table.resolved.get()) & (TableXpr::WrittenWideEntries - 1);
+					__builtin_prefetch(proofs + index);
+					continue;
+				}
 			}
 			__builtin_prefetch(entry);
 		}
@@ -2832,9 +2915,31 @@ vk::DeviceAddress RenderExecutor::TableRingCopy(uint64_t address, uint64_t size,
 	return device;
 }
 
+// If forwarding misses, reuse the existing ring copy or read through one publication of the cached backing pages.
+[[gnu::noinline]] static std::optional<uint64_t> TableSpecBackingOnce(StreamBuffer& upload, uint64_t address, uint64_t size,
+                                                                    Spec::State* forward, bool& forwarded, bool reuse) {
+	const auto [mapped, offset] = upload.Map(size, 16, false);
+	if (mapped == nullptr) {
+		return std::nullopt;
+	}
+	forwarded = forward != nullptr && forward->ReadForwarded(address, mapped, size);
+	if (!forwarded && (reuse || !Libs::LibKernel::Memory::TryReadBackingOnceToHost(address, mapped, size))) {
+		return std::nullopt;
+	}
+	upload.Commit();
+	return offset;
+}
+
+template <typename P>
 bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
-                                 std::array<vk::DeviceAddress, 2>& blocks, bool* writes) {
-	return TableBlocks<Weave::Ordered>(pair, user_data, blocks, writes);
+                                 std::array<vk::DeviceAddress, 2>& blocks, bool* writes, bool versioned) {
+	auto& table = TableOf<P>();
+	if constexpr (!P::worker) {
+		if (versioned) [[unlikely]] {
+			return TableBlocks<P, true>(pair, user_data, blocks, writes, table);
+		}
+	}
+	return TableBlocks<P, false>(pair, user_data, blocks, writes, table);
 }
 
 // Under Weave::Worker: the worker's own entries, ring copies and special generation; its blocks and ring copies in the
@@ -2844,11 +2949,27 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 // else, a buffer the shaders write, or a format the pair isn't compiled for (a respecialization), is a hole. Every V#
 // taken from a game buffer is noted with its range's CPU epoch (a held use, its five block words kept for the turn's
 // recopy), every ring copy with its range.
-template <typename P>
+template <typename P, bool Versioned>
 bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
-                                 std::array<vk::DeviceAddress, 2>& blocks, bool* writes) {
-	using Kind         = ShaderRecompiler::IR::TablePlan::Operand::Kind;
-	auto&      table        = TableOf<P>();
+                                 std::array<vk::DeviceAddress, 2>& blocks, bool* writes,
+                                 TableXpr& table) {
+	using Kind = ShaderRecompiler::IR::TablePlan::Operand::Kind;
+	const auto make_format_classes = [] {
+		std::array<uint32_t, 128> classes {};
+		for (uint32_t format = 0; format < classes.size(); ++format) {
+			classes[format] = ShaderRecompiler::IR::BufferFormatClass(static_cast<Prospero::BufferFormat>(format));
+		}
+		return classes;
+	};
+	const auto& format_classes = [&]() -> const std::array<uint32_t, 128>& {
+		if constexpr (Versioned) {
+			if (!table.buffer_format_classes) table.buffer_format_classes.emplace(make_format_classes());
+			return *table.buffer_format_classes;
+		} else {
+			static const auto classes = make_format_classes();
+			return classes;
+		}
+	}();
 	auto&      buffer_cache = m_context.GetBufferCache();
 	auto&      textures     = m_context.GetTextureCache();
 	auto&      upload       = buffer_cache.GetTableUploadBuffer();
@@ -2899,15 +3020,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 	// A null buffer's device address: valid memory (the shaders' loads of a buffer are not branched around its bounds:
 	// out of bounds they load its first dword).
 	const vk::DeviceAddress null_device = upload.BufferDeviceAddress();
-	// A V#'s buffer word (IR::BufferWord, as IR::BufferDescriptorWord makes it) and stride. (Each format's class
-	// once: the V#s of every draw's buffers asked for it.)
-	static const auto format_classes = [] {
-		std::array<uint32_t, 128> classes {};
-		for (uint32_t format = 0; format < classes.size(); ++format)
-			classes[format] = ShaderRecompiler::IR::BufferFormatClass(static_cast<Prospero::BufferFormat>(format));
-		return classes;
-	}();
-	const auto word_of = [](const std::array<uint32_t, 4>& words4) -> std::pair<uint32_t, uint32_t> {
+	const auto word_of = [&format_classes](const std::array<uint32_t, 4>& words4) -> std::pair<uint32_t, uint32_t> {
 		ShaderBufferResource descriptor;
 		std::copy_n(words4.begin(), 4, descriptor.fields);
 		if (descriptor.Type() != 0) return {0, 0};
@@ -2947,8 +3060,15 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 		       (!resource.formatted || resource.descriptor_format == Prospero::BufferFormat::kInvalid ||
 		        (descriptor.Format() == resource.descriptor_format && descriptor.DstSelXYZW() == resource.descriptor_swizzle));
 	};
-	if (table.gathered != &pair) TableGather<P>(pair, user_data);
+	if (table.gathered != &pair) {
+		TableGather<P, Versioned>(pair, user_data);
+	}
 	table.gathered = nullptr; // (taken: a later draw or dispatch gathers its own)
+	if constexpr (Versioned) {
+		if (table.written_wide.empty()) [[unlikely]] {
+			table.written_wide.resize(TableXpr::WrittenWideEntries);
+		}
+	}
 	// (A weave worker's notes: a V# taken from a game buffer, its five block words placed once the stage's block is
 	// made; a ring copy; a buffer whose last use the turn stamps.)
 	const auto note_held = [&](uint32_t st, size_t i, uint64_t address, uint64_t size, uint64_t epoch) {
@@ -3019,7 +3139,14 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				if (writes != nullptr && resource.written && (uint64_t {words4[0]} | (words4[1] & 0xffffu)) != 0 &&
 				    words4[2] != 0)
 					*writes = true;
-				auto& proof = table.written[XXH3_64bits(words4.data(), sizeof(words4)) & (TableXpr::WrittenEntries - 1)];
+				auto& proof = [&]() -> TableXpr::WrittenRange& {
+					if constexpr (Versioned) {
+						const auto index = static_cast<size_t>(entries[i].second - table.resolved.get());
+						return table.written_wide[index & (TableXpr::WrittenWideEntries - 1)];
+					} else {
+						return table.written[XXH3_64bits(words4.data(), sizeof(words4)) & (TableXpr::WrittenEntries - 1)];
+					}
+				}();
 				if (proof.special != table.special_generation || proof.words != words4) {
 					const auto [clamped_address, clamped_size] = range_of(words4);
 					proof = {.words = words4, .special = table.special_generation, .address = clamped_address, .size = clamped_size};
@@ -3041,6 +3168,8 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						no_range.emplace(reloc);
 						Spec::t_pending_ok  = pending_ok;
 						Spec::t_pending_hit = false;
+					} else if constexpr (Versioned) {
+						written_since = buffer_cache.RegistrationEpoch();
 					}
 					const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, true, formatted);
 					if (spec_here) Spec::t_pending_ok = false;
@@ -3057,8 +3186,11 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						block[plan.BufferDword(i) + 4] = stride;
 						continue;
 					}
-					if (owner == nullptr || buffer_cache.GetBufferIfLive(buffer_cache.FindBuffer(address, size)) != owner)
+					if (owner == nullptr ||
+					    (!(Versioned && !spec_here && buffer_cache.WrittenOwnerHolds(*owner, address, size, written_since)) &&
+					     buffer_cache.GetBufferIfLive(buffer_cache.FindBuffer(address, size)) != owner)) {
 						return false;
+					}
 					if (formatted) textures.InvalidateMemoryFromGPU(address, size, "storage-buffer");
 					device = owner->BufferDeviceAddress() + offset;
 					// (spec_reloc_refs: proven at the epoch read before its lookup.)
@@ -3108,7 +3240,11 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				// registration began proved them for later translations too.)
 				for (auto region = held.address / TRACKER_REGION_SIZE, last = (held.address + held.size - 1) / TRACKER_REGION_SIZE;
 				     current && region <= last; ++region)
-					current = buffer_cache.RegionRegistrationEpoch(region * TRACKER_REGION_SIZE) <= held.registration;
+					// (Quiet inserts: a quiet insert moves no owner, so not the resolution epoch: BufferCache::ChangeRegister. A
+					// weave worker keeps the epoch every change moves: on a live 0 -> 4 it can read the mode as 4 before the
+					// floor moves and before the weave pauses, and an unregister made in mode 0 moved that epoch alone.)
+					current = (P::worker ? buffer_cache.RegionRegistrationEpoch(region * TRACKER_REGION_SIZE)
+					                     : buffer_cache.RegionResolutionEpoch(region * TRACKER_REGION_SIZE)) <= held.registration;
 				if (current) held.registration = registration;
 			}
 			if (current && held.size != 0) {
@@ -3118,21 +3254,21 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 					current = range_clean(held.address, held.size);
 					// (Inside a speculation range_clean's BufferCache::IsRegionCpuModified answers clean for a range in the
 					// translation's current_set, its pages CPU-dirty still: noted current by a packet a Rollback took back
-					// since (Rollback cuts `current`, keeps current_set), or by a translation dropped since. The tracker's
-					// own bits decide: dirty, no epoch is kept (re-proven at each use while dirty: a later translation,
-					// whose current_set lacks the range, then resolves it afresh and notes it there) and, when no note of
-					// the translation's `current` covers the range, it is noted current, as the fresh lookup's
-					// EnsureBufferContents notes it, so the commit uploads it before the work. Before, nothing uploaded it
-					// and the work read the buffer's stale bytes. Any speculation mode.)
+					// since (Rollback cuts `current`, keeps current_set), by a translation dropped since, or by an earlier
+					// segment of this one, whose notes the commit applies only if it keeps that segment (one it runs in
+					// order as a hole instead applies none: Speculation::SegmentAsHole, no Before). The tracker's own bits
+					// decide: dirty, no epoch is kept (re-proven at each use while dirty: a later translation, whose
+					// current_set lacks the range, then resolves it afresh and notes it there) and it is noted current in
+					// the open segment, as the fresh lookup's EnsureBufferContents notes it, so the segment's own commit
+					// uploads it before the work, whatever sealed segments noted (NoteCurrent drops a repeat against the
+					// open segment's notes only). Before, nothing uploaded it and the work read the buffer's stale bytes.
+					// Any speculation mode.)
 					if (current) {
 						// (Behind the plain global, as BufferCache::IsRegionCpuModified's: mode 0, no thread-local read.)
 						auto* spec = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr;
 						const bool dirty = spec != nullptr && buffer_cache.IsRegionCpuDirty(held.address, held.size);
 						held.cpu_epoch   = dirty ? 0 : epoch;
-						if (dirty && std::none_of(spec->current.begin(), spec->current.end(), [&](const Spec::Range& noted) {
-							    return noted.begin <= held.address && held.address + held.size <= noted.end;
-						    }))
-							spec->NoteCurrent(held.address, held.size);
+						if (dirty) spec->NoteCurrent(held.address, held.size);
 					}
 				}
 			}
@@ -3149,9 +3285,15 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 					if (address % 4 != 0 || (formatted && image_starts(address))) return false;
 					// (A speculation's: the guest's writes, not those its commit makes current; with none of its own
 					// guest memory writes pending over the range, read as no GPU work wrote it.)
-					auto* const spec        = Spec::Current();
-					const bool  cpu_written = buffer_cache.IsRegionCpuDirty(address, size) &&
-					                         !buffer_cache.IsRegionGpuModified(address, size);
+					auto* const spec = Spec::Current();
+					const bool cpu_written = [&] {
+						if constexpr (!P::worker) {
+							if (spec != nullptr) [[unlikely]]
+								return buffer_cache.SpecTableCpuWritten(*spec, address, size);
+						}
+						return buffer_cache.IsRegionCpuDirty(address, size) &&
+						       !buffer_cache.IsRegionGpuModified(address, size);
+					}();
 					if (cpu_written && size <= BufferCache::CACHING_PAGESIZE &&
 					    (spec == nullptr || !spec->JournalIntersects(address, size))) {
 						// As ObtainBuffer: a small range the guest wrote is read from a copy in the ring (nothing held: the
@@ -3203,7 +3345,10 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 							// same range: the commit's checks see the same lists); the shader reads the copy's bytes at its
 							// address, in the same ring, fenced for the same commit.)
 							TableXpr::SpecRingCopy* spec_shared = nullptr;
-							if (spec != nullptr && cpu != 0 && ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+							const bool forward_enabled = spec != nullptr && spec->ForwardReadsEnabled();
+							const bool try_forward = forward_enabled && spec->MightReadForwarded(address, size);
+							bool forwarded = false;
+							if (spec != nullptr && cpu != 0 && Spec::ModeFour()) {
 								if (!table.spec_ring_copies)
 									table.spec_ring_copies = std::make_unique<TableXpr::SpecRingCopy[]>(TableXpr::RingCopies);
 								spec_shared = &table.spec_ring_copies[((address ^ (size << 40u)) * 0x9e3779b97f4a7c15ull) >> 52u];
@@ -3216,22 +3361,37 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 								       spec_shared->segment == spec->closed.size() && spec_shared->rollbacks == spec->rollbacks &&
 								       spec_shared->waits == spec_waits();
 							};
+							const bool reuse_spec_copy = spec_shared != nullptr && spec_own();
 							if (shared != nullptr && cpu != 0 && shared->address == address && shared->size == size &&
 							    shared->observation == observation && shared->tick == tick && shared->cpu_epoch == cpu) {
 								device = shared->device;
 								LiveCounters::Add(LiveCounters::TableRingShared);
 								LiveCounters::Add(LiveCounters::TableRingSharedBytes, size);
-							} else if (spec_shared != nullptr && spec_own()) {
-								device = spec_shared->copy.device;
-								spec->NoteCleanRead(address, size);
-							} else if (auto [mapped, offset] = upload.Map(size, 16, false);
-							           mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(address, mapped, size)) {
-								upload.Commit();
-								if (spec != nullptr) spec->NoteCleanRead(address, size);
-								device = upload.BufferDeviceAddress() + offset;
+							} else if (const auto offset = [&]() __attribute__((always_inline)) -> std::optional<uint64_t> {
+								if (reuse_spec_copy && !try_forward) {
+									return std::nullopt;
+								}
+								std::optional<uint64_t> copied_offset;
+								if (spec_shared != nullptr) {
+									auto* const forward = try_forward ? spec : nullptr;
+									copied_offset = TableSpecBackingOnce(upload, address, size, forward, forwarded, reuse_spec_copy);
+								} else if (const auto [mapped, at] = upload.Map(size, 16, false); mapped != nullptr) {
+									forwarded = try_forward && spec->ReadForwarded(address, mapped, size);
+									if (forwarded || Libs::LibKernel::Memory::TryReadBackingToHost(address, mapped, size)) {
+										upload.Commit();
+										copied_offset = at;
+									}
+								}
+								return copied_offset;
+							}(); offset) {
+								if (spec != nullptr && !forwarded) {
+									spec->NoteCleanRead(address, size);
+								}
+								device = upload.BufferDeviceAddress() + *offset;
 								LiveCounters::Add(LiveCounters::TableRingCopies);
 								LiveCounters::Add(LiveCounters::TableRingBytes, size);
-								if (spec_shared != nullptr) // (after its note)
+								// A forwarded upload is tied to this segment's validation.
+								if (spec_shared != nullptr && !forwarded) { // (after its note)
 									*spec_shared = {.copy      = {.address     = address,
 									                              .size        = size,
 									                              .observation = observation,
@@ -3242,6 +3402,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 									                .rollbacks = spec->rollbacks,
 									                .waits     = spec_waits(),
 									                .segment   = spec->closed.size()};
+								}
 								if (shared != nullptr && cpu != 0)
 									*shared = {.address     = address,
 									           .size        = size,
@@ -3249,6 +3410,9 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 									           .tick        = tick,
 									           .cpu_epoch   = cpu,
 									           .device      = device};
+							} else if (reuse_spec_copy) {
+								device = spec_shared->copy.device;
+								spec->NoteCleanRead(address, size);
 							}
 							// (The V#'s later uses take it from its held entry.)
 							if (device != 0 && shared != nullptr && cpu != 0)
@@ -3410,7 +3574,8 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 // does at every use (the read plans' words from the user data and the blocks' slots); an unbounded plan, all of them.
 // (Without it, particle simulations at Stonefang read stale pages: readbacks the game crashed on, and indirect
 // arguments that lost the device.)
-void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data) {
+void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
+                                     bool flat) {
 	const auto global = [&](uint32_t st) { return pair.programs[st] != nullptr && pair.programs[st]->table_plan.global_memory; };
 	if (!global(0) && !global(1)) return;
 	auto&                                               table = OwnTable();
@@ -3421,6 +3586,13 @@ void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span
 	for (uint32_t st = 0; st < 2 && bounded; ++st) {
 		if (!global(st)) continue;
 		const auto& program = *pair.programs[st];
+		if (flat) {
+			// Read the words the snapshot below would hold directly from their source.
+			bounded = ShaderRecompiler::IR::AppendBdaReadRanges(
+			    program.bda_read_plan, user_data[st],
+			    std::span<const uint32_t>(table.blocks[st].data(), program.table_plan.slots.size()), ranges);
+			continue;
+		}
 		snapshot.user_data.assign(user_data[st].begin(), user_data[st].end());
 		snapshot.flattened_srt.assign(table.blocks[st].begin(), table.blocks[st].begin() + program.table_plan.slots.size());
 		bounded = ShaderRecompiler::IR::EvaluateBdaReadPlan(program.bda_read_plan, snapshot, stage_ranges);
@@ -3970,9 +4142,10 @@ static void Replay(std::span<const LocalVulkanRecording::Segment> segments, cons
 // The call recorded as such a packet (true), with its reference noted in the speculation's state; false: record it plainly.
 // (A plain one over a game buffer, not a ring's copy (no guest address), is one more reference the commit cannot
 // relocate: noted as such, so the segment stops as before when a registration moved over its range.)
-// (No check that `used` is still the range's registered buffer: TableDraw found the registration epoch unmoved after its
-// lookups, and a registration after that moves it past the segment's base over the range, which the commit's Changed()
-// finds: the cell is then rewritten with the live buffer (RelocEligible / RelocPatch) or the segment stops.)
+// (No check that `used` is still the range's registered buffer: a registration over the range after the speculation began
+// moves it past the segment's base, which the commit's Changed() finds, whether it came after the draw's lookups or during
+// them (a worker's draw is kept over an epoch that moved during its lookups: TableDraw): the cell is then rewritten with
+// the live buffer (RelocEligible / RelocPatch) or the segment stops.)
 // The caller calls it only with relocation on (a speculation's state with reloc_on).
 static bool TableRelocRecord(vk::CommandBuffer vk_buffer, Spec::State& spec, uint8_t kind,
                              const std::pair<Buffer*, uint64_t>& used, uint64_t address, uint64_t size, uint32_t op,
@@ -4000,10 +4173,11 @@ static bool TableRelocRecord(vk::CommandBuffer vk_buffer, Spec::State& spec, uin
 	return false;
 }
 
-// (Mode 4) A worker's table draw whose blocks, argument and index lookups saw the registration epoch move (the GPU thread's
-// registrations, anywhere: a speculation's lookups register nothing) is kept when no registration since reached the tracker
-// regions of a buffer range its open segment used (a superset of this draw's: its notes merge into them), and refused as
-// before otherwise. The commit's Changed() asks the same of those ranges since the speculation began.
+// (Mode 4) A worker's table dispatch whose lookups saw the registration epoch move (the GPU thread's registrations,
+// anywhere: a speculation's lookups register nothing) is kept when no registration since reached the tracker regions of a
+// buffer range its open segment used (a superset of this dispatch's: its notes merge into them), and refused as before
+// otherwise. The commit's Changed() asks the same of those ranges since the speculation began. (A worker's table draw is
+// kept without this test, its commit deciding: TableDraw.)
 static bool TableWorkerKeepsMoved(const Spec::State& spec, const BufferCache& cache, uint64_t epoch) {
 	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return false;
 	for (size_t i = spec.Sealed().buffer_ranges; i < spec.buffer_ranges.size(); ++i) {
@@ -4132,6 +4306,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	// reads in the draw. The mode kept for the set's target test below.)
 	const auto         speculate_mode = ::kyty_local_speculate_mode.load(std::memory_order_relaxed);
 	Spec::State* const spec_state     = speculate_mode != 0 ? Spec::Current() : nullptr;
+	const bool         versioned      = !P::worker && speculate_mode == 4 && m_context.GetBufferCache().WriteVersionsConfigured();
 	// (A speculation's relocatable index buffer and draw arguments, TableRelocRecord: nothing of it runs without one.)
 	const bool reloc = spec_state != nullptr && spec_state->reloc_on;
 	const auto& sh     = buffer.GetShaders();
@@ -4156,7 +4331,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		TableScoutApply(table, pair, *scout, stages);
 	} else {
 		const bool evaluated = TableEvaluate<P>(pair, user_data);
-		if (evaluated) TableGather<P>(pair, user_data);
+		if (evaluated) TableGather<P>(pair, user_data, versioned);
 		if (scout != nullptr) TableScoutVerify(table, pair, *scout, stages, evaluated);
 		if (!evaluated)
 			return TableAdd<P>(LiveCounters::TableDrawNative), Spec::Refuse("table: evaluation"), TableResult::Native;
@@ -4283,13 +4458,13 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		for (uint32_t st = 0; st < stages; ++st)
 			if (pair.programs[st]->table_plan.global_memory) return WeaveMiss(Weave::Miss::Memory), TableResult::Native;
 	} else {
-		TablePrepareBda(pair, user_data);
+		TablePrepareBda(pair, user_data, speculate_mode == 4);
 	}
 	// The blocks take each buffer's device address as it resolves: a later lookup that registers a buffer (a merge
 	// replaces an earlier one) leaves an earlier address stale, where the normal path binds after all its lookups
 	// (RebindBuffers). Such a draw takes the normal path; the next use finds the buffers registered.
 	const auto registration = buffer_cache.RegistrationEpoch();
-	if (!TableBlocks<P>(pair, user_data, blocks, &writes))
+	if (!TableBlocks<P>(pair, user_data, blocks, &writes, versioned))
 		return TableAdd<P>(LiveCounters::TableDrawNative), Spec::Refuse("table: blocks"), TableResult::Native;
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 9);
@@ -4320,8 +4495,19 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		});
 		if (indices.first == nullptr) return TableResult::Native;
 	}
+	// The registration epoch moved during the lookups (the GPU thread's registrations, anywhere: a speculation's lookups
+	// register nothing). The GPU thread's draw, and any draw outside mode 4: Native as before. A worker's draw (mode 4) is
+	// kept and its segment's commit decides, as it already does for every reference the draw records, since the
+	// speculation began (at or before this draw's epoch) and with the finer predicate (regions, then granules):
+	// - the index buffer and draw arguments are relocatable cells (reloc_refs, with their buffer ranges: RelocEligible /
+	//   RelocPatch re-point them to the live buffer; a plain bind over a game buffer is a reloc_unrel range, below);
+	// - the table V#s are spec_reloc_refs' entries with their `since` (looked up again when registered over since);
+	// - any other game buffer reference is a buffer range and a reloc_unrel range (Changed() stops; RelocEligible refuses a
+	//   moved one): a segment stopped there runs as a hole, as any other.
+	// Before, it was refused unless no registration since reached its open segment's buffer ranges (TableWorkerKeepsMoved,
+	// still the dispatch's test), and TableTry's caller ran it as a "native record" hole.
 	if (buffer_cache.RegistrationEpoch() != registration &&
-	    (spec_state == nullptr || !TableWorkerKeepsMoved(*spec_state, buffer_cache, registration)))
+	    (spec_state == nullptr || speculate_mode != 4))
 		return TableAdd<P>(LiveCounters::TableRegistered), TableResult::Native;
 	// (A speculation's lookups and preparation refuse without failing: nothing is recorded for a refused draw.)
 	if (spec_state != nullptr && spec_state->refused != nullptr) return TableResult::Native;
@@ -4476,6 +4662,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (!same_index && !(reloc && TableRelocRecord(vk_buffer, *spec_state, Spec::RelocIndex, indices, index_base, index_bytes,
 	                                               0, static_cast<uint32_t>(static_cast<VkIndexType>(index_type)), 0)))
 		vk_buffer.bindIndexBuffer(indices.first->Handle(), indices.second, index_type);
+	if (spec_state != nullptr && spec_state->reloc_on && !set->pending_images.empty() &&
+	    (groups != 0 || (direct != nullptr && !vertex_arguments)))
+		spec_state->NotePendingSetUse();
 	if (direct != nullptr && !vertex_arguments) {
 		// This draw's offsets, as the normal path's ResolveVertexOffset/ResolveInstanceOffset give them: the index
 		// offset register, else (a vertex program that fetches) the user data its fetch adds.
@@ -4738,6 +4927,9 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX> mapping {};
 	for (uint32_t i = 0; i < state.color_count; i++)
 		mapping[state.color_info[i].target_slot] = state.color_info[i].export_mapping;
+	// (spec_format_ahead, mode 4 only: the pair's birth lookup takes its recorded pair's mask: PipelineCache::t_fa_birth.)
+	const bool fa_birth = pair->programs[0] == nullptr && FormatAheadOn();
+	if (fa_birth) [[unlikely]] PipelineCache::t_fa_birth = true;
 	table_state.programs = pipelines.GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx,
 	                                                     buffer.GetUserConfig(), mapping, state.ps_active,
 	                                                     table_state.vs_input_info, table_state.ps_input_info, true,
@@ -4769,6 +4961,9 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 			const Weave::Hold hold;
 			pair->programs   = programs;
 			pair->push_fit   = Spec::On() && PipelineCache::t_push_fit_taken; // (the lookup above: mode 4 sets it)
+			// (spec_format_ahead: the buffers its recorded pair's mask made portable, kept as learned bits: every later
+			// lookup of the pair passes them in, so gets the form it was born on.)
+			if (fa_birth) [[unlikely]] pair->portable[0] |= PipelineCache::t_fa_pair_bits;
 			TableRuns(*pair);
 			TableScoutPublish(*pair);
 		}
@@ -5016,7 +5211,10 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	    (!pair.programs[0]->table_plan.indirect.empty() || pair.programs[0]->table_plan.dynamic_reads))
 		return m_dispatch_declined = "table: indirect off", false;
 	if (!TableEvaluate(pair, user_data)) return m_dispatch_declined = "table: tables unmapped", false;
-	TableGather(pair, user_data);
+	const bool mode_four = Spec::ModeFour();
+	auto&      cache     = m_context.GetBufferCache();
+	const bool versioned = mode_four && cache.WriteVersionsConfigured();
+	TableGather<Weave::Ordered>(pair, user_data, versioned);
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 2);
 	auto* set = TableSet(buffer, pair, nullptr, nullptr);
@@ -5026,7 +5224,6 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 3);
 	std::array<vk::DeviceAddress, 2> blocks {};
 	bool                             storage_writes  = false;
-	auto&                            cache           = m_context.GetBufferCache();
 	vk::Buffer                       indirect_buffer = nullptr;
 	uint64_t                         indirect_offset = 0;
 	// (Mode 4) A speculation's dispatch whose lookups saw the buffer registration epoch move under them takes back its
@@ -5034,8 +5231,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	// once, from the epoch then; a second move refuses as before. A first take that recorded work (RecordedWrites moved)
 	// is refused as before, never taken again, so no recorded work outlives its notes. What the first take did besides
 	// its notes (ring copies no command reads, posted ranges) is what a refused packet's Rollback leaves too.
-	auto* const retry_spec =
-	    kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? Spec::Current() : nullptr;
+	auto* const retry_spec = mode_four ? Spec::Current() : nullptr;
 	std::optional<Spec::Counts> retry_mark;
 	bool                        retry_bda  = false;
 	uint64_t                    retry_work = 0;
@@ -5045,9 +5241,10 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 		retry_work = LocalVulkanRecording::RecordedWrites();
 	}
 	for (uint32_t attempt = 0;; ++attempt) {
-		TablePrepareBda(pair, user_data); // (as TableDraw's: before the blocks)
+		TablePrepareBda(pair, user_data, mode_four); // (as TableDraw's: before the blocks)
 		const auto registration = cache.RegistrationEpoch(); // (as TableDraw's)
-		if (!TableBlocks(pair, user_data, blocks, &storage_writes)) return m_dispatch_declined = "table: blocks", false;
+		if (!TableBlocks<Weave::Ordered>(pair, user_data, blocks, &storage_writes, versioned))
+			return m_dispatch_declined = "table: blocks", false;
 		if (indirect_args != 0) {
 			// As DispatchDirect's: the arguments' owner, made current.
 			cache.EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
@@ -5058,15 +5255,22 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 			indirect_offset = owner.Offset(indirect_args);
 		}
 		if (cache.RegistrationEpoch() == registration) break;
-		if (attempt == 0 && retry_spec != nullptr && retry_spec->refused == nullptr &&
-		    LocalVulkanRecording::RecordedWrites() == retry_work) {
-			// (The blocks and arguments again, from the epoch now: what the commit checks is noted again by them.)
-			retry_spec->RollbackTo(*retry_mark, retry_bda);
-			blocks          = {};
-			storage_writes  = false;
-			indirect_buffer = nullptr;
-			indirect_offset = 0;
-			continue;
+		if (retry_spec != nullptr && retry_spec->refused == nullptr) {
+			if (attempt == 0 && LocalVulkanRecording::RecordedWrites() == retry_work) {
+				// (The blocks and arguments again, from the epoch now: what the commit checks is noted again by them.)
+				retry_spec->RollbackTo(*retry_mark, retry_bda);
+				blocks          = {};
+				storage_writes  = false;
+				indirect_buffer = nullptr;
+				indirect_offset = 0;
+				continue;
+			}
+			// Keep the dispatch if registrations since its epoch missed the open segment's buffers.
+			if (TableWorkerKeepsMoved(*retry_spec, cache, registration)) {
+				LiveCounters::Add(LiveCounters::SpecTablePatchRegisteredKept);
+				break;
+			}
+			LiveCounters::Add(LiveCounters::SpecTablePatchRegisteredRefused);
 		}
 		return LiveCounters::Add(LiveCounters::TableRegistered), m_dispatch_declined = "table: buffers registered meanwhile", false;
 	}
@@ -5108,6 +5312,8 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	const bool continues_chain = chain && buffer.ComputeChainPending();
 	if (storage_writes && !continues_chain) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, BindPipelineHandle(pipeline));
+	if (retry_spec != nullptr && retry_spec->reloc_on && !set->pending_images.empty())
+		retry_spec->NotePendingSetUse();
 	if (indirect_args != 0) {
 		vk::BufferMemoryBarrier args_barrier {};
 		args_barrier.srcAccessMask       = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite |
@@ -5567,6 +5773,7 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(Comm
 	if (const auto drawn = TableEntryOverlay(buffer, existing, commands, index_base, index_bytes, index_type, direct)) return *drawn;
 	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> programs_held {};
 	bool push_fit_held = false; // (KYTY_SPEC_PAIR_PUSH_FIT: a new pair's programs the retry's: TablePair::push_fit)
+	uint32_t fa_pair_bits_held = 0; // (spec_format_ahead: a new pair's recorded-pair bits: PipelineCache::t_fa_pair_bits)
 	std::array<uint32_t, 2>                                        portable {};
 	TableVariant*                                                  stored_variant = nullptr;
 	if (existing != nullptr) {
@@ -5739,6 +5946,8 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(Comm
 	// goes on to the table gates before its private normal pipeline is made.)
 	if ((gate_pipeline || want_private) && !unrecorded_held) {
 		PipelineCache::t_no_fault_failed = false;
+		const bool fa_birth = existing == nullptr && FormatAheadOn(); // (spec_format_ahead: a new pair's birth lookup)
+		if (fa_birth) [[unlikely]] PipelineCache::t_fa_birth = true;
 		const auto programs = pipelines.GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx, buffer.GetUserConfig(),
 		                                                    mapping, ps_active, vertex_info, pixel_info, true, portable);
 		read_failed        = PipelineCache::t_no_fault_failed;
@@ -5763,6 +5972,7 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(Comm
 			if (parked == nullptr) parked_stand_in.reset();
 		}
 		if (existing == nullptr) programs_held = {vertex, pixel}, push_fit_held = PipelineCache::t_push_fit_taken;
+		if (fa_birth) [[unlikely]] fa_pair_bits_held = PipelineCache::t_fa_pair_bits;
 		// (The normal pipeline made privately only now, the table gates passed: a refused entry makes none. Not made because
 		// the cache has the key by now (made meanwhile): found, the records alone committed. A parked entry's too.)
 		if (want_private && table_mode && (pipeline != nullptr || parked != nullptr)) {
@@ -5876,6 +6086,8 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(Comm
 		pair.start_instance = start_instance;
 		pair.programs       = programs_held;
 		pair.push_fit       = push_fit_held;
+		if (fa_pair_bits_held != 0) [[unlikely]] // (spec_format_ahead: kept as learned bits, as TableStore keeps them)
+			pair.portable[0] |= fa_pair_bits_held;
 		TableRuns(pair);
 		pair.variants.push_back(h.variant);
 		pair.Generation(Role()) = generation; // (its programs are those of the code at its addresses as of the lookups)
@@ -5893,8 +6105,11 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(Comm
 	}
 	auto* const owner = &Catalog();
 	auto* const raw   = holder.get();
+	using Settlement = Spec::State::ProposedSet::Settlement;
 	spec->proposed_sets.push_back({nullptr, mix, raw, spec->closed.size(), false,
-	                               [owner, holder](bool commit) { owner->TableEntrySettle(holder, commit); }});
+	                               [owner, holder](Settlement action) {
+		                               owner->TableEntrySettle(holder, action == Settlement::Publish);
+	                               }});
 	spec->proposed_sets.back().check = [owner, raw] { return owner->TableEntryCheck(*raw); };
 	// (Its segment re-run as a hole drew the draw in order, maybe through the table without a normal lookup: what its commit
 	// would do for the draw is not done at a later segment's (records, private pipeline dropped here).)
@@ -5905,18 +6120,20 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableWorkerEntry(Comm
 	if (raw->state != nullptr && raw->state->virtual_targets != nullptr) {
 		auto& proposed        = spec->proposed_sets.back();
 		proposed.resolve      = [owner, raw, spec] { return owner->TableEntryResolveVirtual(*raw, spec); };
-		proposed.resolve_over = [raw](uint64_t address, uint64_t size) {
+		proposed.resolve_over = [raw](uint64_t address, uint64_t size, bool include_resolved) {
 			const auto* state = raw->state.get();
-			if (state == nullptr || state->virtual_targets == nullptr || raw->virtual_hole) return false;
+			if (state == nullptr || raw->virtual_hole) return false;
 			const auto meets = [&](uint64_t begin, uint64_t bytes) { return bytes != 0 && begin < address + size && address < begin + bytes; };
-			for (const auto& made: state->virtual_targets->targets) {
-				const auto& info = made.desc.info;
-				if (meets(info.data.address, info.data.size) ||
-				    (info.HasMetadata() && meets(info.metadata.range.address, info.metadata.range.size)) ||
-				    (info.HasStencil() && meets(info.stencil.address, info.stencil.size)))
-					return true;
-			}
-			return false;
+			const auto overlaps = [&](const ImageInfo& info) {
+				return meets(info.data.address, info.data.size) ||
+				       (info.HasMetadata() && meets(info.metadata.range.address, info.metadata.range.size)) ||
+				       (info.HasStencil() && meets(info.stencil.address, info.stencil.size));
+			};
+			// The layout plan also checks after resolution has filled the real targets and cleared virtual_targets.
+			if (state->virtual_targets == nullptr)
+				return include_resolved &&
+				       std::ranges::any_of(state->targets, [&](const auto& target) { return overlaps(target.requested); });
+			return std::ranges::any_of(state->virtual_targets->targets, [&](const auto& made) { return overlaps(made.desc.info); });
 		};
 		spec->any_resolve = true;
 		proposed.on_hole  = [raw, before = std::move(proposed.on_hole)] {
@@ -6316,7 +6533,8 @@ std::optional<RenderExecutor::TableResult> RenderExecutor::TableEntryOverlay(Com
 		for (const auto& p: spec->proposed_sets)
 			if (p.pair == nullptr && p.hash == 0 && p.set == raw && p.segment == segment) return;
 		auto* const owner = &Catalog();
-		spec->proposed_sets.push_back({nullptr, 0, raw, segment, false, [held = std::move(held)](bool) { (void)held; }});
+		spec->proposed_sets.push_back({nullptr, 0, raw, segment, false,
+		                               [held = std::move(held)](Spec::State::ProposedSet::Settlement) { (void)held; }});
 		spec->proposed_sets.back().check = [owner, raw] { return owner->TableEntryOverlayCheck(*raw); };
 	};
 	// (Its own translation's entry for a new pair, the catalog's pair for the key made since: proposed with the mix
@@ -6437,12 +6655,15 @@ struct SettlePendingPart {
 	const RenderExecutor* owner = nullptr;
 	std::function<void()> work;
 };
-static std::vector<SettlePendingPart> g_settle_pending; // (the GPU thread's; a short list, taken from its front)
+// Owned by the GPU thread. Construct the FIFO when a catalog part first has to wait.
+static std::optional<std::deque<SettlePendingPart>> g_settle_pending;
 
 void RenderExecutor::SettleOrQueue(const void* owner_opaque, std::function<void()> work) {
 	const auto* owner = static_cast<const RenderExecutor*>(owner_opaque);
-	if (owner == nullptr) return work();
-	if (g_settle_pending.empty()) {
+	if (owner == nullptr) {
+		return work();
+	}
+	if (!g_settle_pending || g_settle_pending->empty()) {
 		std::unique_lock<std::shared_mutex> lock(owner->m_catalog_mutex, std::try_to_lock);
 		if (lock.owns_lock()) {
 			t_settle_held = &owner->m_catalog_mutex;
@@ -6453,29 +6674,37 @@ void RenderExecutor::SettleOrQueue(const void* owner_opaque, std::function<void(
 			return;
 		}
 	}
-	g_settle_pending.push_back({owner, std::move(work)});
-	s_settle_pending_n.store(static_cast<uint32_t>(g_settle_pending.size()), std::memory_order_relaxed);
+	if (!g_settle_pending) {
+		g_settle_pending.emplace();
+	}
+	g_settle_pending->push_back({owner, std::move(work)});
+	s_settle_pending_n.store(static_cast<uint32_t>(g_settle_pending->size()), std::memory_order_relaxed);
 }
 
 void RenderExecutor::SettleDrain(bool blocking) {
-	while (!g_settle_pending.empty()) {
-		const auto* owner = g_settle_pending.front().owner;
+	if (!g_settle_pending) {
+		return;
+	}
+	while (!g_settle_pending->empty()) {
+		const auto* owner = g_settle_pending->front().owner;
 		std::unique_lock<std::shared_mutex> lock;
 		if (blocking) {
 			lock = owner->CatalogWrite(); // (outside mode 4 an empty lock: no reader then)
 		} else {
 			lock = std::unique_lock<std::shared_mutex>(owner->m_catalog_mutex, std::try_to_lock);
-			if (!lock.owns_lock()) return;
+			if (!lock.owns_lock()) {
+				return;
+			}
 		}
 		t_settle_held = &owner->m_catalog_mutex;
 		struct Release {
 			~Release() { t_settle_held = nullptr; }
 		} release;
 		// (Every waiting part of this owner at the front, in order, under the one write.)
-		while (!g_settle_pending.empty() && g_settle_pending.front().owner == owner) {
-			auto part = std::move(g_settle_pending.front());
-			g_settle_pending.erase(g_settle_pending.begin());
-			s_settle_pending_n.store(static_cast<uint32_t>(g_settle_pending.size()), std::memory_order_relaxed);
+		while (!g_settle_pending->empty() && g_settle_pending->front().owner == owner) {
+			auto part = std::move(g_settle_pending->front());
+			g_settle_pending->pop_front();
+			s_settle_pending_n.store(static_cast<uint32_t>(g_settle_pending->size()), std::memory_order_relaxed);
 			part.work();
 		}
 	}
@@ -6491,8 +6720,10 @@ void RenderExecutor::SettleClear() {
 			g_entry_overlay_n.store(0, std::memory_order_relaxed);
 		}
 	}
-	if (g_settle_pending.empty()) return;
-	g_settle_pending.clear();
+	if (!g_settle_pending || g_settle_pending->empty()) {
+		return;
+	}
+	g_settle_pending->clear();
 	s_settle_pending_n.store(0, std::memory_order_relaxed);
 }
 

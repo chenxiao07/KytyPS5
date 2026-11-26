@@ -244,4 +244,61 @@ bool EvaluateBdaReadPlan(const BdaReadPlan& plan, const ResourceSnapshot& snapsh
 	}
 	return true;
 }
+
+// EvaluateBdaReadPlan's tests, sort and merge, in its order, done in `output`'s own tail.
+bool AppendBdaReadRanges(const BdaReadPlan& plan, std::span<const uint32_t> user_data,
+                         std::span<const uint32_t> flattened_srt, std::vector<GuestRange>& output) {
+	if (!plan.complete || plan.spans.empty() || plan.spans.size() > BdaReadPlan::Capacity) return false;
+	const auto start  = output.size();
+	const auto failed = [&] {
+		output.resize(start);
+		return false;
+	};
+	const auto word = [&](BdaReadWord source, uint32_t& value) {
+		if (source.kind == BdaReadWord::Kind::Immediate) {
+			value = source.value;
+			return true;
+		}
+		if (source.kind != BdaReadWord::Kind::Flat && source.kind != BdaReadWord::Kind::UserData) return false;
+		const auto values = source.kind == BdaReadWord::Kind::Flat ? flattened_srt : user_data;
+		if (source.value >= values.size()) return false;
+		value = values[source.value];
+		return true;
+	};
+	const auto add = [](uint64_t base, int64_t offset, uint64_t& value) {
+		if (offset < 0) {
+			const uint64_t magnitude = uint64_t(-(offset + 1)) + 1;
+			if (base < magnitude) return false;
+			value = base - magnitude;
+		} else {
+			if (uint64_t(offset) > UINT64_MAX - base) return false;
+			value = base + uint64_t(offset);
+		}
+		return true;
+	};
+	for (const auto& span: plan.spans) {
+		uint32_t low, high;
+		if (!word(span.low, low) || !word(span.high, high) || span.end <= span.begin) return failed();
+		uint64_t base = uint64_t(low) | uint64_t(high) << 32u;
+		if (span.scalar_base) base &= 0x0000fffffffffffcULL;
+		uint64_t begin, end;
+		if (!add(base, span.begin, begin) || !add(base, span.end, end) || end > TRACKER_ADDRESS_SIZE) return failed();
+		begin &= ~uint64_t {3};
+		end = (end + 3u) & ~uint64_t {3};
+		const GuestRange range {begin, end - begin};
+		if (!range.Valid()) return failed();
+		output.push_back(range);
+	}
+	const std::span<GuestRange> made(output.data() + start, output.size() - start);
+	std::ranges::sort(made);
+	size_t last = 0;
+	for (size_t i = 1; i < made.size(); ++i) {
+		if (made[i].address <= made[last].End())
+			made[last].size = std::max(made[last].End(), made[i].End()) - made[last].address;
+		else
+			made[++last] = made[i];
+	}
+	output.resize(start + last + 1);
+	return true;
+}
 } // namespace Libs::Graphics::ShaderRecompiler::IR

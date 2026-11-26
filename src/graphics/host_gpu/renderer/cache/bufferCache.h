@@ -15,6 +15,7 @@
 
 #include <vk_mem_alloc.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <deque>
@@ -70,6 +71,13 @@ public:
 		auto* buffer = m_slot_buffers.try_get(id);
 		return buffer != nullptr && !buffer->is_deleted ? buffer : nullptr;
 	}
+	// Start tracking write versions on entry to mode 4.
+	void StartWriteVersions();
+	[[nodiscard]] bool WriteVersionsConfigured() const {
+		return m_write_versions.load(std::memory_order_relaxed);
+	}
+	// The in-order written ObtainBuffer returned this owner. The registration epoch is sampled before the call.
+	[[nodiscard]] bool WrittenOwnerHolds(const Buffer& owner, uint64_t address, uint64_t size, uint64_t registered);
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	// FindBuffer's speculative-translation form, out of line (bufferCache.cpp).
 	[[gnu::noinline]] [[nodiscard]] BufferId FindBufferSpec(uint64_t vaddr, uint64_t size);
@@ -164,9 +172,9 @@ public:
 	                                                            uint64_t total, const char** why = nullptr);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
-	                bool src_gds);
+	                bool src_gds, bool linear_dispatch = false);
 	// CopyBuffer's copy on the CPU: only the destination pages whose bytes differ are written.
-	void CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size);
+	void CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool linear_dispatch = false);
 	// A commit's copy bytes written by a guarded write (speculation.cpp, GuardedCopy): the regions' epochs move, as
 	// CopyGuestMemory's writes move them.
 	void NoteGuardedCopyWrite(uint64_t vaddr, uint64_t size);
@@ -219,6 +227,7 @@ public:
 	enum class RelocUpload : uint8_t { Uploaded, Refused, StillDirty };
 	[[nodiscard]] RelocUpload UploadRelocated(BufferId id, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	[[gnu::noinline]] [[nodiscard]] bool SpecTableCpuWritten(const Spec::State& spec, uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	struct SyncRegionRequest {
@@ -231,17 +240,27 @@ public:
 	// one in the open command buffer, so a binding to the old one GPU work records after it reads or writes bytes
 	// nothing reads again (the old buffer lives until the tick). The render thread's.
 	[[nodiscard]] uint64_t UnregisterEpoch() const { return m_unregister_epoch; }
-	// A buffer registered or unregistered in the tracker regions of the range since `epoch`.
+	// A buffer registered or unregistered in the tracker regions of the range since `epoch`. (Mode 4, quiet inserts
+	// (QuietResolution): a buffer unregistered, or registered by a change that is not a quiet insert - the regions'
+	// resolution epochs - and true for an epoch before the floor; see ChangeRegister for why that answers every caller.)
 	[[nodiscard]] bool RegisteredSince(uint64_t vaddr, uint64_t size, uint64_t epoch) const {
+		if (const auto* resolution = QuietResolution(); resolution != nullptr) [[unlikely]] {
+			if (epoch < m_exact_floor.load(std::memory_order_acquire)) return true;
+			for (auto region = vaddr / TRACKER_REGION_SIZE, last = (vaddr + size - 1) / TRACKER_REGION_SIZE; region <= last; ++region)
+				if (ResolutionLoad(resolution, region) > epoch) return true;
+			return false;
+		}
 		for (auto region = vaddr / TRACKER_REGION_SIZE, last = (vaddr + size - 1) / TRACKER_REGION_SIZE; region <= last; ++region)
 			if (RegionRegistrationEpoch(region * TRACKER_REGION_SIZE) > epoch) return true;
 		return false;
 	}
 	// spec_exact_reg_stop: as RegisteredSince, over the range's 16 KiB granules: a buffer registered or
 	// unregistered over the range itself since `epoch` (KYTY_SPECULATE=4 marks them; the render thread's, as the
-	// commit that asks). False also when nothing was marked (another mode).
+	// commit that asks). False also when nothing was marked (another mode). True for an epoch before the granules'
+	// floor (MarkExactEpochsFromNow): a change before it may have gone unmarked (made outside mode 4).
 	[[nodiscard]] bool RegisteredSinceExact(uint64_t vaddr, uint64_t size, uint64_t epoch) const {
 		if (size == 0) return false;
+		if (epoch < m_exact_floor.load(std::memory_order_acquire)) return true;
 		// (Each leaf looked up once for its granules.)
 		constexpr uint64_t leaf_mask = (uint64_t {1} << RegLeafBits) - 1;
 		for (uint64_t g = vaddr >> RegGranuleBits, last = (vaddr + size - 1) >> RegGranuleBits; g <= last;) {
@@ -255,12 +274,59 @@ public:
 		}
 		return false;
 	}
+	// spec_regional_pending (KYTY_SPECULATE=4 only: the granule epochs): true when no buffer was registered or unregistered
+	// over the range since `epoch`, proven at a bounded cost: its 4 MiB tracker regions' epochs (at most 64 of them, the
+	// range inside the tracker's address space), then, when one of them moved, its 16 KiB granules' (at most 256). False
+	// (not proven) otherwise. No lock; the render thread's, as RegisteredSinceExact.
+	[[nodiscard]] bool RegistrationUnchangedSince(uint64_t vaddr, uint64_t size, uint64_t epoch) const {
+		constexpr uint64_t MaxRegions = 64, MaxGranules = 256;
+		if (size == 0 || vaddr + size < vaddr || vaddr + size > TRACKER_ADDRESS_SIZE) return false;
+		const auto last = vaddr + size - 1;
+		if (last / TRACKER_REGION_SIZE - vaddr / TRACKER_REGION_SIZE + 1 > MaxRegions) return false;
+		if (!RegisteredSince(vaddr, size, epoch)) return true;
+		return (last >> RegGranuleBits) - (vaddr >> RegGranuleBits) + 1 <= MaxGranules &&
+		       !RegisteredSinceExact(vaddr, size, epoch);
+	}
+	// The granule epochs' floor: every change from the registration epoch now on is marked in them (RegisteredSinceExact
+	// answers changed for an epoch before it). Called as mode 4's machinery starts (graphicsRun.cpp start_speculation: at
+	// a KYTY_SPECULATE=4 boot, and on a live `mode 4` after the mode reads 4), on the thread that registers: before any
+	// speculation exists to commit, but not before every thread that reads the mode (a weave worker runs on until the
+	// pause after it, and so asks nothing the floor guards: RegionResolutionEpoch). A live switch from 4 to 0 and back
+	// leaves the changes made in mode 0 unmarked.
+	// (Quiet inserts: the regions' resolution epochs made here, at mode 4's first start, after the floor that guards their
+	// readers - a mode-0 boot never makes them.)
+	void MarkExactEpochsFromNow() {
+		m_exact_floor.store(m_registration_epoch.load(std::memory_order_relaxed), std::memory_order_release);
+		if (m_region_resolution_storage == nullptr) {
+			m_region_resolution_storage = std::make_unique<std::atomic<uint64_t>[]>(TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE);
+			m_region_resolution.store(m_region_resolution_storage.get(), std::memory_order_release);
+		}
+	}
 	// The registration epoch of the last change of a buffer covering the tracker region of `vaddr`: a region
 	// request's proof only depends on the buffers of its own region.
 	[[nodiscard]] uint64_t RegionRegistrationEpoch(uint64_t vaddr) const {
 		const auto region = vaddr / TRACKER_REGION_SIZE;
 		return region < TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE ? m_region_registrations[region].load(std::memory_order_acquire)
 		                                                           : 0;
+	}
+	// Quiet inserts (under KYTY_SPECULATE=4 only): a buffer registration over pages no buffer holds moves no resolution
+	// epoch (ChangeRegister). The regions' resolution epochs while they act: null outside mode 4, and before mode 4's
+	// machinery first started (MarkExactEpochsFromNow makes them). One relaxed load of the mode, then (mode 4) one of the
+	// array, read at each change and each proof.
+	[[nodiscard]] const std::atomic<uint64_t>* QuietResolution() const {
+		if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return nullptr;
+		return m_region_resolution.load(std::memory_order_acquire);
+	}
+	// The epoch a resolution of a range in the tracker region of `vaddr` is proven against (table-xpr.inc's held V#
+	// entries: "no buffer covering its tracker regions moved since"): RegionRegistrationEpoch, or in mode 4
+	// (QuietResolution) the region's last change that is not a quiet insert, never below the granules' floor (a change
+	// before it, made outside mode 4, is not marked there: an entry proven before the floor is not current). Never a weave
+	// worker's question: it can read the mode as 4 before the floor moved (MarkExactEpochsFromNow), and so asks
+	// RegionRegistrationEpoch, which every change moves, quiet or not.
+	[[nodiscard]] uint64_t RegionResolutionEpoch(uint64_t vaddr) const {
+		const auto* resolution = QuietResolution();
+		if (resolution == nullptr) return RegionRegistrationEpoch(vaddr);
+		return std::max(ResolutionLoad(resolution, vaddr / TRACKER_REGION_SIZE), m_exact_floor.load(std::memory_order_acquire));
 	}
 	// Proofs that an earlier resolution still holds. Pure queries; TouchLiveBuffer
 	// only refreshes the LRU slot exactly as ObtainBuffer's TouchBuffer would.
@@ -515,9 +581,22 @@ private:
 	// Per tracker region, see RegionRegistrationEpoch.
 	std::unique_ptr<std::atomic<uint64_t>[]> m_region_registrations =
 	    std::make_unique<std::atomic<uint64_t>[]>(TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE);
+	// Quiet inserts (ChangeRegister): the value of the last registration change, every change's (GPU thread only). Equal
+	// to the published epoch whenever no quiet insert came after the last other change (in mode 0 from its first change
+	// on: none there is quiet).
+	uint64_t m_change_counter {1};
+	// Quiet inserts: per tracker region, the value of the last change over it that is not a quiet insert, written in mode
+	// 4 only, from the granules' floor on (QuietResolution, RegionResolutionEpoch). Made at mode 4's first start
+	// (MarkExactEpochsFromNow), never freed before the cache: a mode-0 boot has none.
+	std::unique_ptr<std::atomic<uint64_t>[]> m_region_resolution_storage;
+	std::atomic<std::atomic<uint64_t>*>      m_region_resolution {nullptr};
+	[[nodiscard]] static uint64_t ResolutionLoad(const std::atomic<uint64_t>* resolution, uint64_t region) {
+		return region < TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE ? resolution[region].load(std::memory_order_acquire) : 0;
+	}
 	// spec_exact_reg_stop: per 16 KiB granule, the epoch of the last registration change over it (RegisteredSinceExact).
 	static constexpr uint64_t                                 RegGranuleBits = 14, RegLeafBits = 16;
 	std::unordered_map<uint64_t, std::unique_ptr<uint64_t[]>> m_reg_granule_epochs;
+	std::atomic<uint64_t>                                     m_exact_floor {0}; // (MarkExactEpochsFromNow)
 	std::vector<GuestRange> m_registration_spans; // see TakeRegistrationSpans
 	bool                    m_registration_spans_lost = true;
 	struct SyncBuffer {
@@ -560,6 +639,17 @@ private:
 		bool     texel = false;
 	};
 	std::array<WriteMemo, 4096> m_write_memo {};
+	std::atomic<bool> m_write_versions {false};
+	[[nodiscard]] bool WriteVersionHit(WriteMemo& memo, uint64_t address, uint64_t size);
+	void NoteCoverageSubtracted(uint64_t address, uint64_t size);
+	template <typename Ranges>
+	void NoteRangesSubtracted(const Ranges& ranges) {
+		if (Spec::ModeFour() && WriteVersionsConfigured()) {
+			for (const auto& range: ranges) {
+				NoteCoverageSubtracted(range.address, range.size);
+			}
+		}
+	}
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	// ObtainBufferForImage (KYTY_ASYNC_UPLOAD=2): the backing pieces of an image upload.

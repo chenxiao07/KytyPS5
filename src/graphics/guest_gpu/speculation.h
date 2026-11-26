@@ -8,10 +8,13 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "speculation-state.h"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -31,6 +34,8 @@ extern volatile std::atomic_uint32_t kyty_local_speculate_threads;
 
 namespace Libs::Graphics {
 
+class GuestGpu;
+
 class StreamBuffer;
 
 // KYTY_SPEC_DRAW_INDIRECT_VERIFY: a sampled DRAW_INDIRECT table draw against what the normal path would draw there (on
@@ -49,11 +54,18 @@ void VerifyDrawIndirect(RenderContext& renderer, const Spec::DrawIndirectVerify&
 // (RenderExecutor::ReadCatalogOf); its holes and the rest of the command buffer are translated by those.
 class Speculation {
 public:
-	// `interrupt_id`: the queue's processor's (0: the graphics queue; an async compute queue's: KYTY_SPECULATE_ASYNC);
+	// `interrupt_id`: the queue's processor's (0: the graphics queue; a compute queue's: KYTY_SPEC_COMPUTE);
 	// `base`: the first speculation thread's packet slot and executor role less one (after another speculation's).
 	// `pass_thread`: KYTY_SPEC_PASS_THREAD, one translator after the `threads` that takes only the state pass.
 	explicit Speculation(RenderContext& renderer, int interrupt_id = 0, uint32_t base = 0, uint32_t threads = 0,
-	                     bool pass_thread = false);
+	                     bool pass_thread = false, GuestGpu* waitless_gpu = nullptr);
+	[[nodiscard]] bool Waitless() const noexcept { return m_waitless_gpu != nullptr; }
+
+	[[nodiscard]] bool ReclaimPending() const noexcept { return m_reclaim.load(std::memory_order_acquire); }
+	void Reclaim(bool idle = false);
+	void EnablePlacementLogging() { m_log_placement = true; }
+	void SeedCompute(uint64_t completed, const CommandProcessor* cp);
+	[[nodiscard]] bool StartWorkers(uint32_t queue_id) noexcept;
 	// Its translators (the workers and the pass thread): the next instance's packet slots and roles start after them.
 	[[nodiscard]] uint32_t TranslatorCount() const { return static_cast<uint32_t>(m_translators.size()); }
 	~Speculation();
@@ -61,7 +73,12 @@ public:
 	// (Tooling, the live mode toggle: on the GPU thread, between submissions.) The threads stopped and every result not
 	// committed finished as a lost one (Finish: its recorded command buffers discarded, their ticks given up, its
 	// pending writes dropped, the live count down), so the destructor waits for no tick that will never be submitted.
+	void RequestStop();
 	void Stop();
+	// On mode-4 exit, after all participating instances have stopped.
+	void ReleaseCopyForwarding();
+	// With forwarding enabled, before starting mode-4 workers. The GPU owns the enqueue serial for their lifetime.
+	void PrepareCopyForwarding(const std::atomic<uint64_t>& enqueue_serial);
 
 	// Blocked: committed up to a wait hole not satisfied yet (the submission waits; Resume goes on from there). Chunk:
 	// committed up to the end of its chunk (mode 4: the execution is where the next begins). Yield (mode 4): nothing
@@ -103,27 +120,34 @@ public:
 	void Push(const Job& job);
 	[[nodiscard]] Outcome CommitReady(CommandProcessor& cp, const Job& job, uint32_t chunk, Pm4Execution& execution,
 	                                  std::optional<Pm4Execution>& end);
+	[[nodiscard]] Outcome CommitReadyWaitless(CommandProcessor& cp, const Job& job, uint32_t chunk,
+	                                          Pm4Execution& execution, std::optional<Pm4Execution>& end);
 	void                  Done(uint64_t serial, const CommandProcessor& cp);
 	// Mode 4: a translated chunk of the submission with that serial is waiting to be committed (the speculation's own
 	// lock, taken and released here; the caller holds no other instance's).
-	[[nodiscard]] bool    FrontReady(uint64_t serial, uint32_t chunk);
+	[[nodiscard]] bool    FrontReady(uint64_t serial, uint32_t chunk, bool nonblocking = false);
 	static constexpr uint32_t ChunkWork = 128;
-	// KYTY_SPEC_CHUNK_IN_ORDER (live spec_chunk_in_order, default off): a chunk the state pass has not cut when the GPU
-	// thread comes for it ("not passed yet") is translated in order up to where the pass will end it (ChunkWork draws
-	// and dispatches from its start), not to the command buffer's end; the chunks after it stay the speculation's
-	// threads' (~1.3 ms of in-order translation each, 0.4-0.9 ms a frame at the arch, 1 Nov).
-	[[nodiscard]] static bool ChunkInOrder();
 	// The graphics queue's time in a slice of a command buffer (the report's total).
 	void NoteQueueTime(uint64_t ns) noexcept { m_queue_ns += ns; }
 	// What the normal translation does while a speculation is not committed (Spec::t_effects of the thread that
 	// commits).
 	[[nodiscard]] Spec::EffectsLog& Log() noexcept { return m_log; }
+	[[nodiscard]] bool SharesEffectsLog() const noexcept { return m_shared != nullptr; }
 	[[nodiscard]] static uint64_t NowNs() noexcept;
 	// The GPU thread (KYTY_SPEC_GPU_AFFINITY, live spec_gpu_affinity; on under KYTY_SPECULATE=4): its CPUs without the
 	// speculation workers' cores, taken at a guest flip in mode 4 and given back out of it (speculation.cpp).
 	static void GpuThreadAffinityAtFlip();
 
 private:
+	friend class CommandProcessor;
+	friend struct Spec::State;
+	bool FinishCopyPacket(uint64_t serial, uint64_t pass, const Spec::CopyCursor& cursor, const Spec::CopyOutcome& copy,
+	                      bool replay = false);
+	void AdvanceCopyProgress(uint64_t serial, const Spec::CopyCursor& next, bool inclusive = false);
+	void DropCopyCandidates(uint64_t serial = 0, uint32_t chunk = UINT32_MAX, uint64_t pass = 0);
+	bool MightReadForwarded(uint64_t address, uint64_t size) const;
+	bool ReadForwarded(Spec::State& state, uint64_t address, void* out, uint64_t size) const;
+
 	// A packet left to the commit (Spec::State::closed: it follows the segment of its index), why, and the
 	// speculation's execution past it.
 	struct Hole {
@@ -170,8 +194,11 @@ private:
 		std::optional<Pm4Execution> resume_at;
 		Pm4Execution start_at; // where its translation began
 		bool         failed = false, progressed = false;
+		bool         abandoned = false; // claimed by the GPU thread during translation
 		bool         blind  = false; // translated without the one before it while that was not done (mode 4)
 		size_t       submitted = 0, next = 0; // recorded command buffers submitted, segments committed
+		size_t       first_unsettled_proposal = 0;
+		bool         premut_fullwalk = false; // proposal ownership changed on the GPU thread
 		uint64_t     last_tick = 0;           // the last of them's tick (0: none; batched / spliced: not yet submitted)
 		size_t       blocked   = SIZE_MAX;    // the wait hole the commit waits at
 		bool         blocked_as_hole = false; // (... after its segment ran as a hole: `cp` holds the hole's state)
@@ -200,6 +227,7 @@ private:
 	struct Translator {
 		explicit Translator(RenderContext& renderer, uint32_t number, int interrupt_id);
 		uint32_t                                   index = 0;
+		int64_t                                    applied_cpus = 0;
 		bool                                       pass_only = false; // (KYTY_SPEC_PASS_THREAD: the state pass's own thread)
 		std::unique_ptr<RenderExecutor>            draw, compute;
 		RenderContext::Executors                   executors;
@@ -207,6 +235,7 @@ private:
 		std::unique_ptr<StreamBuffer>              table_upload, shader_upload;
 		std::vector<std::unique_ptr<Result>>       free;     // (under m_mutex)
 		std::vector<std::pair<uint64_t, uint64_t>> resolved; // (under m_mutex)
+		std::vector<std::pair<uint64_t, uint64_t>> resolving; // waitless worker's spare for resolved
 		std::thread                                thread;
 		uint64_t                                   translating = 0; // (under m_mutex: serial, chunk)
 		uint32_t                                   translating_chunk = 0;
@@ -216,8 +245,16 @@ private:
 		// (Mode 4: set when its translation saw `cancel`, Spec::State::cancel_seen; CommitReady's spin goes on through the
 		// tail then.)
 		std::atomic<bool>                          cancel_seen {false};
+#if defined(_WIN32)
+		// Cancel priority loan, registered by the worker and changed under m_mutex.
+		uint64_t                                   translation_turn = 0; // m_clock at the claim, kept through acknowledgement
+		void*                                      cancel_thread = nullptr;
+		int                                        cancel_base_priority = 0;
+		bool                                       cancel_boosted = false;
+#endif
 		uint64_t                                   began_ns = 0;
 		uint64_t                                   since       = 0;
+		bool                                       abandoned   = false; // under m_mutex
 	};
 	// A chunk of a submission (mode 4), once the state pass passed it: the processor state and position it starts at,
 	// where it ends (where the next begins; `last`: the submission's end), the pass's record of it (Spec::t_record),
@@ -242,7 +279,8 @@ private:
 	[[nodiscard]] std::unique_ptr<Result> Translate(Translator& translator, const CommandProcessorState& start,
 	                                                std::span<const uint32_t> commands, const Pm4Execution& execution,
 	                                                const Result* previous = nullptr, const Spec::State* record = nullptr,
-	                                                const Pm4Execution* stop = nullptr);
+	                                                const Pm4Execution* stop = nullptr,
+	                                                std::unique_ptr<CommandProcessorState>* chunk_start = nullptr);
 	// The result committed (cp and execution as TranslateAndCommit leaves them), from where it is.
 	[[nodiscard]] Outcome Commit(std::unique_ptr<Result> result, CommandProcessor& cp, Pm4Execution& execution);
 	[[nodiscard]] Outcome Continue(std::unique_ptr<Result> result, CommandProcessor& cp, Pm4Execution& execution);
@@ -265,12 +303,13 @@ private:
 	[[nodiscard]] bool SampledLevelsMapped(const Spec::ImageUse& use, uint64_t mapping) const;
 	// The segments committed, the holes after them run: all, or up to what the work after it no longer holds
 	// (Result::next: the segments committed).
+	[[nodiscard]] bool ForwardedReadFailure(const Result& result, size_t index) const;
 	// Under KYTY_SPECULATE=4 (Spec::State::read_values_on): whether a clean read of segment `index` that a processor
 	// write was logged over since the speculation began still gives the translation's bytes.
 	[[nodiscard]] bool     ReadValuesHold(const Result& result, size_t index, const Spec::Range& read) const;
 	[[nodiscard]] Progress CommitSegments(Result& result, CommandProcessor& cp);
 	// The segment before its work and after it.
-	void Before(Result& result, size_t index);
+	void Before(Result& result, size_t index, Spec::PendingImagePlan& plan);
 	void After(Result& result, size_t index);
 	// The hole translated the normal way: changed what the work after it assumed, or a wait not satisfied yet.
 	// `copy_state` false: `cp` is already at the hole in the state it runs from (a segment run as a hole, its state checked).
@@ -282,15 +321,37 @@ private:
 	[[nodiscard]] AsHole SegmentAsHole(Result& result, CommandProcessor& cp, size_t index, bool resume = false);
 	// At segment `index`'s commit (KYTY_SPECULATE=4): why a word it read from the journal that an earlier segment's
 	// write gave no longer holds (null: all hold).
-	[[nodiscard]] const char* JournalReadsMoved(const Result& result, size_t index) const;
+	[[nodiscard]] const char* JournalReadsMoved(const Result& result, size_t index, Spec::Range* changed_bytes) const;
 	// KYTY_SPECULATE=4: a speculation thread; the state pass of a submission (the state it starts from, null: none to
 	// translate, or the pass could not follow it); the state pass on from the GPU thread's last submission when it
 	// cannot follow or is behind (under m_mutex).
 	void AheadRun(Translator& translator);
-	// The state pass of a submission (its chunks given to its entry as it passes them, while the pass is `which`):
-	// false: it could not follow it.
-	[[nodiscard]] bool StatePass(const Job& job, uint64_t which);
+	bool AheadTurn(Translator& translator, std::unique_lock<std::mutex>& lock, const std::atomic<int64_t>& live_cpus);
+	std::condition_variable& PassWake() noexcept;
+	std::condition_variable& GpuWake() noexcept;
+	void WakePass() noexcept;
+	void WakeGpu(uint64_t serial, std::optional<uint32_t> chunk = std::nullopt) noexcept;
+	[[nodiscard]] bool TranslatingChunk(uint64_t serial, uint32_t chunk) const noexcept;
+	[[nodiscard]] bool ReadingSpan(uint64_t serial) const noexcept;
+	[[nodiscard]] bool StampPoolsShort() const;
+	void WakeStampRefill();
+	void WakeAll() noexcept;
+	void LogWorker(const Translator& translator) const;
+	// Cuts belong to the current generation. Claimed leaves a private continuation for the guarded pass.
+	enum class PassResult { Followed, Stopped, Claimed };
+	[[nodiscard]] PassResult StatePass(const Job& job, uint64_t which, bool one_cut);
+	void WalkClaimedPass(const Job& job, std::unique_lock<std::mutex>& lock);
 	void               ResyncStatePass();
+	void               ClaimBlockingRemainder(uint64_t serial, std::unique_lock<std::mutex>& lock);
+	void               RetireFront();
+	[[nodiscard]] bool ResultEligible(const Result& result) const;
+	template <typename Visit>
+	decltype(auto) WithJobs(Visit&& visit) {
+		if (m_waitless_jobs) {
+			return visit(m_waitless_jobs->active);
+		}
+		return visit(m_jobs);
+	}
 	// (Under m_mutex.) The submission's entry (null: done, or not pushed), the chunk's record (null: none any more); what
 	// links to `from` links to `to` (results, the translations going on, records); when the oldest translation going on
 	// began (m_clock; UINT64_MAX: none): what was retired before is reached by none; a record for a state pass (a
@@ -315,18 +376,42 @@ private:
 	void Report();
 
 	RenderContext&                           m_renderer;
+	struct SharedEffects;
+	std::shared_ptr<SharedEffects> m_shared = AcquireSharedEffects(); // outlives the results' completion tokens
 	std::vector<std::unique_ptr<Translator>> m_translators;
 	bool                                     m_pass_thread = false; // (KYTY_SPEC_PASS_THREAD: the last of m_translators)
 	std::deque<std::unique_ptr<Result>>      m_ahead;     // translated ahead (under m_mutex in mode 4)
-	// (Mode 4) moved by every worker's push into m_ahead (written under m_mutex: no locked add): CommitReady's spin.
+	// CommitReady's spin generation. Advances under m_mutex on q0's awaited completion, or on each publish elsewhere.
 	std::atomic<uint64_t>                    m_ahead_gen {0};
 	std::unique_ptr<Result>                  m_blocked;   // a commit waiting at a wait hole
 	std::unique_ptr<CommandProcessor>        m_chain;     // mode 3: the state the next one ahead starts from
 	static constexpr size_t                  MaxAhead = 8;
 	std::atomic<uint64_t>                    m_pending {CommandScheduler::PendingTick}; // the latest pending tick
-	// What the normal translation did, and what of it was logged since the result being committed began.
-	Spec::EffectsLog                     m_log;
+	// In mode 4, `m_live`: the effects_from of every result of this instance from its sample to Finish,
+	// wherever it is meanwhile (translated, ahead, abandoned, in hand, blocked; under m_mutex); `m_oldest_live`: their
+	// least, LiveNone, or LiveSampling while one is being sampled: the shared drop reads it without the lock.
+	static constexpr uint64_t LiveNone = UINT64_MAX, LiveSampling = UINT64_MAX - 1;
+	[[nodiscard]] static std::shared_ptr<SharedEffects> AcquireSharedEffects();
+	[[nodiscard]] Spec::EffectsLog&                     SelectEffectsLog();
+	void                   JoinSharedEffects();
+	void                   NoteLive(const Result& result);
+	void                   DropLive(const Result& result);
+	void                   PublishLive();
+	[[nodiscard]] uint64_t DropShared();
+	void                   BeginShared(const Result& result);
+	void                   TakeShared();
+	std::unique_ptr<Spec::EffectsLog> m_own_log =
+	    m_shared ? nullptr : std::make_unique<Spec::EffectsLog>();
+	// What the normal translation did, and what of it was logged since the result being committed began (its own log, or
+	// the shared log in mode 4).
+	Spec::EffectsLog& m_log = SelectEffectsLog();
+	std::vector<std::pair<const Result*, uint64_t>> m_live;
+	std::atomic<uint64_t>                           m_oldest_live {LiveNone};
 	int                                  m_interrupt_id = 0; // its queue's processor's
+#if defined(_WIN32)
+	// Present for Windows mode-4 queue 0. Only shutdown signals this wait.
+	std::optional<std::condition_variable> m_cancel_restore_wake;
+#endif
 	Spec::Effects                        m_effects;
 	// Outcomes since the last report: command buffers committed whole, partly, not at all; segments and holes
 	// committed; why packets became holes, why speculations or commits stopped.
@@ -344,8 +429,49 @@ private:
 	// last submission it passed, which pass (a pass that went wrong starts another: what began from it is dropped),
 	// whether a thread runs it and whether it cannot follow the submission broken_at; the last submission the GPU
 	// thread took the normal way and the last it did, with its state after it.
+	// Shared by all roles by default. With role wakes, this is the translator channel.
 	std::condition_variable           m_ahead_wake;
+	struct GpuWait {
+		uint64_t serial;
+		std::optional<uint32_t> chunk; // An empty chunk means drain every reader of the serial.
+	};
+	struct RoleWakes {
+		std::condition_variable pass, gpu;
+		std::optional<GpuWait> gpu_wait; // Under m_mutex. Only the GPU thread enrolls, before it unlocks.
+	};
+	std::optional<RoleWakes>           m_role_wakes; // q0 mode 4, set before workers start
+	class ScopedGpuWait {
+	public:
+		ScopedGpuWait(Speculation& instance, uint64_t serial, std::optional<uint32_t> chunk = std::nullopt) noexcept;
+		~ScopedGpuWait();
+		ScopedGpuWait(const ScopedGpuWait&) = delete;
+		ScopedGpuWait& operator=(const ScopedGpuWait&) = delete;
+
+	private:
+		std::optional<GpuWait>* const m_wait;
+	};
+	bool                              m_log_placement = false;
+	std::optional<Pm4Execution>        m_pass_resume;
+	struct ClaimedPass {
+		uint64_t serial;
+		uint64_t generation;
+		std::optional<Pm4Execution> cursor; // Empty stack in a saved cursor means the raw pass finished.
+		bool armed = false;
+	};
+	std::optional<ClaimedPass>         m_claimed_walk; // Under m_mutex, separate from a lent turn's resume.
+	uint64_t                          m_claimed_active = 0; // Guarded walk, never in ReadingSpan.
+	uint64_t                          m_claimed_seed_serial = 0; // The prediction awaits validation at a later take.
+	std::atomic<uint64_t>             m_claimed_retired {0};
 	std::deque<Entry>                 m_jobs;
+	struct WaitlessJobs {
+		std::list<Entry> active, free;
+	};
+	static constexpr size_t WaitlessJobsMax = 64, WaitlessChunksMax = 32, WaitlessAheadMax = 64;
+	GuestGpu* const                   m_waitless_gpu;
+	std::optional<WaitlessJobs>       m_waitless_jobs;
+	std::atomic<bool>                 m_reclaim {false}, m_pass_cancel {false};
+	std::atomic<uint64_t>             m_skip_through {0};
+	uint64_t                          m_pass_active_serial = 0; // pass holding the job span, under m_mutex
 	std::unique_ptr<CommandProcessor> m_state;
 	uint64_t                          m_state_serial = 0, m_pass = 1, m_broken_at = 0;
 	bool                              m_state_busy = false, m_broken = false;
@@ -358,6 +484,8 @@ private:
 	std::unique_ptr<CommandProcessorState> m_done_state;
 	Spec::State*                           m_pass_record = nullptr; // the record the state pass fills
 	std::vector<std::pair<uint64_t, std::unique_ptr<Spec::State>>> m_retired_records; // (when: m_clock)
+	// Under m_mutex: a spare from a result admitted for reuse by Horizon.
+	std::unique_ptr<CommandProcessorState> m_pass_snapshot;
 	uint64_t                          m_waits_for_ahead = 0, m_ahead_misses = 0; // (the report's)
 	uint64_t                          m_blind = 0, m_stopped = 0, m_blind_stopped = 0; // (the report's)
 	// (The report's classes of the results: committed, full (to its chunk's or submission's end) or cut short (its

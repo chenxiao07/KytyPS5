@@ -28,6 +28,8 @@ public:
 		uint64_t size    = 0;
 	};
 
+	// Speculation sets often extend an existing interval. They can replace it without shifting the block twice.
+	template <bool ReplaceInPlace = false>
 	void Add(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
 		if (Fast() && Covered(address, end)) return;
@@ -45,6 +47,13 @@ public:
 			last  = std::max(last, At(it).end);
 		}
 		const Interval merged {begin, last};
+		if constexpr (ReplaceInPlace) {
+			if (first != it && Next(first) == it) {
+				m_blocks[first.block][first.index] = merged;
+				Fix(first.block);
+				return;
+			}
+		}
 		Replace(first, it, &merged, 1);
 	}
 

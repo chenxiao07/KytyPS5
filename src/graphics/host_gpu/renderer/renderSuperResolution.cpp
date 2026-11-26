@@ -678,7 +678,8 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 			             vk_buffer);
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		const LocalVulkanRecording::Segment segment {&record, sizeof(record)};
-		if (!LocalVulkanRecording::EnqueuePacket(ReplayUpscale, {&segment, 1}))
+		if (!LocalVulkanRecording::EnqueuePacket(ReplayUpscale, {&segment, 1}, {},
+		                                       LocalVulkanRecording::SubmitFoldEnabled()))
 			LocalVulkanRecording::ReplayInline(ReplayUpscale, {&segment, 1});
 #else
 		RunUpscale(record, VULKAN_HPP_DEFAULT_DISPATCHER);

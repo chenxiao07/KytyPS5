@@ -23,6 +23,8 @@ namespace Libs::Graphics {
 
 class CommandScheduler {
 public:
+	enum class FlushReason : uint8_t { Work, Wait, Readback, Flip };
+
 	CommandScheduler(RenderContext& context, GraphicContext& graphics);
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
@@ -30,7 +32,7 @@ public:
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           BeginRendering(const RenderState& state);
 	void           EndRendering();
-	void           Flush();
+	void           Flush(FlushReason reason = FlushReason::Work);
 	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();
 	void           Finish();
@@ -44,7 +46,7 @@ public:
 	void           FlushDeferred();
 	[[nodiscard]] bool FlushPending() const noexcept { return m_flush_deferred; }
 	CommandBuffer& BeginCommand();
-	uint64_t       Submit(SubmitInfo submit = {});
+	uint64_t       Submit(SubmitInfo submit = {}, FlushReason reason = FlushReason::Work);
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
@@ -189,7 +191,8 @@ private:
 		bool              ended          = false;
 		uint32_t          timestamp_slot = UINT32_MAX;
 	};
-	uint64_t SubmitBuffers(std::span<const SubmitEntry> entries, SubmitInfo submit);
+	uint64_t SubmitBuffers(std::span<const SubmitEntry> entries, SubmitInfo submit,
+	                       FlushReason reason = FlushReason::Work);
 	uint64_t SubmitBuffer(vk::CommandBuffer buffer, bool ended, uint32_t timestamp_slot, SubmitInfo submit) {
 		const SubmitEntry entry {buffer, ended, timestamp_slot};
 		return SubmitBuffers({&entry, 1}, submit);
@@ -224,6 +227,9 @@ private:
 	uint32_t                     m_deferred_checks     = 0;
 	// The last tick handed to the driver (its vkQueueSubmit returned: on the recording worker for a deferred one).
 	std::atomic<uint64_t>        m_driver_tick {0};
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	uint64_t                     m_submit_fold_epoch = 0;   // producer only
+#endif
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	// Count of live entries in m_pending_operations, updated under

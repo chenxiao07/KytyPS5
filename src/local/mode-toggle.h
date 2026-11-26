@@ -8,6 +8,9 @@
 // for the new mode are set at the same moment, a switch whose environment variable is set kept. With KYTY_SPECULATE
 // unset nothing of mode 4 is made until a `mode 4`; the GPU thread's loop reads one relaxed atomic.
 #include "live-switch.h"
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+#include "vulkan-recording.h"
+#endif
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -32,7 +35,7 @@ inline constexpr Row Table[] = {
     {"fill_buffer_clears", 1, 0},       {"spec_draw_indirect", 1, 0},    {"spec_predict_dcc", 3, 0},
     {"spec_read_one_set", 1, 0},        {"speculate_flush_every", 8, 0}, {"speculate_keep_pass", 1, 0},
     {"speculate_texel_sync", 1, 0},     {"spec_late_reads", 1, 0},       {"spec_start_instance_free", 1, 0},
-    {"spec_chunk_in_order", 1, 0},      {"serve_in_waits", 7, 1},        {"write_guard_spec", 1, 0},
+    {"serve_in_waits", 7, 1},        {"write_guard_spec", 1, 0},
     {"eager_feedback", 1, 0},           {"feedback_batch", 1, 0},        {"table_serials", 1, 0},
     {"table_memo", 1, 0},               {"spec_worker_packets", 1, 0},  {"table_learn_portable", 2, 0},
     {"table_dead_user_data", 1, 0},     {"spec_gpu_affinity", 1, 0},
@@ -41,6 +44,12 @@ inline constexpr Row Table[] = {
     {"spec_protect_async", 1, 0},       {"spec_completed_snapshot", 1, 0}, {"spec_texcache_shared", 1, 0},
     {"spec_texcache_upload_unlocked", 0, 0}, {"spec_pool_layers", 1, 0},
     {"spec_pair_push_fit", 1, 0},       {"spec_pair_dense_indirect", 1, 0},
+    {"front_unblock_retest", 1, 0}, // (graphicsRun.cpp: a blocked front's stored wait re-read, not unblocked untested)
+    {"spec_format_ahead", 1, 0}, // (a table pair born with its recorded pair's vertex format mask: local/format-ahead.h)
+    {"spec_compute", 3, 0}, // (mode 4 startup: 0 off, 1 legacy async, 3 both claim and cancel)
+    {"spec_log_flat", 1, 0}, // (the effects log's Add cheaper, the same contents; read at the first log: speculation-state.h)
+    {"spec_commit_walks", 1, 0}, // (read the effects log indexes during commit, sampled per submission slice)
+    {"submit_fold", 1, 0}, // (fold queued graphics submits, sampled at replay)
 };
 // KYTY_TABLE_TARGET_READ (not a live switch: read where image sets are made): on under mode 4.
 inline constexpr uint32_t TableTargetRead4 = 1, TableTargetRead0 = 0;
@@ -66,7 +75,14 @@ inline void ApplyTable(int mode) {
 		for (const char* c = row.name; *c != '\0'; ++c) variable += static_cast<char>(*c >= 'a' && *c <= 'z' ? *c - 32 : *c);
 		const char* env = std::getenv(variable.c_str());
 		const int64_t value = mode == 4 ? row.on4 : row.on0;
-		if (env == nullptr || *env == '\0') LiveSwitch::Find(row.name, value).store(value, std::memory_order_relaxed);
+		if (env != nullptr && *env != '\0') continue;
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+		if (std::strcmp(row.name, "submit_fold") == 0) {
+			LocalVulkanRecording::SetSubmitFold(value);
+			continue;
+		}
+#endif
+		LiveSwitch::Find(row.name, value).store(value, std::memory_order_relaxed);
 	}
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 	const char* target_read = std::getenv("KYTY_TABLE_TARGET_READ");

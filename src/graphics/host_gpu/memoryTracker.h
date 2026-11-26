@@ -64,6 +64,7 @@ public:
 	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size,
 	                                               std::unique_lock<TextureCacheLock>* handoff = nullptr) noexcept;
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] RegionManager::DirtyBits ReadRegionDirtyForSpeculation(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	// CPU-dirty, the write protection kept (RegionManager::MarkCpuDirtyKeepProtection): for a write through the
 	// backing view. False, with nothing changed, when a page is GPU-dirty.

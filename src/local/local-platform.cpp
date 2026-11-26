@@ -1,5 +1,8 @@
 #include "local-platform.h"
 
+#include "cpu-shape.h"
+#include "live-switch.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -11,6 +14,9 @@
 #include <deque>
 #include <filesystem>
 #include <iterator>
+#include <memory>
+#include <new>
+#include <optional>
 #include <map>
 #include <set>
 #include <tuple>
@@ -29,6 +35,7 @@
 #include <windows.h>
 #include <dxgi1_6.h>
 #include <psapi.h>
+#include <setupapi.h>
 #include <softpub.h>
 #include <tlhelp32.h>
 #include <wincrypt.h>
@@ -413,6 +420,16 @@ uint32_t PerformanceLogicalCpus() {
 			offset += info->Size;
 		}
 	return count;
+}
+
+uint64_t ProcessAffinityMask() {
+	DWORD_PTR process = 0, system = 0;
+	return GetProcessAffinityMask(GetCurrentProcess(), &process, &system) != 0 ? static_cast<uint64_t>(process) : 0;
+}
+
+uint64_t InspectThreadAffinity() {
+	GROUP_AFFINITY affinity {};
+	return GetThreadGroupAffinity(GetCurrentThread(), &affinity) != 0 ? static_cast<uint64_t>(affinity.Mask) : 0;
 }
 
 uint64_t CurrentThreadAffinity() {
@@ -1402,6 +1419,278 @@ static std::vector<Core> MachineCores(uint64_t& allowed) {
 	}
 	return cores;
 }
+
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+struct GraphicsIrqLayout {
+	uint64_t targets = 0;
+	std::array<uint64_t, 64> cores {};
+};
+
+namespace {
+template <typename Function>
+Function IrqProc(HMODULE module, const char* name) {
+	return module != nullptr ? reinterpret_cast<Function>(reinterpret_cast<void*>(GetProcAddress(module, name))) : nullptr;
+}
+
+const auto& GraphicsIrqApis() {
+	// Keep the system modules loaded for the lifetime of the cached entry points.
+	static const auto api = [] {
+		const auto setup = LoadLibraryExW(L"setupapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+		const auto registry = LoadLibraryExW(L"advapi32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+		const auto kernel = GetModuleHandleW(L"kernel32.dll");
+		struct {
+			decltype(&SetupDiGetClassDevsW) get_devices;
+			decltype(&SetupDiEnumDeviceInfo) enum_device;
+			decltype(&SetupDiGetDeviceRegistryPropertyW) get_property;
+			decltype(&SetupDiOpenDevRegKey) open_key;
+			decltype(&SetupDiDestroyDeviceInfoList) destroy_devices;
+			decltype(&RegGetValueW) read_value;
+			decltype(&RegCloseKey) close_key;
+			decltype(&GetActiveProcessorGroupCount) group_count;
+			decltype(&SetThreadIdealProcessorEx) set_ideal;
+		} functions {
+			IrqProc<decltype(&SetupDiGetClassDevsW)>(setup, "SetupDiGetClassDevsW"),
+			IrqProc<decltype(&SetupDiEnumDeviceInfo)>(setup, "SetupDiEnumDeviceInfo"),
+			IrqProc<decltype(&SetupDiGetDeviceRegistryPropertyW)>(setup, "SetupDiGetDeviceRegistryPropertyW"),
+			IrqProc<decltype(&SetupDiOpenDevRegKey)>(setup, "SetupDiOpenDevRegKey"),
+			IrqProc<decltype(&SetupDiDestroyDeviceInfoList)>(setup, "SetupDiDestroyDeviceInfoList"),
+			IrqProc<decltype(&RegGetValueW)>(registry, "RegGetValueW"),
+			IrqProc<decltype(&RegCloseKey)>(registry, "RegCloseKey"),
+			IrqProc<decltype(&GetActiveProcessorGroupCount)>(kernel, "GetActiveProcessorGroupCount"),
+			IrqProc<decltype(&SetThreadIdealProcessorEx)>(kernel, "SetThreadIdealProcessorEx"),
+		};
+		return functions;
+	}();
+	return api;
+}
+
+struct RegistryKey {
+	HKEY key;
+	~RegistryKey() { if (key != INVALID_HANDLE_VALUE) GraphicsIrqApis().close_key(key); }
+};
+
+struct DisplayDevices {
+	HDEVINFO handle;
+	~DisplayDevices() { if (handle != INVALID_HANDLE_VALUE) GraphicsIrqApis().destroy_devices(handle); }
+};
+
+constexpr wchar_t IrqPolicy[] = L"Interrupt Management\\Affinity Policy";
+constexpr wchar_t IrqTemporalPolicy[] = L"Interrupt Management\\Affinity Policy - Temporal";
+
+bool MissingRegistryValue(LSTATUS status) {
+	return status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND;
+}
+
+template <typename T>
+LSTATUS ReadIrqValue(HKEY key, const wchar_t* path, const wchar_t* name, DWORD flags, T& value) {
+	DWORD size = sizeof(value);
+	const LSTATUS status = GraphicsIrqApis().read_value(key, path, name, flags, nullptr, &value, &size);
+	return status == ERROR_SUCCESS && size != sizeof(value) ? ERROR_INVALID_DATA : status;
+}
+
+bool ReadInstanceIrqTargets(HKEY key, uint64_t known, uint64_t& targets) {
+	DWORD policy = 0;
+	const auto status = ReadIrqValue(key, IrqPolicy, L"DevicePolicy", RRF_RT_REG_DWORD, policy);
+	if (status != ERROR_SUCCESS && !MissingRegistryValue(status)) return false;
+	// IRQ_DEVICE_POLICY values run from MachineDefault (0) through AllProcessorsInMachineWhenSteered (6).
+	if (status == ERROR_SUCCESS && policy > 6) return false;
+	uint64_t mask = 0;
+	if (status == ERROR_SUCCESS && policy == 4) {
+		// AssignmentSetOverride is a little-endian KAFFINITY in the sole processor group.
+		DWORD size = sizeof(mask), type = 0;
+		const auto pin = GraphicsIrqApis().read_value(key, IrqPolicy, L"AssignmentSetOverride",
+		    RRF_RT_REG_BINARY | RRF_RT_REG_DWORD | RRF_RT_REG_QWORD, &type, &mask, &size);
+		if (pin != ERROR_SUCCESS || size == 0 || size > sizeof(DWORD_PTR) ||
+		    (type == REG_DWORD && size != sizeof(DWORD)) || (type == REG_QWORD && size != sizeof(mask))) return false;
+	} else {
+		DWORD group = 0;
+		if (ReadIrqValue(key, IrqTemporalPolicy, L"TargetGroup", RRF_RT_REG_DWORD, group) != ERROR_SUCCESS || group != 0 ||
+		    ReadIrqValue(key, IrqTemporalPolicy, L"TargetSet", RRF_RT_REG_QWORD, mask) != ERROR_SUCCESS) return false;
+	}
+	if (mask == 0 || (mask & ~known) != 0) return false;
+	targets |= mask;
+	return true;
+}
+
+uint64_t ReadGraphicsIrqTargets(uint32_t vendor, uint32_t device, uint64_t known) {
+	const auto& api = GraphicsIrqApis();
+	if (!api.get_devices || !api.enum_device || !api.get_property || !api.open_key || !api.destroy_devices ||
+	    !api.read_value || !api.close_key || !api.group_count || !api.set_ideal) return 0;
+	if (api.group_count() != 1 || vendor > 0xffff || device > 0xffff) return 0;
+	// GUID_DEVCLASS_DISPLAY (the Display setup class).
+	constexpr GUID display {0x4d36e968, 0xe325, 0x11ce, {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
+	const DisplayDevices devices {api.get_devices(&display, L"PCI", nullptr, DIGCF_PRESENT)};
+	if (devices.handle == INVALID_HANDLE_VALUE) return 0;
+
+	char prefix[22];
+	std::snprintf(prefix, sizeof(prefix), "PCI\\VEN_%04X&DEV_%04X", vendor, device);
+	const auto prefix_size = sizeof(prefix) - 1;
+	uint64_t targets = 0;
+	for (DWORD index = 0;; ++index) {
+		SP_DEVINFO_DATA info {};
+		info.cbSize = sizeof(info);
+		if (!api.enum_device(devices.handle, index, &info)) {
+			if (GetLastError() == ERROR_NO_MORE_ITEMS) break;
+			return 0;
+		}
+		wchar_t ids[4096];
+		DWORD type = 0, bytes = 0;
+		if (!api.get_property(devices.handle, &info, SPDRP_HARDWAREID, &type, reinterpret_cast<BYTE*>(ids), sizeof(ids), &bytes) ||
+		    type != REG_MULTI_SZ || bytes > sizeof(ids) || bytes % sizeof(wchar_t) != 0 ||
+		    bytes < 2 * sizeof(wchar_t) || ids[bytes / sizeof(wchar_t) - 1] != L'\0' ||
+		    ids[bytes / sizeof(wchar_t) - 2] != L'\0')
+			return 0;
+		const auto* end = ids + bytes / sizeof(wchar_t) - 1;
+		bool matches = false;
+		for (const auto* id = ids; id != end;) {
+			const auto* terminator = id;
+			while (*terminator != L'\0') ++terminator;
+			if (terminator == id) return 0;
+			if (!matches && static_cast<size_t>(terminator - id) >= prefix_size) {
+				matches = std::equal(prefix, prefix + prefix_size, id, [](char expected, wchar_t actual) {
+					if (actual >= L'a' && actual <= L'z') actual -= L'a' - L'A';
+					return actual == expected;
+				}) && (id[prefix_size] == L'&' || id[prefix_size] == L'\0');
+			}
+			id = terminator + 1;
+		}
+		if (!matches) continue;
+		const RegistryKey instance {api.open_key(devices.handle, &info, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ)};
+		if (instance.key == INVALID_HANDLE_VALUE || !ReadInstanceIrqTargets(instance.key, known, targets)) return 0;
+	}
+	return targets;
+}
+
+// CPU-set CoreIndex orders the physical cores independently of their SMT siblings' logical CPU numbers.
+std::array<uint64_t, 64> IrqPhysicalCores() {
+	ULONG length = 0;
+	(void)GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+	const auto capacity = length;
+	const std::unique_ptr<uint8_t[]> buffer(length != 0 ? new (std::nothrow) uint8_t[length] : nullptr);
+	if (!buffer || !GetSystemCpuSetInformation(reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.get()), capacity,
+	                                            &length, GetCurrentProcess(), 0) || length > capacity) return {};
+	std::array<uint64_t, 256> indexed {};
+	uint64_t known = 0;
+	for (ULONG offset = 0; offset < length;) {
+		if (length - offset < sizeof(SYSTEM_CPU_SET_INFORMATION)) return {};
+		const auto* cpu = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.get() + offset);
+		if (cpu->Size < sizeof(*cpu) || cpu->Size > length - offset || cpu->Size % alignof(SYSTEM_CPU_SET_INFORMATION) != 0 ||
+		    cpu->Type != CpuSetInformation || cpu->CpuSet.Group != 0 ||
+		    cpu->CpuSet.LogicalProcessorIndex >= sizeof(DWORD_PTR) * 8) return {};
+		const auto bit = uint64_t {1} << cpu->CpuSet.LogicalProcessorIndex;
+		if ((known & bit) != 0) return {};
+		known |= bit;
+		indexed[cpu->CpuSet.CoreIndex] |= bit;
+		offset += cpu->Size;
+	}
+	if (static_cast<DWORD>(std::popcount(known)) != GetActiveProcessorCount(0)) return {};
+	std::array<uint64_t, 64> cores {};
+	std::copy_if(indexed.rbegin(), indexed.rend(), cores.begin(), [](auto core) { return core != 0; });
+	return cores;
+}
+
+int ChooseIrqIdeal(const GraphicsIrqLayout& layout, uint64_t candidates, uint64_t avoid_cores = 0) {
+	for (const auto core: layout.cores) {
+		if (core == 0) break;
+		const auto eligible = core & candidates;
+		if (eligible != 0 && (core & avoid_cores) == 0) return std::bit_width(eligible) - 1;
+	}
+	return -1;
+}
+
+thread_local std::optional<PROCESSOR_NUMBER> g_previous_irq_ideal;
+int g_gpu_irq_ideal = -1;
+
+bool SetIrqIdeal(int cpu) {
+	PROCESSOR_NUMBER ideal {0, static_cast<BYTE>(cpu), 0};
+	PROCESSOR_NUMBER previous {};
+	if (!GraphicsIrqApis().set_ideal(GetCurrentThread(), &ideal, &previous)) return false;
+	if (!g_previous_irq_ideal) g_previous_irq_ideal = previous;
+	return true;
+}
+
+uint64_t WithoutIrqTargets(uint64_t mask, uint64_t targets) {
+	const auto clean = mask & ~targets;
+	return std::popcount(clean) >= 2 ? clean : mask;
+}
+
+const GraphicsIrqLayout* DiscoverGraphicsIrqLayout(uint32_t vendor, uint32_t device) {
+	static GraphicsIrqLayout layout;
+	layout.cores = IrqPhysicalCores();
+	uint64_t known = 0;
+	for (const auto core: layout.cores) known |= core;
+	if (known != 0) layout.targets = ReadGraphicsIrqTargets(vendor, device, known);
+	return layout.targets != 0 ? &layout : nullptr;
+}
+} // namespace
+
+GpuIrqAffinity g_gpu_irq_affinity;
+std::atomic<bool> g_irq_avoid_ever_armed {false};
+RecordingIrqPlacement g_recording_irq_placement;
+
+uint64_t GpuIrqAffinity::Filter(uint64_t mask) const { return mask & ~targets; }
+
+bool RestoreIrqIdeal() {
+	if (!g_previous_irq_ideal) return true;
+	if (!GraphicsIrqApis().set_ideal(GetCurrentThread(), &*g_previous_irq_ideal, nullptr)) {
+		std::fputs("IRQ avoid: could not restore the thread's ideal CPU\n", stderr);
+		return false;
+	}
+	g_previous_irq_ideal.reset();
+	return true;
+}
+
+static void PrepareGpuIrqAvoid(uint32_t vendor, uint32_t device, const CpuShape::Plan& boot_plan, uint32_t workers) {
+	const auto* layout = DiscoverGraphicsIrqLayout(vendor, device);
+	if (layout == nullptr) return;
+	const char* pass = std::getenv("KYTY_SPEC_PASS_THREAD");
+	const auto plan = (boot_plan.gpu_cpus | boot_plan.record_cpus) != 0 ? boot_plan
+	                 : CpuShape::BootPlan(workers, pass == nullptr || std::atoi(pass) > 0, false, true);
+	g_gpu_irq_ideal = ChooseIrqIdeal(*layout, plan.gpu_cpus & ~layout->targets);
+	const auto gpu_cpu = g_gpu_irq_ideal >= 0 ? uint64_t {1} << g_gpu_irq_ideal : 0;
+	const int record = ChooseIrqIdeal(*layout, plan.record_cpus & ~layout->targets, plan.workers_cpus | plan.pass_cpu | gpu_cpu);
+	g_recording_irq_placement = {layout, record};
+	g_irq_avoid_ever_armed.store(true, std::memory_order_release);
+}
+
+void ApplyGpuIrqAvoid(uint32_t vendor, uint32_t device, const CpuShape::Plan& boot_plan, uint32_t workers) {
+	// A prior placement whose restore failed still owns the saved base mask.
+	if (g_gpu_irq_affinity.targets != 0) return;
+	static bool tried = false;
+	if (!std::exchange(tried, true)) PrepareGpuIrqAvoid(vendor, device, boot_plan, workers);
+	if (!g_irq_avoid_ever_armed.load(std::memory_order_relaxed)) return;
+	// An earlier IRQ placement may have failed before speculation narrowed the mask.
+	if (auto& saved = g_gpu_irq_affinity.speculation_base; saved != 0) {
+		if (!SetCurrentThreadAffinity(saved)) {
+			std::fputs("IRQ avoid: could not restore the GPU thread's mask before placement\n", stderr);
+			return;
+		}
+		saved = 0;
+	}
+	const auto* layout = g_recording_irq_placement.layout;
+	const int ideal = g_gpu_irq_ideal;
+	const auto current = InspectThreadAffinity();
+	const auto mask = WithoutIrqTargets(current, layout->targets);
+	if (ideal >= 0 && (current & (uint64_t {1} << ideal)) != 0 && SetIrqIdeal(ideal)) {
+		if (mask == current || SetCurrentThreadAffinity(mask)) {
+			g_gpu_irq_affinity = {layout->targets, current, mask};
+		} else {
+			RestoreIrqIdeal();
+		}
+	}
+	const bool applied = g_gpu_irq_affinity.targets != 0;
+	std::printf("IRQ avoid: GPU mask=0x%llx ideal=%d\n",
+	            static_cast<unsigned long long>(applied ? mask : current), applied ? ideal : -1);
+	std::fflush(stdout);
+}
+
+void ApplyRecordingIrqAvoid(const RecordingIrqPlacement& placement) {
+	const int ideal = placement.ideal;
+	const bool applied = ideal >= 0 && (InspectThreadAffinity() & (uint64_t {1} << ideal)) != 0 && SetIrqIdeal(ideal);
+	std::printf("IRQ avoid: Record ideal=%d\n", applied ? ideal : -1);
+	std::fflush(stdout);
+}
+#endif
 
 // The render thread runs on both CPUs of its core (the form that was measured). The process's default CPU set becomes
 // every other CPU of the process, and every thread without a CPU set or mask of its own takes it: the game's, the
@@ -2799,6 +3088,27 @@ std::string SpareCpu(const char* avoid) {
 #endif
 }
 
+uint64_t ProcessAffinityMask() {
+#if defined(__linux__)
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (sched_getaffinity(getpid(), sizeof(set), &set) != 0) {
+		return 0;
+	}
+	uint64_t mask = 0;
+	for (int cpu = 0; cpu < 64; ++cpu) {
+		if (CPU_ISSET(cpu, &set)) {
+			mask |= uint64_t {1} << cpu;
+		}
+	}
+	return mask;
+#else
+	return 0;
+#endif
+}
+
+uint64_t InspectThreadAffinity() { return CurrentThreadAffinity(); }
+
 uint64_t CurrentThreadAffinity() {
 #if defined(__linux__)
 	cpu_set_t set;
@@ -3271,3 +3581,93 @@ void StartHeapTrimmer() {
 }
 
 } // namespace LocalPlatform
+
+namespace CpuShape {
+
+std::string CpuList(uint64_t mask) {
+	std::string list;
+	for (uint32_t cpu = 0; cpu < 64;) {
+		if ((mask & (uint64_t {1} << cpu)) == 0) {
+			++cpu;
+			continue;
+		}
+		const auto first = cpu++;
+		while (cpu < 64 && (mask & (uint64_t {1} << cpu)) != 0) {
+			++cpu;
+		}
+		list += (list.empty() ? "" : ",") + std::to_string(first);
+		if (cpu > first + 1) {
+			list += "-" + std::to_string(cpu - 1);
+		}
+	}
+	return list;
+}
+
+Plan BootPlan(uint32_t requested_workers, bool pass_enabled, bool pipe_enabled, bool placement_only) {
+	uint64_t allowed = LocalPlatform::ProcessAffinityMask(), render_core = 0;
+	std::vector<Core> cores;
+
+#if defined(_WIN32)
+	for (const auto& core: LocalPlatform::MachineCores(allowed)) {
+		cores.push_back({core.cpus, core.efficiency});
+	}
+	uint64_t core_allowed = 0;
+	bool by_fallback = false;
+	if (LocalPlatform::RenderCoreChoice(nullptr, render_core, core_allowed, by_fallback) < 0) {
+		render_core = 0;
+	}
+#endif
+	const char* workers = std::getenv("KYTY_SPECULATE_CPUS");
+	const bool named = workers != nullptr && *workers != '\0';
+	const auto boot_switch = [placement_only](const char* name, const char* env, int64_t fallback) {
+		if (!placement_only) return LiveSwitch::Find(name, fallback).load(std::memory_order_relaxed);
+		const char* value = std::getenv(env);
+		return value != nullptr && *value != '\0' ? static_cast<int64_t>(std::strtoll(value, nullptr, 10)) : fallback;
+	};
+	const auto live = static_cast<uint64_t>(boot_switch("speculate_cpu_mask", "KYTY_SPECULATE_CPU_MASK", 0));
+	const auto list = named ? std::string(workers) : LocalPlatform::SpeculationCpuList();
+	const auto worker_mask = live != 0 ? live : LocalPlatform::CpuListMask(list.c_str());
+	const auto render = LocalPlatform::CpuListMask(std::getenv("KYTY_RENDER_CPUS"));
+	const auto record = LocalPlatform::CpuListMask(std::getenv("KYTY_RECORDING_CPUS"));
+	const auto copy_override = pipe_enabled ? PipeOverride() : std::optional<uint32_t> {0};
+	const bool gpu_apart = boot_switch("spec_gpu_affinity", "KYTY_SPEC_GPU_AFFINITY", 1) != 0;
+	auto plan = Choose(cores, allowed, requested_workers, named, worker_mask, live != 0, render, record, render_core,
+	                   pass_enabled, true, copy_override, gpu_apart);
+	if (!plan.stands_down && plan.cores == 0) {
+		plan.cores = LocalPlatform::CoresIn(~uint64_t {0});
+		plan.copies = copy_override.value_or(CopyBudget(plan.cores, plan.workers, LocalPlatform::CoresIn(worker_mask),
+		                                               plan.pass));
+	}
+	return plan;
+}
+
+uint32_t PipeCopyBudget(uint32_t workers, uint64_t mask, bool pass, bool automatic) {
+	const auto count = LocalPlatform::CoresIn(~uint64_t {0});
+	bool match_hybrid = false;
+#if defined(_WIN32)
+	if (automatic && HasSixPCorePeer(count)) {
+		uint64_t allowed = 0;
+		std::vector<Core> cores;
+		for (const auto& core: LocalPlatform::MachineCores(allowed)) {
+			cores.push_back({core.cpus, core.efficiency});
+		}
+		match_hybrid = AllCoresHaveSmt2(cores, allowed);
+	}
+#else
+	(void)automatic;
+#endif
+	return CopyBudget(count, workers, LocalPlatform::CoresIn(mask), pass, match_hybrid);
+}
+
+std::optional<uint32_t> PipeOverride() {
+	const char* value = std::getenv("KYTY_SPEC_UPLOAD_PIPE_THREADS");
+	if (value == nullptr || *value == '\0') {
+		return {};
+	}
+	if (std::strlen(value) > 9 || std::strspn(value, "0123456789") != std::strlen(value)) {
+		return {};
+	}
+	return static_cast<uint32_t>(std::min(std::strtoul(value, nullptr, 10), 16ul));
+}
+
+} // namespace CpuShape

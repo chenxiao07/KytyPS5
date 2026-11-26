@@ -514,24 +514,12 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 			std::lock_guard lock(varying_mutex);
 			if (const auto found = varying_of.find(program_of[index]); found != varying_of.end()) return found->second;
 		}
-		uint32_t                                                          bits = 0;
-		std::vector<ShaderRecompiler::IR::ResourceSpecialization::Buffer> first_buffers;
-		bool                                                              have_first = false;
+		SeedVarying fold; // (shared with spec_format_ahead's recorded pair masks: SeedVarying)
 		for (const auto member: group(index)) {
 			LocalShaderWarmup::Record record;
-			if (!decode(member, record) || record.specialization.buffers.empty()) continue;
-			const auto& buffers = record.specialization.buffers;
-			if (!have_first) {
-				first_buffers = buffers;
-				have_first    = true;
-				continue;
-			}
-			for (size_t b = 0; b < std::min<size_t>({buffers.size(), first_buffers.size(), 32}); b++) {
-				if (buffers[b].descriptor_format != first_buffers[b].descriptor_format ||
-				    buffers[b].descriptor_swizzle != first_buffers[b].descriptor_swizzle)
-					bits |= 1u << b;
-			}
+			if (decode(member, record)) fold.Add(record.specialization.buffers);
 		}
+		const uint32_t  bits = fold.bits;
 		std::lock_guard lock(varying_mutex);
 		varying_of[program_of[index]] = bits;
 		return bits;

@@ -1493,6 +1493,11 @@ bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBackingToHost(vaddr, data, size);
 }
 
+bool TryReadBackingOnceToHost(uint64_t vaddr, void* data, uint64_t size) {
+	return (g_guest_address_space != nullptr && g_guest_address_space->TryCopyCachedBackingToHost(vaddr, data, size)) ||
+	       TryReadBackingToHost(vaddr, data, size);
+}
+
 // A speculative translation's CPU read of guest memory no GPU work wrote: not memory its own work or its guest
 // memory writes write (both wait for its commit), and noted (speculation-state.h: a hole that writes it stops the
 // commit before the reading segment).
@@ -1504,7 +1509,7 @@ static bool SpeculationReadsClean(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
-bool TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
+static bool ReadGpuCleanBackingRaw(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		// (A weave thread's read is proven too: both caches' tests take the lock another thread's question needs.)
 		if (!(Graphics::GuestGpu::IsTranslatingThread() || Weave::OffGpuThread()) ||
@@ -1524,6 +1529,19 @@ bool TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBackingToHost(vaddr, data, size);
 }
 
+[[gnu::always_inline]] static inline bool TrySpeculativeByteRead(uint64_t vaddr, void* data, uint64_t size) {
+	if (!Graphics::Spec::CopyForwardActive()) {
+		return false;
+	}
+	auto* spec = Graphics::Spec::t_state;
+	return spec != nullptr && spec->ForwardReadsEnabled() && spec->ReadForwarded(vaddr, data, size);
+}
+
+bool TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
+	return TrySpeculativeByteRead(vaddr, data, size) ||
+	       ReadGpuCleanBackingRaw(vaddr, data, size);
+}
+
 bool IsUniqueGuestBackingRange(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space != nullptr && g_guest_address_space->IsUniqueBackingRange(vaddr, size);
 }
@@ -1538,10 +1556,11 @@ void PostLevelUploadAhead(uint64_t vaddr, uint64_t size) {
 
 // `data` is host memory (every caller reads into a local or a scratch vector): the lock-free
 // host read applies; the guest-destination variant took both backing locks for each word.
-bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t size) {
+bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t size, bool forward) {
 	return g_gpu_resources != nullptr && Graphics::GuestGpu::IsTranslatingThread() &&
 	       IsGpuAddressRange(vaddr, size) && g_gpu_resources->HasReadWatchers(vaddr, size) &&
-	       TryReadGpuCleanBackingToHost(vaddr, data, size);
+	       ((forward && TrySpeculativeByteRead(vaddr, data, size)) ||
+	        ReadGpuCleanBackingRaw(vaddr, data, size));
 }
 
 bool ReadFaults(uint64_t vaddr, uint64_t size) {
@@ -1568,9 +1587,12 @@ static bool CopyUnwatched(uint64_t vaddr, void* data, uint64_t size) {
 	return Common::GuardedCopy(data, reinterpret_cast<const void*>(vaddr), size) == 0;
 }
 
-bool TryReadGuestNoFault(uint64_t vaddr, void* data, uint64_t size) {
+bool TryReadGuestNoFault(uint64_t vaddr, void* data, uint64_t size, bool forward) {
 	if (data == nullptr || size == 0 || !Graphics::GuestGpu::IsTranslatingThread() || Graphics::GuestGpu::IsGpuThread())
 		return false;
+	if (forward && TrySpeculativeByteRead(vaddr, data, size)) {
+		return true;
+	}
 	// (As TryReadGpuShaderSpan's raw form: a page no read watcher guards holds what the GPU thread reads there; a guarded
 	// copy, a fault refused. A read-watched one only through its clean backing.)
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
@@ -1579,7 +1601,9 @@ bool TryReadGuestNoFault(uint64_t vaddr, void* data, uint64_t size) {
 		// reads back buffers only (GpuResourceManager's fault: BufferCache::ReadMemory), so the in-order read there is a
 		// plain load whatever image the open segment renders into or stores to: the same bytes as this copy.)
 		return CopyUnwatched(vaddr, data, size);
-	if (TryReadGpuCleanBackingToHost(vaddr, data, size)) return true;
+	if (ReadGpuCleanBackingRaw(vaddr, data, size)) {
+		return true;
+	}
 	// spec_nofault_journal: refused only for the speculations' pending processor writes over it (none of their GPU work's,
 	// no GPU-dirty bytes): the words as ReadJournaled gives them, over the clean backing. No image over the words either,
 	// GPU-modified or not: an earlier draw or dispatch of the open segment may render into or store to one there, noted
@@ -1615,6 +1639,9 @@ bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean)
 	if (!data || size < 8 || size > (clean ? 4096u : 64u) || size % 4 != 0 || !g_gpu_resources ||
 	    !Graphics::GuestGpu::IsTranslatingThread() || !IsGpuAddressRange(vaddr, size))
 		return false;
+	if (TrySpeculativeByteRead(vaddr, data, size)) {
+		return true;
+	}
 	if (!clean && !g_gpu_resources->HasReadWatchers(vaddr, size) && SpeculationReadsClean(vaddr, size)) {
 		// A speculation's thread: the GPU thread may read-protect the page after the look above (work it commits
 		// writes it), and a fault there waits for the GPU thread, which may wait for this thread (a mode 4 hang at the
@@ -1629,7 +1656,7 @@ bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean)
 		if (at < size) std::memcpy(out + at, in + at, 4);
 		return true;
 	}
-	return TryReadGpuCleanBackingToHost(vaddr, data, size);
+	return ReadGpuCleanBackingRaw(vaddr, data, size);
 }
 
 thread_local uint64_t g_srt_shader_hash = 0;

@@ -8,11 +8,18 @@
 #include "weave.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <span>
 #include <vector>
 
 namespace Libs::Graphics {
+
+class Speculation;
+namespace Spec {
+struct CopyOutcome;
+struct CopyCursor;
+} // namespace Spec
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
 // The first entry of an indirect register table (`pairs` register-value pairs; `bank`: 0 context, 1 SH, 2 uconfig) that
@@ -106,6 +113,14 @@ public:
 	// index and indirect bases, instances, counters, predication, context pushes), translating and executing nothing:
 	// the state a command buffer leaves, before it is translated.
 	void SetStateOnly(bool state_only) noexcept { m_state_only = state_only; }
+	// Used by waitless workers and their state passes, once per job.
+	void SetGuardedCommands(const std::atomic<bool>& cancel, const std::atomic<uint64_t>& skip, uint64_t serial) noexcept {
+		m_command_cancel = &cancel;
+		m_command_skip = &skip;
+		m_command_serial = serial;
+		m_guarded_dispatch_args = true;
+	}
+	[[nodiscard]] bool GuardedCommandReads() const noexcept { return m_command_skip != nullptr; }
 	// Chunks of a command buffer (KYTY_SPECULATE=4): a state pass suspends before every `every`-th draw or dispatch that
 	// does not continue a run of indirect draws (TakeBoundary: it did); Process suspends before the packet at `at` (the
 	// next chunk's start; null: none; TakeStopReached: it did). Positions are compared by the packets they are at.
@@ -125,11 +140,13 @@ public:
 	static void PrintPacketAt(const Pm4Execution& at, const char* what);
 	// The packet a suspended execution stopped at (its length in `dwords`), and past it.
 	[[nodiscard]] static const uint32_t* SuspendedPacket(const Pm4Execution& execution, uint32_t& dwords);
+	[[nodiscard]] static const uint32_t* ReadGuardedSuspendedPacket(const Pm4Execution& execution, uint32_t& header,
+	                                                                uint32_t& dwords);
 	// SuspendedPacket would size it (the packet is in its buffer: not past a rewritten buffer's end).
 	[[nodiscard]] static bool            SuspendedPacketFits(const Pm4Execution& execution);
 	// The execution stopped at a WAIT_REG_MEM.
 	[[nodiscard]] static bool AtWait(const Pm4Execution& execution);
-	static void                          SkipSuspendedPacket(Pm4Execution& execution);
+	static void                          SkipSuspendedPacket(Pm4Execution& execution, uint32_t dwords = 0);
 
 	void            BufferInit();
 	void            BufferFlush();
@@ -161,7 +178,7 @@ public:
 	[[nodiscard]] uint32_t TryNativeAutoDraw(std::span<const uint32_t> packet);
 	// KYTY_SPEC_DRAW_INDIRECT (live spec_draw_indirect): a DRAW_INDIRECT (non-indexed) as a table draw, its arguments
 	// read on the GPU: the packet's dwords, or 0.
-	[[nodiscard]] uint32_t TryNativeIndirectAutoDraw(std::span<const uint32_t> packet);
+	[[nodiscard]] uint32_t TryNativeIndirectAutoDraw(std::span<const uint32_t> packet, const uint32_t* command_words = nullptr);
 	// A DRAW_INDEX_INDIRECT_MULTI of a count it holds, as that many DRAW_INDEX_INDIRECT: the packet's dwords, or 0.
 	[[nodiscard]] uint32_t TryNativeMultiDraw(std::span<const uint32_t> packet);
 	uint32_t TryDrawIndirectRun(std::span<const uint32_t> packets);
@@ -228,6 +245,11 @@ public:
 
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
+	void SetCopySubmission(Speculation* owner, uint64_t serial, uint64_t pass = 0) {
+		m_copy_owner = owner;
+		m_copy_serial = serial;
+		m_copy_pass = pass;
+	}
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 	// The weave (weave.h): GuestGpu::Enqueue's feed of a queue-0 graphics submission to the reader (the queue mutex
@@ -239,18 +261,46 @@ public:
 	void        WeaveModeChanged();
 
 private:
+	template <bool GuardedArgs>
+	void DispatchIndirectAddressImpl(uint64_t args_addr, uint32_t mode);
+	bool                m_guarded_dispatch_args = false;
 	uint32_t            m_draw_run_skip = 0;
 	bool                m_state_only    = false;
 	uint32_t            m_chunk_every = 0, m_chunk_work = 0, m_chunk_last_opcode = 0;
 	bool                m_at_boundary = false, m_stop_reached = false, m_watched_stop = false;
 	const Pm4Execution* m_stop_at = nullptr;
+	friend class Speculation;
+	Speculation* m_copy_owner = nullptr;
+	uint64_t m_copy_serial = 0, m_copy_pass = 0;
+	const Pm4Execution* m_copy_hole_at = nullptr;
+	static bool CopyPosition(const Pm4Execution& execution, Spec::CopyCursor& cursor);
+	void NoteCopyPacket(const Pm4Execution& execution, const Spec::CopyOutcome& copy);
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
-	void ProcessPm4(Pm4Execution& execution, size_t stop_depth);
+	void ProcessPm4(Pm4Execution& execution, size_t stop_depth, uint32_t mode);
+	[[nodiscard]] bool UpdatePm4DrawState(uint32_t opcode, uint32_t header, const uint32_t* packet,
+	                                      bool off_gpu_thread);
+	[[nodiscard]] bool ClaimedCommandReads() const noexcept { return m_claimed_commands; }
+	void BeginClaimedCommands() noexcept {
+		m_claimed_commands = true;
+		m_claimed_words_left = 1u << 20u;
+	}
+	void EndClaimedCommands() noexcept {
+		m_claimed_commands = false;
+		m_command_cancel = nullptr;
+		m_command_skip = nullptr;
+		m_guarded_dispatch_args = false;
+	}
+	template <bool Guarded, bool Claimed = false>
 	void ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth);
+	const std::atomic<bool>*     m_command_cancel = nullptr;
+	const std::atomic<uint64_t>* m_command_skip = nullptr;
+	uint64_t                     m_command_serial = 0;
+	uint32_t                     m_claimed_words_left = 0;
+	bool                         m_claimed_commands = false;
 	// ProcessPm4's loop, one body: <false> as it is, <true> with the weave's hooks at queue 0's draw packets (taken
 	// only while the weave runs on this processor; a build without KYTY_LOCAL_VULKAN_RECORDING instantiates only
 	// <false>).

@@ -84,6 +84,8 @@ private:
 	static constexpr uint32_t ComputeQueueCount    = ComputePipeCount * QueuesPerComputePipe;
 	static constexpr uint32_t ComputeQueueBase     = 0x20;
 	static constexpr uint32_t QueueCount           = 1 + ComputeQueueCount;
+	static constexpr uint32_t ComputeQueue1        = 1;
+	static constexpr uint32_t ComputeQueue49       = 49;
 
 	enum class SubmissionType { Graphics, Compute, FlipPreparation, FrameBoundary };
 
@@ -114,25 +116,38 @@ private:
 	};
 
 	void              Enqueue(Submission submission);
+	static void       PushGraphics(Speculation& speculation, const Submission& submission);
+	static void       PushCompute(Speculation& speculation, const Submission& submission);
+	[[nodiscard]] Speculation* ComputeLane(uint32_t queue_id) const noexcept;
+	void              WakeForComputeReclaim();
+	void              ReclaimCompute(bool idle = false);
+	[[nodiscard]] bool ReclaimComputeBeforeIdle();
 	void              WaitForIdle();
 	bool              CanProcessSubmission(const Submission& submission) const;
 
 public:
-	// KYTY_SPECULATE=4, on the GPU thread (Speculation::CommitReady, holding no speculation's lock): another queue's
-	// compute front runnable now: 1 the async speculation's front with its chunk translated, 2 another (unspeculated)
-	// one; 0 none.
-	[[nodiscard]] static int ReadyFrontElsewhere() noexcept;
+	// On the GPU thread, with no lane lock held. A runnable front elsewhere: 1 with a translated chunk, 2 in order.
+	// A waitless compute lane can also yield to queue 0.
+	[[nodiscard]] static int ReadyFrontElsewhere(uint32_t except = 0) noexcept;
 
 private:
 	// KYTY_SPECULATE=4, on the GPU thread holding m_queue_mutex (released for the reads, taken again): the blocked fronts
-	// whose stored WAIT_REG_MEM (m_failed_waits) passes now unblocked; how many.
-	uint32_t          RetestBlockedFronts();
+	// whose stored WAIT_REG_MEM (m_failed_waits) passes now unblocked; how many. `at` (front_unblock_retest,
+	// graphicsRun.cpp): Selector, as always (a word not read: kept blocked); at a completion or the selector's idle
+	// timeout, in place of the blanket unblock, a word not read unblocks its front as the blanket did, and a front whose
+	// word was read and fails is kept blocked.
+	enum class RetestAt { Selector, Completion, IdleTimeout };
+	uint32_t          RetestBlockedFronts(RetestAt at = RetestAt::Selector);
+	// (front_unblock_retest, holding m_queue_mutex: at a completion / the idle timeout) every blocked front unblocked as
+	// before except those holding a stored wait, which RetestBlockedFronts(at) re-reads until the mode-4 bound.
+	void              UnblockFrontsRetested(RetestAt at, bool bound_retest);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 
 	RenderContext&                                 m_renderer;
+	const std::atomic<int64_t>&                     m_commit_walks_switch;
 	Common::Mutex                                  m_submission_mutex;
 	Common::Mutex                                  m_queue_mutex;
 	std::mutex                                     m_shutdown_mutex;
@@ -143,6 +158,7 @@ private:
 	std::atomic_uint32_t                           m_pending_commands {0};
 	uint32_t                                       m_next_queue        = 0;
 	std::array<uint64_t, QueueCount>               m_serials {};
+	std::atomic<uint64_t>                           m_copy_enqueue_serial {0};
 	uint32_t                                       m_submission_count  = 0;
 	// Producer epoch is owned by m_submission_mutex; consumed epoch by m_queue_mutex.
 	uint64_t                                       m_submitted_frame   = 0;
@@ -157,9 +173,11 @@ private:
 	bool                                           m_scout_reset       = false;
 	// Under m_queue_mutex, KYTY_SPECULATE=4 only (0 / empty otherwise): the queued submissions a yield marked; and for a
 	// compute front requeued blocked at a WAIT_REG_MEM, that wait with the front's serial (size 0: none), and how many.
+	// (front_unblock_retest on, any mode: the fronts it covers, graphicsRun.cpp.)
 	struct FailedWait {
 		uint64_t serial = 0, address = 0, reference = 0, mask = 0;
 		uint32_t function = 0, size = 0;
+		uint32_t suppressed_unblocks = 0;
 	};
 	uint32_t                                       m_yields            = 0;
 	std::array<FailedWait, QueueCount>             m_failed_waits {};
@@ -169,11 +187,16 @@ private:
 	// KYTY_SPECULATE (speculation.h): made at the first graphics command buffer it translates.
 	std::unique_ptr<Speculation>                                     m_speculation;
 	std::atomic<Speculation*>                                        m_ahead {nullptr}; // KYTY_SPECULATE=4's
-	// KYTY_SPECULATE_ASYNC=<queue id> (mode 4): that async compute queue's command buffers speculated too, by
-	// KYTY_SPECULATE_ASYNC_THREADS threads of their own (the culling chain's, 3.7 ms a frame on the GPU thread, 10-31).
+	std::array<bool, QueueCount>                                     m_spec_start_failed {}; // GPU thread only
+	// KYTY_SPEC_COMPUTE=1 retains round 4's single configurable async queue.
 	std::unique_ptr<Speculation>                                     m_speculation_async;
 	std::atomic<Speculation*>                                        m_ahead_async {nullptr};
-	uint32_t                                                         m_async_queue = 0; // (0: none)
+	uint32_t                                                         m_async_queue = 0;
+	// Each fixed compute lane has its own results, state pass and workers.
+	std::unique_ptr<Speculation>                                     m_speculation_q49;
+	std::unique_ptr<Speculation>                                     m_speculation_q1;
+	std::atomic<Speculation*>                                        m_ahead_q49 {nullptr};
+	std::atomic<Speculation*>                                        m_ahead_q1 {nullptr};
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
 	uint64_t        m_submit_id = 0;
@@ -181,6 +204,7 @@ private:
 	std::jthread    m_thread;
 
 	friend class CommandProcessor;
+	friend class Speculation;
 };
 } // namespace Libs::Graphics
 

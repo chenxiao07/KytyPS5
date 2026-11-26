@@ -158,9 +158,10 @@ Spec::ImageEntry* Image::SpeculativeEntry() {
 	if (inserted) {
 		// (As a speculation before it not committed yet leaves it: the commit then finds it there.)
 		const auto* chain = spec->ChainImage(this, serial);
-		entry             = &spec->overlay.emplace_back();
-		entry->image      = this;
-		entry->serial     = serial;
+		entry                        = &spec->overlay.emplace_back();
+		entry->image                 = this;
+		entry->serial                = serial;
+		entry->restore_general_order = spec->reloc_on ? &spec->image_access_order : nullptr;
 		if (chain != nullptr) {
 			entry->state        = chain->state;
 			entry->subresources = chain->subresources;
@@ -211,6 +212,8 @@ Spec::ImageEntry* Image::SpeculativeEntry() {
 		entry->layer_nontarget       = 0;
 		entry->writes                = 0;
 		entry->not_sampled           = false;
+		entry->general_read_use      = 0;
+		entry->first_general_to_sro  = 0;
 		spec->used.push_back(found->second);
 	}
 	return entry;
@@ -222,13 +225,41 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
                                    std::optional<ImageSubresourceRange> range, bool read_after_write) {
 	// (Behind a plain global: KYTY_SPECULATE unset, no call and no thread-local read per barrier.)
 	auto* const entry = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? SpeculativeEntry() : nullptr;
-	if (range && info.IsVolume()) {
-		range->base_layer  = 0;
-		range->layer_count = 1;
-	}
 	// redo_level_precise (speculation-state.h ImageEntry): every access of a speculation's segment to the image, recorded
 	// whatever the switch (a switch moved mid-translation must not leave a segment's record short).
 	if (entry != nullptr) {
+		using Access = vk::AccessFlagBits2;
+		if (auto* order = entry->restore_general_order) {
+			constexpr auto shader_read = Access::eShaderRead | Access::eShaderSampledRead;
+			constexpr auto attachment = Access::eColorAttachmentRead | Access::eColorAttachmentWrite |
+			                            Access::eDepthStencilAttachmentRead | Access::eDepthStencilAttachmentWrite |
+			                            Access::eInputAttachmentRead;
+			constexpr auto storage = Access::eShaderWrite | Access::eShaderStorageRead | Access::eShaderStorageWrite;
+			const bool read = (destination_access & shader_read) && !(destination_access & ~shader_read);
+			if (read && destination_layout == vk::ImageLayout::eGeneral)
+				entry->general_read_use |= Spec::GeneralRead;
+			else if (read && destination_layout == vk::ImageLayout::eShaderReadOnlyOptimal)
+				entry->general_read_use |= Spec::SroRead;
+			else
+				entry->general_read_use |= Spec::GeneralOther;
+			if (destination_access & attachment) entry->general_read_use |= Spec::GeneralAttachment;
+			if ((destination_access & storage) || read_after_write) entry->general_read_use |= Spec::GeneralStorage;
+			// Check the requested range before a volume's slices are normalized to its one Vulkan array layer.
+			const bool partial = range && (range->base_level != 0 || range->level_count != info.resources.levels ||
+			                               range->base_layer != 0 || range->layer_count != info.resources.layers);
+			if (partial) entry->general_read_use |= Spec::GeneralPartial;
+			// Transit emits the whole-image barrier for this layout change before another use can be recorded.
+			// A discarded recording cannot reach the splice. The other GetBarriers callers request transfer layouts.
+			if (read && destination_layout == vk::ImageLayout::eShaderReadOnlyOptimal && !partial &&
+			    (!range || !info.IsVolume() || info.resources.layers == 1) &&
+			    entry->state.layout == vk::ImageLayout::eGeneral && entry->subresources.empty() &&
+			    entry->first_general_to_sro == 0)
+				entry->first_general_to_sro = ++*order;
+		}
+		if (range && info.IsVolume()) {
+			range->base_layer  = 0;
+			range->layer_count = 1;
+		}
 		if (destination_layout == vk::ImageLayout::eShaderReadOnlyOptimal &&
 		    destination_access == vk::AccessFlags2 {vk::AccessFlagBits2::eShaderRead} && range && range->base_level != 0 &&
 		    range->level_count != 0) {
@@ -278,13 +309,15 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 			}
 		}
 		// (Its write accesses, by kind: Spec::ImageUse::writes.)
-		using Access = vk::AccessFlagBits2;
 		if (static_cast<bool>(destination_access & (Access::eColorAttachmentWrite | Access::eDepthStencilAttachmentWrite)))
 			entry->writes |= Spec::ImageUse::WriteTarget;
 		if (static_cast<bool>(destination_access & (Access::eShaderWrite | Access::eShaderStorageWrite)))
 			entry->writes |= Spec::ImageUse::WriteStorage;
 		if (static_cast<bool>(destination_access & (Access::eTransferWrite | Access::eHostWrite | Access::eMemoryWrite)))
 			entry->writes |= Spec::ImageUse::WriteOther;
+	} else if (range && info.IsVolume()) {
+		range->base_layer  = 0;
+		range->layer_count = 1;
 	}
 	const bool partial =
 	    range && (range->base_level != 0 || range->level_count != info.resources.levels ||
@@ -458,6 +491,30 @@ const VulkanImageState& Image::CurrentState() const {
 	return backing.state;
 }
 
+void Image::RecordWholeReplayRestore(const VulkanImageState& state, vk::CommandBuffer command_buffer) const {
+	vk::ImageMemoryBarrier2 barrier {};
+	{
+		const StateLock lock(*this);
+		barrier.srcStageMask        = backing.state.pl_stage;
+		barrier.srcAccessMask       = backing.state.access_mask;
+		barrier.oldLayout           = backing.state.layout;
+	}
+	barrier.dstStageMask        = state.pl_stage;
+	barrier.dstAccessMask       = state.access_mask;
+	barrier.newLayout           = state.layout;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image               = backing.image;
+	barrier.subresourceRange    = {FullAspectMask(backing.format), 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+
+	// Only the replay sees this layout. Workers continue to read the live SRO state.
+	m_scheduler.EndRendering();
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 1;
+	dependency.pImageMemoryBarriers    = &barrier;
+	command_buffer.pipelineBarrier2(dependency);
+}
+
 void Image::RestoreState(const VulkanImageState& state, const std::vector<VulkanImageState>& subresources,
                          vk::CommandBuffer command_buffer) {
 	const StateLock       lock(*this);
@@ -603,23 +660,38 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	// thread writes, is neither read nor written here. The segment's commands then hold the clear exactly where the
 	// in-order Transit makes it when the commit finds the image as the segment found it (Speculation::Before stops the
 	// segment otherwise). Without a speculation: the backing's, as before.
-	auto* const       zero_spec  = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr;
+	const bool        speculative_readers = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0;
+	auto* const       zero_spec = speculative_readers ? Spec::Current() : nullptr;
 	Spec::ImageEntry* zero_entry = nullptr;
 	if (zero_spec != nullptr && destination_layout != vk::ImageLayout::eUndefined && backing.image && ZeroNewImages() &&
 	    vk::blockExtent(info.pixel_format)[0] == 1) {
 		auto* const entry = SpeculativeEntry(); // (the entry GetBarriers below takes)
 		if (entry->state.layout == vk::ImageLayout::eUndefined && entry->subresources.empty()) zero_entry = entry;
 	}
-	if (zero_entry != nullptr ||
-	    (zero_spec == nullptr && backing.state.layout == vk::ImageLayout::eUndefined && backing.subresource_states.empty() &&
-	     destination_layout != vk::ImageLayout::eUndefined && backing.image && ZeroNewImages() &&
-	     vk::blockExtent(info.pixel_format)[0] == 1)) {
+	const VulkanImageState zeroed {vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+	                               vk::ImageLayout::eTransferDstOptimal};
+	const auto backing_undefined = [&] {
+		return backing.state.layout == vk::ImageLayout::eUndefined && backing.subresource_states.empty();
+	};
+	bool zero_backing = false;
+	if (zero_spec == nullptr && (speculative_readers || backing_undefined()) &&
+	    destination_layout != vk::ImageLayout::eUndefined && backing.image && ZeroNewImages() &&
+	    vk::blockExtent(info.pixel_format)[0] == 1) {
+		if (speculative_readers) {
+			const StateLock lock(*this);
+			if (backing_undefined()) {
+				backing.state = zeroed;
+				zero_backing = true;
+			}
+		} else {
+			zero_backing = true;
+		}
+	}
+	if (zero_entry != nullptr || zero_backing) {
 		m_scheduler.EndRendering();
 		ZeroNewImage(backing.image, FullAspectMask(info.pixel_format), command_buffer);
-		const VulkanImageState zeroed {vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
-		                               vk::ImageLayout::eTransferDstOptimal};
 		if (zero_entry != nullptr) zero_entry->state = zeroed;
-		else backing.state = zeroed;
+		else if (!speculative_readers) backing.state = zeroed;
 	}
 	if (LiveTrace::WriteTicks()) {
 		constexpr auto writes = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |

@@ -11,15 +11,18 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 extern "C" {
 volatile std::atomic<uint32_t> kyty_local_specialization_guard_mode {1};
@@ -392,7 +395,7 @@ private:
 };
 
 // `enumeration`: what made the candidates, a description made only for a summary of dropped classes.
-template <typename Describe>
+template <bool DescribeDrops = true, typename Describe>
 bool FinishIndirectImage(const ImageResource& image, std::vector<DescriptorValue>& probed,
                          bool over_approximates, const Describe& enumeration, IndirectImage& next,
                          std::string* reason) {
@@ -425,15 +428,18 @@ bool FinishIndirectImage(const ImageResource& image, std::vector<DescriptorValue
 			}
 			next.dropped_shapes = static_cast<uint32_t>(classes.size() - 1u);
 		}
-		next.dropped_summary =
-		    fmt::format("{} {}={}", enumeration(),
-		                over_approximates ? "kept" : "exact probe, refused",
-		                ClassText(classes[dominant]));
-		for (uint32_t index = 0; index < classes.size(); index++) {
-			if (index != dominant) {
-				next.dropped_summary +=
-				    fmt::format(" | {} x{} {}", over_approximates ? "dropped" : "kept",
-				                tally[index], ClassText(classes[index]));
+		// The table draw only needs the candidates and drop counts. A report also needs the description.
+		if constexpr (DescribeDrops) {
+			next.dropped_summary =
+			    fmt::format("{} {}={}", enumeration(),
+			                over_approximates ? "kept" : "exact probe, refused",
+			                ClassText(classes[dominant]));
+			for (uint32_t index = 0; index < classes.size(); index++) {
+				if (index != dominant) {
+					next.dropped_summary +=
+					    fmt::format(" | {} x{} {}", over_approximates ? "dropped" : "kept",
+					                tally[index], ClassText(classes[index]));
+				}
 			}
 		}
 	}
@@ -456,6 +462,12 @@ bool FinishIndirectImage(const ImageResource& image, std::vector<DescriptorValue
 	return true;
 }
 
+// Both diagnostic specializations reuse the same scratch on each thread.
+thread_local std::vector<uint32_t> t_dense_descriptor_span;
+thread_local std::vector<uint32_t> t_address_probe_keys;
+thread_local std::vector<uint32_t> t_address_probe_descriptors;
+
+template <bool DescribeDrops = true>
 bool MaterializeDenseIndirectImage(const DescriptorSource::IndirectImage& indirect,
                                    const ImageResource&   image,
                                    const DescriptorValue& heap_value,
@@ -492,8 +504,8 @@ bool MaterializeDenseIndirectImage(const DescriptorSource::IndirectImage& indire
 	// below, as without it). A clean span read succeeds only where every word reads clean, so its words are the ones the
 	// entry reads return; nothing GPU-written is there for the sync to read back, and a speculation's sync would only
 	// refuse a read-watched page whose bytes read clean.
-	thread_local std::vector<uint32_t> dense_span;
-	bool                               spanned = false;
+	auto& dense_span = t_dense_descriptor_span;
+	bool  spanned    = false;
 	if (span_first && entries > 1u && runtime.try_read_memory_span != nullptr) {
 		const auto first = base + indirect.table_offset;
 		const auto words = static_cast<uint64_t>(entries) << (DenseDescriptorShift - 2u);
@@ -530,7 +542,7 @@ bool MaterializeDenseIndirectImage(const DescriptorSource::IndirectImage& indire
 		next.keys.push_back(key);
 		probed.push_back(candidate);
 	}
-	if (!FinishIndirectImage(image, probed, true,
+	if (!FinishIndirectImage<DescribeDrops>(image, probed, true,
 	                         [&] {
 		                         return fmt::format("dense table=0x{:x} entries={}", indirect.table_offset,
 		                                            indirect.key_bound);
@@ -541,6 +553,8 @@ bool MaterializeDenseIndirectImage(const DescriptorSource::IndirectImage& indire
 	result = std::move(next);
 	return true;
 }
+
+template <bool DescribeDrops = true>
 bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage& indirect,
                                           const ImageResource&                   image,
                                           const DescriptorValue&                 material_value,
@@ -571,7 +585,7 @@ bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage&
 	// 32 records of a light table lie within 5 KiB, read for each of its dispatches), word by word where the span
 	// read is refused (as before: the same keys, in the same order).
 	constexpr uint64_t SpanDwords = 1024; // (ReadShaderMemorySpan's limit for clean reads)
-	thread_local std::vector<uint32_t> span;
+	auto& span = t_address_probe_keys;
 	const uint64_t span_records = runtime.try_read_memory_span != nullptr && indirect.selector_stride % 4u == 0u &&
 	                                      indirect.selector_stride <= (SpanDwords - 1u) * 4u
 	                                  ? (SpanDwords - 1u) * 4u / indirect.selector_stride + 1u
@@ -609,8 +623,8 @@ bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage&
 	uint32_t           span_keys = 0;
 	for (const auto key: next.keys)
 		if (key < SpanKeys) span_keys = std::max(span_keys, key + 1u);
-	thread_local std::vector<uint32_t> table_span;
-	bool                               spanned = false;
+	auto& table_span = t_address_probe_descriptors;
+	bool  spanned    = false;
 	if (runtime.try_read_memory_span != nullptr && span_keys > 1u) {
 		const auto first = heap_base + indirect.table_offset;
 		const auto words = span_keys << (DenseDescriptorShift - 2u);
@@ -647,7 +661,7 @@ bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage&
 		}
 		probed.push_back(candidate);
 	}
-	if (!FinishIndirectImage(image, probed, true,
+	if (!FinishIndirectImage<DescribeDrops>(image, probed, true,
 	                         [&] {
 		                         return fmt::format("address probe records={} stride={} table=0x{:x} keys={}",
 		                                            indirect.item_bound, indirect.selector_stride,
@@ -903,7 +917,9 @@ bool EnumerateAddressProbe(const DescriptorSource::IndirectImage& probe, const I
 	heap.dwords[0]    = static_cast<uint32_t>(heap_base);
 	heap.dwords[1]    = static_cast<uint32_t>(heap_base >> 32u);
 	IndirectImage enumerated;
-	if (!MaterializeAddressProbeIndirectImage(probe, root, records, heap, runtime, enumerated, nullptr)) return false;
+	if (!MaterializeAddressProbeIndirectImage<false>(probe, root, records, heap, runtime, enumerated, nullptr)) {
+		return false;
+	}
 	result.keys        = std::move(enumerated.keys);
 	result.candidates  = std::move(enumerated.candidates);
 	result.descriptors = std::move(enumerated.descriptors);
@@ -918,7 +934,9 @@ bool EnumerateDense(const DescriptorSource::IndirectImage& probe, const ImageRes
 	heap.dwords[0] = static_cast<uint32_t>(heap_base);
 	heap.dwords[1] = static_cast<uint32_t>(heap_base >> 32u);
 	IndirectImage enumerated;
-	if (!MaterializeDenseIndirectImage(probe, root, heap, nullptr, runtime, enumerated, nullptr, true)) return false;
+	if (!MaterializeDenseIndirectImage<false>(probe, root, heap, nullptr, runtime, enumerated, nullptr, true)) {
+		return false;
+	}
 	result.keys           = std::move(enumerated.keys);
 	result.candidates     = std::move(enumerated.candidates);
 	result.descriptors    = std::move(enumerated.descriptors);

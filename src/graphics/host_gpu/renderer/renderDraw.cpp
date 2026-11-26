@@ -37,6 +37,7 @@
 #include "live-census.h"
 #include "live-counters.h"
 #include "live-switch.h"
+#include "format-ahead.h" // (table-xpr.inc: spec_format_ahead)
 #include "device-fault.h"
 #include "frame-capture.h"
 #include "frame-gen.h"
@@ -60,6 +61,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <mutex>

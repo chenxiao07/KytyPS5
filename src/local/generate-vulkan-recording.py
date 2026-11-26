@@ -148,7 +148,8 @@ def generate(registry, header):
             invalidate = 'InvalidateRawState(); ' if mutates_state else ''
             declarations.append('    auto capture = [&](Writer& writer) {')
             declarations.extend('        ' + c for c in copies)
-            declarations.append(f'        writer.Command([=] {{ {invalidate}original.{name}({", ".join(args)}); }});')
+            fold_barrier = '' if name.startswith('vkCmd') else ', PacketKind::Barrier'
+            declarations.append(f'        writer.Command([=] {{ {invalidate}original.{name}({", ".join(args)}); }}{fold_barrier});')
             declarations.append('    };')
             declarations.append(f'    if (auto* stream = pAllocator == nullptr ? {stream_expr} : nullptr) {{'
                                 if allocator else f'    if (auto* stream = {stream_expr}) {{')

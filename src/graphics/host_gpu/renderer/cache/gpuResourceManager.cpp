@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
@@ -493,8 +494,15 @@ int GpuResourceManager::UnmappedSinceByList(uint64_t epoch, uint64_t vaddr, uint
 		// (The log is in epoch order: the entries after `epoch` are its tail.)
 		auto first = std::upper_bound(m_unmap_log.begin(), m_unmap_log.end(), epoch,
 		                              [](uint64_t e, const UnmapLogEntry& entry) { return e < entry.epoch; });
-		m_unmap_list_ok = static_cast<size_t>(m_unmap_log.end() - first) <= 8192;
+		constexpr std::size_t max_list_size = 8192;
+		const auto count = static_cast<std::size_t>(m_unmap_log.end() - first);
+		m_unmap_list_ok = count <= max_list_size;
 		if (m_unmap_list_ok) {
+			const auto capacity = m_unmap_list.capacity();
+			// We know the entire tail size. Grow once and leave room for later rebuilds.
+			if (count > capacity) {
+				m_unmap_list.reserve(std::max(count, std::min(capacity * 2, max_list_size)));
+			}
 			for (auto it = first; it != m_unmap_log.end(); ++it) m_unmap_list.emplace_back(it->begin, it->end);
 			std::sort(m_unmap_list.begin(), m_unmap_list.end());
 			size_t out = 0;

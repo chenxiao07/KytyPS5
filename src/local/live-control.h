@@ -767,7 +767,13 @@ inline void Run(uint64_t id, const std::string& line) {
 		std::printf("LIVE_SCREENSHOTS id=%" PRIu64 " path=%s count=%s\n", id, arg1, arg2);
 	} else if (cmd == "set" && n >= 3) {
 		// set <name> <value>: a live switch (live-switch.h).
-		const bool ok = LiveSwitch::Set(arg1, std::strtoll(arg2, nullptr, 10));
+		const auto value = std::strtoll(arg2, nullptr, 10);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		const bool ok = std::strcmp(arg1, "submit_fold") == 0 ? LocalVulkanRecording::SetSubmitFold(value)
+		                                                      : LiveSwitch::Set(arg1, value);
+#else
+		const bool ok = LiveSwitch::Set(arg1, value);
+#endif
 		std::printf("LIVE_SET id=%" PRIu64 " %s=%s ok=%d\n", id, arg1, arg2, ok ? 1 : 0);
 	} else if (cmd == "sleep" && n >= 2) {
 		std::this_thread::sleep_for(std::chrono::duration<double>(std::strtod(arg1, nullptr)));

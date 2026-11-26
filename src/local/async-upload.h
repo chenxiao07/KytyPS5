@@ -9,6 +9,7 @@
 // into the guest's fault handler, and unmapping a range waits for the jobs on it before the range can be reused.
 
 #include "common/guardedCopy.h"
+#include "cpu-shape.h"
 #include "live-census.h"
 #include "live-counters.h"
 #include "local-platform.h"
@@ -66,9 +67,8 @@ inline volatile std::atomic<uint32_t> kyty_local_upload_help {[] {
 namespace AsyncUpload {
 
 // Whether mode 4 made the state pass its own thread (graphicsRun.cpp start_speculation; -1: not made yet, then the same
-// test is repeated with SpecPacketSlots, Spec::MaxPacketSlots: static_assert there). Read by Worker::PipeCopyThreads.
+// test uses the shared CpuShape slot budget). Read by Worker::PipeCopyThreads.
 inline std::atomic<int32_t>      g_spec_pass_made {-1};
-inline constexpr uint32_t        SpecPacketSlots = 12;
 
 // True on the worker's thread (a fault there cannot wait for the render thread, which may wait for the worker).
 inline thread_local bool t_worker = false;
@@ -295,75 +295,46 @@ private:
 	// either mode), read at each batch: the worker's batches as pipe sessions (PipeSession) in place of Process's runs, and
 	// the queued protections a batch runs merged where adjacent (RunProtectionMerged). Off: one relaxed load a batch. With
 	// no copy threads (PipeCopyThreads 0) it stays off as if the switch were 0.
-	static bool PipeOn() {
+	bool PipeOn() {
 		static auto& on = LiveSwitch::Find("spec_upload_pipe", ModeToggle::Default("spec_upload_pipe"));
 		return on.load(std::memory_order_relaxed) != 0 && PipeCopyThreads() != 0;
 	}
 
-	// KYTY_SPEC_UPLOAD_PIPE_THREADS=<n> (0-16, digits only): the pipe's copy threads; 0: none, the walker only, which is
-	// the pipe off (Process's runs, no merged protections: KYTY_SPEC_UPLOAD_PIPE=0); anything else is not a count, said,
-	// and the rule decides. Unset: the physical cores left after the threads that are busy, at most 7 (every pipe measure
-	// ran with 7): the cores the process may run on, every efficiency class (LocalPlatform::CoresIn), less 3 (the GPU,
-	// record and upload threads), and under KYTY_SPECULATE=4 less the workers' (KYTY_SPECULATE_THREADS, at most the
-	// cores of their CPU list: speculate_cpu_mask, else KYTY_SPECULATE_CPUS, else LocalPlatform::SpeculationCpuList; a
-	// core each where there is no list) and 1 for the state pass thread where it has one (g_spec_pass_made, or
-	// start_speculation's test). The async queue's 2 speculation threads are not counted. 8 P-cores (16 CPUs) + 8
-	// E-cores, workers on CPUs 8-15: 16 - 4 - 3 - 1 = 8, so 7. 8 cores alike (16 CPUs; the workers on 8-15), or that
-	// part held to CPUs 0-15: 8 - 4 - 3 - 1 = 0, the walker only (an 8-core 7800X3D measured +5 % with the pipe off).
-	// Cores not known: 7. Worked out once, at the first batch the pipe switch is on for, and said with its sum (the count
-	// fixed for the run: the threads are made once).
-	static constexpr uint32_t PipeThreadsMax = 7;
-	static uint32_t PipeCopyThreads() {
-		static const uint32_t threads = [] {
-			char        why[256] = {};
-			uint32_t    count    = PipeThreadsMax;
-			const char* value    = std::getenv("KYTY_SPEC_UPLOAD_PIPE_THREADS");
-			const bool  set      = value != nullptr && *value != '\0';
-			const bool  digits   = set && std::strlen(value) <= 9 && std::strspn(value, "0123456789") == std::strlen(value);
-			if (digits) {
-				count = static_cast<uint32_t>(std::min<unsigned long>(std::strtoul(value, nullptr, 10), 16ul));
-				std::snprintf(why, sizeof(why), "KYTY_SPEC_UPLOAD_PIPE_THREADS=%s", value);
-			} else {
-				const bool        spec      = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4;
-				static auto&      live_cpus = LiveSwitch::Find("speculate_cpu_mask", 0);
-				const int64_t     live      = live_cpus.load(std::memory_order_relaxed);
-				const char*       named     = std::getenv("KYTY_SPECULATE_CPUS");
-				const std::string list = named != nullptr && *named != '\0' ? std::string(named) : LocalPlatform::SpeculationCpuList();
-				const uint64_t    mask = live != 0 ? static_cast<uint64_t>(live) : LocalPlatform::CpuListMask(list.c_str());
-				const uint32_t    cores        = LocalPlatform::CoresIn(~uint64_t {0});
-				const uint32_t    workers      = ::kyty_local_speculate_threads.load(std::memory_order_relaxed);
-				const uint32_t    list_cores   = mask != 0 ? LocalPlatform::CoresIn(mask) : 0;
-				const uint32_t    worker_cores = !spec ? 0u : list_cores != 0 ? std::min(workers, list_cores) : workers;
-				const char*       pass_env     = std::getenv("KYTY_SPEC_PASS_THREAD");
-				const int32_t     made         = g_spec_pass_made.load(std::memory_order_relaxed);
-				const bool        pass_test    = (pass_env == nullptr || std::atoi(pass_env) > 0) && workers + 1 < SpecPacketSlots;
-				const uint32_t    pass         = spec && (made >= 0 ? made > 0 : pass_test) ? 1u : 0u;
-				const int64_t     left = int64_t {cores} - int64_t {worker_cores} - 3 - int64_t {pass};
-				char              rejected[96] = {};
-				if (set)
-					std::snprintf(rejected, sizeof(rejected), "KYTY_SPEC_UPLOAD_PIPE_THREADS='%.40s' not a count: the rule; ", value);
-				if (cores == 0) {
-					std::snprintf(why, sizeof(why), "%sthe cores not known: %u", rejected, PipeThreadsMax);
-				} else if (!spec) {
-					count = static_cast<uint32_t>(std::clamp<int64_t>(left, 0, PipeThreadsMax));
-					std::snprintf(why, sizeof(why),
-					              "%s%u cores - 3 GPU, record, upload = %lld, at most %u (no speculation threads: not mode 4); "
-					              "KYTY_SPEC_UPLOAD_PIPE_THREADS sets it",
-					              rejected, cores, static_cast<long long>(left), PipeThreadsMax);
-				} else {
-					count = static_cast<uint32_t>(std::clamp<int64_t>(left, 0, PipeThreadsMax));
-					std::snprintf(why, sizeof(why),
-					              "%s%u cores - %u of the %u workers' - 3 GPU, record, upload - %u state pass = %lld, at most %u; "
-					              "KYTY_SPEC_UPLOAD_PIPE_THREADS sets it",
-					              rejected, cores, worker_cores, workers, pass, static_cast<long long>(left), PipeThreadsMax);
-				}
+	// The worker and Help hold m_process. Size the pool the first time it is used and keep it for the run.
+	// The core budget is shared with the mode-4 boot rule. 8 cores alike: 8 - 4 - 3 - 1 = 0, walker only
+	// (a 7800X3D measured +5 % with the pipe off).
+	uint32_t PipeCopyThreads() {
+		if (m_pipe_threads.has_value()) {
+			return *m_pipe_threads;
+		}
+		if (const auto override = CpuShape::PipeOverride()) {
+			m_pipe_threads = override;
+		} else {
+			const char* value = std::getenv("KYTY_SPEC_UPLOAD_PIPE_THREADS");
+			if (value != nullptr && *value != '\0') {
+				std::printf("Upload pipe: KYTY_SPEC_UPLOAD_PIPE_THREADS='%.40s' is invalid, using the core budget\n", value);
 			}
-			if (count == 0) std::printf("Upload pipe: off, the walker only: no copy threads (%s)\n", why);
-			else std::printf("Upload pipe: %u copy threads (%s)\n", count, why);
-			std::fflush(stdout);
-			return count;
-		}();
-		return threads;
+			if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) {
+				m_pipe_threads = CpuShape::PipeCopyBudget(0, 0, false, false);
+			} else {
+				const auto live = LiveSwitch::Find("speculate_cpu_mask", 0).load(std::memory_order_relaxed);
+				const char* named = std::getenv("KYTY_SPECULATE_CPUS");
+				const bool named_workers = named != nullptr && *named != '\0';
+				const auto list = named_workers ? std::string(named) : LocalPlatform::SpeculationCpuList();
+				const auto mask = live != 0 ? static_cast<uint64_t>(live) : LocalPlatform::CpuListMask(list.c_str());
+				const char* count_env = std::getenv("KYTY_SPECULATE_THREADS");
+				const bool automatic = live == 0 && !named_workers && (count_env == nullptr || *count_env == '\0');
+				const auto workers = ::kyty_local_speculate_threads.load(std::memory_order_relaxed);
+				const char* pass_env = std::getenv("KYTY_SPEC_PASS_THREAD");
+				const auto made = g_spec_pass_made.load(std::memory_order_relaxed);
+				const bool pass = made >= 0 ? made > 0 : CpuShape::HasPass(workers, pass_env == nullptr || std::atoi(pass_env) > 0);
+				m_pipe_threads = CpuShape::PipeCopyBudget(workers, mask, pass, automatic);
+			}
+		}
+		std::printf("Upload pipe: %u copy threads%s\n", *m_pipe_threads,
+		            *m_pipe_threads == 0 ? ", walker only" : "");
+		std::fflush(stdout);
+		return *m_pipe_threads;
 	}
 
 	// KYTY_SPEC_UPLOAD_PIPE: one session (the worker, holding m_process: Help waits for the prefix meanwhile). One walker
@@ -1085,6 +1056,7 @@ private:
 	std::deque<PipeCall>                              m_pipe_calls;
 	uint32_t                                          m_pipe_barriers = 0;
 	std::map<uint64_t, std::pair<uint64_t, uint64_t>> m_pipe_staging;
+	std::optional<uint32_t>                           m_pipe_threads;
 	bool                                              m_pipe_started = false;
 	std::unique_ptr<std::atomic<uint64_t>[]>          m_slot_words;
 	std::unique_ptr<std::atomic<uint32_t>[]>          m_chunks_left;

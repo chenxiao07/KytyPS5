@@ -811,7 +811,7 @@ struct Presenter::Impl {
 		} else {
 			auto& command = present_scheduler.BeginCommand();
 			frame.Clear(command, clear);
-			frame.present_tick = present_scheduler.Submit();
+			frame.present_tick = present_scheduler.Submit({}, CommandScheduler::FlushReason::Flip);
 		}
 	}
 
@@ -968,7 +968,7 @@ struct Presenter::Impl {
 			    count > 0 && !shot.empty() && !Screenshot::IsSeriesFrame(shot)
 			        ? Screenshot::Record(window.graphic_ctx, command.Handle(), generated[0], shot + ".gen.ppm")
 			        : Screenshot::Pending {};
-			frame.present_tick = present_scheduler.Submit();
+			frame.present_tick = present_scheduler.Submit({}, CommandScheduler::FlushReason::Flip);
 			if (capture.buffer != VK_NULL_HANDLE || generated_capture.buffer != VK_NULL_HANDLE) {
 				present_scheduler.Wait(frame.present_tick);
 				Screenshot::Finish(window.graphic_ctx, capture);
@@ -1942,6 +1942,11 @@ Swapchain::Status Swapchain::Present() {
 	} else {
 		Common::LockGuard lock(graphics.queue_mutex);
 		call();
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		// Streamline can submit DLSS-G work inside its replacement for vkQueuePresentKHR.
+		const LocalVulkanRecording::DirectGraphicsSubmit boundary(
+		    LocalVulkanRecording::SubmitFoldEnabled() && FrameGen::UsesStreamlineFrameGeneration());
+#endif
 		result = graphics.queue.presentKHR(&present);
 	}
 	stage.reset();
