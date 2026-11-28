@@ -494,7 +494,7 @@ fs::path LauncherContext::Fsr4Folder() const {
 		folders.push_back(dir / "fsr4");
 	}
 	for (const auto& folder: folders) {
-		if (Exists(folder / "libffx_vk_linux.so") && Exists(folder / "amdvkffx64.dll") &&
+		if (Exists(folder / "libffx_vk_linux.so") &&
 		    (Exists(folder / "amd_fidelityfx_loader_vk.dll") || Exists(folder / "amd_fidelityfx_upscaler_vk.dll")))
 			return folder;
 	}
